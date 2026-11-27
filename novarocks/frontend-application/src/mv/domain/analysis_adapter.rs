@@ -121,7 +121,7 @@ pub fn analyze_mv_select_with_provider(
     current_database: &str,
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
@@ -144,7 +144,7 @@ pub(crate) fn analyze_mv_select_with_captured_catalog(
     current_database: &str,
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let prepared =

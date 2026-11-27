@@ -152,7 +152,7 @@ pub(crate) struct BackendRootEncodingReport {
 }
 
 impl NativeTransportGeometryReport {
-    // Design: ADR-0276 (docs/adr/ADR-0276-third-party-encoding-buffers-use-transport-headroom.md)
+    // Design: ADR-0277 (docs/adr/ADR-0277-third-party-encoding-buffers-use-transport-headroom.md)
     pub(crate) fn backend_root_encoding_report(
         &self,
         geometry: &NativeResultSupportGeometry,

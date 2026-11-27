@@ -41,7 +41,7 @@ use crate::{
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot_with_creation},
     values::lower_values_with_creation,
 };
-use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
+use novarocks_functions::{ConstantValidation, PureEngineFunctionCatalog};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
     Distribution, EdgeKind, FragmentSink, JoinSide, NodeId, NodeKind, RowMultiplicity,
@@ -64,7 +64,7 @@ pub struct LocalCompileOptions {
     pub pipeline_dop: NonZeroUsize,
     pub root_sink_dop: Option<NonZeroUsize>,
     pub kernel_abi: KernelAbiVersion,
-    pub constants: ConstantPolicy,
+    pub constants: ConstantValidation,
 }
 
 #[derive(Debug)]

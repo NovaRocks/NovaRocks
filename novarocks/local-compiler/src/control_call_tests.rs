@@ -26,11 +26,10 @@ use novarocks_expression_contract::{
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PurePreparationSource,
-    ScopedExpressionEffects,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
+    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, PurePreparationSource, ScopedExpressionEffects,
 };
 use novarocks_local_program::{KernelAbiVersion, ProgramNodeKind};
 use novarocks_physical_plan::{
@@ -119,18 +118,20 @@ fn options() -> LocalCompileOptions {
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture limits, never production admission defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -281,7 +282,6 @@ fn package(
                 arguments,
                 logical_argument_count: request.logical_argument_count,
                 expected_result_type: None,
-                constant_policy: options().constants,
             },
         )?;
         draft.definition_control(
@@ -471,7 +471,7 @@ fn package(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: options().constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,

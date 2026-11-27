@@ -172,8 +172,8 @@ fn bytes<T>(n: usize) -> Result<usize, Error> {
         .map(|v| v.size())
         .map_err(|_| invalid("relation allocation layout is unrepresentable"))
 }
-fn cap(n: usize, max: usize, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-    let yes = n <= max;
+fn cap(n: usize, max: Option<usize>, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+    let yes = max.is_none_or(|max| n <= max);
     w.step()?;
     if yes {
         Ok(())
@@ -325,7 +325,7 @@ type Admit<'a> = dyn FnMut(&RelationProjectionFacts) -> Result<(), CompileContro
 struct Admission<'a> {
     definitions: usize,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: Option<RelationProjectionLimits>,
     callback: &'a mut Admit<'a>,
 }
 impl Model<'_> {
@@ -357,29 +357,30 @@ impl Model<'_> {
     fn prefix(&mut self) -> Result<(), Error> {
         if let Some(admission) = self.admission.as_ref() {
             let facts = self.numerical_facts(admission.definitions, admission.source)?;
-            let l = admission.limits;
-            for (value, maximum) in [
-                (facts.definition_count, l.max_definitions),
-                (facts.schema_field_count, l.max_schema_fields),
-                (facts.predicate_guarantee_count, l.max_predicate_guarantees),
-                (facts.metadata_kind_bytes, l.max_metadata_kind_bytes),
-                (facts.coverage_bytes, l.max_coverage_bytes),
-                (
-                    facts.allocation_requests_upper_bound,
-                    l.max_allocation_requests,
-                ),
-                (
-                    facts.allocation_request_bytes_upper_bound,
-                    l.max_allocation_request_bytes,
-                ),
-                (
-                    facts.coexisting_source_and_request_bytes_upper_bound,
-                    l.max_coexisting_source_and_request_bytes,
-                ),
-                (facts.cumulative_work_upper_bound, l.max_work),
-            ] {
-                if value > maximum {
-                    return Err(CompileControlError::ResourceExhausted.into());
+            if let Some(l) = admission.limits {
+                for (value, maximum) in [
+                    (facts.definition_count, l.max_definitions),
+                    (facts.schema_field_count, l.max_schema_fields),
+                    (facts.predicate_guarantee_count, l.max_predicate_guarantees),
+                    (facts.metadata_kind_bytes, l.max_metadata_kind_bytes),
+                    (facts.coverage_bytes, l.max_coverage_bytes),
+                    (
+                        facts.allocation_requests_upper_bound,
+                        l.max_allocation_requests,
+                    ),
+                    (
+                        facts.allocation_request_bytes_upper_bound,
+                        l.max_allocation_request_bytes,
+                    ),
+                    (
+                        facts.coexisting_source_and_request_bytes_upper_bound,
+                        l.max_coexisting_source_and_request_bytes,
+                    ),
+                    (facts.cumulative_work_upper_bound, l.max_work),
+                ] {
+                    if value > maximum {
+                        return Err(CompileControlError::ResourceExhausted.into());
+                    }
                 }
             }
             (self.admission.as_mut().expect("admission exists").callback)(&facts)?;
@@ -493,8 +494,12 @@ impl Model<'_> {
         &mut self,
         f: physical_properties_v2::PhysicalPropertyProjectionFacts,
     ) -> Result<(), Error> {
-        if let Some(admission) = self.admission.as_ref() {
-            let l = admission.limits.properties;
+        if let Some(l) = self
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.limits)
+            .map(|limits| limits.properties)
+        {
             for (value, maximum) in [
                 (f.value_reference_count, l.max_value_references),
                 (f.allocation_requests_upper_bound, l.max_allocation_requests),
@@ -522,7 +527,7 @@ impl Model<'_> {
         &self,
         n: usize,
         source: usize,
-        l: RelationProjectionLimits,
+        l: Option<RelationProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<RelationProjectionFacts, Error> {
         if self.observed() {
@@ -533,19 +538,39 @@ impl Model<'_> {
             }
             return self.numerical_facts(n, source);
         }
-        cap(self.fields, l.max_schema_fields, w)?;
-        cap(self.guarantees, l.max_predicate_guarantees, w)?;
-        cap(self.kinds, l.max_metadata_kind_bytes, w)?;
-        cap(self.coverage, l.max_coverage_bytes, w)?;
-        cap(self.requests, l.max_allocation_requests, w)?;
-        cap(self.bytes, l.max_allocation_request_bytes, w)?;
+        cap(self.fields, l.map(|limits| limits.max_schema_fields), w)?;
+        cap(
+            self.guarantees,
+            l.map(|limits| limits.max_predicate_guarantees),
+            w,
+        )?;
+        cap(
+            self.kinds,
+            l.map(|limits| limits.max_metadata_kind_bytes),
+            w,
+        )?;
+        cap(self.coverage, l.map(|limits| limits.max_coverage_bytes), w)?;
+        cap(
+            self.requests,
+            l.map(|limits| limits.max_allocation_requests),
+            w,
+        )?;
+        cap(
+            self.bytes,
+            l.map(|limits| limits.max_allocation_request_bytes),
+            w,
+        )?;
         let coexist = self.sum(source, self.bytes)?;
-        cap(coexist, l.max_coexisting_source_and_request_bytes, w)?;
+        cap(
+            coexist,
+            l.map(|limits| limits.max_coexisting_source_and_request_bytes),
+            w,
+        )?;
         let work = self.sum(
             self.work,
             self.sum(self.product(self.bytes, 4)?, self.requests)?,
         )?;
-        cap(work, l.max_work, w)?;
+        cap(work, l.map(|limits| limits.max_work), w)?;
         Ok(RelationProjectionFacts {
             definition_count: n,
             schema_field_count: self.fields,
@@ -940,10 +965,11 @@ pub fn encode_relations_in<'loan, 'source, 'control>(
     reads: &'loan EncodedProviderReads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
     admit: &mut impl FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(work.control(), reads.original_control()) {
         return Err(invalid("relation control loan differs"));
     }
@@ -956,10 +982,11 @@ pub fn decode_relations_in<'loan, 'wire, 'control>(
     reads: &'loan DecodedProviderReads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
     admit: &mut impl FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(work.control(), reads.original_control()) {
         return Err(invalid("relation control loan differs"));
     }
@@ -970,8 +997,9 @@ pub fn encode_relations<'loan, 'source, 'control>(
     reads: &'loan EncodedProviderReads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
 ) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     let mut w = CompileCheckpoints::try_new(reads.original_control(), CompilePhase::Encode)?;
     let r = encode_core(inputs, reads, types, source, limits, None, &mut w);
     finish(r, w)
@@ -981,7 +1009,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
     reads: &'loan EncodedProviderReads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
-    l: RelationProjectionLimits,
+    l: Option<RelationProjectionLimits>,
     admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
@@ -1006,7 +1034,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
     let mut largest_relation = 0;
     m.request(m.buffer_bytes::<usize>(inputs.len())?)?;
     m.request(m.buffer_bytes::<wire::RelationDefinition>(inputs.len())?)?;
-    cap(inputs.len(), l.max_definitions, w)?;
+    cap(inputs.len(), l.map(|limits| limits.max_definitions), w)?;
     for input in inputs {
         let r = input.relation;
         let valid = r.schema().len() == input.value_type_ids.len();
@@ -1067,7 +1095,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
         )?;
     }
     m.prefix()?;
-    cap(m.work, l.max_work, w)?;
+    cap(m.work, l.map(|limits| limits.max_work), w)?;
     floor(source, add(root, largest_ids)?, w)?;
     floor(source, largest_relation, w)?;
     floor(source, reads.retained_floor_observed(w)?, w)?;
@@ -1087,7 +1115,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
                     &field.ty,
                     ty,
                     source,
-                    l.max_work,
+                    l.map(|limits| limits.max_work),
                     &mut |facts| {
                         let next = facts.work_upper_bound();
                         m.work = m.sum(
@@ -1105,9 +1133,13 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
                     &field.ty,
                     ty,
                     source,
-                    l.max_work
-                        .checked_sub(m.work)
-                        .ok_or_else(|| invalid("relation work envelope exhausted"))?,
+                    l.map(|limits| {
+                        limits
+                            .max_work
+                            .checked_sub(m.work)
+                            .ok_or_else(|| invalid("relation work envelope exhausted"))
+                    })
+                    .transpose()?,
                     w,
                 )?;
                 m.work = m.sum(m.work, checked.work_upper_bound())?;
@@ -1121,13 +1153,13 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
         let pf = physical_properties_v2::preflight_encode_observed(
             r.provided_properties(),
             source,
-            l.properties,
+            l.map(|limits| limits.properties),
             w,
         )?;
         if !m.observed() {
             m.properties(pf)?;
         }
-        cap(m.work, l.max_work, w)?;
+        cap(m.work, l.map(|limits| limits.max_work), w)?;
         w.step()?;
     }
     let facts = m.gate(inputs.len(), source, l, w)?;
@@ -1159,7 +1191,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
         let (props, _) = physical_properties_v2::encode_observed(
             r.provided_properties(),
             source,
-            l.properties,
+            l.map(|limits| limits.properties),
             w,
         )?;
         let digest = copy(&r.selection_digest(), w)?;
@@ -1211,8 +1243,9 @@ pub fn decode_relations<'loan, 'wire, 'control>(
     reads: &'loan DecodedProviderReads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
 ) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut w = CompileCheckpoints::try_new(reads.original_control(), CompilePhase::Decode)?;
     let r = decode_core(defs, reads, types, source, limits, None, &mut w);
     finish(r, w)
@@ -1222,12 +1255,12 @@ fn preflight_decode_observed<'admit>(
     reads: &DecodedProviderReads<'_, '_>,
     types: &DecodedTypeTable,
     source: usize,
-    l: RelationProjectionLimits,
+    l: Option<RelationProjectionLimits>,
     admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<RelationProjectionFacts, Error> {
     let observed = admit.is_some();
-    if observed && defs.len() > l.max_definitions {
+    if observed && l.is_some_and(|limits| defs.len() > limits.max_definitions) {
         return Err(CompileControlError::ResourceExhausted.into());
     }
     let mut m = Model::default();
@@ -1248,7 +1281,7 @@ fn preflight_decode_observed<'admit>(
     let mut known = bytes::<wire::RelationDefinition>(defs.len())?;
     m.request(m.buffer_bytes::<usize>(defs.len())?)?;
     m.request(m.buffer_bytes::<p::Relation>(defs.len())?)?;
-    cap(defs.len(), l.max_definitions, w)?;
+    cap(defs.len(), l.map(|limits| limits.max_definitions), w)?;
     for def in defs {
         let result = raw_source(def);
         if !m.observed() {
@@ -1315,7 +1348,7 @@ fn preflight_decode_observed<'admit>(
         )?;
     }
     m.prefix()?;
-    cap(m.work, l.max_work, w)?;
+    cap(m.work, l.map(|limits| limits.max_work), w)?;
     floor(source, known, w)?;
     floor(source, reads.retained_floor_observed(w)?, w)?;
     for def in defs {
@@ -1365,13 +1398,13 @@ fn preflight_decode_observed<'admit>(
         let pf = physical_properties_v2::preflight_decode_observed(
             properties(&r, w)?,
             source,
-            l.properties,
+            l.map(|limits| limits.properties),
             w,
         )?;
         if !m.observed() {
             m.properties(pf)?;
         }
-        cap(m.work, l.max_work, w)?;
+        cap(m.work, l.map(|limits| limits.max_work), w)?;
         w.step()?;
     }
     m.gate(defs.len(), source, l, w)
@@ -1381,7 +1414,7 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
     reads: &'loan DecodedProviderReads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
-    l: RelationProjectionLimits,
+    l: Option<RelationProjectionLimits>,
     admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
@@ -1429,8 +1462,12 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
             w.step()?;
         }
         let guarantees = boxed(guarantees, w)?;
-        let (provided_properties, _) =
-            physical_properties_v2::decode_observed(properties(&r, w)?, source, l.properties, w)?;
+        let (provided_properties, _) = physical_properties_v2::decode_observed(
+            properties(&r, w)?,
+            source,
+            l.map(|limits| limits.properties),
+            w,
+        )?;
         w.flush()?;
         let read = read.clone();
         w.flush()?;

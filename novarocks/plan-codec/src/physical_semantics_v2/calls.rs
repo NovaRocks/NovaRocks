@@ -757,7 +757,7 @@ fn decode_calls_core(
 pub fn encode_frozen_calls_observed(
     input: &FrozenFragmentCalls,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::FrozenCalls, NodeProjectionFacts), E> {
@@ -769,7 +769,7 @@ pub fn decode_frozen_calls_observed(
     fragment: &Fragment,
     input: &wire::FrozenCalls,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FrozenFragmentCalls, NodeProjectionFacts), E> {
@@ -783,7 +783,7 @@ pub fn decode_frozen_calls_observed(
 pub(crate) fn decode_frozen_call_entries_observed(
     input: &wire::FrozenCalls,
     source_retained_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Vec<FrozenPhysicalCall>, NodeProjectionFacts), E> {
@@ -962,7 +962,7 @@ fn validate_writer_source_shape(call: &FrozenPhysicalCall) -> Result<(), E> {
 pub(crate) fn encode_expression_claims_in(
     unit: &novarocks_expression_contract::BoundExprSet,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ExpressionClaims, NodeProjectionFacts), E> {
@@ -1059,7 +1059,7 @@ fn claim_resource_error(error: novarocks_type_contract::ControlResourceError) ->
 pub(crate) fn decode_expression_claims_in<H>(
     input: &wire::ExpressionClaims,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,

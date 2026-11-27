@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::test_constants as checked;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::{BoundFunction, ExprId, ExprKind};
 use novarocks_physical_plan::*;
@@ -247,7 +246,6 @@ fn scalar_fixture(count: usize, _retired_fragment_id: u32) -> Fixture {
                 arguments: Box::default(),
                 logical_argument_count: 0,
                 expected_result_type: None,
-                constant_policy: checked::policy(),
             },
         )
         .unwrap();
@@ -502,7 +500,6 @@ fn relation_fixture(count: usize, id: u32) -> RelationFixture {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: checked::policy(),
                 },
             )
         })
@@ -755,7 +752,6 @@ fn special_fixture_with_rows(input_rows: usize) -> RelationFixture {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: checked::policy(),
                 },
             )
         })

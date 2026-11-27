@@ -342,6 +342,7 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
 - [ADR-0275](ADR-0275-approximate-distinct-freezes-precision-for-split.md) — 近似去重怎样从原参数取得固定精度，统一 HLL 状态并复核分阶段来源（active，部分替代 ADR-0259 的普通近似去重状态）
 - [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
 
@@ -631,7 +632,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：Rust 的普通分配失败会终止进程，所以可恢复的容量控制只能建立在**比单次分配更粗的事前授权**上——先取额度、再分配、最后结算，且授予额度内的结算不会因容量失败。一个进程一个权威，账户成严格树，账户对父级持有的份额**就是**它的承诺；已下放的独立域内 funded 步骤不触父/root；补额修改在足够的父级余额停止，祖先增长资格门仍须握手。配置目标与历史债务独立。归属绑定在稳定 allocation origin，真实退出后残留交同分支祖先，物理释放以前仍计费。覆盖是**两级**且诚实的：硬治理覆盖声明的对象集合，其余由进程分配观测按 headroom 预算测量并列出盲区——不冒充按查询精确归属，也不承诺避免所有物理 OOM。授权、实际分配、共享持有、回收估计与物理压力是五个必须分别表达、永不相加的事实。本领域与 `runtime-role` 的工作治理是同一进程内的两半：ADR-0147 拥有责任、scope、阶段准入与取消，本领域拥有容量机制本身，并回答 ADR-0147 重评估条件 2 点名的「扩展真实内存来源与强制接入」。
 
-- [ADR-0276](ADR-0276-third-party-encoding-buffers-use-transport-headroom.md) — 随查询数据变化的第三方编码缓冲归传输服务和 H，Root 的结构请求字节由原位置与尺寸推导（active，承接 ADR-0170 与 ADR-0148）
+- [ADR-0277](ADR-0277-third-party-encoding-buffers-use-transport-headroom.md) — 随查询数据变化的第三方编码缓冲归传输服务和 H，Root 的结构请求字节由原位置与尺寸推导（active，承接 ADR-0170 与 ADR-0148）
+- [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
 - [ADR-0227](ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md) — 元数据列举与任务传输为何使用真实容量边界，组批为何只作目标，回复布局为何只在 Joint 记责而不构成回复总字节治理（active；部分替代 Task创建版0158、0170、0196、HMS版0216与0224的准确固定额度条款，其余规则保留）
 - [ADR-0216](ADR-0216-execution-vocabulary-participation-task-and-handles.md) — 执行词汇为何把协议记录叫 Participation、协议实例叫 Task，并且只把会到期的授予叫 Lease（active）
 - ADR-0148 — 为何采用唯一的非等待进程容量权威（active；旧余额、Arrow charge 与仲裁框架由 ADR-0166 替换，观察责任保留；全局 allocator 归属由 ADR-0167 部分替换）

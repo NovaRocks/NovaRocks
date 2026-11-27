@@ -33,8 +33,7 @@ use novarocks_local_program::ProgramNodeKind;
 use novarocks_physical_plan::StaticFunctionArgument;
 use novarocks_plan_codec::{
     physical_package_v2::{
-        decode_fragment_package, encode_fragment_package,
-        test_support::{decode_limits, encode_limits},
+        decode_fragment_package, encode_fragment_package, test_support::decode_limits,
     },
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
@@ -69,13 +68,11 @@ impl KernelEvaluationControl for Control {
 
 fn source_packages(
     source: &SqlAuthoredPhysicalPlan,
-    policy: novarocks_functions::ConstantPolicy,
 ) -> BTreeMap<novarocks_physical_plan::FragmentId, Arc<novarocks_physical_plan::FragmentPackage>> {
     use novarocks_physical_plan::{
         FragmentPackageAdmission, FrozenFragmentPruning, PlanLimits, PropertyProofProjectionLimits,
         extract_fragment_packages,
     };
-    source.require_statement_constant_policy(policy).unwrap();
     let pruning = source
         .plan()
         .fragments()
@@ -190,32 +187,19 @@ fn check_array_source(
             }
         }
         assert_eq!(indexes, 1);
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        };
-        source.require_statement_constant_policy(policy).unwrap();
         let functions = installed_builtin_owner_catalogue();
         let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
         let mut producer = None;
         let mut failures = vec![];
-        for package in source_packages(&source, policy).into_values() {
-            let encoded = encode_fragment_package(&package, &encode_limits(), &Control)
+        for package in source_packages(&source).into_values() {
+            let encoded = encode_fragment_package(&package, &Control)
                 .unwrap()
                 .encode_to_vec();
             let decoded = Arc::new(
                 decode_fragment_package(&encoded, &model, &decode_limits(), &Control).unwrap(),
             );
             assert_eq!(
-                encode_fragment_package(&decoded, &encode_limits(), &Control)
+                encode_fragment_package(&decoded, &Control)
                     .unwrap()
                     .encode_to_vec(),
                 encoded

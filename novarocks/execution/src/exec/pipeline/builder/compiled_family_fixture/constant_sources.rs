@@ -395,7 +395,7 @@ pub(crate) struct PlanBuilder {
 impl PlanBuilder {
     pub(crate) fn new(version: p::PlanVersionId, sources: &Sources) -> Self {
         Self {
-            physical: p::PlanBuilder::new(version, constant_policy()),
+            physical: p::PlanBuilder::new(version),
             _sources: sources.clone(),
         }
     }

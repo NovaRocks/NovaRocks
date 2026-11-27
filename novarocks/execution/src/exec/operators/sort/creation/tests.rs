@@ -213,13 +213,11 @@ fn list_program(
     let package = if wire_roundtrip {
         use crate::exec::operators::family_fixture::FixtureControl;
         use novarocks_plan_codec::physical_package_v2::{
-            PackageDecodeLimits, PackageEncodeLimits, decode_fragment_package,
-            encode_fragment_package,
+            PackageDecodeLimits, decode_fragment_package, encode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use prost::Message;
-        let wire = encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &FixtureControl)
-            .unwrap();
+        let wire = encode_fragment_package(&package, &FixtureControl).unwrap();
         Arc::new(
             decode_fragment_package(
                 &wire.encode_to_vec(),

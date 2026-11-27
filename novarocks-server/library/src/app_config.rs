@@ -1320,42 +1320,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
     }
 }
 
-/// Explicit FE scalar constant admission ceilings supplied by deployment.
-///
-/// Each field is required. These are independent limits, not allocation grants;
-/// zero refuses the corresponding dimension and no value is clamped.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FrontendConstantPolicyConfig {
-    pub max_rows: u64,
-    pub max_array_nodes: u64,
-    pub max_logical_elements: u64,
-    pub max_retained_buffer_bytes: u64,
-    pub max_type_depth: u32,
-    pub max_type_nodes: u64,
-    pub max_dictionary_depth: u32,
-    pub max_metadata_bytes: u64,
-    pub max_library_validation_work: u64,
-    pub max_library_validation_bytes: u64,
-}
-
-impl FrontendConstantPolicyConfig {
-    pub fn policy(&self) -> novarocks_functions::ConstantPolicy {
-        novarocks_functions::ConstantPolicy {
-            max_rows: self.max_rows,
-            max_array_nodes: self.max_array_nodes,
-            max_logical_elements: self.max_logical_elements,
-            max_retained_buffer_bytes: self.max_retained_buffer_bytes,
-            max_type_depth: self.max_type_depth,
-            max_type_nodes: self.max_type_nodes,
-            max_dictionary_depth: self.max_dictionary_depth,
-            max_metadata_bytes: self.max_metadata_bytes,
-            max_library_validation_work: self.max_library_validation_work,
-            max_library_validation_bytes: self.max_library_validation_bytes,
-        }
-    }
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -1466,9 +1430,6 @@ pub struct RuntimeConfig {
     pub optimizer_query_mem_limit_bytes: u64,
     #[serde(default)]
     pub frontend_workload: FrontendWorkloadRuntimeConfig,
-    /// Required when composing FE. BE-only configurations may omit this section.
-    /// The profile's fields have no deployment defaults.
-    pub frontend_constant_policy: Option<FrontendConstantPolicyConfig>,
     /// Maximum time a connector split source may wait for its first usable
     /// runtime-filter feedback domain. Zero disables this optimization wait.
     #[serde(default = "default_connector_split_initial_dynamic_filter_wait_cap_ms")]
@@ -2634,7 +2595,6 @@ impl Default for RuntimeConfig {
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
             frontend_workload: FrontendWorkloadRuntimeConfig::default(),
-            frontend_constant_policy: None,
             connector_split_initial_dynamic_filter_wait_cap_ms:
                 default_connector_split_initial_dynamic_filter_wait_cap_ms(),
             optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
@@ -5078,89 +5038,19 @@ mod joint_startup_load_tests {
 
 #[cfg(test)]
 mod frontend_constant_policy_tests {
-    use super::{FrontendConstantPolicyConfig, RuntimeConfig};
-
-    const FIELDS: [&str; 10] = [
-        "max_rows",
-        "max_array_nodes",
-        "max_logical_elements",
-        "max_retained_buffer_bytes",
-        "max_type_depth",
-        "max_type_nodes",
-        "max_dictionary_depth",
-        "max_metadata_bytes",
-        "max_library_validation_work",
-        "max_library_validation_bytes",
-    ];
-
-    fn zero_profile(except: Option<&str>) -> String {
-        FIELDS
-            .iter()
-            .filter(|field| Some(**field) != except)
-            .map(|field| format!("{field} = 0\n"))
-            .collect()
-    }
+    use super::RuntimeConfig;
 
     #[test]
-    fn frontend_constant_policy_requires_every_inner_field() {
-        for missing in FIELDS {
-            let error =
-                toml::from_str::<FrontendConstantPolicyConfig>(&zero_profile(Some(missing)))
-                    .expect_err("each deployment ceiling is required");
-            assert!(error.to_string().contains(missing));
-        }
-        let unknown = format!("{}extra = 0\n", zero_profile(None));
-        assert!(toml::from_str::<FrontendConstantPolicyConfig>(&unknown).is_err());
-    }
-
-    #[test]
-    fn frontend_constant_policy_preserves_independent_ceilings_without_clamping() {
-        let source = FrontendConstantPolicyConfig {
-            max_rows: 0,
-            max_array_nodes: 1,
-            max_logical_elements: 2,
-            max_retained_buffer_bytes: u64::MAX,
-            max_type_depth: u32::MAX,
-            max_type_nodes: u64::MAX,
-            max_dictionary_depth: u32::MAX,
-            max_metadata_bytes: 3,
-            max_library_validation_work: 4,
-            max_library_validation_bytes: 5,
-        };
-        let policy = source.policy();
-        assert_eq!(policy.max_rows, 0);
-        assert_eq!(policy.max_array_nodes, 1);
-        assert_eq!(policy.max_logical_elements, 2);
-        assert_eq!(policy.max_retained_buffer_bytes, u64::MAX);
-        assert_eq!(policy.max_type_depth, u32::MAX);
-        assert_eq!(policy.max_type_nodes, u64::MAX);
-        assert_eq!(policy.max_dictionary_depth, u32::MAX);
-        assert_eq!(policy.max_metadata_bytes, 3);
-        assert_eq!(policy.max_library_validation_work, 4);
-        assert_eq!(policy.max_library_validation_bytes, 5);
-    }
-
-    #[test]
-    fn runtime_constant_policy_absence_is_explicit_and_zero_profile_is_preserved() {
-        assert!(RuntimeConfig::default().frontend_constant_policy.is_none());
-        let absent: RuntimeConfig = toml::from_str("").expect("BE may omit the FE-only profile");
-        assert!(absent.frontend_constant_policy.is_none());
-        let source = format!("[frontend_constant_policy]\n{}", zero_profile(None));
-        let configured: RuntimeConfig = toml::from_str(&source).expect("explicit zero ceilings");
-        let policy = configured
-            .frontend_constant_policy
-            .expect("configured profile is retained")
-            .policy();
-        assert_eq!(policy.max_rows, 0);
-        assert_eq!(policy.max_array_nodes, 0);
-        assert_eq!(policy.max_logical_elements, 0);
-        assert_eq!(policy.max_retained_buffer_bytes, 0);
-        assert_eq!(policy.max_type_depth, 0);
-        assert_eq!(policy.max_type_nodes, 0);
-        assert_eq!(policy.max_dictionary_depth, 0);
-        assert_eq!(policy.max_metadata_bytes, 0);
-        assert_eq!(policy.max_library_validation_work, 0);
-        assert_eq!(policy.max_library_validation_bytes, 0);
+    fn runtime_config_rejects_retired_frontend_constant_policy() {
+        assert!(toml::from_str::<RuntimeConfig>("").is_ok());
+        let error = toml::from_str::<RuntimeConfig>("[frontend_constant_policy]\nmax_rows = 4096")
+            .err()
+            .expect("the retired constant policy is an unknown field");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `frontend_constant_policy`")
+        );
     }
 }
 

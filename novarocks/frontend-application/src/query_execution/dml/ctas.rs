@@ -1261,7 +1261,6 @@ async fn prepare_planned_ctas_connector_write_async(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.static_plan_carrier(),
-        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 session: session.as_ref(),

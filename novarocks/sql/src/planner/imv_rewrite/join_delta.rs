@@ -431,7 +431,7 @@ fn inject_join_apply_key_into_branch(
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), crate::compiler::SqlCompileError> {
     let LogicalPlanKind::Project(project) = &mut branch.kind else {
@@ -477,7 +477,7 @@ fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     evidence: &JoinDeltaBranchEvidence,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![

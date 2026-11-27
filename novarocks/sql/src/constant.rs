@@ -18,11 +18,13 @@
 //! SQL constant presentation and ordered literal runs.
 
 use arrow::datatypes::DataType;
-use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantValidation, ConstantValue};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 mod literal_run;
-pub(crate) use literal_run::{admit_syntax_constant_run, syntax_run_carrier};
+#[cfg(test)]
+pub(crate) use literal_run::admit_syntax_constant_run;
+pub(crate) use literal_run::{SyntaxLiteralPrefix, syntax_run_carrier};
 
 pub(crate) use novarocks_expression::typing::admit_syntax_constant;
 use novarocks_expression::typing::syntax_constant::{
@@ -30,8 +32,23 @@ use novarocks_expression::typing::syntax_constant::{
 };
 
 #[cfg(any(test, novarocks_dev_controls))]
-pub(crate) fn test_constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+pub(crate) fn test_constant_policy() -> ConstantValidation {
+    test_constant_validation(1 << 20)
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) fn test_constant_validation(max_rows: u64) -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows,
+            ..test_constant_fixture()
+        },
+    )
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) fn test_constant_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
         max_rows: 1 << 20,
         max_array_nodes: 1 << 20,
         max_logical_elements: 1 << 24,

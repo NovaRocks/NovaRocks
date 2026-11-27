@@ -64,11 +64,11 @@ use crate::query_execution::preparation::attempt_access::{
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
 
-/// Production encoding borrows the admitted statement window. Pure semantic
-/// fixtures name their separate author explicitly and cannot enter production.
+/// Production encoding checks the original statement scope before freezing.
+/// Pure semantic fixtures have no statement scope.
 #[derive(Clone, Copy)]
 pub(crate) enum EncodingAuthor<'a> {
-    Statement(&'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding),
+    Statement(&'a novarocks_workload_control::WorkScope),
     #[cfg(test)]
     SemanticFixture,
 }
@@ -157,13 +157,13 @@ pub(crate) struct WriteTargetFacts<'a> {
     pub(crate) session: &'a dyn WriteRecipeSession,
 }
 
-/// Freeze one completed plan into compiled packages under the host's explicit
-/// admission and encode limits and the statement's own constant policy.
+/// Freeze one completed plan into compiled packages using the statement's
+/// capacity binding and the carrier's frozen plan and wire limits.
 // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -171,10 +171,9 @@ pub(crate) fn encode_completed_plan(
     encode_completed_plan_authored(
         paired,
         carrier,
-        statement_constant_policy,
         write_targets,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 
@@ -182,14 +181,13 @@ pub(crate) fn encode_completed_plan(
 pub(crate) fn encode_completed_plan_for_test(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     encode_completed_plan_authored(
         paired,
         carrier,
-        statement_constant_policy,
         write_targets,
         control,
         EncodingAuthor::SemanticFixture,
@@ -267,7 +265,6 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
         return Err("empty two-core fixture retained unexpected Provider access".into());
     }
     let mut pruning = BTreeMap::new();
-    let mut admissions = BTreeMap::new();
     for &id in plan.fragments().keys() {
         let frozen_pruning = p::FrozenFragmentPruning::try_new(id, Vec::new(), control).map_err(
             |error| match error {
@@ -278,14 +275,13 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
             },
         )?;
         pruning.insert(id, frozen_pruning);
-        admissions.insert(id, *carrier.admission());
     }
-    let packages = p::extract_fragment_packages(
+    let packages = p::extract_fragment_packages_input_derived(
         plan,
         &BTreeMap::new(),
         &BTreeMap::new(),
         &pruning,
-        &admissions,
+        carrier.plan_limits(),
         control,
     )
     .map_err(|error| match error {
@@ -332,20 +328,13 @@ pub(crate) fn encode_empty_values_exchange_program_for_test(
 fn encode_completed_plan_authored(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
-    let result = encode_completed_packages(
-        paired,
-        carrier,
-        statement_constant_policy,
-        write_targets,
-        control,
-        author,
-    );
+    let result = encode_completed_packages(paired, carrier, write_targets, control, author);
     if matches!(
         &result,
         Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
@@ -395,7 +384,7 @@ pub(crate) fn split_frozen_reads(
 fn encode_completed_packages(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
@@ -406,7 +395,6 @@ fn encode_completed_packages(
         candidate,
         &encodings,
         carrier,
-        statement_constant_policy,
         write_targets,
         control,
         author,
@@ -512,7 +500,6 @@ pub(crate) fn encode_completed_plan_borrowed(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
@@ -520,9 +507,8 @@ pub(crate) fn encode_completed_plan_borrowed(
         candidate,
         access,
         carrier,
-        policy,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 
@@ -530,18 +516,16 @@ fn encode_completed_plan_borrowed_authored(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    encode_borrowed_original(candidate, access, carrier, policy, None, control, author)
+    encode_borrowed_original(candidate, access, carrier, None, control, author)
 }
 
 pub(crate) fn encode_completed_write_plan_borrowed(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: &WriteTargetFacts<'_>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -550,10 +534,9 @@ pub(crate) fn encode_completed_write_plan_borrowed(
         candidate,
         access,
         carrier,
-        policy,
         write_targets,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 
@@ -561,7 +544,6 @@ fn encode_completed_write_plan_borrowed_authored(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: &WriteTargetFacts<'_>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
@@ -570,7 +552,6 @@ fn encode_completed_write_plan_borrowed_authored(
         candidate,
         access,
         carrier,
-        policy,
         Some(write_targets),
         control,
         author,
@@ -581,7 +562,6 @@ fn encode_borrowed_original(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
@@ -611,7 +591,6 @@ fn encode_borrowed_original(
         candidate,
         &encodings,
         carrier,
-        policy,
         write_targets,
         control,
         author,
@@ -635,7 +614,7 @@ fn encode_static_packages(
     candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     carrier: &CompiledPackageCarrier,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
     author: EncodingAuthor<'_>,
@@ -660,8 +639,7 @@ fn encode_static_packages(
         &candidate,
         encodings,
         &writes,
-        statement_constant_policy,
-        carrier.admission(),
+        carrier.plan_limits(),
         control,
     )?;
     let submission = compiled_plan_submission_facts(&candidate, &topology)?;
@@ -1202,7 +1180,6 @@ mod tests {
         let encoded = encode_completed_plan_for_test(
             completed,
             &compiled_carrier(),
-            crate::application::test_constant_policy(),
             None,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
@@ -1260,8 +1237,6 @@ mod tests {
         Vec<novarocks_physical_plan::FragmentId>,
         std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Vec<u8>>,
     ) {
-        use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
-
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1278,9 +1253,7 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            crate::application::test_constant_policy(),
             &test_package_admission(),
-            &encode_limits(),
             &control,
         )
         .unwrap_or_else(|error| panic!("{sql}: checked v2 packages: {error}"));
@@ -1479,9 +1452,7 @@ mod tests {
 
     #[test]
     fn a_completed_statement_freezes_v2_packages_that_roundtrip_through_the_receiver() {
-        use novarocks_plan_codec::physical_package_v2::test_support::{
-            decode_limits, encode_limits,
-        };
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
         use novarocks_plan_codec::physical_package_v2::{
             decode_fragment_package, encode_fragment_package,
         };
@@ -1496,16 +1467,14 @@ mod tests {
             let decoded = decode_fragment_package(bytes, &model, &decode_limits(), &control)
                 .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error}"));
             assert_eq!(decoded.fragment().id(), *id);
-            let again = encode_fragment_package(&decoded, &encode_limits(), &control)
+            let again = encode_fragment_package(&decoded, &control)
                 .expect("re-encode")
                 .encode_to_vec();
             assert_eq!(&again, bytes, "fragment {id:?} roundtrips byte-identically");
         }
     }
 
-    /// Package admission within the test encode limits' source/coexistence
-    /// envelope: the package's retained source floor travels in the sender's
-    /// cumulative source invoice. This is not a production sizing.
+    /// Explicit package extraction bounds for component fixtures.
     fn test_package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         novarocks_physical_plan::FragmentPackageAdmission {
             plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
@@ -1520,10 +1489,7 @@ mod tests {
 
     /// The compiled package carrier under test sizing.
     fn compiled_carrier() -> CompiledPackageCarrier {
-        CompiledPackageCarrier::for_test(
-            test_package_admission(),
-            novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
-        )
+        CompiledPackageCarrier::for_test(test_package_admission())
     }
 
     /// Complete one table-free statement with the production Frontend
@@ -1554,7 +1520,6 @@ mod tests {
         let encoded = encode_completed_plan_for_test(
             completed,
             carrier,
-            crate::application::test_constant_policy(),
             None,
             &SqlCompileControl::unbounded(),
         );
@@ -1927,8 +1892,8 @@ mod tests {
     #[test]
     fn wide_statistics_source_freezes_with_production_limits() {
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 
@@ -1951,7 +1916,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY,
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -1981,9 +1946,7 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_CONSTANT_POLICY,
-            &FROZEN_PACKAGE_ADMISSION,
-            &PackageEncodeLimits::FROZEN,
+            &PACKAGE_ADMISSION_FIXTURE,
             &control,
         )
         .unwrap_or_else(|error| panic!("wide statistics source package freeze: {error:#?}"));
@@ -2003,8 +1966,7 @@ mod tests {
     fn completed_values_receiver_refusal_freezes_no_native_artifact_and_keeps_its_cause() {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
-            encode_fragment_package,
+            PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits, encode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::{
             FragmentDecodeResourceModel, ResourceModelError,
@@ -2016,14 +1978,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            crate::application::test_constant_policy(),
-            &FROZEN_PACKAGE_ADMISSION,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let first = packages.first_key_value().unwrap().1;
-        let bytes = encode_fragment_package(first, &PackageEncodeLimits::FROZEN, &control)
+        let bytes = encode_fragment_package(first, &control)
             .unwrap()
             .encode_to_vec();
         let usage = model
@@ -2036,12 +1997,8 @@ mod tests {
         receiver.max_field_occurrences = usage.field_occurrences.checked_sub(1).unwrap();
         let expected = model.preflight(&bytes, receiver, &control).unwrap_err();
         assert!(matches!(expected, ResourceModelError::Limit(_)));
-        let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
-            PackageEncodeLimits::FROZEN,
-            model,
-            receiver,
-        );
+        let carrier =
+            CompiledPackageCarrier::new(PACKAGE_ADMISSION_FIXTURE.plan_limits, model, receiver);
         struct TailRefusal {
             decoded: std::sync::atomic::AtomicBool,
         }
@@ -2067,13 +2024,7 @@ mod tests {
             decoded: std::sync::atomic::AtomicBool::new(false),
         };
         let before = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let error = match encode_completed_plan_for_test(
-            completed,
-            &carrier,
-            crate::application::test_constant_policy(),
-            None,
-            &tail,
-        ) {
+        let error = match encode_completed_plan_for_test(completed, &carrier, None, &tail) {
             Err(error) => error,
             Ok(_) => panic!("receiver refusal must not produce a Native encoding"),
         };
@@ -2125,7 +2076,6 @@ mod tests {
             let error = match encode_completed_plan_for_test(
                 completed,
                 &compiled_carrier(),
-                crate::application::test_constant_policy(),
                 None,
                 &Reject {
                     cause: cause.clone(),
@@ -2148,8 +2098,8 @@ mod tests {
     #[test]
     fn original_information_schema_scale_values_freeze_under_the_production_receiver() {
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         let rows = (0..32)
@@ -2179,7 +2129,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY,
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2203,15 +2153,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_CONSTANT_POLICY,
-            &FROZEN_PACKAGE_ADMISSION,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
-            PackageEncodeLimits::FROZEN,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
         );
@@ -2244,8 +2192,8 @@ mod tests {
         use crate::query_execution::package_freeze::PackageFreezeError;
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::{
             FragmentDecodeResourceModel, ResourceModelError,
@@ -2280,7 +2228,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            FROZEN_CONSTANT_POLICY,
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2314,15 +2262,13 @@ mod tests {
             completed.candidate(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            FROZEN_CONSTANT_POLICY,
-            &FROZEN_PACKAGE_ADMISSION,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();
         let model = Arc::new(FragmentDecodeResourceModel::try_new(&control).unwrap());
         let carrier = CompiledPackageCarrier::new(
-            FROZEN_PACKAGE_ADMISSION,
-            PackageEncodeLimits::FROZEN,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             Arc::clone(&model),
             PackageDecodeLimits::FROZEN.wire,
         );
@@ -2366,8 +2312,7 @@ mod tests {
                 receiver.max_field_occurrences =
                     production.usage.field_occurrences.checked_sub(1).unwrap();
                 let limited_carrier = CompiledPackageCarrier::new(
-                    FROZEN_PACKAGE_ADMISSION,
-                    PackageEncodeLimits::FROZEN,
+                    PACKAGE_ADMISSION_FIXTURE.plan_limits,
                     Arc::clone(&model),
                     receiver,
                 );
@@ -2426,8 +2371,8 @@ mod tests {
         use arrow::datatypes::{DataType, Field};
         use novarocks_connector_contract::{ConnectorWriteBinding, ConnectorWriteRecipeDraft};
         use novarocks_plan_codec::physical_package_v2::{
-            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
-            PackageEncodeLimits, decode_fragment_package,
+            CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits,
+            decode_fragment_package,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
@@ -2481,7 +2426,7 @@ mod tests {
             &functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
-            FROZEN_CONSTANT_POLICY,
+            CONSTANT_POLICY_FIXTURE.into(),
             control.clone(),
         ))
         .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
@@ -2619,8 +2564,7 @@ mod tests {
             &candidate,
             &BTreeMap::new(),
             &BTreeMap::from([(ordinal, recipe)]),
-            FROZEN_CONSTANT_POLICY,
-            &FROZEN_PACKAGE_ADMISSION,
+            PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap_or_else(|error| panic!("wide INSERT checked package extraction: {error:#?}"));
@@ -2629,10 +2573,7 @@ mod tests {
         for (id, package) in &packages {
             let bytes = crate::query_execution::package_freeze::encode_checked_package(
                 package,
-                &CompiledPackageCarrier::for_test(
-                    FROZEN_PACKAGE_ADMISSION,
-                    PackageEncodeLimits::FROZEN,
-                ),
+                &CompiledPackageCarrier::for_test(PACKAGE_ADMISSION_FIXTURE),
                 &control,
             )
             .unwrap_or_else(|error| panic!("wide INSERT fragment {id:?} encode: {error:#?}"));
@@ -2730,14 +2671,8 @@ mod tests {
                 tail_error: error.clone(),
                 earlier_error: None,
             };
-            encode_completed_plan_for_test(
-                completed,
-                &compiled_carrier(),
-                crate::application::test_constant_policy(),
-                None,
-                &observed,
-            )
-            .expect("the observed encoding succeeds");
+            encode_completed_plan_for_test(completed, &compiled_carrier(), None, &observed)
+                .expect("the observed encoding succeeds");
             let encode_checkpoints = observed.encode_checkpoints.load(Ordering::SeqCst);
             assert!(encode_checkpoints >= 4, "FE and codec entry/exit at least");
             let observed_checkpoints = observed.checkpoints.into_inner().unwrap();
@@ -2776,7 +2711,6 @@ mod tests {
                 encode_completed_plan_for_test(
                     completed,
                     &compiled_carrier(),
-                    crate::application::test_constant_policy(),
                     None,
                     &control,
                 ),
@@ -2815,7 +2749,6 @@ mod tests {
                 encode_completed_plan_for_test(
                     completed,
                     &compiled_carrier(),
-                    crate::application::test_constant_policy(),
                     None,
                     &first_failure,
                 ),
@@ -2859,7 +2792,6 @@ mod tests {
         let encoded = encode_completed_plan_for_test(
             completed,
             &compiled_carrier(),
-            crate::application::test_constant_policy(),
             None,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
@@ -3020,10 +2952,7 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("scan fragment");
-        let mut builder = PlanBuilder::new(
-            PlanVersionId::try_new([11; 16]).expect("version"),
-            crate::application::test_constant_policy(),
-        );
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([11; 16]).expect("version"));
         builder.add_fragment(fragment).expect("one fragment");
         builder.finish().expect("validated scan plan")
     }

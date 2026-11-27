@@ -614,7 +614,6 @@ pub(super) fn lambda_compilation_fixture() -> (
             })
             .collect(),
         expected_result_type: None,
-        constant_policy: policy(),
     };
     (binding, request, catalog(owner))
 }
@@ -655,7 +654,6 @@ fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExpr
                     }]),
                     logical_argument_count: 1,
                     expected_result_type: None,
-                    constant_policy: policy(),
                 },
             )
             .unwrap();
@@ -712,7 +710,6 @@ fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExpr
                     .collect::<Box<[_]>>(),
                 logical_argument_count: 2,
                 expected_result_type: owner.expected_constraint.clone(),
-                constant_policy: policy(),
             },
         )
         .unwrap();
@@ -1078,7 +1075,6 @@ fn intrinsic_controller_keeps_hand_checked_branch_guards_without_scalar_instance
             ]),
             logical_argument_count: 3,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -1273,7 +1269,6 @@ fn seal_type_only_fixture(
             })),
             logical_argument_count: 2,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -1529,14 +1524,7 @@ fn zero_port_strict_null_skips_kernel_creation() {
         register_call_requests(&mut draft, &authors, &mut constants);
         let mut work =
             CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-        declare_call_controls(
-            &mut draft,
-            &functions,
-            &constants,
-            &parameters,
-            policy(),
-            &mut work,
-        );
+        declare_call_controls(&mut draft, &functions, &constants, &parameters, &mut work);
         let sealed = draft.seal(Vec::new(), &mut work).unwrap();
         let unit = finish_unit(
             &functions,
@@ -1544,7 +1532,6 @@ fn zero_port_strict_null_skips_kernel_creation() {
             &authors,
             &constants,
             &parameters,
-            policy(),
             &mut work,
         );
         work.finish().unwrap();

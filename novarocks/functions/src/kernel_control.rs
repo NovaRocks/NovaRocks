@@ -215,12 +215,106 @@ impl KernelFailure {
                     | FailureClass::Representation
             )
     }
+    /// A kernel could not construct its local output allocation after checking
+    /// the layout. Host capacity and execution control have their own failures.
+    pub fn is_local_output_allocation_failure(&self) -> bool {
+        matches!(self, Self::Source(source) if source.0.downcast_ref::<LocalOutputAllocation>().is_some())
+    }
+
     pub fn from_domain<E: novarocks_failure_contract::OuterFailureProjection>(source: E) -> Self {
         Self::Source(KernelSourceFailure(
             novarocks_failure_contract::SharedFailureCause::new(source),
         ))
     }
 }
+#[derive(Debug)]
+struct LocalOutputAllocation(
+    crate::allocation_failure::AllocationRefusal<std::collections::TryReserveError>,
+);
+
+impl fmt::Display for LocalOutputAllocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for LocalOutputAllocation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for LocalOutputAllocation {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.0.failure_fact()
+    }
+}
+
+impl novarocks_failure_contract::OuterFailureProjection for LocalOutputAllocation {}
+
+/// Only for the initial reservation of a checked, empty output vector.
+pub(crate) fn reserve_local_output<T>(
+    len: usize,
+    operation: &'static str,
+) -> Result<Vec<T>, KernelFailure> {
+    use crate::allocation_failure::AllocationRefusal;
+    std::alloc::Layout::array::<T>(len).map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(len).map_err(|source| {
+        KernelFailure::from_domain(LocalOutputAllocation(AllocationRefusal::new(
+            operation, source,
+        )))
+    })?;
+    Ok(output)
+}
+
+#[derive(Debug)]
+struct I32OutputExtent(usize);
+
+impl fmt::Display for I32OutputExtent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "output requires {} bytes beyond the i32 offset extent",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for I32OutputExtent {}
+
+impl novarocks_failure_contract::FailureProjection for I32OutputExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        use std::num::NonZeroU16;
+        FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(domain::KERNEL, NonZeroU16::new(370).unwrap()),
+        )
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: domain::KERNEL,
+                code: NonZeroU16::new(66).unwrap(),
+            },
+            required: u64::try_from(self.0).ok(),
+            extent_limit: Some(i32::MAX as u64),
+            representable_prefix: None,
+        })
+    }
+}
+
+impl novarocks_failure_contract::OuterFailureProjection for I32OutputExtent {}
+
+pub(crate) fn check_i32_output_extent(bytes: usize) -> Result<(), KernelFailure> {
+    i32::try_from(bytes)
+        .map(|_| ())
+        .map_err(|_| KernelFailure::from_domain(I32OutputExtent(bytes)))
+}
+
 impl std::error::Error for KernelFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

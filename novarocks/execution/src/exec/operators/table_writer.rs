@@ -2897,7 +2897,7 @@ pub(crate) mod tests {
                 constants,
                 version: PlanVersionId::try_new([71; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                statement_constant_policy: crate::exec::expr::test_support::constant_policy(),
+
                 pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap(),
                 fragment,
                 cuts: FragmentCuts {

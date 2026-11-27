@@ -653,9 +653,9 @@ fn relation_limits() -> RelationProjectionLimits {
 fn dispatch_limits() -> NodeDispatchLimits {
     NodeDispatchLimits {
         node: limits(),
-        binding: binding_limits(),
+        binding: Some(binding_limits()),
         relation: relation_limits(),
-        writer_schema: WriterSchemaProjectionLimits {
+        writer_schema: Some(WriterSchemaProjectionLimits {
             max_fields: 8,
             max_name_bytes: 1024,
             max_type_references: 16,
@@ -663,7 +663,7 @@ fn dispatch_limits() -> NodeDispatchLimits {
             max_allocation_request_bytes: 65536,
             max_coexisting_source_and_request_bytes: COEX,
             max_work: 64 << 20,
-        },
+        }),
     }
 }
 fn finish<T>(
@@ -682,10 +682,18 @@ fn encode(
     c: &Control,
     admit: &mut NodeAdmit<'_>,
 ) -> Result<(wire::PhysicalNode, NodeProjectionFacts), NodeCodecError> {
+    encode_with_limits(n, ctx, c, dispatch_limits(), admit)
+}
+fn encode_with_limits(
+    n: &p::PhysicalNode,
+    ctx: &NodeEncodeContext<'_, '_, '_, '_>,
+    c: &Control,
+    limits: NodeDispatchLimits<impl Into<Option<NodeProjectionLimits>>>,
+    admit: &mut NodeAdmit<'_>,
+) -> Result<(wire::PhysicalNode, NodeProjectionFacts), NodeCodecError> {
     let mut work = CompileCheckpoints::try_new(c, CompilePhase::LowerProgram)?;
     let result = (|| {
-        let token =
-            prepare_node_encode_in(n, ctx, None, SOURCE, dispatch_limits(), admit, &mut work)?;
+        let token = prepare_node_encode_in(n, ctx, None, SOURCE, limits, admit, &mut work)?;
         let expected_facts = *token.facts();
         let result = token.emit_in(admit, &mut work)?;
         assert_eq!(result.1, expected_facts);
@@ -699,9 +707,18 @@ fn decode(
     c: &Control,
     admit: &mut NodeAdmit<'_>,
 ) -> Result<(p::PhysicalNode, NodeProjectionFacts), NodeCodecError> {
+    decode_with_limits(n, ctx, c, dispatch_limits(), admit)
+}
+fn decode_with_limits(
+    n: &wire::PhysicalNode,
+    ctx: &NodeDecodeContext<'_, '_, '_, '_>,
+    c: &Control,
+    limits: NodeDispatchLimits<impl Into<Option<NodeProjectionLimits>>>,
+    admit: &mut NodeAdmit<'_>,
+) -> Result<(p::PhysicalNode, NodeProjectionFacts), NodeCodecError> {
     let mut work = CompileCheckpoints::try_new(c, CompilePhase::LowerProgram)?;
     let result = (|| {
-        let token = prepare_node_decode_in(n, ctx, SOURCE, dispatch_limits(), admit, &mut work)?;
+        let token = prepare_node_decode_in(n, ctx, SOURCE, limits, admit, &mut work)?;
         let expected_facts = *token.facts();
         let result = token.emit_in(admit, &mut work)?;
         assert_eq!(result.1, expected_facts);
@@ -734,6 +751,47 @@ fn dispatcher_simple_family_preserves_independent_sparse_wire_and_original_token
                     .all(|(phase, _)| *phase == CompilePhase::LowerProgram)
             );
         }
+    });
+}
+
+#[test]
+fn input_derived_node_dispatch_admits_original_geometry_and_wire() {
+    let c = Control::default();
+    Fixture::new().with_tokens(&c, |send, receive| {
+        let explicit = dispatch_limits();
+        let input_derived = NodeDispatchLimits {
+            node: None,
+            binding: explicit.binding,
+            relation: explicit.relation,
+            writer_schema: explicit.writer_schema,
+        };
+        for at in 0..8 {
+            let input = source(at);
+            let original = encode(&input, &send, &c, &mut |_| Ok(())).unwrap();
+            let mut admitted = None;
+            let output = encode_with_limits(&input, &send, &c, input_derived, &mut |facts| {
+                admitted = Some(*facts);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(output, original);
+            assert_eq!(admitted, Some(output.1));
+            assert_eq!(
+                decode_with_limits(&output.0, &receive, &c, input_derived, &mut |_| Ok(()))
+                    .unwrap(),
+                decode(&original.0, &receive, &c, &mut |_| Ok(())).unwrap(),
+            );
+        }
+
+        let refused = encode_with_limits(&source(3), &send, &c, input_derived, &mut |_| {
+            Err(CompileControlError::ResourceExhausted)
+        });
+        assert!(matches!(
+            refused,
+            Err(NodeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
     });
 }
 

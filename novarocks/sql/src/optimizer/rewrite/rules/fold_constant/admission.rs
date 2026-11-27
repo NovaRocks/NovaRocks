@@ -17,13 +17,14 @@
 
 //! Fold policy for input carriers, prepared calls and one-row results.
 
+use super::evaluation::is_fold_output_extent;
 use crate::compiler::SqlCompileError;
 use arrow::array::{ArrayRef, Decimal128Array, Decimal256Array};
 use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType, Field};
 use novarocks_expression::CompiledExprSet;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_functions::{
-    ConstantPolicy, ConstantPool, ConstantValue, KernelDiagnostic, KernelFailure,
+    ConstantPool, ConstantValidation, ConstantValue, KernelDiagnostic, KernelFailure,
     PreparedNullIfEquality, PreparedPureKernel, validate_function_value_type_observed,
 };
 use novarocks_type_contract::{
@@ -131,7 +132,7 @@ pub(super) fn compiled_unit_can_fold(
 pub(super) fn admit_result(
     output: ArrayRef,
     arena_type: &FunctionValueType,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<Option<ConstantValue>, SqlCompileError> {
     let phase = CompilePhase::FunctionSpecialization;
@@ -177,7 +178,11 @@ pub(super) fn admit_result(
         let pool =
             match ConstantPool::try_new(field, arena_type.clone(), data, policy, phase, control) {
                 Ok(pool) => pool,
-                Err(novarocks_functions::ConstantError::Limit(_)) => return Ok(None),
+                Err(error)
+                    if error.is_local_allocation_failure() || is_fold_output_extent(&error) =>
+                {
+                    return Ok(None);
+                }
                 Err(error) => return Err(error.into()),
             };
         work.step()?;

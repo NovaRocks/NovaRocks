@@ -26,7 +26,7 @@ use novarocks_physical_plan::{
 
 use super::SqlCompileIntent;
 use super::tests::complete_with_exact_statistics;
-use crate::compiler::{PackageSemanticsError, SqlAuthoredPhysicalPlan, SqlCompileControl};
+use crate::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 
 // A table-free statement completes on its first step: it has no catalog,
 // statistics or provider observation need.
@@ -53,9 +53,6 @@ fn owner(sql: &str) -> SqlAuthoredPhysicalPlan {
 #[test]
 fn aggregate_scan_statement_authors_every_fragment_and_covers_each_aggregate_call() {
     let owner = owner("SELECT MIN(order_key) AS lo FROM orders");
-    owner
-        .require_statement_constant_policy(crate::constant::test_constant_policy())
-        .unwrap();
     let control = SqlCompileControl::unbounded();
     let mut aggregate_calls = 0;
     for (id, fragment) in owner.plan().fragments() {
@@ -82,29 +79,12 @@ fn aggregate_scan_statement_authors_every_fragment_and_covers_each_aggregate_cal
     assert!(aggregate_calls >= 1);
 }
 
-#[test]
-fn statement_policy_must_equal_every_captured_call_policy() {
-    let owner = owner("SELECT MIN(order_key) AS lo FROM orders");
-    let mut other = crate::constant::test_constant_policy();
-    other.max_rows -= 1;
-    let error = owner
-        .require_statement_constant_policy(other)
-        .expect_err("a different statement policy is refused");
-    assert!(
-        matches!(error, PackageSemanticsError::StatementPolicyMismatch),
-        "{error}"
-    );
-}
-
 // A provider-free statement publishes complete checked packages through the
 // original extraction law with the authored uses, calls and pruning.
 #[test]
 fn provider_free_statement_publishes_checked_packages_through_extraction() {
     let owner = table_free_owner("SELECT 1 + 2 AS x, abs(-5) AS y");
     let control = SqlCompileControl::unbounded();
-    owner
-        .require_statement_constant_policy(crate::constant::test_constant_policy())
-        .unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
     for &id in owner.plan().fragments().keys() {
@@ -210,9 +190,6 @@ fn json_in_subquery_authors_a_null_aware_hash_mark_with_canonical_keys() {
                 .any(|line| line.contains("NULL AWARE LEFT MARK"))
         );
     }
-    owner
-        .require_statement_constant_policy(crate::constant::test_constant_policy())
-        .unwrap();
     for fragment in owner.plan().fragments().values() {
         fragment
             .calls()

@@ -357,7 +357,7 @@ pub(crate) fn build_iceberg_write_plan(
     insert_columns: &[String],
     source: &Query,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<
     (
@@ -1444,18 +1444,19 @@ mod provider_admission_before_shaping_tests {
             1024 * 1024,
         )
         .unwrap();
-        let policy = novarocks_functions::ConstantPolicy {
-            max_rows: 100,
-            max_array_nodes: 1000,
-            max_logical_elements: 1000,
-            max_retained_buffer_bytes: 1024 * 1024,
-            max_type_depth: 64,
-            max_type_nodes: 1000,
-            max_dictionary_depth: 4,
-            max_metadata_bytes: 64 * 1024,
-            max_library_validation_work: 10000,
-            max_library_validation_bytes: 1024 * 1024,
-        };
+        let policy =
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+                max_rows: 100,
+                max_array_nodes: 1000,
+                max_logical_elements: 1000,
+                max_retained_buffer_bytes: 1024 * 1024,
+                max_type_depth: 64,
+                max_type_nodes: 1000,
+                max_dictionary_depth: 4,
+                max_metadata_bytes: 64 * 1024,
+                max_library_validation_work: 10000,
+                max_library_validation_bytes: 1024 * 1024,
+            });
         let error = build_iceberg_write_plan(
             &lease,
             "main",

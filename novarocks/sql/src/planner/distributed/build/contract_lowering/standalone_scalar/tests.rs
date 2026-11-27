@@ -21,7 +21,7 @@ use arrow::{
     array::{Array, StringArray},
     datatypes::DataType,
 };
-use novarocks_constant_contract::{ConstantError, ConstantPool};
+use novarocks_constant_contract::{ConstantError, ConstantPool, ConstantValidation};
 use novarocks_failure_contract::FailureProjection;
 use novarocks_parser::ast::AstBox;
 use novarocks_type_contract::DecimalOverflowPolicy;
@@ -272,8 +272,10 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     }
     // This limit originates at lowering, before any ordinary finishing footer.
     // Arming the next callback must not replace the actual source Limit.
-    let mut small = policy();
-    small.max_retained_buffer_bytes = 1;
+    let small = ConstantValidation::bounded(novarocks_constant_contract::ConstantPolicy {
+        max_retained_buffer_bytes: 1,
+        ..crate::constant::test_constant_fixture()
+    });
     let expression = text("an actual over-limit source literal");
     let baseline_control = Control::default();
     let result = lower_required_constant_unit(

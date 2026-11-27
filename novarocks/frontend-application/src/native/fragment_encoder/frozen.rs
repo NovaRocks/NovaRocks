@@ -45,12 +45,17 @@ use novarocks_physical_plan::{
     WriteTargetOrdinal,
 };
 use novarocks_proto_models::novarocks as wire;
-use novarocks_type_contract::PureCompileControl;
-use prost::Message;
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueSchemaCreation,
+    ValueTypeStorageLifetime,
+};
+use novarocks_workload_control::WorkScope;
 
-use crate::metrics::task_creation::{RetainedPayload, static_fragment_frozen};
+use crate::metrics::task_creation::static_fragment_frozen;
 use crate::query_execution::artifact::FragmentId;
-use crate::query_execution::package_freeze::PackageFreezeError;
+use crate::query_execution::package_freeze::{
+    PackageFreezeError, encode_checked_package_with_creator, encode_freeze_buffer,
+};
 
 /// One static sink branch, in the order the static plan declares it.
 ///
@@ -206,12 +211,27 @@ impl FragmentFacts {
 pub(crate) struct FragmentArtifact {
     content: FrozenBytes,
     facts: FragmentFacts,
-    /// This plan's share of the retained static-plan gauges, returned when
-    /// the last task, resend or template holding the plan drops it.
-    _retained: RetainedPayload,
 }
 
 impl FragmentArtifact {
+    pub(crate) fn freeze_statement_package(
+        root: &WorkScope,
+        package: &FragmentPackage,
+        edges: &BTreeMap<EdgeId, Edge>,
+        carrier: &CompiledPackageCarrier,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self>, PackageFreezeError> {
+        root.check().map_err(|error| {
+            PackageFreezeError::Control(CompileControlError::Source(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ))
+        })?;
+        control
+            .checkpoint(CompilePhase::Validate, 0)
+            .map_err(PackageFreezeError::Control)?;
+        Self::freeze_package(package, edges, carrier, control)
+    }
+
     /// Encodes one fragment's checked v2 package, once, as a compiled
     /// carrier.
     ///
@@ -220,16 +240,20 @@ impl FragmentArtifact {
     /// nothing beside it restates them. The facts are read from the same
     /// package's physical fragment, and its sink branches from the plan
     /// edges that sink names, in declared order.
-    pub(crate) fn freeze_package_with_creator(
+    pub(crate) fn freeze_package(
         package: &FragmentPackage,
         edges: &BTreeMap<EdgeId, Edge>,
         carrier: &CompiledPackageCarrier,
         control: &dyn PureCompileControl,
-        creation: &mut novarocks_type_contract::ValueSchemaCreation<
-            '_,
-            novarocks_type_contract::CompileControlError,
-        >,
     ) -> Result<Arc<Self>, PackageFreezeError> {
+        // Design: ADR-0276 (docs/adr/ADR-0276-plan-freezing-uses-frontend-planning-memory.md)
+        control
+            .checkpoint(CompilePhase::LowerProgram, 0)
+            .map_err(PackageFreezeError::Control)?;
+        let mut request = |_| control.checkpoint(CompilePhase::LowerProgram, 0);
+        let mut opaque = |_| control.checkpoint(CompilePhase::LowerProgram, 0);
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
         let fragment = package.fragment();
         let fragment_id = fragment.id().get();
         // Validate the signed native representation in every build. Only tests
@@ -296,60 +320,15 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings: true,
         };
         let frozen = wire::FrozenFragment {
-            package: crate::query_execution::package_freeze::encode_checked_package_with_creator(
-                package, carrier, control, creation,
-            )?
-            .into(),
+            package: encode_checked_package_with_creator(package, carrier, control, &mut creation)?
+                .into(),
         };
-        let layout = std::alloc::Layout::array::<u8>(frozen.encoded_len()).map_err(|_| {
-            PackageFreezeError::Control(novarocks_type_contract::CompileControlError::from_domain(
-                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
-            ))
-        })?;
-        creation
-            .request_layout(layout)
-            .map_err(PackageFreezeError::Control)?;
-        let owner = FrozenBytes::encoded_custody_layout::<
-            novarocks_type_contract::ValueTypeStorageLifetime,
-        >()
-        .map_err(|_| {
-            PackageFreezeError::Control(novarocks_type_contract::CompileControlError::from_domain(
-                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
-            ))
-        })?;
-        creation
-            .request_layout(owner)
-            .map_err(PackageFreezeError::Control)?;
-        let content = FrozenBytes::freeze_encoded_with_custody(
-            frozen.encode_to_vec(),
-            creation.storage_lifetime(),
-        );
+        let encoded = encode_freeze_buffer(&frozen, &mut creation)?;
+        let retained = static_fragment_frozen(encoded.len());
+        let content = FrozenBytes::freeze_encoded_with_custody(encoded, retained);
         #[cfg(test)]
         tests::record_freeze();
-        let retained = static_fragment_frozen(content.len());
-        Ok(Arc::new(Self {
-            content,
-            facts,
-            _retained: retained,
-        }))
-    }
-
-    /// Pure semantic fixtures explicitly choose their construction author.
-    #[cfg(test)]
-    pub(crate) fn freeze_package(
-        package: &FragmentPackage,
-        edges: &BTreeMap<EdgeId, Edge>,
-        carrier: &CompiledPackageCarrier,
-        control: &dyn PureCompileControl,
-    ) -> Result<Arc<Self>, PackageFreezeError> {
-        let mut request = |_| Ok::<_, novarocks_type_contract::CompileControlError>(());
-        let mut opaque = |_| Ok::<_, novarocks_type_contract::CompileControlError>(());
-        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            &mut request,
-            &mut opaque,
-        );
-        Self::freeze_package_with_creator(package, edges, carrier, control, &mut creation)
+        Ok(Arc::new(Self { content, facts }))
     }
 
     /// The frozen bytes every task of this fragment is created from.
@@ -466,6 +445,9 @@ fn package_sink_targets(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use prost::Message;
 
     use super::*;
 
@@ -536,7 +518,7 @@ pub(crate) mod tests {
                 )),
                 ty.clone(),
                 &bytes,
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE,
                 CompilePhase::Validate,
                 &control,
             )
@@ -707,8 +689,7 @@ pub(crate) mod tests {
                 version: p::PlanVersionId::try_new(version).expect("nonzero version"),
                 required: p::RequiredContracts::default(),
                 fragment,
-                statement_constant_policy:
-                    novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
                 pruning,
                 cuts,
                 result,
@@ -718,7 +699,7 @@ pub(crate) mod tests {
                 annotations: Box::default(),
                 layouts: Default::default(),
             },
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             &control,
         )
         .expect("checked package");
@@ -726,16 +707,14 @@ pub(crate) mod tests {
             &package,
             &edges,
             &CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
             &control,
         )
         .expect("a genuine package freezes")
     }
 
-    #[test]
-    fn statement_funded_fragment_bytes_keep_the_original_receipt_until_last_rpc_alias() {
+    fn statement_package() -> FragmentPackage {
         use novarocks_plan_codec::physical_package_v2::{
             PackageDecodeLimits, decode_fragment_package,
         };
@@ -755,76 +734,147 @@ pub(crate) mod tests {
         let wire = wire::FrozenFragment::decode(original.content().bytes().clone()).unwrap();
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
         let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
-        let package = decode_fragment_package(
+        decode_fragment_package(
             &wire.package,
             &model,
             &PackageDecodeLimits::FROZEN,
             &control,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn statement_freeze_preserves_result_windows_and_observes_last_byte_alias() {
+        use crate::metrics::task_creation::retained_static_fragments;
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+
+        let package = statement_package();
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
         let carrier = CompiledPackageCarrier::for_test(
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         );
-        let (_control, root, capacity, _positions) =
-            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
-        let window = capacity.try_window_alias().unwrap();
-        let artifact = crate::query_execution::required_constant_eval::with_root_value_creation(
-            &root.owner.scope(),
-            &window,
-            &control,
-            |creation| {
-                FragmentArtifact::freeze_package_with_creator(
-                    &package,
-                    &BTreeMap::new(),
-                    &carrier,
-                    &control,
-                    creation,
-                )
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
             },
         )
-        .unwrap()
         .unwrap();
-        let charged = window.retained_payload_bytes();
-        assert!(charged >= artifact.content().encoded_backing_capacity().unwrap() as u64);
-        let rpc = artifact.content().to_bytes();
-        let replay = rpc.clone();
-        assert!(artifact.content().shares_backing_with(
-            &novarocks_execution_contract::FrozenBytes::freeze(rpc.clone())
-        ));
-        drop(artifact);
-        drop(rpc);
-        assert_eq!(window.retained_payload_bytes(), charged);
-        assert!(!replay.is_empty());
-        drop(replay);
-        assert_eq!(window.retained_payload_bytes(), 0);
-        let occupied = window
-            .reserve_payload_bytes(window.payload_capacity_bytes())
+        let _capacity = workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
-        let refused = crate::query_execution::required_constant_eval::with_root_value_creation(
+        workload.mark_ready().unwrap();
+
+        for class in [ResultWindowClass::Client, ResultWindowClass::Internal] {
+            let (root, window) = workload
+                .root_admission()
+                .try_begin_root_with_result(WorkRequest::new(WorkClass::Management), class)
+                .unwrap();
+            let window = window.retain_alias();
+            let _occupied = window
+                .reserve_payload_bytes(window.payload_capacity_bytes())
+                .unwrap();
+            let before = window.retained_payload_bytes();
+            let (before_count, before_bytes) = retained_static_fragments();
+            let artifact = FragmentArtifact::freeze_statement_package(
+                &root.owner.scope(),
+                &package,
+                &BTreeMap::new(),
+                &carrier,
+                &control,
+            )
+            .unwrap();
+            assert_eq!(window.retained_payload_bytes(), before);
+            let len = artifact.content().len() as i64;
+            assert!(artifact.content().encoded_backing_capacity().unwrap() >= len as usize);
+            let gauges_with_fragment = (before_count + 1, before_bytes + len);
+            assert_eq!(retained_static_fragments(), gauges_with_fragment);
+            let rpc = artifact.content().to_bytes();
+            let replay = rpc.clone();
+            assert!(artifact.content().shares_backing_with(
+                &novarocks_execution_contract::FrozenBytes::freeze(rpc.clone())
+            ));
+            drop(artifact);
+            assert_eq!(retained_static_fragments(), gauges_with_fragment);
+            drop(rpc);
+            assert_eq!(retained_static_fragments(), gauges_with_fragment);
+            assert!(!replay.is_empty());
+            drop(replay);
+            assert_eq!(retained_static_fragments(), (before_count, before_bytes));
+            assert_eq!(window.retained_payload_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn cancellation_during_statement_freeze_preserves_original_control_and_window() {
+        struct CancelDuringFreeze(AtomicUsize);
+
+        impl PureCompileControl for CancelDuringFreeze {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                work_units: u32,
+            ) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::LowerProgram
+                    && work_units == 0
+                    && self.0.fetch_add(1, Ordering::Relaxed) == 1
+                {
+                    return Err(CompileControlError::Cancelled);
+                }
+                Ok(())
+            }
+        }
+
+        let package = statement_package();
+        let (_workload, root, capacity, _positions) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = capacity.try_window_alias().unwrap();
+        let before = window.retained_payload_bytes();
+        let control = CancelDuringFreeze(AtomicUsize::new(0));
+        let carrier = CompiledPackageCarrier::for_test(
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
+        );
+        let result = FragmentArtifact::freeze_statement_package(
             &root.owner.scope(),
-            &window,
+            &package,
+            &BTreeMap::new(),
+            &carrier,
             &control,
-            |creation| {
-                FragmentArtifact::freeze_package_with_creator(
-                    &package,
-                    &BTreeMap::new(),
-                    &carrier,
-                    &control,
-                    creation,
-                )
-            },
         );
         assert!(matches!(
-            refused,
-            Err(novarocks_type_contract::CompileControlError::Source(_))
+            result,
+            Err(PackageFreezeError::Control(CompileControlError::Cancelled))
         ));
+        assert_eq!(window.retained_payload_bytes(), before);
+
+        use novarocks_workload_control::{CancellationReason, WorkError};
+        root.owner.cancel(CancellationReason::ClientCancelRequested);
+        let unentered = CancelDuringFreeze(AtomicUsize::new(0));
+        let error = FragmentArtifact::freeze_statement_package(
+            &root.owner.scope(),
+            &package,
+            &BTreeMap::new(),
+            &carrier,
+            &unentered,
+        )
+        .unwrap_err();
+        let PackageFreezeError::Control(CompileControlError::Source(cause)) = error else {
+            panic!("preserve the original statement cancellation");
+        };
         assert_eq!(
-            window.retained_payload_bytes(),
-            window.payload_capacity_bytes()
+            cause.downcast_ref::<WorkError>(),
+            Some(&WorkError::Cancelled(
+                CancellationReason::ClientCancelRequested
+            ))
         );
-        drop(occupied);
-        assert_eq!(window.retained_payload_bytes(), 0);
+        assert_eq!(unentered.0.load(Ordering::Relaxed), 0);
+        assert_eq!(window.retained_payload_bytes(), before);
     }
 
     #[test]

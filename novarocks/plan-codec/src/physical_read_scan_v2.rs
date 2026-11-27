@@ -408,7 +408,7 @@ impl Model {
     fn facts(
         &self,
         current: &c::WriterOwnedResourceFacts,
-        l: ReadScanProjectionLimits,
+        l: Option<ReadScanProjectionLimits>,
     ) -> Result<ReadScanProjectionFacts, E> {
         let mut f = self.facts;
         f.allocation_requests_upper_bound = add(
@@ -428,22 +428,23 @@ impl Model {
         )?;
         f.coexisting_source_and_request_bytes_upper_bound =
             add(self.source, f.allocation_request_bytes_upper_bound)?;
-        if f.scan_count > l.max_scans
-            || f.item_count > l.max_items
-            || f.scalar_bytes > l.max_scalar_bytes
-            || f.allocation_requests_upper_bound > l.max_allocation_requests
-            || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
-            || f.coexisting_source_and_request_bytes_upper_bound
-                > l.max_coexisting_source_and_request_bytes
-            || f.cumulative_work_upper_bound > l.max_work
-        {
+        if l.is_some_and(|l| {
+            f.scan_count > l.max_scans
+                || f.item_count > l.max_items
+                || f.scalar_bytes > l.max_scalar_bytes
+                || f.allocation_requests_upper_bound > l.max_allocation_requests
+                || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
+                || f.coexisting_source_and_request_bytes_upper_bound
+                    > l.max_coexisting_source_and_request_bytes
+                || f.cumulative_work_upper_bound > l.max_work
+        }) {
             return Err(E::Control(CompileControlError::ResourceExhausted));
         }
         Ok(f)
     }
     fn gate(
         &self,
-        l: ReadScanProjectionLimits,
+        l: Option<ReadScanProjectionLimits>,
         a: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     ) -> Result<(), E> {
         a(&self.facts(&Default::default(), l)?)?;
@@ -693,7 +694,7 @@ fn decode_properties(
 fn encode_tuple(
     input: &c::TupleDomain<c::ScanColumnId>,
     model: &Model,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<w::ScanTupleDomain, E> {
@@ -725,7 +726,7 @@ fn encode_tuple(
 fn decode_tuple(
     input: &w::ScanTupleDomain,
     model: &Model,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<c::TupleDomain<c::ScanColumnId>, E> {
@@ -781,7 +782,7 @@ fn count_raw_value(value: &cv::Value, m: &mut Model) -> Result<(), E> {
 fn count_tuple(
     input: &c::TupleDomain<c::ScanColumnId>,
     m: &mut Model,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
@@ -820,7 +821,7 @@ fn count_tuple(
 fn count_raw_tuple(
     input: &w::ScanTupleDomain,
     m: &mut Model,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
@@ -890,7 +891,7 @@ fn count_expr(
     input: &c::ConnectorExpression,
     m: &mut Model,
     depth: usize,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<usize, E> {
@@ -1052,7 +1053,7 @@ fn preflight_expr(
     path: &mut [u32; 65],
     depth: usize,
     m: &mut Model,
-    l: ReadScanProjectionLimits,
+    l: Option<ReadScanProjectionLimits>,
     a: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<usize, E> {
@@ -1463,7 +1464,7 @@ pub fn encode_read_scans_observed(
     sources: &[ReadScanSource<'_>],
     context: ReadScanEncodeContext<'_, '_, '_>,
     source_retained_bytes: usize,
-    limits: ReadScanProjectionLimits,
+    limits: impl Into<Option<ReadScanProjectionLimits>>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
@@ -1474,6 +1475,7 @@ pub fn encode_read_scans_observed(
     ),
     E,
 > {
+    let limits = limits.into();
     let mut m = Model::new::<w::FrozenReadScan>(sources.len(), source_retained_bytes)?;
     // Namespace counts are available without walking their owned backing. All
     // source scans and lookups are charged before the first observed operation.
@@ -1770,10 +1772,11 @@ pub fn decode_read_scans_observed(
     expressions: &[w::ConnectorExpressionDefinition],
     context: ReadScanDecodeContext<'_, '_, '_>,
     source_retained_bytes: usize,
-    limits: ReadScanProjectionLimits,
+    limits: impl Into<Option<ReadScanProjectionLimits>>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedReadScans, E> {
+    let limits = limits.into();
     decode_read_scans_core::<Infallible>(
         scans,
         expressions,
@@ -1792,11 +1795,12 @@ pub fn decode_read_scans_with_creator<H>(
     expressions: &[w::ConnectorExpressionDefinition],
     context: ReadScanDecodeContext<'_, '_, '_>,
     source_retained_bytes: usize,
-    limits: ReadScanProjectionLimits,
+    limits: impl Into<Option<ReadScanProjectionLimits>>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     creation: &mut ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedReadScans, ProjectionFailure<E, H>> {
+    let limits = limits.into();
     decode_read_scans_core(
         scans,
         expressions,
@@ -1814,7 +1818,7 @@ fn decode_read_scans_core<H>(
     expressions: &[w::ConnectorExpressionDefinition],
     context: ReadScanDecodeContext<'_, '_, '_>,
     source_retained_bytes: usize,
-    limits: ReadScanProjectionLimits,
+    limits: Option<ReadScanProjectionLimits>,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,

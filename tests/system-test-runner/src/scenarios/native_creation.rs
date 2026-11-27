@@ -59,6 +59,9 @@ use super::query_lifecycle::{
     await_token_scoped_marker, resource_snapshot,
 };
 
+#[path = "native_creation_constant_capacity.rs"]
+pub(super) mod constant_capacity;
+
 #[path = "raw_creation_controls.rs"]
 mod raw_creation_controls;
 
@@ -80,14 +83,16 @@ const CREATES_FROZEN: &str = "novarocks_task_creates_frozen_total";
 const CREATE_PAYLOADS_RETAINED: &str = "novarocks_task_create_payloads_retained";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![
+    let mut scenarios: Vec<Box<dyn Scenario>> = vec![
         Box::new(FrozenReplayAndMembership::default()),
         Box::new(CreationPayloadLifetime::default()),
         Box::new(FixedPlanRecovery::default()),
         Box::new(NormalCloseRetainedAdmission { byte_corpus: false }),
         Box::new(NormalCloseRetainedAdmission { byte_corpus: true }),
         Box::new(AcceptedPreparationControlRaces),
-    ]
+    ];
+    scenarios.extend(constant_capacity::scenarios());
+    scenarios
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
@@ -890,7 +895,7 @@ pub(super) fn compiled_fragment(
                 Arc::new(Field::new("v", DataType::Int64, false)),
                 ty.clone(),
                 arrow_array::Array::to_data(&array),
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+                novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 CompilePhase::Validate,
                 &Control,
             )
@@ -1041,7 +1046,7 @@ pub(super) fn compiled_fragment(
         }]
         .into_boxed_slice(),
     });
-    let package = FragmentPackage::try_new(
+    let package = FragmentPackage::try_new_input_derived(
         FragmentPackageInput {
             constants,
             version: PlanVersionId::try_new([0x5b; 16]).expect("version"),
@@ -1049,8 +1054,7 @@ pub(super) fn compiled_fragment(
             pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control)
                 .expect("empty pruning"),
             fragment,
-            statement_constant_policy:
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
             cuts,
             result,
             parameters: SemanticParameters::try_new([]).expect("parameters"),
@@ -1059,16 +1063,13 @@ pub(super) fn compiled_fragment(
             annotations: Box::default(),
             layouts: Default::default(),
         },
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+        novarocks_physical_plan::PlanLimits::FROZEN,
         &Control,
     )
     .expect("checked package");
-    let wire = novarocks_plan_codec::physical_package_v2::encode_fragment_package(
-        &package,
-        &novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-        &Control,
-    )
-    .expect("package codec");
+    let wire =
+        novarocks_plan_codec::physical_package_v2::encode_fragment_package(&package, &Control)
+            .expect("package codec");
     proto::FrozenFragment {
         package: wire.encode_to_vec().into(),
     }
@@ -1511,17 +1512,7 @@ struct FrontendCreationGauges {
 
 impl FrontendCreationGauges {
     fn scrape(context: &mut ScenarioContext) -> Result<Self> {
-        let port = context.handle().runtime().fe_http_port;
-        let body = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?
-            .get(format!("http://127.0.0.1:{port}/metrics"))
-            .send()
-            .context("scrape FE /metrics")?
-            .error_for_status()
-            .context("FE /metrics status")?
-            .text()
-            .context("read FE /metrics")?;
+        let body = scrape_frontend_metrics(context)?;
         Ok(Self {
             static_fragments_frozen: metric(&body, STATIC_FRAGMENTS_FROZEN)?,
             static_fragments_retained: metric(&body, STATIC_FRAGMENTS_RETAINED)?,
@@ -1530,6 +1521,31 @@ impl FrontendCreationGauges {
             create_payloads_retained: metric(&body, CREATE_PAYLOADS_RETAINED)?,
         })
     }
+}
+
+fn completed_statement_freeze_bytes(context: &mut ScenarioContext) -> Result<(i64, i64)> {
+    let body = scrape_frontend_metrics(context)?;
+    Ok((
+        metric(
+            &body,
+            "novarocks_task_statement_static_fragment_bytes_count",
+        )?,
+        metric(&body, "novarocks_task_statement_static_fragment_bytes_sum")?,
+    ))
+}
+
+fn scrape_frontend_metrics(context: &mut ScenarioContext) -> Result<String> {
+    let port = context.handle().runtime().fe_http_port;
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .context("scrape FE /metrics")?
+        .error_for_status()
+        .context("FE /metrics status")?
+        .text()
+        .context("read FE /metrics")
 }
 
 /// The one unlabelled sample of `name` in a Prometheus text body.

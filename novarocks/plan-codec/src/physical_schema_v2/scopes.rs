@@ -92,7 +92,7 @@ fn extra<H>(
     layout: Layout,
     source: usize,
     fields: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
 ) -> Result<(), Failure<H>> {
     model.layout_request(layout, 1).map_err(Error::from)?;
@@ -104,7 +104,7 @@ fn begin<'a, H, F: ValueSchemaCreationFactory<H>>(
     model: &mut Model,
     source: usize,
     fields: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<F::Scope<'a>, Failure<H>> {
@@ -134,7 +134,7 @@ struct ScopedEmission<'a, 'm, 'admit, H, F: ValueSchemaCreationFactory<H> + 'a> 
     model: &'m mut Model,
     source: usize,
     field_count: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<NodeProjectionLimits>,
     admit: &'m mut Admission<'admit>,
     temporary: F::Scope<'a>,
     container: F::Scope<'a>,
@@ -309,11 +309,12 @@ pub fn decode_schemas_with_factory_in<'loan, 'control, H, F: ValueSchemaCreation
     definitions: &'loan [wire::SchemaDefinition],
     types: &'loan DecodedTypeTable,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     factory: &F,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<DecodedSchemas<'loan, 'control>, Failure<H>> {
+    let limits = limits.into();
     let (mut model, _) = decode_preflight(
         definitions,
         types,

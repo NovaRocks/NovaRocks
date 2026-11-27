@@ -21,12 +21,11 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     PureCompileControl, ValueTypeRef,
 };
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 /// Matches the native-v1 expanded-expression budget. This bounds the arena
 /// independently of the encoded descriptor's byte budget.
 pub const MAX_STATIC_EXPRESSIONS: usize = novarocks_type_contract::MAX_CONTROL_DEFINITIONS;
-pub const MAX_STATIC_EXPRESSION_DYNAMIC_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATIC_EXPRESSION_DEPTH: usize = novarocks_type_contract::MAX_CONTROL_DEPTH;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -264,7 +263,6 @@ pub enum StaticExpressionError {
     TooManyNodes,
     InvalidReference,
     TooDeep,
-    TooManyBytes,
     InvalidMetadataArity,
     ConstantTypeMismatch,
 }
@@ -342,8 +340,6 @@ impl ImmutableExpressions {
             return Err(StaticExpressionError::TooManyNodes.into());
         }
         let mut depths = Vec::with_capacity(nodes.len());
-        let mut dynamic_bytes = 0usize;
-        let mut charged_constant_arrays = HashSet::new();
         for (index, node) in nodes.iter().enumerate() {
             if let StaticExprKind::NaryAnd { args } | StaticExprKind::NaryOr { args } = &node.kind {
                 let empty = args.is_empty();
@@ -381,26 +377,6 @@ impl ImmutableExpressions {
                 if !same {
                     return Err(StaticExpressionError::ConstantTypeMismatch.into());
                 }
-                let array = Arc::as_ptr(value.pool().array()) as *const () as usize;
-                let first = charged_constant_arrays.insert(array);
-                observe(ExpressionObservation::Step)?;
-                if first {
-                    let facts = value.pool().resource_facts();
-                    let retained = facts
-                        .retained_buffer_capacity_bytes
-                        .checked_add(facts.metadata_bytes)
-                        .and_then(|bytes| usize::try_from(bytes).ok());
-                    observe(ExpressionObservation::Step)?;
-                    let retained = retained.ok_or(StaticExpressionError::TooManyBytes)?;
-                    let next = dynamic_bytes.checked_add(retained);
-                    observe(ExpressionObservation::Step)?;
-                    dynamic_bytes = next.ok_or(StaticExpressionError::TooManyBytes)?;
-                }
-            }
-            let too_many_bytes = dynamic_bytes > MAX_STATIC_EXPRESSION_DYNAMIC_BYTES;
-            observe(ExpressionObservation::Step)?;
-            if too_many_bytes {
-                return Err(StaticExpressionError::TooManyBytes.into());
             }
         }
         observe(ExpressionObservation::OpaqueBoundary)?;

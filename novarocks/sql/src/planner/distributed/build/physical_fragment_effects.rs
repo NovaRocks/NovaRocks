@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_physical_plan::{
     AggregateCall, AggregatePhase, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls,
     NodeKind, PhysicalCallBinding, PhysicalCallSite, PhysicalNode, WriterAggregateCall,
@@ -81,7 +81,7 @@ pub(crate) struct PhysicalFragmentEffectsInput<'a> {
     pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
-    pub literal_policy: ConstantPolicy,
+    pub literal_policy: ConstantValidation,
     pub node_effects: &'a BTreeMap<
         novarocks_physical_plan::NodeId,
         super::contract_lowering::NodeExpressionEffects,
@@ -334,10 +334,8 @@ fn compose_fragment_effects_observed(
                                 input.constants,
                                 work,
                             )?;
-                            let same = request.captured_constant_policy()
-                                == Some(input.literal_policy)
-                                && request.captured_decimal_overflow_policy()
-                                    == Some(scope.decimal_overflow_policy);
+                            let same = request.captured_decimal_overflow_policy()
+                                == Some(scope.decimal_overflow_policy);
                             work.step()?;
                             if !same {
                                 return Err(PhysicalFragmentEffectsError::InvalidSource(
@@ -384,10 +382,8 @@ fn compose_fragment_effects_observed(
                             )?;
                             let request =
                                 author_physical_table_request_from_journal_observed(&entry, work)?;
-                            let same = request.captured_constant_policy()
-                                == Some(input.literal_policy)
-                                && request.captured_decimal_overflow_policy()
-                                    == Some(scope.decimal_overflow_policy);
+                            let same = request.captured_decimal_overflow_policy()
+                                == Some(scope.decimal_overflow_policy);
                             work.step()?;
                             if !same {
                                 return Err(PhysicalFragmentEffectsError::InvalidSource(
@@ -432,13 +428,6 @@ fn compose_fragment_effects_observed(
                         source,
                         work,
                     )?;
-                    let same_policy = entry.captured().constant_policy() == input.literal_policy;
-                    work.step()?;
-                    if !same_policy {
-                        return Err(PhysicalFragmentEffectsError::InvalidSource(
-                            "SQL Writer composition changes the captured constant policy",
-                        ));
-                    }
                     let request = author_physical_writer_request_observed(&entry, work)?;
                     prepare_physical_writer_occurrence_observed(
                         PhysicalWriterOccurrenceInput {
@@ -496,14 +485,6 @@ fn compose_fragment_effects_observed(
                                 source,
                                 work,
                             )?;
-                            let same_policy =
-                                entry.captured().constant_policy() == input.literal_policy;
-                            work.step()?;
-                            if !same_policy {
-                                return Err(PhysicalFragmentEffectsError::InvalidSource(
-                                    "SQL aggregate composition changes the captured constant policy",
-                                ));
-                            }
                             match entry.phase() {
                                 AggregatePhase::Single | AggregatePhase::Partial { .. } => {
                                     let request = author_physical_aggregate_update_request_from_journal_observed(

@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> novarocks_functions::ConstantPolicy {
+fn policy() -> novarocks_functions::ConstantValidation {
     crate::constant::test_constant_policy()
 }
 fn largeint(nullable: bool) -> ValueType {

@@ -234,7 +234,7 @@ fn record_sources_captured<'t, 'control>(
     record_sources_captured_observed(
         record,
         types,
-        source_retained_bytes,
+        Some(source_retained_bytes),
         &mut |value, source, work| capture(value, source.field(), work),
         work,
     )
@@ -243,7 +243,7 @@ fn record_sources_captured<'t, 'control>(
 fn record_sources_captured_observed<'t, 'control, E: From<PhysicalConstantCodecError>>(
     record: &wire::IpcConstantPool,
     types: &'t DecodedTypeTable,
-    source_retained_bytes: usize,
+    source_retained_bytes: Option<usize>,
     capture: &mut impl FnMut(
         &'t FunctionValueType,
         crate::physical_type_v2::SourceFieldBorrow<'t>,
@@ -274,7 +274,7 @@ fn record_sources_captured_observed<'t, 'control, E: From<PhysicalConstantCodecE
         "constant record references an unknown value type",
     ))?;
     let field = types.source_field_borrow(field_id);
-    if source_retained_bytes >= record.arrow_ipc.capacity()
+    if source_retained_bytes.is_none_or(|source| source >= record.arrow_ipc.capacity())
         && let Some(field) = field
     {
         capture(value_type, field, work)?;
@@ -283,7 +283,8 @@ fn record_sources_captured_observed<'t, 'control, E: From<PhysicalConstantCodecE
     let field = field.ok_or(PhysicalConstantCodecError::InvalidShape(
         "constant record references an unknown Field",
     ))?;
-    let source_covers_ipc = source_retained_bytes >= record.arrow_ipc.capacity();
+    let source_covers_ipc =
+        source_retained_bytes.is_none_or(|source| source >= record.arrow_ipc.capacity());
     work.step().map_err(PhysicalConstantCodecError::from)?;
     if !source_covers_ipc {
         return Err((PhysicalConstantCodecError::InvalidShape(
@@ -684,18 +685,25 @@ fn prepare_record_core<'pool, 'control, H>(
 mod binding_resources;
 mod namespace;
 mod write_namespace;
+#[cfg(test)]
 pub(crate) use namespace::prepare_constant_namespace_in;
 pub use namespace::{
     ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
     decode_constant_namespace, prepare_constant_namespace,
+    prepare_constant_namespace_input_derived_in,
+    prepare_constant_namespace_input_derived_with_creator_in,
+    prepare_constant_namespace_input_derived_with_factory_in,
     prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
 };
 
+#[cfg(test)]
 pub(crate) use write_namespace::prepare_constant_namespace_write_in;
 
+pub use crate::ipc_schema_v2::ConstantWriteRequest;
 pub use write_namespace::{
     ConstantNamespaceWriteFacts, ConstantRecordTypeIds, PreparedConstantNamespaceWrite,
-    encode_constant_namespace, prepare_constant_namespace_write,
+    encode_constant_namespace, encode_constant_namespace_input_derived_in,
+    prepare_constant_namespace_write,
 };
 
 #[cfg(test)]

@@ -665,7 +665,7 @@ fn grouped_observed_ports_keep_standalone_success_and_ordinary_control_traces() 
     let raw = expected();
     let projection = GroupedProjection {
         source: SOURCE,
-        limits: limits(),
+        limits: Some(limits()),
         parent: None,
     };
     fixture.with_tokens(&c, |values, expressions, read| {
@@ -805,7 +805,7 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
             let parent = GroupedNodeAdmission {
                 base,
                 values: values.count(),
-                limits: l,
+                limits: Some(l),
             };
             assert_eq!(
                 parent
@@ -818,7 +818,7 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
             let run = |parent| {
                 let projection = GroupedProjection {
                     source: SOURCE,
-                    limits: limits(),
+                    limits: Some(limits()),
                     parent: Some(parent),
                 };
                 if decode {
@@ -840,7 +840,7 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
                 c.arm(None);
                 assert!(matches!(
                     run(GroupedNodeAdmission {
-                        limits: under_limits,
+                        limits: Some(under_limits),
                         ..parent
                     }),
                     Err(Error::Control(CompileControlError::ResourceExhausted))
@@ -850,7 +850,7 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
                     c.arm(Some((trace.len(), cause)));
                     assert!(matches!(
                         run(GroupedNodeAdmission {
-                            limits: under_limits,
+                            limits: Some(under_limits),
                             ..parent
                         }),
                         Err(Error::Control(CompileControlError::ResourceExhausted))

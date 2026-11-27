@@ -20,7 +20,9 @@ use arrow::{
     array::{Array, Date64Array, Float32Array},
     datatypes::{DataType, i256},
 };
-use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{
+    ConstantError, ConstantPolicy, ConstantValidation, ConstantValue,
+};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
 };
@@ -391,7 +393,7 @@ fn syntax_decimal_admission_never_truncates_nonzero_digits_or_accepts_scientific
 fn trace_case(
     value: &LiteralValue,
     declared: &FunctionValueType,
-    caps: ConstantPolicy,
+    caps: impl Into<ConstantValidation> + Copy,
     success: bool,
     wide: bool,
 ) {
@@ -531,10 +533,12 @@ fn syntax_constructor_policy_limits_are_exact_at_boundary_and_refuse_one_below()
     use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
     let declared = ty(DataType::Int64, false);
     let syntax = LiteralValue::Int(7);
-    let exact = ConstantPolicy {
-        max_rows: 1,
-        ..policy()
-    };
+    let exact = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1,
+            ..policy()
+        },
+    );
     assert_eq!(
         admit_syntax_constant(&syntax, &declared, exact, &Control::new(None))
             .unwrap()
@@ -542,10 +546,12 @@ fn syntax_constructor_policy_limits_are_exact_at_boundary_and_refuse_one_below()
             .unwrap(),
         Some(7)
     );
-    let low = ConstantPolicy {
-        max_rows: 0,
-        ..exact
-    };
+    let low = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            ..policy()
+        },
+    );
     let baseline = Control::new(None);
     let source = admit_syntax_constant(&syntax, &declared, low, &baseline).unwrap_err();
     assert!(matches!(source, ConstantError::Limit(_)));
@@ -872,7 +878,7 @@ fn first_syntax_runs_preserve_scalar_rows_types_nulls_and_original_field() {
     for (declared, values) in cases {
         let refs = values.iter().collect::<Vec<_>>();
         let (pool, count) =
-            admit_syntax_constant_run(&refs, &declared, policy(), &Control::new(None)).unwrap();
+            admit_syntax_constant_run(&refs, &declared, &Control::new(None)).unwrap();
         assert_eq!(count, values.len());
         assert_eq!(pool.array().len(), values.len());
         assert_eq!(pool.value_type(), &declared);
@@ -898,47 +904,30 @@ fn first_syntax_runs_preserve_scalar_rows_types_nulls_and_original_field() {
 }
 
 #[test]
-fn syntax_runs_chunk_only_new_pools_under_original_policy() {
+fn syntax_runs_keep_the_full_representable_prefix_and_exact_values() {
     use crate::constant::admit_syntax_constant_run;
     let values = (0..9).map(LiteralValue::Int).collect::<Vec<_>>();
     let refs = values.iter().collect::<Vec<_>>();
     let declared = ty(DataType::Int64, false);
-    let (pool, count) =
-        admit_syntax_constant_run(&refs, &declared, policy(), &Control::new(None)).unwrap();
-    assert_eq!(count, 4);
-    assert_eq!(pool.array().len(), 4);
-    for row in 0..4 {
+    let (pool, count) = admit_syntax_constant_run(&refs, &declared, &Control::new(None)).unwrap();
+    assert_eq!(count, 9);
+    assert_eq!(pool.array().len(), 9);
+    for row in 0..9 {
         assert_eq!(
             pool.value(row).unwrap().try_i64().unwrap(),
             Some(i64::from(row))
         );
     }
-    let text = (0..4)
-        .map(|_| LiteralValue::String("x".repeat(100)))
-        .collect::<Vec<_>>();
-    let refs = text.iter().collect::<Vec<_>>();
-    let tight = ConstantPolicy {
-        max_retained_buffer_bytes: 256,
-        ..policy()
-    };
+    let value = LiteralValue::String("x".repeat(4097));
+    let refs = vec![&value; 2050];
     let (pool, count) =
-        admit_syntax_constant_run(&refs, &ty(DataType::Utf8, true), tight, &Control::new(None))
-            .unwrap();
-    assert_eq!(count, 2);
+        admit_syntax_constant_run(&refs, &ty(DataType::Utf8, true), &Control::new(None)).unwrap();
+    assert_eq!(count, refs.len());
+    assert!(pool.resource_facts().retained_buffer_capacity_bytes > 8 * 1024 * 1024);
     assert_eq!(
-        pool.value(0).unwrap().try_utf8().unwrap(),
-        Some("x".repeat(100).as_str())
+        pool.value(2049).unwrap().try_utf8().unwrap(),
+        Some("x".repeat(4097).as_str())
     );
-    let too_large = LiteralValue::String("x".repeat(1000));
-    assert!(matches!(
-        admit_syntax_constant_run(
-            &[&too_large],
-            &ty(DataType::Utf8, true),
-            tight,
-            &Control::new(None)
-        ),
-        Err(ConstantError::Limit(_))
-    ));
     for (value, declared) in [
         (LiteralValue::Int(128), ty(DataType::Int8, false)),
         (LiteralValue::Float(0.1), ty(DataType::Float32, false)),
@@ -952,9 +941,7 @@ fn syntax_runs_chunk_only_new_pools_under_original_policy() {
         ),
         (LiteralValue::Null, ty(DataType::Utf8, false)),
     ] {
-        assert!(
-            admit_syntax_constant_run(&[&value], &declared, policy(), &Control::new(None)).is_err()
-        );
+        assert!(admit_syntax_constant_run(&[&value], &declared, &Control::new(None)).is_err());
     }
 }
 
@@ -985,14 +972,9 @@ fn first_literal_run_keeps_original_control_and_source_at_every_selected_prefix(
         .collect::<Vec<_>>();
     let refs = values.iter().collect::<Vec<_>>();
     let declared = ty(DataType::Utf8, true);
-    let caps = ConstantPolicy {
-        max_rows: 1024,
-        max_logical_elements: 4096,
-        ..policy()
-    };
     let baseline = Control::new(None);
     assert_eq!(
-        admit_syntax_constant_run(&refs, &declared, caps, &baseline)
+        admit_syntax_constant_run(&refs, &declared, &baseline)
             .unwrap()
             .1,
         1024
@@ -1009,7 +991,7 @@ fn first_literal_run_keeps_original_control_and_source_at_every_selected_prefix(
         for at in [1, first_quantum, last_quantum, trace.len()] {
             let control = Control::new(Some((at, cause.clone())));
             assert!(
-                matches!(admit_syntax_constant_run(&refs,&declared,caps,&control),
+                matches!(admit_syntax_constant_run(&refs,&declared,&control),
                 Err(ConstantError::Control(actual)) if actual==cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
@@ -1048,13 +1030,9 @@ fn analyzed_ordinary_integers_reach_actual_scalar_and_run_constant_carriers() {
         assert_eq!(scalar.pool().array().data_type(), &expected);
         assert_eq!(scalar.try_i64().unwrap(), Some(value));
         let literals = [literal, literal];
-        let (run, count) = admit_syntax_constant_run(
-            &literals,
-            &expression.value_type,
-            policy(),
-            &Control::new(None),
-        )
-        .unwrap();
+        let (run, count) =
+            admit_syntax_constant_run(&literals, &expression.value_type, &Control::new(None))
+                .unwrap();
         assert_eq!(count, 2);
         assert_eq!(run.array().data_type(), &expected);
         if expected == DataType::Int32 {

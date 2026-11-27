@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation};
 use novarocks_expression::{
     CallAuthorInputs, EvaluationEnvironment, author_call_controls, author_unit_calls,
     testkit::{ClaimAuthor, HarnessControl, add_call, register_call_requests},
@@ -34,18 +34,20 @@ use novarocks_type_contract::{
     FunctionValueType, SemanticParameters,
 };
 
-const POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 16,
-    max_array_nodes: 128,
-    max_logical_elements: 1024,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    },
+);
 
 fn utf8() -> FunctionValueType {
     FunctionValueType::new(DataType::Utf8, true)
@@ -85,7 +87,6 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
             constants: &constants,
             parameters: &parameters,
         },
-        constant_policy: POLICY,
         functions: &functions,
         decimal_overflow: &decimal,
     };
@@ -151,7 +152,6 @@ fn missing_overflow_policy_is_an_invariant() {
             constants: &constants,
             parameters: &parameters,
         },
-        constant_policy: POLICY,
         functions: &functions,
         decimal_overflow: &empty,
     };
@@ -272,7 +272,6 @@ impl AuthorFixture {
                 constants: &self.constants,
                 parameters: &parameters,
             },
-            constant_policy: POLICY,
             functions: &self.functions,
             decimal_overflow: &self.decimal,
         };
@@ -305,7 +304,6 @@ impl AuthorFixture {
                 constants: &self.constants,
                 parameters,
             },
-            constant_policy: POLICY,
             functions: &self.functions,
             decimal_overflow: &self.decimal,
         };

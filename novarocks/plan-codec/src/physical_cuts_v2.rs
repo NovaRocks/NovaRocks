@@ -41,8 +41,8 @@ use std::mem::size_of;
 pub type CutsCodecError = NodeCodecError;
 #[derive(Clone, Copy, Debug)]
 pub struct CutsProjectionLimits {
-    pub node: NodeProjectionLimits,
-    pub binding: BindingProjectionLimits,
+    pub node: Option<NodeProjectionLimits>,
+    pub binding: Option<BindingProjectionLimits>,
 }
 /// Ordered type IDs for every actual CutValue, WriterResult field, then runtime
 /// filter domain occurrence. Repeated occurrences are not interned.
@@ -253,7 +253,9 @@ impl Count<'_> {
     }
     fn ty(&mut self, w: &mut CompileCheckpoints<'_>) -> Result<(), E> {
         self.types = r::add(self.types, 1)?;
-        r::check_cap(self.types, self.limits.binding.max_type_references)?;
+        if let Some(limits) = self.limits.binding {
+            r::check_cap(self.types, limits.max_type_references)?;
+        }
         // Only the original namespace lookup is known from this header.
         // Recursive comparison work arrives through its sole admitted author.
         self.model.delegated_work = r::add(self.model.delegated_work, self.lookup_work)?;
@@ -292,7 +294,7 @@ impl Count<'_> {
             props::preflight_distribution_encode_observed(
                 p,
                 self.source,
-                self.limits.node.properties,
+                self.limits.node.map(|limits| limits.properties),
                 w,
             )?;
         } else {
@@ -300,7 +302,7 @@ impl Count<'_> {
             props::preflight_distribution_decode_observed(
                 p,
                 self.source,
-                self.limits.node.properties,
+                self.limits.node.map(|limits| limits.properties),
                 w,
             )?;
             props::validate_distribution_source_observed(p, w)?;
@@ -1144,7 +1146,7 @@ pub fn encode_fragment_cuts_observed(
             ty,
             root,
             source_retained_bytes,
-            limits.node.max_work,
+            limits.node.map(|limits| limits.max_work),
             &mut |facts| {
                 c.model.delegated_work = r::add(base, facts.work_upper_bound())?;
                 c.gate()

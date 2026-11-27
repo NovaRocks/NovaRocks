@@ -24,7 +24,7 @@ use crate::{
     CompiledExprId, ExprCompileError, ExprCompileFailure, ImmutableExpressions, InputBinding,
     ScopeLayout, ScopeLayouts,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation};
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal, RootScope};
 use novarocks_functions::{
     PureCallSpecialization, PureEngineFunctionCatalog, ScopedExpressionEffects,
@@ -110,7 +110,7 @@ pub fn compile_expr_set<H, F: ValueSchemaCreationFactory<H>>(
     unit: &BoundExprSet,
     environment: EvaluationEnvironment<'_>,
     scopes: ScopeLayouts<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     catalog: &PureEngineFunctionCatalog,
     creation: ExprCreation<'_, H, F>,
     work: &mut CompileCheckpoints<'_>,
@@ -132,7 +132,7 @@ pub fn compile_expr_set_pure(
     unit: &BoundExprSet,
     environment: EvaluationEnvironment<'_>,
     scopes: ScopeLayouts<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     catalog: &PureEngineFunctionCatalog,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Arc<CompiledExprSet>, ExprCompileError> {
@@ -154,7 +154,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
     unit: &BoundExprSet,
     environment: EvaluationEnvironment<'_>,
     scopes: ScopeLayouts<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     catalog: &PureEngineFunctionCatalog,
     mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
     mut retained: Option<&mut dyn ValueSchemaCreationScope<H>>,

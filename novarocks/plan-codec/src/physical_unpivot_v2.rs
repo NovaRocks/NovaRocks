@@ -202,7 +202,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: UnpivotNodeProjectionLimits,
+    l: Option<UnpivotNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<UnpivotNodeProjectionFacts, Error> {
@@ -325,15 +325,20 @@ fn prepare_encode(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -379,7 +384,7 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    l: UnpivotNodeProjectionLimits,
+    l: Option<UnpivotNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<UnpivotNodeProjectionFacts, Error> {
@@ -511,15 +516,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -591,7 +601,7 @@ fn prepare_decode(
 fn emit_encode(
     input: &p::PhysicalNode,
     source: usize,
-    l: UnpivotNodeProjectionLimits,
+    l: Option<UnpivotNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let spec = encode_spec(input)?;
@@ -640,7 +650,7 @@ fn emit_encode(
 fn emit_decode(
     input: &wire::PhysicalNode,
     source: usize,
-    l: UnpivotNodeProjectionLimits,
+    l: Option<UnpivotNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let spec = decode_spec(input)?;
@@ -711,7 +721,7 @@ pub struct PreparedUnpivotNodeEncode<'node, 'namespace, 'loan, 'source, 'control
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: UnpivotNodeProjectionLimits,
+    limits: Option<UnpivotNodeProjectionLimits>,
     facts: UnpivotNodeProjectionFacts,
 }
 impl PreparedUnpivotNodeEncode<'_, '_, '_, '_, '_> {
@@ -754,6 +764,7 @@ pub fn prepare_unpivot_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     source_retained_bytes: usize,
     limits: UnpivotNodeProjectionLimits,
 ) -> Result<PreparedUnpivotNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -780,10 +791,11 @@ pub fn prepare_unpivot_node_encode_in<'node, 'namespace, 'loan, 'source, 'contro
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: UnpivotNodeProjectionLimits,
+    limits: impl Into<Option<UnpivotNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedUnpivotNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -812,7 +824,7 @@ pub struct PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> 
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: UnpivotNodeProjectionLimits,
+    limits: Option<UnpivotNodeProjectionLimits>,
     facts: UnpivotNodeProjectionFacts,
 }
 impl PreparedUnpivotNodeDecode<'_, '_, '_, '_, '_> {
@@ -849,6 +861,7 @@ pub fn prepare_unpivot_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: UnpivotNodeProjectionLimits,
 ) -> Result<PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
     let result = prepare_decode(
         input,
@@ -872,10 +885,11 @@ pub fn prepare_unpivot_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: UnpivotNodeProjectionLimits,
+    limits: impl Into<Option<UnpivotNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(expressions.control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -905,6 +919,7 @@ pub fn encode_unpivot_node(
     source_retained_bytes: usize,
     limits: UnpivotNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, UnpivotNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(
@@ -927,6 +942,7 @@ pub fn decode_unpivot_node(
     source_retained_bytes: usize,
     limits: UnpivotNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, UnpivotNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
     let result = (|| {
         let facts = prepare_decode(

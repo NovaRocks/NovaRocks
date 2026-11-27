@@ -620,7 +620,7 @@ pub(crate) fn resolve_sql_aggregate_binding(
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
     trusted: bool,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
@@ -662,7 +662,7 @@ pub(crate) fn resolve_sql_aggregate_call(
     distinct: bool,
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
@@ -698,7 +698,7 @@ pub(crate) fn resolve_sql_aggregate_window_call(
     distinct: bool,
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     use novarocks_functions::PureCallLifecycle;
@@ -763,7 +763,7 @@ fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<
 fn bind_aggregate_arguments(
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
     bind: impl FnOnce(
         FunctionBindingRequest<'_>,

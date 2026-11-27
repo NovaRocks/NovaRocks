@@ -18,7 +18,7 @@
 //! Pure catalog observation and analysis for a prepared DML write source.
 
 use super::{
-    CatalogRelationFact, CatalogRelationNeed, ConstantPolicy, RootDistributionRequirement,
+    CatalogRelationFact, CatalogRelationNeed, ConstantValidation, RootDistributionRequirement,
     SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError, SqlCompileIntent,
     SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
     SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
@@ -54,7 +54,7 @@ pub struct SqlDmlTableSequenceAnalysis {
     occurrences: Vec<TableSequenceOccurrence>,
     functions: Arc<dyn SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 }
 
 impl SqlDmlTableSequenceAnalysis {
@@ -205,7 +205,7 @@ impl SqlDmlCatalogPreparation {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
     ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
         self.analyze_with_pass(facts, functions, sealed_functions, policy, None)?
             .ok_or_else(|| {
@@ -219,7 +219,7 @@ impl SqlDmlCatalogPreparation {
         self,
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
     ) -> Result<SqlDmlAnalysisProgress, SqlCompileError> {
         let functions = functions.snapshot();
         let pass = TableSequencePass::request(
@@ -258,7 +258,7 @@ impl SqlDmlCatalogPreparation {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
         pass: Option<&TableSequencePass>,
     ) -> Result<Option<SqlAnalyzedQuery>, SqlCompileError> {
         self.control.check()?;

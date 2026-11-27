@@ -138,7 +138,7 @@ fn admit_work(
     facts: &mut BindingProjectionFacts,
     state_bytes: usize,
     lookup_work: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -169,7 +169,7 @@ fn admit_work(
         )?,
     )?;
     policy.gate(facts, limits, admit)?;
-    if facts.cumulative_work_upper_bound > limits.max_work {
+    if limits.is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work) {
         return Err(invalid("aggregate header work exceeds its envelope"));
     }
     Ok(())
@@ -178,19 +178,19 @@ fn preflight(
     definitions: &[wire::AggregateBindingDefinition],
     functions: &PreparedFunctionBindingHeaders<'_>,
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
     let add = |a, b| policy.add(a, b, "aggregate header arithmetic overflow");
     let n = definitions.len();
-    if !policy.0 && n > limits.max_definitions {
+    if !policy.0 && limits.is_some_and(|limits| n > limits.max_definitions) {
         return Err(invalid(
             "aggregate header definition count exceeds its envelope",
         ));
     }
-    if !policy.0 && n > limits.max_type_references {
+    if !policy.0 && limits.is_some_and(|limits| n > limits.max_type_references) {
         return Err(invalid(
             "aggregate header type references exceed their envelope",
         ));
@@ -234,10 +234,11 @@ fn preflight(
             ));
         }
     }
-    if requested > limits.max_request_bytes
-        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-        || facts.coexisting_source_and_request_bytes_upper_bound
-            > limits.max_coexisting_source_and_request_bytes
+    if let Some(limits) = limits
+        && (requested > limits.max_request_bytes
+            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+            || facts.coexisting_source_and_request_bytes_upper_bound
+                > limits.max_coexisting_source_and_request_bytes)
     {
         return Err(invalid(
             "aggregate header index requests exceed their envelope",
@@ -365,7 +366,7 @@ fn prepare<'loan, 'source>(
     definitions: &'loan [wire::AggregateBindingDefinition],
     functions: &'loan PreparedFunctionBindingHeaders<'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -393,14 +394,14 @@ pub fn prepare_aggregate_binding_headers<'loan, 'source>(
     definitions: &'loan [wire::AggregateBindingDefinition],
     functions: &'loan PreparedFunctionBindingHeaders<'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
 ) -> Result<PreparedAggregateBindingHeaders<'loan, 'source>, BindingCodecError> {
     let mut work = CompileCheckpoints::try_new(functions.original_control(), CompilePhase::Decode)?;
     let result = prepare(
         definitions,
         functions,
         source_retained_bytes,
-        limits,
+        limits.into(),
         Policy(false),
         &mut |_| Ok(()),
         &mut work,
@@ -416,7 +417,7 @@ pub fn prepare_aggregate_binding_headers_in<'loan, 'source>(
     definitions: &'loan [wire::AggregateBindingDefinition],
     functions: &'loan PreparedFunctionBindingHeaders<'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAggregateBindingHeaders<'loan, 'source>, BindingCodecError> {
@@ -424,7 +425,7 @@ pub fn prepare_aggregate_binding_headers_in<'loan, 'source>(
         definitions,
         functions,
         source_retained_bytes,
-        limits,
+        limits.into(),
         Policy(true),
         admit,
         work,

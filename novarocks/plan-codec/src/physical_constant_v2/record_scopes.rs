@@ -224,6 +224,10 @@ pub(super) struct ConstantRecordScopes<S> {
     pool: S,
 }
 impl ScopedPreparedConstantRecord<'_, '_, '_> {
+    pub(super) fn body_bytes(&self) -> usize {
+        self.reader.body_bytes()
+    }
+
     pub fn construction_facts(
         &self,
     ) -> Result<ConstantRecordConstructionFacts, CompileControlError> {

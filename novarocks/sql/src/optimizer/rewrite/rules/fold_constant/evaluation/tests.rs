@@ -389,3 +389,37 @@ fn callback_request_is_a_fatal_invariant() {
         FailureClass::Invariant
     );
 }
+
+#[test]
+fn fold_result_keeps_representable_output_above_retired_byte_threshold() {
+    let text = "x".repeat(9 << 20);
+    let array = Arc::new(arrow::array::StringArray::from(vec![text.as_str()]));
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let value = admit_result(
+        array,
+        &ty,
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
+        &control,
+    )
+    .unwrap()
+    .expect("a representable output is admitted");
+
+    assert_eq!(value.try_utf8().unwrap(), Some(text.as_str()));
+}
+
+#[test]
+fn optional_fold_output_classification_distinguishes_original_control() {
+    let extent =
+        novarocks_functions::ConstantError::offset_extent(i32::MAX as u64 + 1, i32::MAX as u64);
+    assert!(is_fold_output_extent(&extent));
+    for error in [
+        KernelFailure::CompileControl(CompileControlError::Cancelled),
+        KernelFailure::CompileControl(CompileControlError::DeadlineExceeded),
+        KernelFailure::ResourceExhausted,
+        KernelFailure::InvalidProgram(KernelDiagnostic::new("invalid output carrier")),
+    ] {
+        assert!(!is_fold_output_extent(&error));
+        assert!(!error.is_local_output_allocation_failure());
+    }
+}

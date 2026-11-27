@@ -99,14 +99,14 @@ fn preflight<H>(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, HostError<H>> {
     let add = |a, b| policy.add(a, b, "binding projection arithmetic overflow");
     let mul = |a, b| policy.mul(a, b, "binding projection arithmetic overflow");
-    if !policy.0 && inputs.len() > limits.max_definitions {
+    if !policy.0 && limits.is_some_and(|limits| inputs.len() > limits.max_definitions) {
         return Err(invalid("binding definition count exceeds its envelope").into());
     }
     let mut facts = BindingProjectionFacts {
@@ -126,7 +126,7 @@ fn preflight<H>(
     // Admit fixed header/tail work and the original definition walk before it
     // starts. Empty tables still perform bounded projection bookkeeping.
     let own_prefix = add(128, mul(inputs.len(), 12)?)?;
-    if !policy.0 && own_prefix > limits.max_work {
+    if !policy.0 && limits.is_some_and(|limits| own_prefix > limits.max_work) {
         return Err(invalid("binding work exceeds its envelope").into());
     }
     request::<wire::FunctionBindingDefinition>(inputs.len(), &mut facts, policy)?;
@@ -239,7 +239,8 @@ fn preflight<H>(
                 policy.gate_with_host(&facts, limits, admit)?;
             }
             work.step()?;
-            if facts.type_reference_count > limits.max_type_references {
+            if limits.is_some_and(|limits| facts.type_reference_count > limits.max_type_references)
+            {
                 return Err(invalid("binding type references exceed their envelope").into());
             }
         }
@@ -279,24 +280,26 @@ fn preflight<H>(
             return Err(invalid("binding source invoice omits original signature backing").into());
         }
     }
-    if facts.type_reference_count > limits.max_type_references {
+    if limits.is_some_and(|limits| facts.type_reference_count > limits.max_type_references) {
         return Err(invalid("binding type references exceed their envelope").into());
     }
-    if facts.request_bytes_upper_bound > limits.max_request_bytes
-        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-    {
+    if limits.is_some_and(|limits| {
+        facts.request_bytes_upper_bound > limits.max_request_bytes
+            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+    }) {
         return Err(invalid("binding output requests exceed their envelope").into());
     }
     facts.coexisting_source_and_request_bytes_upper_bound =
         add(source, facts.request_bytes_upper_bound)?;
-    if facts.coexisting_source_and_request_bytes_upper_bound
-        > limits.max_coexisting_source_and_request_bytes
-    {
+    if limits.is_some_and(|limits| {
+        facts.coexisting_source_and_request_bytes_upper_bound
+            > limits.max_coexisting_source_and_request_bytes
+    }) {
         return Err(invalid("binding coexistence exceeds its envelope").into());
     }
     refresh(types, source, own_prefix, name_chunks, &mut facts, policy)?;
     policy.gate_with_host(&facts, limits, admit)?;
-    if facts.cumulative_work_upper_bound > limits.max_work {
+    if limits.is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work) {
         return Err(invalid("binding work exceeds its envelope").into());
     }
     Ok(facts)
@@ -327,7 +330,7 @@ fn verify_id<H>(
     types: &EncodedTypeTable<'_>,
     id: u32,
     expected: &FunctionValueType,
-    envelope: (usize, BindingProjectionLimits, Policy),
+    envelope: (usize, Option<BindingProjectionLimits>, Policy),
     facts: &mut BindingProjectionFacts,
     admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
@@ -337,29 +340,41 @@ fn verify_id<H>(
     let actual = types
         .value_type_observed(id, work)?
         .ok_or_else(|| invalid("binding value type ID is absent"))?;
-    let remaining = limits
-        .max_work
-        .checked_sub(facts.cumulative_work_upper_bound)
-        .ok_or_else(|| invalid("binding work exceeds its envelope"))?;
     let base = facts.cumulative_work_upper_bound;
-    let verified = if policy.0 {
-        crate::borrowed_type_resources::verify_type_binding_admitted(
+    let mut capture = |prefix: crate::borrowed_type_resources::BoundTypeComparisonFacts| {
+        facts.cumulative_work_upper_bound = policy.add(
+            base,
+            prefix.work_upper_bound(),
+            "binding projection arithmetic overflow",
+        )?;
+        policy.gate_with_host(facts, limits, admit)
+    };
+    let verified = if let Some(limits) = limits {
+        let remaining = limits
+            .max_work
+            .checked_sub(base)
+            .ok_or_else(|| invalid("binding work exceeds its envelope"))?;
+        if policy.0 {
+            crate::borrowed_type_resources::verify_type_binding_admitted(
+                expected,
+                actual,
+                source,
+                remaining,
+                &mut capture,
+                work,
+            )?
+        } else {
+            verify_type_binding(expected, actual, source, remaining, work)?
+        }
+    } else {
+        crate::borrowed_type_resources::verify_type_binding_optional_work_in(
             expected,
             actual,
             source,
-            remaining,
-            &mut |prefix| {
-                facts.cumulative_work_upper_bound = policy.add(
-                    base,
-                    prefix.work_upper_bound(),
-                    "binding projection arithmetic overflow",
-                )?;
-                policy.gate_with_host(facts, limits, admit)
-            },
+            None,
+            &mut capture,
             work,
         )?
-    } else {
-        verify_type_binding(expected, actual, source, remaining, work)?
     };
     facts.cumulative_work_upper_bound = add(base, verified.work_upper_bound())?;
     policy.gate_with_host(facts, limits, admit)?;
@@ -371,7 +386,7 @@ fn verify_id<H>(
 fn validate<H>(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
-    envelope: (usize, BindingProjectionLimits, Policy),
+    envelope: (usize, Option<BindingProjectionLimits>, Policy),
     facts: &mut BindingProjectionFacts,
     admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
@@ -510,7 +525,7 @@ pub(super) fn encode(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -531,7 +546,7 @@ pub(super) fn encode_with_host<H>(
     types: &EncodedTypeTable<'_>,
     inputs: &[FunctionBindingInput<'_>],
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     policy: Policy,
     admit: &mut HostAdmit<'_, H>,
     work: &mut CompileCheckpoints<'_>,
@@ -638,10 +653,10 @@ pub(crate) fn verify_scalar_signature(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
-    let result = verify_signature_inner(left, right, source, max_work, None, work);
+    let result = verify_signature_inner(left, right, source, max_work.into(), None, work);
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
@@ -653,11 +668,11 @@ pub(crate) fn verify_scalar_signature_admitted(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut dyn FnMut(usize) -> Result<(), BindingCodecError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
-    let result = verify_signature_inner(left, right, source, max_work, Some(admit), work);
+    let result = verify_signature_inner(left, right, source, max_work.into(), Some(admit), work);
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
@@ -668,7 +683,7 @@ fn verify_signature_inner(
     left: &BoundFunction,
     right: &BoundFunction,
     source: usize,
-    max_work: usize,
+    max_work: Option<usize>,
     mut admit: Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
@@ -680,7 +695,7 @@ fn verify_signature_inner(
         |bound: usize,
          parent: &mut Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>| {
             if let Some(parent) = parent.as_mut() {
-                if bound > max_work {
+                if max_work.is_some_and(|max_work| bound > max_work) {
                     return Err(CompileControlError::ResourceExhausted.into());
                 }
                 parent(bound)?;
@@ -711,7 +726,7 @@ fn verify_signature_inner(
             "binding source invoice omits original signature roots",
         ));
     }
-    if max_work == 0 {
+    if max_work == Some(0) {
         return Err(invalid("binding signature work exceeds its envelope"));
     }
     if same {
@@ -745,7 +760,7 @@ fn verify_signature_inner(
         gate(bound, &mut admit)?;
         work.step()?;
     }
-    if bound > max_work {
+    if max_work.is_some_and(|max_work| bound > max_work) {
         return Err(invalid("binding signature work exceeds its envelope"));
     }
     let mut facts = VerifiedSignature {
@@ -773,8 +788,12 @@ fn verify_signature_inner(
     let mut compare =
         |left: &FunctionValueType, right: &FunctionValueType| -> Result<bool, BindingCodecError> {
             let remaining = max_work
-                .checked_sub(facts.work)
-                .ok_or_else(|| invalid("binding signature work exceeds its envelope"))?;
+                .map(|max_work| {
+                    max_work
+                        .checked_sub(facts.work)
+                        .ok_or_else(|| invalid("binding signature work exceeds its envelope"))
+                })
+                .transpose()?;
             let base = facts.work;
             let compared = if let Some(parent) = admit.as_mut() {
                 crate::borrowed_type_resources::verify_type_binding_admitted(
@@ -784,7 +803,7 @@ fn verify_signature_inner(
                     remaining,
                     &mut |prefix| {
                         let total = add(base, prefix.work_upper_bound())?;
-                        if total > max_work {
+                        if max_work.is_some_and(|max_work| total > max_work) {
                             return Err(CompileControlError::ResourceExhausted.into());
                         }
                         parent(total)

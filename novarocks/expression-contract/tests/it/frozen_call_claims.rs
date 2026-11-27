@@ -16,6 +16,7 @@
 // under the License.
 
 //! Original per-occurrence claim properties at their neutral unit owner.
+use super::support::request as original_request;
 use super::support::*;
 use novarocks_expression_contract::*;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
@@ -40,23 +41,6 @@ fn original_signature(
             semantic_parameters: Box::default(),
         }),
     }
-}
-
-fn original_request(signature: &BoundFunction) -> PhysicalCallRequest {
-    let mut source = super::support::request(signature);
-    source.constant_policy = novarocks_constant_contract::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 32,
-        max_logical_elements: 128,
-        max_retained_buffer_bytes: 64 * 1024,
-        max_type_depth: 16,
-        max_type_nodes: 128,
-        max_dictionary_depth: 8,
-        max_metadata_bytes: 4096,
-        max_library_validation_work: 1_000_000,
-        max_library_validation_bytes: 1024 * 1024,
-    };
-    source
 }
 
 fn repeated(count: usize) -> BoundExprSet {

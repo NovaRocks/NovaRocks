@@ -25,7 +25,7 @@ use novarocks_expression::{
 use novarocks_expression_contract::{
     ExprId, ExprKind, ExprNode, RootOrdinal, RootScope, SealedUnit, UnitError,
 };
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 use novarocks_physical_plan::{ConstantPools, FragmentBuilder, FragmentId, NodeId};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
@@ -42,7 +42,6 @@ pub(super) fn author_component_calls(
     unit: &SealedUnit,
     constants: &ConstantPools,
     parameters: &SemanticParameters,
-    policy: ConstantPolicy,
     overflow: DecimalOverflowPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<UnitCallAuthorship, CallAuthorError> {
@@ -63,7 +62,6 @@ pub(super) fn author_component_calls(
                 constants,
                 parameters,
             },
-            constant_policy: policy,
             functions: &functions,
             decimal_overflow: &decimal_overflow,
         },
@@ -76,7 +74,7 @@ pub(super) fn seal_node_observed(
     node: NodeId,
     constants: &ConstantPools,
     functions: &novarocks_functions::PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SealedUnit, ComponentSealError> {
     let definitions = UnitDefinitions::from_draft(fragment, node);
@@ -93,11 +91,8 @@ pub(super) fn seal_node_observed(
             work,
         )
         .map_err(ComponentSealError::request)?;
-        let request = transfer_component_request_for_test(
-            input.request(),
-            policy,
-            work,
-            &mut |value, work| {
+        let request =
+            transfer_component_request_for_test(input.request(), work, &mut |value, work| {
                 for (&pool_id, pool) in constants.entries() {
                     work.step()?;
                     if pool.backing_identity() == value.pool().backing_identity() {
@@ -112,9 +107,8 @@ pub(super) fn seal_node_observed(
                         detail: "component request has no original constant pool".into(),
                     },
                 )
-            },
-        )
-        .map_err(ComponentSealError::transfer)?;
+            })
+            .map_err(ComponentSealError::transfer)?;
         requests.push((source.id, request));
     }
     let ports = if fragment.construction_node(node).is_some() {
@@ -135,7 +129,6 @@ pub(super) fn seal_node_observed(
             constants,
             parameters: &parameters,
         },
-        constant_policy: policy,
         functions,
         decimal_overflow: &decimal_overflow,
     };
@@ -185,7 +178,7 @@ impl FixtureBuilder {
     pub(super) fn seal_observed(
         mut self,
         functions: &novarocks_functions::PureEngineFunctionCatalog,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<UnitFixture, ComponentSealError> {
         Ok(UnitFixture {

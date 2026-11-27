@@ -178,10 +178,7 @@ fn fixture() -> (
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([9; 16]).unwrap(),
-        crate::application::test_constant_policy(),
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([9; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish().unwrap();
 

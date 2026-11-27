@@ -278,9 +278,6 @@ fn materialize_requests<'a>(
                 "call definition has no original request",
             )));
         };
-        if request.constant_policy != inputs.constant_policy {
-            return Err(CallAuthorError::Invariant(InvariantRefusal::ConstantPolicy));
-        }
         let materialized = novarocks_expression_contract::materialize_call_request_observed(
             request,
             inputs.environment.constants,

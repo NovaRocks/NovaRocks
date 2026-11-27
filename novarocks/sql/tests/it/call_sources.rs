@@ -111,10 +111,7 @@ mod substring {
 }
 mod canonical_calls {
     use arrow::datatypes::DataType;
-    use novarocks_failure_contract::{FailureClass, FailureProjection};
-    use novarocks_sql::compiler::{
-        PackageSemanticsError, SqlCompileControl, check_pure_call_definitions_observed,
-    };
+    use novarocks_sql::compiler::{SqlCompileControl, check_pure_call_definitions_observed};
     use novarocks_sql_testkit::sql_source;
     #[test]
     fn e08s1_late_actual_source_same_journal_supported_canonical_calls_and_over_are_accepted() {
@@ -124,19 +121,6 @@ mod canonical_calls {
                 DataType::Int32,
             );
             check_pure_call_definitions_observed(&source, &SqlCompileControl::unbounded()).unwrap();
-            let policy = novarocks_sql_testkit::sql_fixture_constant_policy();
-            assert_eq!(source.plan().statement_constant_policy(), policy);
-            source.require_statement_constant_policy(policy).unwrap();
-            let mut foreign = policy;
-            foreign.max_rows -= 1;
-            let error = source
-                .require_statement_constant_policy(foreign)
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                PackageSemanticsError::StatementPolicyMismatch
-            ));
-            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
         }
     }
 }

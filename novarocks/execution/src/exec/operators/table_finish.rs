@@ -4795,7 +4795,7 @@ mod tests {
         use novarocks_expression_contract::RootScope;
         use novarocks_expression_contract::{BoundFunction, PhysicalCallRequest};
         use novarocks_functions::{
-            AggregateStateFormatIdentity, ConstantPolicy, EngineFunctionCatalogBuilder,
+            AggregateStateFormatIdentity, ConstantValidation, EngineFunctionCatalogBuilder,
             FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId,
             FunctionResultType, InstalledPureKernel, PureEngineFunctionCatalog,
             PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
@@ -5046,13 +5046,12 @@ mod tests {
                 }]),
                 logical_argument_count: 1,
                 expected_result_type: None,
-                constant_policy: constants(),
             }
         }
 
-        fn constants() -> ConstantPolicy {
+        fn constants() -> ConstantValidation {
             const MAX_FIXTURE_ROWS: u64 = 4096;
-            ConstantPolicy {
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
                 max_rows: MAX_FIXTURE_ROWS,
                 max_array_nodes: 128,
                 // List CV admission conservatively bounds each selected row
@@ -5067,7 +5066,7 @@ mod tests {
                 max_metadata_bytes: 1 << 20,
                 max_library_validation_work: 1 << 20,
                 max_library_validation_bytes: 1 << 20,
-            }
+            })
         }
 
         fn pools(count: usize) -> [(ConstantPoolId, ConstantPool); 2] {

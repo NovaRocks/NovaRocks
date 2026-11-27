@@ -201,7 +201,7 @@ fn preflight(
     headers: &PreparedAggregateBindingHeaders<'_, '_>,
     functions: &MaterializedFunctionBindings<'_, '_>,
     source: usize,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     observed: bool,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -349,14 +349,14 @@ pub fn prepare_aggregate_bindings_materialization<'loan, 'headers, 'source>(
     headers: &'loan PreparedAggregateBindingHeaders<'headers, 'source>,
     functions: &'loan MaterializedFunctionBindings<'headers, 'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
 ) -> Result<PreparedAggregateBindingsMaterialization<'loan, 'headers, 'source>, Error> {
     let mut work = CompileCheckpoints::try_new(headers.original_control(), CompilePhase::Decode)?;
     let result = preflight(
         headers,
         functions,
         source_retained_bytes,
-        limits,
+        limits.into(),
         false,
         &mut |_| Ok(()),
         &mut work,
@@ -483,7 +483,7 @@ pub fn prepare_aggregate_bindings_materialization_in<'loan, 'headers, 'source>(
     headers: &'loan PreparedAggregateBindingHeaders<'headers, 'source>,
     functions: &'loan MaterializedFunctionBindings<'headers, 'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedAggregateBindingsMaterialization<'loan, 'headers, 'source>, Error> {
@@ -491,7 +491,7 @@ pub fn prepare_aggregate_bindings_materialization_in<'loan, 'headers, 'source>(
         headers,
         functions,
         source_retained_bytes,
-        limits,
+        limits.into(),
         true,
         admit,
         work,

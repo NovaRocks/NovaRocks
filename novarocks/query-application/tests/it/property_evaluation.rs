@@ -25,7 +25,7 @@ use arrow::{
     },
     datatypes::Field,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
+use novarocks_constant_contract::{ConstantPool, ConstantValue};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{SYNTHETIC, Span, ast::Expr, parser::parse_expression};
 use novarocks_query_application::{
@@ -81,18 +81,20 @@ fn constant(array: ArrayRef, logical: ValueLogicalType) -> ConstantValue {
         metadata.insert("original-provider", "retained");
         field = Arc::new(declared.with_metadata(metadata));
     }
-    let policy = ConstantPolicy {
-        max_rows: 2,
-        max_array_nodes: 32,
-        max_logical_elements: 4096,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 16,
-        max_type_nodes: 64,
-        max_dictionary_depth: 8,
-        max_metadata_bytes: 1 << 16,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 2,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 8,
+            max_metadata_bytes: 1 << 16,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    );
     let pool = ConstantPool::try_new(
         field.clone(),
         ty.clone(),

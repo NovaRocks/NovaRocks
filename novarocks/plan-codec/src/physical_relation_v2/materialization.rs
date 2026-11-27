@@ -27,7 +27,7 @@ pub struct PreparedRelationMaterialization<'borrow, 'loan, 'wire, 'control> {
     namespace: &'borrow DecodedRelations<'loan, 'wire, 'control>,
     definition: &'wire wire::RelationDefinition,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: Option<RelationProjectionLimits>,
     facts: RelationProjectionFacts,
 }
 impl PreparedRelationMaterialization<'_, '_, '_, '_> {
@@ -112,8 +112,9 @@ pub fn prepare_relation_materialization<'borrow, 'loan, 'wire, 'control>(
     namespace: &'borrow DecodedRelations<'loan, 'wire, 'control>,
     id: u32,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
 ) -> Result<PreparedRelationMaterialization<'borrow, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(namespace.original_control(), CompilePhase::Decode)?;
     let result = prepare_observed(namespace, id, source, limits, &mut work);
     finish(result, work)
@@ -125,8 +126,9 @@ pub fn materialize_relation(
     namespace: &DecodedRelations<'_, '_, '_>,
     id: u32,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
 ) -> Result<p::Relation, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(namespace.original_control(), CompilePhase::Decode)?;
     let result = prepare_observed(namespace, id, source, limits, &mut work)
         .and_then(|prepared| prepared.emit_observed(&mut work));
@@ -137,7 +139,7 @@ pub(crate) fn prepare_observed<'borrow, 'loan, 'wire, 'control>(
     namespace: &'borrow DecodedRelations<'loan, 'wire, 'control>,
     id: u32,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: Option<RelationProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRelationMaterialization<'borrow, 'loan, 'wire, 'control>, Error> {
     prepare_core(namespace, id, source, limits, None, work)
@@ -147,10 +149,11 @@ pub fn prepare_relation_materialization_in<'borrow, 'loan, 'wire, 'control>(
     namespace: &'borrow DecodedRelations<'loan, 'wire, 'control>,
     id: u32,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: impl Into<Option<RelationProjectionLimits>>,
     admit: &mut impl FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRelationMaterialization<'borrow, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     check_control(namespace.original_control(), work)?;
     prepare_core(namespace, id, source, limits, Some(admit), work)
 }
@@ -175,7 +178,7 @@ fn prepare_core<'borrow, 'loan, 'wire, 'control, 'admit>(
     namespace: &'borrow DecodedRelations<'loan, 'wire, 'control>,
     id: u32,
     source: usize,
-    limits: RelationProjectionLimits,
+    limits: Option<RelationProjectionLimits>,
     mut admit: Option<&'admit mut Admit<'admit>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRelationMaterialization<'borrow, 'loan, 'wire, 'control>, Error> {
@@ -222,7 +225,7 @@ fn prepare_core<'borrow, 'loan, 'wire, 'control, 'admit>(
         root.prefix()?;
         root_floor = Some(root.numerical_facts(1, source)?);
     }
-    cap(overhead, limits.max_work, work)?;
+    cap(overhead, limits.map(|limits| limits.max_work), work)?;
     floor(source, namespace.retained_floor_observed(work)?, work)?;
     let at = namespace
         .indices
@@ -249,7 +252,7 @@ fn prepare_core<'borrow, 'loan, 'wire, 'control, 'admit>(
                     .coexisting_source_and_request_bytes_upper_bound
                     .max(root.coexisting_source_and_request_bytes_upper_bound);
             }
-            if next.cumulative_work_upper_bound > limits.max_work {
+            if limits.is_some_and(|limits| next.cumulative_work_upper_bound > limits.max_work) {
                 return Err(CompileControlError::ResourceExhausted);
             }
             callback(&next)
@@ -282,7 +285,11 @@ fn prepare_core<'borrow, 'loan, 'wire, 'control, 'admit>(
         numeric_mul(facts.cumulative_work_upper_bound, 2, observed)?,
         observed,
     )?;
-    cap(facts.cumulative_work_upper_bound, limits.max_work, work)?;
+    cap(
+        facts.cumulative_work_upper_bound,
+        limits.map(|limits| limits.max_work),
+        work,
+    )?;
     Ok(PreparedRelationMaterialization {
         namespace,
         definition,

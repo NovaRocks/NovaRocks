@@ -37,9 +37,21 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
 
 #[derive(Clone, Copy, Debug)]
-pub struct ScanProjectionLimits {
-    pub node: NodeProjectionLimits,
-    pub relation: RelationProjectionLimits,
+pub struct ScanProjectionLimits<N = NodeProjectionLimits, R = RelationProjectionLimits> {
+    pub node: N,
+    pub relation: R,
+}
+impl<N: Into<Option<NodeProjectionLimits>>, R: Into<Option<RelationProjectionLimits>>>
+    ScanProjectionLimits<N, R>
+{
+    fn capture_node_profile(
+        self,
+    ) -> ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>> {
+        ScanProjectionLimits {
+            node: self.node.into(),
+            relation: self.relation.into(),
+        }
+    }
 }
 type Error = ScanNodeCodecError;
 struct Physical<'a> {
@@ -123,7 +135,7 @@ fn physical_model(
     input: &p::PhysicalNode,
     body: &Physical<'_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     source_work: SourceWork,
     admit: &mut Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
@@ -197,7 +209,7 @@ fn physical_model(
             add(256, mul(add(model.items, model.inputs)?, 32)?)?,
             model.delegated_work,
         )?,
-        limits.node.max_work,
+        limits.node.map(|limits| limits.max_work),
         work,
     )?;
     Ok(model)
@@ -208,7 +220,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScanNodeProjectionFacts, Error> {
     prepare_encode_core(
@@ -228,7 +240,7 @@ fn prepare_encode_core(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     mut admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScanNodeProjectionFacts, Error> {
@@ -285,15 +297,23 @@ fn prepare_encode_core(
         if let Some(callback) = admit.as_mut() {
             let property_facts =
                 properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, limits.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                limits.node.map(|limits| limits.properties),
+            )?;
             model.property(property_facts)?;
             model.admit_in(source, values.count(), limits.node, &mut **callback)?;
-            properties::preflight_encode_observed(property, source, limits.node.properties, work)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                limits.node.map(|limits| limits.properties),
+                work,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                limits.node.properties,
+                limits.node.map(|limits| limits.properties),
                 work,
             )?)?;
         }
@@ -338,7 +358,7 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
     prepare_decode_core(input, relations, expressions, source, limits, None, work)
@@ -348,7 +368,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     mut admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
@@ -482,7 +502,7 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
             add(256, mul(add(model.items, model.inputs)?, 32)?)?,
             model.delegated_work,
         )?,
-        limits.node.max_work,
+        limits.node.map(|limits| limits.max_work),
         work,
     )?;
     floor(source, relations.retained_floor_observed(work)?, work)?;
@@ -505,15 +525,23 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         if let Some(callback) = admit.as_mut() {
             let property_facts =
                 properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(property_facts, limits.node.properties)?;
+            properties::check_properties_numerical_facts(
+                property_facts,
+                limits.node.map(|limits| limits.properties),
+            )?;
             model.property(property_facts)?;
             model.admit_in(source, values.count(), limits.node, &mut **callback)?;
-            properties::preflight_decode_observed(property, source, limits.node.properties, work)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                limits.node.map(|limits| limits.properties),
+                work,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                limits.node.properties,
+                limits.node.map(|limits| limits.properties),
                 work,
             )?)?;
         }
@@ -570,15 +598,14 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
         }
         None => model.facts(source, values.count(), limits.node, work)?,
     };
-    let remaining = limits
-        .node
-        .max_work
-        .checked_sub(prefix.cumulative_work_upper_bound)
-        .ok_or_else(|| invalid("Scan relation has no remaining work envelope"))?;
-    let relation_limits = RelationProjectionLimits {
-        max_work: limits.relation.max_work.min(remaining),
-        ..limits.relation
-    };
+    let mut relation_limits = limits.relation;
+    if let (Some(node_limits), Some(relation_limits)) = (limits.node, relation_limits.as_mut()) {
+        let remaining = node_limits
+            .max_work
+            .checked_sub(prefix.cumulative_work_upper_bound)
+            .ok_or_else(|| invalid("Scan relation has no remaining work envelope"))?;
+        relation_limits.max_work = relation_limits.max_work.min(remaining);
+    }
     let relation = if let Some(callback) = admit.as_mut() {
         let base = model;
         let mut update = |child: &crate::physical_relation_v2::RelationProjectionFacts| {
@@ -639,7 +666,7 @@ fn emit_encode(
     relations: &EncodedRelations<'_, '_, '_>,
     values: &EncodedValues<'_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let body = physical(input)?;
@@ -686,7 +713,7 @@ fn emit_decode(
     expressions: &DecodedExpressions<'_, '_, '_>,
     prepared: ReadPreparation<'_, '_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
     emit_decode_core(input, expressions, prepared, source, limits, None, work)
@@ -696,7 +723,7 @@ fn emit_decode_core(
     expressions: &DecodedExpressions<'_, '_, '_>,
     prepared: ReadPreparation<'_, '_, '_, '_>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     admit: Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
@@ -771,7 +798,7 @@ pub struct PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control> {
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
     facts: ScanNodeProjectionFacts,
 }
 impl PreparedScanNodeEncode<'_, '_, '_, '_, '_> {
@@ -805,6 +832,7 @@ pub fn prepare_scan_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     source_retained_bytes: usize,
     limits: ScanProjectionLimits,
 ) -> Result<PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -831,7 +859,7 @@ pub struct PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     prepared: ReadPreparation<'namespace, 'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>>,
 }
 impl PreparedScanNodeDecode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &ScanNodeProjectionFacts {
@@ -858,6 +886,7 @@ pub fn prepare_scan_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: ScanProjectionLimits,
 ) -> Result<PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -885,6 +914,7 @@ pub fn encode_scan_node(
     source_retained_bytes: usize,
     limits: ScanProjectionLimits,
 ) -> Result<(wire::PhysicalNode, ScanNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(
@@ -915,6 +945,7 @@ pub fn decode_scan_node(
     source_retained_bytes: usize,
     limits: ScanProjectionLimits,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
+    let limits = limits.capture_node_profile();
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -945,10 +976,14 @@ pub fn prepare_scan_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let facts = prepare_encode_core(
         input,
         relations,
@@ -974,10 +1009,14 @@ pub fn prepare_scan_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: ScanProjectionLimits,
+    limits: ScanProjectionLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.capture_node_profile();
     let prepared = prepare_decode_core(
         input,
         relations,

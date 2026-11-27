@@ -86,7 +86,7 @@ fn fixture_parameter_input(plan: &PhysicalPlan, parameters: SemanticParameters) 
     crate::plan::PhysicalPlanParts {
         constants: plan.constants().clone(),
         parameters,
-        statement_constant_policy: plan.statement_constant_policy(),
+
         version: plan.version(),
         fragments: plan.fragments().clone(),
         edges: plan.edges().clone(),
@@ -144,7 +144,7 @@ fn package_input(
     .unwrap();
     FragmentPackageInput {
         constants: fixture_constants.for_fragment(&fragment),
-        statement_constant_policy: crate::tests::constant_fixture::policy(),
+
         version: version(),
         required: RequiredContracts::default(),
         pruning,
@@ -168,7 +168,7 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
         false,
         &mut constants,
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &constants).unwrap();
     let packages = extract(
@@ -215,7 +215,7 @@ fn extraction_requires_explicit_pruning_table_for_every_fragment() {
         false,
         &mut fixture_constants,
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let parameters = SemanticParameters::default();
@@ -267,7 +267,7 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
         FragmentPackage::try_new(input, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Pruning(FrozenPruningError::WrongFragment)
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     // The map key is correct; the table's own exact fragment identity is not.
@@ -465,7 +465,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
         &mut fixture_constants,
     );
     let input = package_input(fragment.clone(), &mut fixture_constants);
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     for failure in [
@@ -867,7 +867,7 @@ fn package_extracts_metadata_without_losing_public_scan_facts() {
     let scan = frozen_scan(&fragment);
     let fragment_id = fragment.id();
     let node_id = fragment.root();
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     builder.add_annotation(PlanAnnotation {
         subject: AnnotationSubject::Node(fragment_id, node_id),
@@ -943,7 +943,7 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
     assert_eq!(retained.scan().unenforced_predicate(), &unenforced);
     // Empty structural declarations retain these actual owner-frozen facts;
     // they establish neither implication nor runtime pruning permission.
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let packages = extract(
@@ -1198,10 +1198,6 @@ fn assert_no_constant_package_equal(left: &FragmentPackage, right: &FragmentPack
     }
     assert_eq!(left.version(), right.version());
     assert_eq!(left.required(), right.required());
-    assert_eq!(
-        left.statement_constant_policy(),
-        right.statement_constant_policy()
-    );
     assert_eq!(left.fragment(), right.fragment());
     assert_eq!(left.calls(), right.calls());
     assert_eq!(left.pruning(), right.pruning());
@@ -1222,10 +1218,10 @@ fn remote_plan_statistics_do_not_grow_a_fragment_package() {
         false,
         &mut fixture_constants,
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let before = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_annotation(PlanAnnotation {
         subject: AnnotationSubject::Plan,
@@ -1476,18 +1472,6 @@ fn parameter_fragment_with_claims(
                 arguments: Box::default(),
                 logical_argument_count: 0,
                 expected_result_type: None,
-                constant_policy: crate::ConstantPolicy {
-                    max_rows: 16,
-                    max_array_nodes: 32,
-                    max_logical_elements: 128,
-                    max_retained_buffer_bytes: 64 * 1024,
-                    max_type_depth: 16,
-                    max_type_nodes: 128,
-                    max_dictionary_depth: 8,
-                    max_metadata_bytes: 4096,
-                    max_library_validation_work: 1_000_000,
-                    max_library_validation_bytes: 1024 * 1024,
-                },
             },
         )
         .unwrap();
@@ -1643,7 +1627,7 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
         FragmentPackageError::Requests(expected.clone())
     );
     let observed_plan = |control: &dyn PureCompileControl| {
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment.clone()).unwrap();
         builder.finish_observed(control)
     };
@@ -1651,7 +1635,7 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
         observed_plan(&Control).unwrap_err(),
         crate::PlanConstructionError::Requests(expected)
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     assert!(builder.finish().is_err());
 
@@ -1724,7 +1708,7 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
         .0,
         package_window_fragment(),
     ] {
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment.clone()).unwrap();
         let plan = crate::tests::constant_fixture::publish_plan(builder, &constants).unwrap();
         let packages = extract(
@@ -1849,8 +1833,8 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
             &[reference]
         );
     }
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(input.parameters.clone());
+    let mut builder =
+        PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish_observed(&Control).unwrap();
     let packages = extract_fragment_packages(
@@ -1981,8 +1965,8 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         &[active]
     );
 
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(input.parameters.clone());
+    let mut builder =
+        PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish_observed(&Control).unwrap();
     let snapshot = SemanticParameters::try_new([(
@@ -2050,8 +2034,7 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
         ),
     )])
     .unwrap();
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(parameters.clone());
+    let mut builder = PlanBuilder::new(version()).with_semantic_parameters(parameters.clone());
     builder.add_fragment(fragment).unwrap();
     let plan = builder.finish_observed(&Control).unwrap();
     let packages = extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
@@ -2381,8 +2364,7 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     );
     assert_ne!(unit.claims(), parameter_unit(changed.fragment()).claims());
     assert_ne!(checked.fragment(), changed.fragment());
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(parameters.clone());
+    let mut builder = PlanBuilder::new(version()).with_semantic_parameters(parameters.clone());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = builder.finish_observed(&Control).unwrap();
     let packages = extract(&plan, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
@@ -2514,8 +2496,8 @@ fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_
             .unwrap(),
         &SemanticParameterValue::AllowThrowException(true)
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(input.parameters.clone());
+    let mut builder =
+        PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
     builder.add_fragment(input.fragment).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     let packages = extract_fragment_packages(
@@ -2581,8 +2563,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
         FragmentPackage::try_new(extra.clone(), package_admission(), &Control).unwrap_err(),
         FragmentPackageError::UnusedParameters
     );
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy())
-        .with_semantic_parameters(extra.parameters);
+    let mut builder = PlanBuilder::new(version()).with_semantic_parameters(extra.parameters);
     builder.add_fragment(extra.fragment).unwrap();
     let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
     assert_eq!(
@@ -2599,7 +2580,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     );
     // Whole-plan publication cannot leave even an unused-runtime definition's
     // intrinsic reference dangling. No external extraction table can repair it.
-    let mut missing_plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut missing_plan = PlanBuilder::new(version());
     missing_plan.add_fragment(input.fragment).unwrap();
     assert!(
         crate::tests::constant_fixture::publish_plan(missing_plan, &fixture_constants)
@@ -2954,7 +2935,6 @@ fn package_window_fragment() -> Fragment {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: crate::tests::constant_fixture::policy(),
                 },
             )],
             &Control,

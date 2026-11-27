@@ -606,7 +606,7 @@ fn joint_provider_known_facts_gate_precedes_pending_quantum_and_read_facade_trac
                     bytes: 256,
                 },
                 SOURCE,
-                under(exact(known), axis),
+                Some(under(exact(known), axis)),
                 &mut None,
                 &mut work,
             );
@@ -632,7 +632,7 @@ fn joint_provider_known_facts_gate_precedes_pending_quantum_and_read_facade_trac
                 bytes: 256
             },
             SOURCE,
-            exact(known),
+            Some(exact(known)),
             &mut None,
             &mut work
         )

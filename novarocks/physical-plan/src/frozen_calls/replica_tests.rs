@@ -674,7 +674,7 @@ fn scalar_package_input(fixture: &Fixture) -> FragmentPackageInput {
         version: PlanVersionId::try_new([71; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment: fixture.fragment.clone(),
-        statement_constant_policy: zero_argument_request().constant_policy,
+
         pruning: FrozenFragmentPruning::try_new(fixture.fragment.id(), vec![], &Control::default())
             .unwrap(),
         cuts: FragmentCuts::default(),

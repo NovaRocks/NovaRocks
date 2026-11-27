@@ -20,7 +20,7 @@
 //! that statement. This adapter submits no work and creates no second Root.
 
 use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
-use novarocks_functions::{ConstantPolicy, ConstantValue};
+use novarocks_functions::{ConstantValidation, ConstantValue};
 use novarocks_parser::ast::Expr;
 use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
@@ -44,7 +44,7 @@ pub(crate) struct DdlPropertyConstantEvaluator<'a> {
     pub(crate) current_database: &'a str,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) sql_semantics: &'a SqlSemanticSettings,
-    pub(crate) constant_policy: ConstantPolicy,
+    pub(crate) constant_policy: ConstantValidation,
     pub(crate) control: &'a SqlCompileControl,
     pub(crate) interpreter: &'a super::required_constant_eval::RequiredConstantInterpreter,
     pub(crate) scope: &'a WorkScope,

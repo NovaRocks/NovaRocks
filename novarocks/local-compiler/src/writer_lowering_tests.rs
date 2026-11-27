@@ -30,7 +30,7 @@ use novarocks_expression_contract::{
     BoundFunction, ExprKind, PhysicalCallRequest, RootOrdinal, RootScope,
 };
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi,
 };
@@ -501,10 +501,7 @@ fn fixture_with_types(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([1; 16]).unwrap(),
-        options(1, None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone())?;
     }
@@ -784,18 +781,20 @@ fn options(pipeline_dop: usize, root_sink_dop: Option<usize>) -> LocalCompileOpt
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -1271,7 +1270,6 @@ fn theta_request(binding: &AggregateBinding) -> PhysicalCallRequest {
         }]),
         logical_argument_count: 1,
         expected_result_type: None,
-        constant_policy: options(1, None).constants,
     }
 }
 
@@ -1733,10 +1731,7 @@ fn statistics_fixture() -> StatisticsFixture {
         }),
     );
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([2; 16]).unwrap(),
-        options(1, None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([2; 16]).unwrap());
     for (&id, pool) in constants.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }

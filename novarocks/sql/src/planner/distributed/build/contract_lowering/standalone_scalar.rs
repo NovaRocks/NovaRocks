@@ -27,7 +27,7 @@ pub(crate) struct StandaloneScalarEmission {
     constants: novarocks_physical_plan::ConstantPools,
     parameters: SemanticParameters,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    policy: novarocks_constant_contract::ConstantPolicy,
+    policy: novarocks_constant_contract::ConstantValidation,
     brand: StandaloneSourceBrand,
     journal: SqlLogicalSourceJournal,
 }
@@ -47,7 +47,7 @@ impl StandaloneScalarEmission {
     pub(crate) fn function_catalog(&self) -> &Arc<dyn crate::compiler::SqlFunctionCatalog> {
         &self.functions
     }
-    pub(crate) fn constant_policy(&self) -> novarocks_constant_contract::ConstantPolicy {
+    pub(crate) fn constant_policy(&self) -> novarocks_constant_contract::ConstantValidation {
         self.policy
     }
     pub(crate) fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
@@ -86,7 +86,7 @@ struct StandaloneDraft {
     lambda_scope: Vec<LoweringLambdaScope>,
     journal: SqlLogicalSourceJournal,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    policy: novarocks_constant_contract::ConstantPolicy,
+    policy: novarocks_constant_contract::ConstantValidation,
     allow_throw_exception: bool,
     root_used: bool,
     parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
@@ -95,7 +95,7 @@ impl StandaloneDraft {
     fn new(
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         allow_throw_exception: bool,
-        policy: novarocks_constant_contract::ConstantPolicy,
+        policy: novarocks_constant_contract::ConstantValidation,
     ) -> Self {
         Self {
             brand: StandaloneSourceBrand::new(),
@@ -183,7 +183,7 @@ pub(crate) fn lower_required_constant_unit(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     allow_throw_exception: bool,
-    policy: novarocks_constant_contract::ConstantPolicy,
+    policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<StandaloneScalarEmission, ContractLoweringError> {
     lower_standalone_scalar_unit(
@@ -203,7 +203,7 @@ pub(crate) fn lower_standalone_scalar_unit(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     allow_throw_exception: bool,
-    policy: novarocks_constant_contract::ConstantPolicy,
+    policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<StandaloneScalarEmission, ContractLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
@@ -280,7 +280,6 @@ pub(crate) fn lower_standalone_scalar_unit(
             &source.journal,
             &source.functions,
             sealed_functions.as_ref(),
-            policy,
             &mut work,
         )?;
         Ok(StandaloneScalarEmission {

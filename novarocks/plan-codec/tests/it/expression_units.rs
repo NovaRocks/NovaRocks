@@ -48,7 +48,7 @@ fn pair() -> p::FragmentPackage {
     pair_with_unary(false)
 }
 fn pair_with_unary(unary: bool) -> p::FragmentPackage {
-    let policy = FROZEN_CONSTANT_POLICY;
+    let policy = CONSTANT_POLICY_FIXTURE;
     let ty = p::ValueType::new(arrow::datatypes::DataType::Int64, false);
     let cv = p::ConstantValue::from_i64(
         Arc::new(ty.try_to_field("exact").unwrap()),
@@ -62,7 +62,6 @@ fn pair_with_unary(unary: bool) -> p::FragmentPackage {
     pair_with_constant(cv, unary)
 }
 fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
-    let policy = FROZEN_CONSTANT_POLICY;
     let ty = cv.value_type().clone();
     let address = p::ConstantReference {
         pool: p::ConstantPoolId::new(u32::MAX),
@@ -166,8 +165,8 @@ fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
             p::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap(), policy)
-        .with_constant_pools(pools);
+    let mut plan =
+        p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap()).with_constant_pools(pools);
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish_observed(&Control).unwrap();
     let fragments = p::extract_fragment_packages(
@@ -178,7 +177,7 @@ fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
             p::FragmentId::new(0),
             p::FrozenFragmentPruning::try_new(p::FragmentId::new(0), vec![], &Control).unwrap(),
         )]),
-        &BTreeMap::from([(p::FragmentId::new(0), FROZEN_PACKAGE_ADMISSION)]),
+        &BTreeMap::from([(p::FragmentId::new(0), PACKAGE_ADMISSION_FIXTURE)]),
         &Control,
     )
     .unwrap();
@@ -211,7 +210,7 @@ fn expression_unit_round_trips_temporal_precision_and_observable_value_zone() {
         Arc::new(ty.try_to_field("exact").unwrap()),
         ty.clone(),
         array.into_data(),
-        FROZEN_CONSTANT_POLICY,
+        CONSTANT_POLICY_FIXTURE,
         CompilePhase::Validate,
         &Control,
     )
@@ -219,8 +218,7 @@ fn expression_unit_round_trips_temporal_precision_and_observable_value_zone() {
     .value(0)
     .unwrap();
     let package = pair_with_constant(constant, false);
-    let encoded =
-        encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let encoded = encode_fragment_package(&package, &Control).unwrap();
     let raw = encoded.encode_to_vec();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     let decoded =
@@ -246,7 +244,7 @@ fn expression_unit_round_trips_temporal_precision_and_observable_value_zone() {
         Some(observed)
     );
     assert_eq!(
-        encode_fragment_package(&decoded, &PackageEncodeLimits::FROZEN, &Control)
+        encode_fragment_package(&decoded, &Control)
             .unwrap()
             .encode_to_vec(),
         raw
@@ -255,8 +253,7 @@ fn expression_unit_round_trips_temporal_precision_and_observable_value_zone() {
 #[test]
 fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() {
     let package = pair();
-    let encoded =
-        encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let encoded = encode_fragment_package(&package, &Control).unwrap();
     let nodes = &encoded.fragment.as_ref().unwrap().nodes;
     assert_eq!(nodes.len(), 2);
     for node in nodes {
@@ -275,10 +272,6 @@ fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() 
         decode_fragment_package(&raw, &model, &PackageDecodeLimits::FROZEN, &Control).unwrap();
     assert_eq!(decoded.fragment().nodes(), package.fragment().nodes());
     assert_eq!(
-        decoded.statement_constant_policy(),
-        package.statement_constant_policy()
-    );
-    assert_eq!(
         decoded
             .fragment()
             .nodes()
@@ -290,59 +283,44 @@ fn node_units_keep_local_zero_distinct_ports_source_pool_and_repeated_outputs() 
         2
     );
     assert_eq!(
-        encode_fragment_package(&decoded, &PackageEncodeLimits::FROZEN, &Control).unwrap(),
+        encode_fragment_package(&decoded, &Control).unwrap(),
         encoded
     );
 }
 #[test]
-fn two_valid_unit_namespaces_share_the_original_fragment_projection_limits() {
+fn two_small_units_still_share_the_original_fragment_expression_limit() {
     let package = pair();
-    let encoded =
-        encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let encoded = encode_fragment_package(&package, &Control).unwrap();
     let raw = encoded.encode_to_vec();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
-    for axis in 0..2 {
-        let mut sender = PackageEncodeLimits::FROZEN;
-        let mut receiver = PackageDecodeLimits::FROZEN;
-        if axis == 0 {
-            sender.expressions.max_definitions = 1;
-            receiver.expressions.max_definitions = 1;
-        } else {
-            // Each actual unit fits two references (Values=1, Project=2),
-            // while the complete fragment contains three independent uses.
-            for node in package.fragment().nodes().values() {
-                assert!(
-                    node.expressions
-                        .as_ref()
-                        .unwrap()
-                        .control_flow()
-                        .use_reference_count()
-                        <= 2
-                );
-            }
-            sender.control.max_use_references = 2;
-            receiver.control.max_use_references = 2;
-        }
-        assert!(matches!(
-            encode_fragment_package(&package, &sender, &Control),
-            Err(PackageEncodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        assert!(matches!(
-            decode_fragment_package(&raw, &model, &receiver, &Control),
-            Err(PackageDecodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
+    let mut receiver = PackageDecodeLimits::FROZEN;
+    assert!(decode_fragment_package(&raw, &model, &receiver, &Control).is_ok());
+
+    assert_eq!(package.fragment().nodes().len(), 2);
+    for node in package.fragment().nodes().values() {
+        assert_eq!(
+            node.expressions
+                .as_ref()
+                .unwrap()
+                .definitions()
+                .iter()
+                .count(),
+            1
+        );
     }
+    receiver.plan_limits.fragment_expressions = 1;
+    assert!(matches!(
+        decode_fragment_package(&raw, &model, &receiver, &Control),
+        Err(PackageDecodeError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
 }
 
 #[test]
 fn unit_root_wire_presence_and_fragment_root_header_boundary_remain_explicit() {
     let package = pair();
-    let encoded =
-        encode_fragment_package(&package, &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let encoded = encode_fragment_package(&package, &Control).unwrap();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     for field in 0..4 {
         let mut source = encoded.clone();
@@ -442,7 +420,7 @@ fn receiver_original_creator_refusals_and_escaping_unit_diagnostic_keep_their_ow
     struct Refusal(usize);
     struct Hold;
     impl ValueTypeStorageHold for Hold {}
-    let source = encode_fragment_package(&pair(), &PackageEncodeLimits::FROZEN, &Control).unwrap();
+    let source = encode_fragment_package(&pair(), &Control).unwrap();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     let raw = source.encode_to_vec();
     let run = |raw: &[u8], stop: Option<usize>| {
@@ -620,13 +598,9 @@ fn receiver_factory_flow_keeps_raw_argument_payload_in_the_same_retained_scope()
             Ok(self.open())
         }
     }
-    let source = encode_fragment_package(
-        &pair_with_unary(true),
-        &PackageEncodeLimits::FROZEN,
-        &Control,
-    )
-    .unwrap()
-    .encode_to_vec();
+    let source = encode_fragment_package(&pair_with_unary(true), &Control)
+        .unwrap()
+        .encode_to_vec();
     let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
     let journal = Arc::new(Mutex::new(Journal::default()));
     let factory = Factory(journal.clone());
@@ -682,5 +656,36 @@ fn receiver_factory_flow_keeps_raw_argument_payload_in_the_same_retained_scope()
             .scopes
             .iter()
             .all(|weak| weak.upgrade().is_none())
+    );
+}
+
+#[test]
+fn expression_constant_references_borrow_a_large_checked_pool_through_the_package() {
+    let data = "x".repeat(9 << 20);
+    let ty = p::ValueType::new(arrow::datatypes::DataType::Utf8, false);
+    let value = p::ConstantValue::from_utf8(
+        Arc::new(ty.try_to_field("exact").unwrap()),
+        ty,
+        &data,
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let package = pair_with_constant(value, false);
+    let raw = encode_fragment_package(&package, &Control)
+        .unwrap()
+        .encode_to_vec();
+    let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
+    let decoded =
+        decode_fragment_package(&raw, &model, &PackageDecodeLimits::FROZEN, &Control).unwrap();
+    let pool = decoded
+        .constants()
+        .entries()
+        .get(&p::ConstantPoolId::new(u32::MAX))
+        .unwrap();
+    assert_eq!(
+        pool.value(0).unwrap().try_utf8().unwrap(),
+        Some(data.as_str())
     );
 }

@@ -408,6 +408,7 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
     validate_message_profile: impl FnOnce(&mut W) -> Result<(), W::Error>,
 ) -> Result<CheckedRecursiveBatch<'a>, W::Error> {
     if work.has_admission()
+        && limits.is_some()
         && let Some(raw) = batch.nodes()
     {
         let layout = std::alloc::Layout::array::<RecursiveNodeGeometry<'_>>(raw.len())
@@ -457,6 +458,30 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
         "recursive IPC buffer envelope exceeded",
         work,
     )?;
+    if limits.is_none() {
+        // Verify the original inline FieldNode vector against the exact
+        // declaration before requesting the geometry Vec.
+        let mut nodes = raw_nodes.iter();
+        let mut next = || {
+            let node = nodes
+                .next()
+                .ok_or(shape("recursive IPC FieldNode is missing"))?;
+            Ok::<_, W::Error>((length(node.length())?, length(node.null_count())?))
+        };
+        for field in expected {
+            validate_field_nodes(
+                field,
+                Some((rows, "recursive IPC root node length differs from batch")),
+                &mut next,
+                work,
+            )?;
+        }
+        require(
+            nodes.next().is_none(),
+            "recursive IPC batch has extra FieldNodes",
+            work,
+        )?;
+    }
     let scratch =
         std::alloc::Layout::array::<RecursiveNodeGeometry<'_>>(raw_nodes.len()).map_err(|_| {
             if work.has_admission() {
@@ -468,6 +493,10 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
     if work.has_admission() {
         if limits.is_some_and(|limits| scratch.size() > limits.max_geometry_request_bytes) {
             return Err(CompileControlError::ResourceExhausted.into());
+        }
+        if limits.is_none() {
+            work.flush()?;
+            work.geometry_request(scratch, true)?;
         }
         work.geometry_request(scratch, false)?;
     }
@@ -542,6 +571,44 @@ pub fn preflight_record_batch_with_profile<'a, W: GeometryWork + ?Sized>(
         scratch_request_count: usize::from(scratch.size() != 0),
     })
 }
+fn validate_field_nodes<W: GeometryWork + ?Sized>(
+    field: &Field,
+    expected_rows: Option<(usize, &'static str)>,
+    next: &mut impl FnMut() -> Result<(usize, usize), W::Error>,
+    work: &mut W,
+) -> Result<(), W::Error> {
+    let (rows, nulls) = next()?;
+    require(
+        nulls <= rows,
+        "recursive IPC node NULL count exceeds its rows",
+        work,
+    )?;
+    if let Some((expected, message)) = expected_rows {
+        require(expected == rows, message, work)?;
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            for child in fields {
+                validate_field_nodes(
+                    child,
+                    Some((
+                        rows,
+                        "recursive IPC Struct child length differs from parent",
+                    )),
+                    next,
+                    work,
+                )?;
+            }
+        }
+        DataType::List(child) | DataType::LargeList(child) | DataType::Map(child, _) => {
+            // Parent offsets are checked with the actual body by Walker.
+            validate_field_nodes(child, None, next, work)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 struct Walker<'b, 'a> {
     batch: arrow_ipc::RecordBatch<'b>,
     body: &'b [u8],

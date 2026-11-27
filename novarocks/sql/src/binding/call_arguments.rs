@@ -20,7 +20,7 @@
 use std::alloc::Layout;
 
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
+    ConstantValidation, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
     FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_type_contract::{
@@ -77,13 +77,13 @@ pub(crate) struct CapturedLogicalCallArguments {
     binding: SqlFunctionBinding,
     arguments: Box<[FunctionArgument]>,
     logical_argument_count: usize,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
 }
 impl CapturedLogicalCallArguments {
     pub(crate) fn binding(&self) -> &SqlFunctionBinding {
         &self.binding
     }
-    pub(crate) fn constant_policy(&self) -> ConstantPolicy {
+    pub(crate) fn constant_policy(&self) -> ConstantValidation {
         self.constant_policy
     }
     pub(crate) fn request(&self) -> FunctionBindingRequest<'_> {
@@ -110,7 +110,7 @@ pub(crate) fn capture_logical_call_arguments<'a>(
     binding: &SqlFunctionBinding,
     logical_argument_count: usize,
     ordered: impl IntoIterator<Item = &'a TypedExpr>,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
     capture_call_arguments_with(
@@ -134,7 +134,7 @@ pub(crate) fn move_authored_call_arguments_observed(
     binding: &SqlFunctionBinding,
     logical_argument_count: usize,
     arguments: Vec<FunctionArgument>,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
     capture_call_arguments_with(
@@ -151,7 +151,7 @@ fn capture_call_arguments_with<I: IntoIterator>(
     binding: &SqlFunctionBinding,
     logical_argument_count: usize,
     ordered: I,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     mut author: impl FnMut(
         I::Item,

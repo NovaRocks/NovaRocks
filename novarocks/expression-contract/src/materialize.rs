@@ -20,7 +20,7 @@
 //! same meter. This is neither physical-shape inference nor pure preparation.
 
 use crate::PhysicalCallRequest;
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantTableError};
+use novarocks_constant_contract::{ConstantPools, ConstantTableError};
 use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
 use novarocks_function_contract::{FunctionArgument, FunctionBindingRequest};
 use novarocks_type_contract::{
@@ -85,9 +85,6 @@ impl MaterializedCallRequest<'_> {
             logical_argument_count: self.source.logical_argument_count,
             expected_result_type: self.source.expected_result_type.as_ref(),
         }
-    }
-    pub fn constant_policy(&self) -> ConstantPolicy {
-        self.source.constant_policy
     }
 }
 

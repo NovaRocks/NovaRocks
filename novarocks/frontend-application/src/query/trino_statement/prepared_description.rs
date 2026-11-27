@@ -29,7 +29,7 @@ use novarocks_query_application::{
 use novarocks_result_contract::{ClientPresentationFamily, TrinoJsonFacts};
 use novarocks_spi::connector::ConnectorIoAdmissionPort;
 use novarocks_sql::compiler::{
-    ConstantPolicy, SqlCapturedCatalogPreparation, SqlDescribedColumn, SqlExpressionConstants,
+    ConstantValidation, SqlCapturedCatalogPreparation, SqlDescribedColumn, SqlExpressionConstants,
     SqlFunctionCatalog, SqlPreparedParameters, SqlSessionContext, SqlWriteAssignments,
 };
 use novarocks_type_contract::{
@@ -614,7 +614,7 @@ pub(crate) struct DescriptionCpuInput {
     preparation: SqlCapturedCatalogPreparation,
     session: SqlSessionContext,
     functions: Arc<dyn SqlFunctionCatalog>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     write: Option<DescriptionWrite>,
     family: ClientPresentationFamily,
     producer: LocalResultProducer,

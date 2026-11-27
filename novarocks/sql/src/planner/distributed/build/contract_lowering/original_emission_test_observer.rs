@@ -276,7 +276,7 @@ pub(in crate::planner::distributed::build) fn lower_read_with_original_emission_
     reads: Option<FinalizedProviderReadSet>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &'control dyn PureCompileControl,
     observer: &'control mut dyn OriginalEmissionObserver,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -304,7 +304,7 @@ pub(in crate::planner::distributed::build) fn lower_write_with_original_emission
     input: FinalWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
-    constant_policy: novarocks_constant_contract::ConstantPolicy,
+    constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &'control dyn PureCompileControl,
     observer: &'control mut dyn OriginalEmissionObserver,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {

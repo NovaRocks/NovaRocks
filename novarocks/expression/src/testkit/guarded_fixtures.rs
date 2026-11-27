@@ -25,7 +25,7 @@ use crate::{
     CompiledExprSet, CompiledExpressionInstance, EvaluationEnvironment, ScopeLayout, ScopeLayouts,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantValue};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
@@ -147,19 +147,21 @@ pub fn catalogue(shape: Shape) -> PureEngineFunctionCatalog {
     builder.seal_pure(manifest).unwrap()
 }
 
-pub fn fixture_constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
+pub fn fixture_constant_policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    )
 }
 
 pub fn author(
@@ -342,23 +344,10 @@ fn compile_project_unit_with_layout(
 ) -> Arc<CompiledExprSet> {
     register_call_requests(&mut draft, authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(
-        &mut draft,
-        functions,
-        &constants,
-        parameters,
-        fixture_constant_policy(),
-        &mut work,
-    );
+    declare_call_controls(&mut draft, functions, &constants, parameters, &mut work);
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
-        functions,
-        sealed,
-        authors,
-        &constants,
-        parameters,
-        fixture_constant_policy(),
-        &mut work,
+        functions, sealed, authors, &constants, parameters, &mut work,
     );
     work.finish().unwrap();
     compile_fixture_unit(

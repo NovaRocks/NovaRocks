@@ -430,6 +430,73 @@ fn occurrence_property_proof_actual_quantum_and_every_callback_keep_original_cau
 }
 
 #[test]
+fn input_derived_property_proof_observes_its_node_index_in_the_original_scope() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = scalar_fixture(17, 2, &mut constants);
+    let calls = fixture.checked().unwrap();
+    let control = ProofControl::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let mut snapshots = Vec::new();
+    let proof = calls
+        .property_proof_with_admission_in(
+            &fixture.fragment,
+            &PlanLimits::FROZEN,
+            None,
+            &mut |facts| {
+                snapshots.push(*facts);
+                Ok(())
+            },
+            &mut work,
+        )
+        .unwrap();
+
+    let index = snapshots.last().unwrap();
+    let previous = snapshots.iter().rev().nth(1).copied().unwrap_or_default();
+    assert_eq!(
+        index.allocation_requests_upper_bound - previous.allocation_requests_upper_bound,
+        1
+    );
+    assert_eq!(
+        index.allocation_request_bytes_upper_bound - previous.allocation_request_bytes_upper_bound,
+        proof.facts().request_bytes,
+    );
+    assert_eq!(proof.facts().coexisting_bytes, proof.facts().request_bytes);
+    assert!(
+        proof
+            .replica_safe(fixture.fragment.root(), &mut work)
+            .unwrap()
+    );
+    assert_eq!(
+        proof.require_fragment(&fixture.fragment.clone(), &mut work),
+        Err(FrozenCallError::WrongFragment)
+    );
+    work.finish().unwrap();
+
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let result = calls.property_proof_with_admission_in(
+        &fixture.fragment,
+        &PlanLimits::FROZEN,
+        None,
+        &mut |facts| {
+            if facts.allocation_request_bytes_upper_bound
+                > previous.allocation_request_bytes_upper_bound
+            {
+                Err(CompileControlError::ResourceExhausted)
+            } else {
+                Ok(())
+            }
+        },
+        &mut work,
+    );
+    assert!(matches!(
+        result,
+        Err(FrozenCallError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
+}
+
+#[test]
 fn occurrence_property_proof_exact_projection_envelopes_and_overflow_are_checked() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let fixture = scalar_fixture(320, 17, &mut fixture_constants);

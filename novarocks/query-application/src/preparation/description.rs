@@ -743,18 +743,20 @@ mod tests {
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
-        let policy = novarocks_constant_contract::ConstantPolicy {
-            max_rows: 8,
-            max_array_nodes: 32,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 4 << 20,
-            max_type_depth: 16,
-            max_type_nodes: 64,
-            max_dictionary_depth: 4,
-            max_metadata_bytes: 65536,
-            max_library_validation_work: 64 << 20,
-            max_library_validation_bytes: 64 << 20,
-        };
+        let policy = novarocks_constant_contract::ConstantValidation::bounded(
+            novarocks_constant_contract::ConstantPolicy {
+                max_rows: 8,
+                max_array_nodes: 32,
+                max_logical_elements: 4096,
+                max_retained_buffer_bytes: 4 << 20,
+                max_type_depth: 16,
+                max_type_nodes: 64,
+                max_dictionary_depth: 4,
+                max_metadata_bytes: 65536,
+                max_library_validation_work: 64 << 20,
+                max_library_validation_bytes: 64 << 20,
+            },
+        );
         let mut constants = novarocks_physical_plan::ConstantPools::empty();
         let mut scalar = |value| {
             let source = novarocks_constant_contract::ConstantValue::from_i64(
@@ -865,7 +867,7 @@ mod tests {
                 )
             }))
             .unwrap();
-        let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap(), policy)
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap())
             .with_constant_pools(constants)
             .with_semantic_parameters(parameters);
         builder.add_fragment(fragment).unwrap();

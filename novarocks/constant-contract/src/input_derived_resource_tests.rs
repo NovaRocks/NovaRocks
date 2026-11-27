@@ -166,3 +166,151 @@ fn input_derived_preflight_keeps_first_host_payload_and_has_no_completed_tail() 
         other => panic!("unexpected failure: {other:?}"),
     }
 }
+
+#[test]
+fn input_derived_i64_pool_materializes_exact_nullable_rows() {
+    use arrow_array::Int64Array;
+
+    let control = Control(AtomicBool::new(false));
+    let field = Arc::new(Field::new("source", DataType::Int64, true));
+    let ty = FunctionValueType::new(DataType::Int64, true);
+    let input = Int64Array::from_iter((0..4097).map(|row| (row % 11 != 0).then_some(row)));
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        input.to_data(),
+        ConstantValidation::INPUT_DERIVED,
+        CompilePhase::Decode,
+        &control,
+    )
+    .unwrap();
+
+    assert!(Arc::ptr_eq(pool.field_ref(), &field));
+    assert_eq!(pool.value_type(), &ty);
+    assert_eq!(pool.resource_facts().rows, 4097);
+    for row in 0..4097 {
+        let selected = pool.value(row).unwrap();
+        assert_eq!(selected.ordinal(), row);
+        assert_eq!(
+            selected.try_i64().unwrap(),
+            (row % 11 != 0).then_some(i64::from(row))
+        );
+    }
+}
+
+#[test]
+fn input_derived_list_pool_materializes_backing_and_outer_null() {
+    use arrow_array::{Int32Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+
+    let control = Control(AtomicBool::new(false));
+    let item = Arc::new(Field::new("item", DataType::Int32, false));
+    let field = Arc::new(Field::new("source", DataType::List(item.clone()), true));
+    let ty = FunctionValueType::new(field.data_type().clone(), true);
+    let input = ListArray::try_new(
+        item,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 65_537, 65_537])),
+        Arc::new(Int32Array::from_iter_values(0..65_537)),
+        Some(NullBuffer::from(vec![true, false])),
+    )
+    .unwrap();
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        input.to_data(),
+        ConstantValidation::INPUT_DERIVED,
+        CompilePhase::Decode,
+        &control,
+    )
+    .unwrap();
+
+    assert!(Arc::ptr_eq(pool.field_ref(), &field));
+    assert_eq!(pool.value_type(), &ty);
+    let array = pool.array().as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(array.is_valid(0));
+    assert!(array.is_null(1));
+    let child = array.value(0);
+    let child = child.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(child.len(), 65_537);
+    assert!(child.values().iter().copied().eq(0..65_537));
+}
+
+#[test]
+fn input_derived_preflight_keeps_metadata_and_reports_actual_offset_extent() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+
+    let control = Control(AtomicBool::new(false));
+    let field = Field::new("source", DataType::Utf8, false)
+        .with_metadata([("source", "x".repeat(64 * 1024))]);
+    let ty = FunctionValueType::new(DataType::Utf8, false);
+    let validation = ConstantValidation::INPUT_DERIVED;
+    assert!(matches!(
+        preflight_scalar_construction(
+            &field,
+            &ty,
+            1,
+            false,
+            validation,
+            CompilePhase::Decode,
+            &control,
+        ),
+        Err(ConstantError::Limit(
+            "constant metadata byte limit exceeded"
+        ))
+    ));
+
+    for (carrier, extent_limit) in [
+        (DataType::Utf8, i32::MAX as u64),
+        (DataType::Binary, i32::MAX as u64),
+        (DataType::Utf8View, u32::MAX as u64),
+        (DataType::LargeBinary, i64::MAX as u64),
+    ] {
+        let field = Field::new("source", carrier.clone(), false);
+        let ty = FunctionValueType::new(carrier, false);
+        let required = extent_limit + 1;
+        let error = preflight_scalar_construction(
+            &field,
+            &ty,
+            required,
+            false,
+            validation,
+            CompilePhase::Decode,
+            &control,
+        )
+        .unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let representation = fact.representation().unwrap();
+        assert_eq!(
+            representation.boundary,
+            RepresentationBoundary::SingleOutput
+        );
+        assert_eq!(representation.extent_limit, Some(extent_limit));
+        assert_eq!(representation.required, Some(required));
+        assert!(!error.is_local_allocation_failure());
+    }
+}
+
+#[test]
+fn input_derived_null_factory_rejects_excess_dictionary_depth_before_building() {
+    let control = Control(AtomicBool::new(false));
+    let carrier = (0..9).fold(DataType::Int64, |values, _| {
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(values))
+    });
+    let field = Field::new("dictionary", carrier.clone(), true);
+    let ty = FunctionValueType::new(carrier, true);
+    assert!(matches!(
+        preflight_scalar_construction(
+            &field,
+            &ty,
+            0,
+            true,
+            ConstantValidation::INPUT_DERIVED,
+            CompilePhase::Decode,
+            &control,
+        ),
+        Err(ConstantError::Limit(
+            "constant dictionary depth limit exceeded"
+        ))
+    ));
+}

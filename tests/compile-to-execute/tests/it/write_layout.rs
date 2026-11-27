@@ -245,7 +245,7 @@ fn sender_package() -> FragmentPackage {
             version: PlanVersionId::try_new([11; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            statement_constant_policy: compile_options().constants,
+
             pruning,
             cuts,
             result: None,

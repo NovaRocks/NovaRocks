@@ -1803,7 +1803,6 @@ pub enum AnnotationSubject {
 /// Complete immutable final physical plan.
 #[derive(Clone, Debug)]
 pub struct PhysicalPlan {
-    statement_constant_policy: crate::ConstantPolicy,
     constants: crate::ConstantPools,
     parameters: SemanticParameters,
     version: PlanVersionId,
@@ -1820,9 +1819,6 @@ pub struct PhysicalPlan {
 }
 
 impl PhysicalPlan {
-    pub const fn statement_constant_policy(&self) -> crate::ConstantPolicy {
-        self.statement_constant_policy
-    }
     pub fn constants(&self) -> &crate::ConstantPools {
         &self.constants
     }
@@ -1900,7 +1896,7 @@ impl PhysicalPlan {
 pub(crate) struct PhysicalPlanParts {
     pub constants: crate::ConstantPools,
     pub parameters: SemanticParameters,
-    pub statement_constant_policy: crate::ConstantPolicy,
+
     pub version: PlanVersionId,
     pub fragments: BTreeMap<FragmentId, Fragment>,
     pub edges: BTreeMap<EdgeId, Edge>,
@@ -1919,7 +1915,7 @@ impl From<PhysicalPlanParts> for PhysicalPlan {
         Self {
             constants: parts.constants,
             parameters: parts.parameters,
-            statement_constant_policy: parts.statement_constant_policy,
+
             version: parts.version,
             fragments: parts.fragments,
             edges: parts.edges,

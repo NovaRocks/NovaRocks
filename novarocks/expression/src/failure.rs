@@ -45,11 +45,6 @@ impl FailureProjection for StaticExpressionError {
                 ResourceDimension::Items,
                 crate::MAX_STATIC_EXPRESSION_DEPTH,
             ),
-            Self::TooManyBytes => limit(
-                5,
-                ResourceDimension::Bytes,
-                crate::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
-            ),
             Self::InvalidMetadataArity => fact(FailureClass::Invariant, 7),
             Self::ConstantTypeMismatch => fact(FailureClass::Invariant, 9),
         }

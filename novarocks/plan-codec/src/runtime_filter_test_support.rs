@@ -444,11 +444,8 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         },
     };
 
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([40; 16]).unwrap(),
-        codec_constant_policy(),
-    )
-    .with_constant_pools(fixture_i64_constants());
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([40; 16]).unwrap())
+        .with_constant_pools(fixture_i64_constants());
     plan.add_fragment(left_source).unwrap();
     plan.add_fragment(right_source).unwrap();
     plan.add_fragment(join_stage).unwrap();

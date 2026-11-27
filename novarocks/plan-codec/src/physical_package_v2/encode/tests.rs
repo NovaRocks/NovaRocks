@@ -22,7 +22,7 @@ use crate::physical_package_v2::definition_sources::tests::{
 };
 use crate::physical_package_v2::prepare_package_wire_in;
 use crate::physical_package_v2::provider_sources::tests::checked_read;
-use crate::physical_package_v2::test_support::encode_limits;
+
 use crate::resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel};
 use std::sync::Mutex;
 
@@ -88,14 +88,13 @@ fn decode_limits() -> DecodeProjectionLimits {
 #[test]
 fn whole_sender_emits_every_component_of_actual_checked_packages() {
     for (name, package) in fixtures() {
-        let out = encode_fragment_package(&package, &encode_limits(), &Control::default())
+        let out = encode_fragment_package(&package, &Control::default())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let fragment = out.fragment.as_ref().expect("fragment");
         let original = package.fragment();
         assert_eq!(out.plan_version.len(), 16, "{name}");
         assert!(out.required.is_some(), "{name}");
         assert!(out.types.is_some(), "{name}");
-        assert!(out.source_constant_policy.is_some(), "{name}");
         assert!(out.calls.is_some(), "{name}");
         assert!(out.pruning.is_some(), "{name}");
         assert!(out.parameters.is_some(), "{name}");
@@ -153,10 +152,10 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
 fn whole_sender_output_passes_generated_preflight_and_is_deterministic() {
     let model = FragmentDecodeResourceModel::try_new(&Control::default()).unwrap();
     for (name, package) in fixtures() {
-        let first = encode_fragment_package(&package, &encode_limits(), &Control::default())
+        let first = encode_fragment_package(&package, &Control::default())
             .unwrap()
             .encode_to_vec();
-        let second = encode_fragment_package(&package, &encode_limits(), &Control::default())
+        let second = encode_fragment_package(&package, &Control::default())
             .unwrap()
             .encode_to_vec();
         assert_eq!(first, second, "{name}: same package, same bytes");
@@ -172,20 +171,12 @@ fn whole_sender_output_passes_generated_preflight_and_is_deterministic() {
 }
 
 #[test]
-fn whole_sender_preserves_component_limit_and_control() {
+fn whole_sender_preserves_original_control() {
     for (_name, package) in fixtures() {
-        let mut tight = encode_limits();
-        tight.definition_sources.max_values = package.fragment().values().len() - 1;
-        assert!(matches!(
-            encode_fragment_package(&package, &tight, &Control::default()),
-            Err(PackageEncodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
         // Representative control: the caller's cause stays primary at the entry,
         // in the middle and at the final footer of the one Encode scope.
         let control = Control::default();
-        encode_fragment_package(&package, &encode_limits(), &control).unwrap();
+        encode_fragment_package(&package, &control).unwrap();
         let callbacks = control.trace.lock().unwrap().len();
         for at in [0, callbacks / 2, callbacks - 1] {
             let stop = Control {
@@ -193,7 +184,7 @@ fn whole_sender_preserves_component_limit_and_control() {
                 ..Default::default()
             };
             assert!(matches!(
-                encode_fragment_package(&package, &encode_limits(), &stop),
+                encode_fragment_package(&package, &stop),
                 Err(PackageEncodeError::Control(CompileControlError::Cancelled))
             ));
             assert_eq!(stop.trace.lock().unwrap().len(), at + 1);
@@ -211,7 +202,7 @@ fn whole_package_preserves_declared_keyed_assertion_violation() {
         sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
         sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
     ] {
-        let mut wire = encode_fragment_package(&cv_package(), &encode_limits(), &control).unwrap();
+        let mut wire = encode_fragment_package(&cv_package(), &control).unwrap();
         let fragment = wire.fragment.as_mut().unwrap();
         let source = fragment.root_node_id.unwrap();
         let mut assertion = fragment
@@ -263,7 +254,7 @@ fn whole_package_preserves_declared_keyed_assertion_violation() {
         assert!(
             matches!(&node.kind, p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne { declared_violation: Some(actual), .. }) if *actual == reason)
         );
-        let encoded = encode_fragment_package(&decoded, &encode_limits(), &control).unwrap();
+        let encoded = encode_fragment_package(&decoded, &control).unwrap();
         let roundtrip = decode_fragment_package(
             &encoded.encode_to_vec(),
             &model,

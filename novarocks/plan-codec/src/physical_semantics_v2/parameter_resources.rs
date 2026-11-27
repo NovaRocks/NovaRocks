@@ -67,8 +67,8 @@ fn bytes<T>(n: usize) -> Result<usize, Error> {
         .map(|l| l.size())
         .map_err(|_| invalid("semantic parameter allocation layout is unrepresentable"))
 }
-fn cap(value: usize, maximum: usize, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-    let accepted = value <= maximum;
+fn cap(value: usize, maximum: Option<usize>, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+    let accepted = maximum.is_none_or(|maximum| value <= maximum);
     w.step()?;
     if accepted {
         Ok(())
@@ -92,7 +92,7 @@ type ParentAdmission<'a> =
 
 struct Admission<'borrow, 'callback> {
     parent: Option<&'borrow mut ParentAdmission<'callback>>,
-    limits: ParameterProjectionLimits,
+    limits: Option<ParameterProjectionLimits>,
 }
 impl Admission<'_, '_> {
     fn numeric<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
@@ -108,14 +108,16 @@ impl Admission<'_, '_> {
             let limits = self.limits;
             // All prefix axes are already known. Refuse numerically before
             // any real callback, including a caller's pending quantum.
-            if facts.parameter_count > limits.max_parameters
-                || facts.timezone_request_bytes_upper_bound > limits.max_timezone_request_bytes
-                || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-                || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-                || facts.coexisting_source_and_request_bytes_upper_bound
-                    > limits.max_coexisting_source_and_request_bytes
-                || facts.cumulative_work_upper_bound > limits.max_work
-            {
+            if limits.is_some_and(|limits| {
+                facts.parameter_count > limits.max_parameters
+                    || facts.timezone_request_bytes_upper_bound > limits.max_timezone_request_bytes
+                    || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+                    || facts.allocation_request_bytes_upper_bound
+                        > limits.max_allocation_request_bytes
+                    || facts.coexisting_source_and_request_bytes_upper_bound
+                        > limits.max_coexisting_source_and_request_bytes
+                    || facts.cumulative_work_upper_bound > limits.max_work
+            }) {
                 return Err(CompileControlError::ResourceExhausted.into());
             }
             if let Some(parent) = &mut self.parent {
@@ -195,7 +197,7 @@ fn encode_header(n: usize, admission: &Admission<'_, '_>) -> Result<Header, Erro
 fn preflight(
     input: &wire::SemanticParameters,
     source: usize,
-    limits: ParameterProjectionLimits,
+    limits: Option<ParameterProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<ParameterProjectionFacts, Error> {
@@ -214,7 +216,7 @@ fn preflight(
     if too_many {
         return Err(SemanticParameterError::TooManyParameters.into());
     }
-    cap(n, limits.max_parameters, w)?;
+    cap(n, limits.map(|limits| limits.max_parameters), w)?;
     let mut known = add(
         size_of::<wire::SemanticParameters>(),
         bytes::<wire::SemanticParameter>(input.entries.capacity())?,
@@ -227,7 +229,7 @@ fn preflight(
         Some(header) => header,
         None => decode_header(n, admission)?,
     };
-    cap(header.work, limits.max_work, w)?;
+    cap(header.work, limits.map(|limits| limits.max_work), w)?;
     for entry in &input.entries {
         if let Some(wire::semantic_parameter::Value::TimeZone(zone)) = &entry.value {
             known = add(known, zone.capacity())?;
@@ -242,25 +244,29 @@ fn preflight(
     admission.gate(Ok(facts))?;
     cap(
         facts.timezone_request_bytes_upper_bound,
-        limits.max_timezone_request_bytes,
+        limits.map(|limits| limits.max_timezone_request_bytes),
         w,
     )?;
     cap(
         facts.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
+        limits.map(|limits| limits.max_allocation_requests),
         w,
     )?;
     cap(
         facts.allocation_request_bytes_upper_bound,
-        limits.max_allocation_request_bytes,
+        limits.map(|limits| limits.max_allocation_request_bytes),
         w,
     )?;
     cap(
         facts.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
+        limits.map(|limits| limits.max_coexisting_source_and_request_bytes),
         w,
     )?;
-    cap(facts.cumulative_work_upper_bound, limits.max_work, w)?;
+    cap(
+        facts.cumulative_work_upper_bound,
+        limits.map(|limits| limits.max_work),
+        w,
+    )?;
     Ok(facts)
 }
 
@@ -302,9 +308,10 @@ impl PreparedSemanticParametersDecode<'_, '_> {
 pub fn prepare_semantic_parameters_decode<'source, 'control>(
     input: &'source wire::SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSemanticParametersDecode<'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = preflight(
         input,
@@ -327,9 +334,10 @@ pub fn prepare_semantic_parameters_decode<'source, 'control>(
 pub fn decode_semantic_parameters(
     input: &wire::SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     control: &dyn PureCompileControl,
 ) -> Result<(SemanticParameters, ParameterProjectionFacts), Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = (|| {
         let facts = preflight(
@@ -351,7 +359,7 @@ pub fn decode_semantic_parameters(
 fn preflight_encode(
     input: &SemanticParameters,
     source: usize,
-    limits: ParameterProjectionLimits,
+    limits: Option<ParameterProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<ParameterProjectionFacts, Error> {
@@ -368,7 +376,7 @@ fn preflight_encode(
     if too_many {
         return Err(SemanticParameterError::TooManyParameters.into());
     }
-    cap(n, limits.max_parameters, w)?;
+    cap(n, limits.map(|limits| limits.max_parameters), w)?;
     // The actual BTree may have spare slots and headers; these are necessary
     // occupied-entry lower floors, never a claim of exact retained backing.
     let known = add(
@@ -386,7 +394,7 @@ fn preflight_encode(
         Some(header) => header,
         None => encode_header(n, admission)?,
     };
-    cap(header.work, limits.max_work, w)?;
+    cap(header.work, limits.map(|limits| limits.max_work), w)?;
     let mut strings = 0;
     let mut string_bytes = 0;
     // Iteration follows the original immutable table. A pull is an opaque
@@ -417,25 +425,29 @@ fn preflight_encode(
     admission.gate(Ok(facts))?;
     cap(
         facts.timezone_request_bytes_upper_bound,
-        limits.max_timezone_request_bytes,
+        limits.map(|limits| limits.max_timezone_request_bytes),
         w,
     )?;
     cap(
         facts.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
+        limits.map(|limits| limits.max_allocation_requests),
         w,
     )?;
     cap(
         facts.allocation_request_bytes_upper_bound,
-        limits.max_allocation_request_bytes,
+        limits.map(|limits| limits.max_allocation_request_bytes),
         w,
     )?;
     cap(
         facts.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
+        limits.map(|limits| limits.max_coexisting_source_and_request_bytes),
         w,
     )?;
-    cap(facts.cumulative_work_upper_bound, limits.max_work, w)?;
+    cap(
+        facts.cumulative_work_upper_bound,
+        limits.map(|limits| limits.max_work),
+        w,
+    )?;
     Ok(facts)
 }
 
@@ -474,9 +486,10 @@ impl PreparedSemanticParametersEncode<'_, '_> {
 pub fn prepare_semantic_parameters_encode<'source, 'control>(
     input: &'source SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSemanticParametersEncode<'source, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = preflight_encode(
         input,
@@ -498,9 +511,10 @@ pub fn prepare_semantic_parameters_encode<'source, 'control>(
 pub fn encode_semantic_parameters(
     input: &SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     control: &dyn PureCompileControl,
 ) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
         let facts = preflight_encode(
@@ -524,10 +538,11 @@ pub fn encode_semantic_parameters(
 pub fn prepare_semantic_parameters_decode_observed_in<'source, 'control>(
     input: &'source wire::SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     admit: &mut ParentAdmission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSemanticParametersDecode<'source, 'control>, Error> {
+    let limits = limits.into();
     let facts = preflight(
         input,
         source_retained_bytes,
@@ -550,10 +565,11 @@ pub fn prepare_semantic_parameters_decode_observed_in<'source, 'control>(
 pub fn prepare_semantic_parameters_encode_observed_in<'source, 'control>(
     input: &'source SemanticParameters,
     source_retained_bytes: usize,
-    limits: ParameterProjectionLimits,
+    limits: impl Into<Option<ParameterProjectionLimits>>,
     admit: &mut ParentAdmission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSemanticParametersEncode<'source, 'control>, Error> {
+    let limits = limits.into();
     let facts = preflight_encode(
         input,
         source_retained_bytes,

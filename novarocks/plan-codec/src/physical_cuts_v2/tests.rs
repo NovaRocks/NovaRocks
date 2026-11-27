@@ -64,7 +64,7 @@ fn tl() -> TypeProjectionLimits {
 }
 fn limits() -> CutsProjectionLimits {
     CutsProjectionLimits {
-        node: NodeProjectionLimits {
+        node: Some(NodeProjectionLimits {
             max_input_nodes: 10000,
             max_value_references: 10000,
             max_list_items: 10000,
@@ -79,15 +79,15 @@ fn limits() -> CutsProjectionLimits {
                 max_coexisting_source_and_request_bytes: 32 * B,
                 max_work: usize::MAX / 8,
             },
-        },
-        binding: BindingProjectionLimits {
+        }),
+        binding: Some(BindingProjectionLimits {
             max_definitions: 10000,
             max_type_references: 10000,
             max_allocation_requests: 10000,
             max_request_bytes: 16 * B,
             max_coexisting_source_and_request_bytes: 32 * B,
             max_work: usize::MAX / 8,
-        },
+        }),
     }
 }
 fn ty() -> FunctionValueType {
@@ -726,14 +726,19 @@ fn independent_container_layout_and_all_seven_exact_under_envelopes() {
     for receiving in [false, true] {
         let f = if receiving { df } else { ef };
         let mut exact = limits();
-        exact.node.max_input_nodes = f.input_node_count;
-        exact.node.max_value_references = f.value_reference_count;
-        exact.node.max_list_items = f.list_item_count;
-        exact.node.max_allocation_requests = f.allocation_requests_upper_bound;
-        exact.node.max_allocation_request_bytes = f.allocation_request_bytes_upper_bound;
-        exact.node.max_coexisting_source_and_request_bytes =
+        exact.node.as_mut().unwrap().max_input_nodes = f.input_node_count;
+        exact.node.as_mut().unwrap().max_value_references = f.value_reference_count;
+        exact.node.as_mut().unwrap().max_list_items = f.list_item_count;
+        exact.node.as_mut().unwrap().max_allocation_requests = f.allocation_requests_upper_bound;
+        exact.node.as_mut().unwrap().max_allocation_request_bytes =
+            f.allocation_request_bytes_upper_bound;
+        exact
+            .node
+            .as_mut()
+            .unwrap()
+            .max_coexisting_source_and_request_bytes =
             f.coexisting_source_and_request_bytes_upper_bound;
-        exact.node.max_work = f.cumulative_work_upper_bound;
+        exact.node.as_mut().unwrap().max_work = f.cumulative_work_upper_bound;
         if receiving {
             decode(&raw, &c, exact).unwrap();
         } else {
@@ -742,13 +747,19 @@ fn independent_container_layout_and_all_seven_exact_under_envelopes() {
         for axis in 0..7 {
             let mut l = exact;
             let v = match axis {
-                0 => &mut l.node.max_input_nodes,
-                1 => &mut l.node.max_value_references,
-                2 => &mut l.node.max_list_items,
-                3 => &mut l.node.max_allocation_requests,
-                4 => &mut l.node.max_allocation_request_bytes,
-                5 => &mut l.node.max_coexisting_source_and_request_bytes,
-                _ => &mut l.node.max_work,
+                0 => &mut l.node.as_mut().unwrap().max_input_nodes,
+                1 => &mut l.node.as_mut().unwrap().max_value_references,
+                2 => &mut l.node.as_mut().unwrap().max_list_items,
+                3 => &mut l.node.as_mut().unwrap().max_allocation_requests,
+                4 => &mut l.node.as_mut().unwrap().max_allocation_request_bytes,
+                5 => {
+                    &mut l
+                        .node
+                        .as_mut()
+                        .unwrap()
+                        .max_coexisting_source_and_request_bytes
+                }
+                _ => &mut l.node.as_mut().unwrap().max_work,
             };
             assert!(*v > 0);
             *v -= 1;
@@ -934,7 +945,7 @@ fn source_namespace_loans_and_known_numeric_refusal_precede_late_control() {
         for cause in CAUSES {
             c.reset(Some((1, cause)));
             let mut l = limits();
-            l.node.max_allocation_requests = 0;
+            l.node.as_mut().unwrap().max_allocation_requests = 0;
             let error = run(
                 &c,
                 if receiving {
@@ -1316,14 +1327,19 @@ fn runtime_filter_bindings_are_one_admitted_root_extent_under_all_seven_envelope
     for receiving in [false, true] {
         let f = if receiving { df } else { ef };
         let mut exact = limits();
-        exact.node.max_input_nodes = f.input_node_count;
-        exact.node.max_value_references = f.value_reference_count;
-        exact.node.max_list_items = f.list_item_count;
-        exact.node.max_allocation_requests = f.allocation_requests_upper_bound;
-        exact.node.max_allocation_request_bytes = f.allocation_request_bytes_upper_bound;
-        exact.node.max_coexisting_source_and_request_bytes =
+        exact.node.as_mut().unwrap().max_input_nodes = f.input_node_count;
+        exact.node.as_mut().unwrap().max_value_references = f.value_reference_count;
+        exact.node.as_mut().unwrap().max_list_items = f.list_item_count;
+        exact.node.as_mut().unwrap().max_allocation_requests = f.allocation_requests_upper_bound;
+        exact.node.as_mut().unwrap().max_allocation_request_bytes =
+            f.allocation_request_bytes_upper_bound;
+        exact
+            .node
+            .as_mut()
+            .unwrap()
+            .max_coexisting_source_and_request_bytes =
             f.coexisting_source_and_request_bytes_upper_bound;
-        exact.node.max_work = f.cumulative_work_upper_bound;
+        exact.node.as_mut().unwrap().max_work = f.cumulative_work_upper_bound;
         if receiving {
             decode(&raw, &c, exact).unwrap();
         } else {
@@ -1332,13 +1348,19 @@ fn runtime_filter_bindings_are_one_admitted_root_extent_under_all_seven_envelope
         for axis in 0..7 {
             let mut l = exact;
             let v = match axis {
-                0 => &mut l.node.max_input_nodes,
-                1 => &mut l.node.max_value_references,
-                2 => &mut l.node.max_list_items,
-                3 => &mut l.node.max_allocation_requests,
-                4 => &mut l.node.max_allocation_request_bytes,
-                5 => &mut l.node.max_coexisting_source_and_request_bytes,
-                _ => &mut l.node.max_work,
+                0 => &mut l.node.as_mut().unwrap().max_input_nodes,
+                1 => &mut l.node.as_mut().unwrap().max_value_references,
+                2 => &mut l.node.as_mut().unwrap().max_list_items,
+                3 => &mut l.node.as_mut().unwrap().max_allocation_requests,
+                4 => &mut l.node.as_mut().unwrap().max_allocation_request_bytes,
+                5 => {
+                    &mut l
+                        .node
+                        .as_mut()
+                        .unwrap()
+                        .max_coexisting_source_and_request_bytes
+                }
+                _ => &mut l.node.as_mut().unwrap().max_work,
             };
             assert!(*v > 0);
             *v -= 1;

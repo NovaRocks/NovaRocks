@@ -114,14 +114,14 @@ fn limits() -> AggregateNodeProjectionLimits {
                 max_work: 2_000_000_000,
             },
         },
-        binding: BindingProjectionLimits {
+        binding: Some(BindingProjectionLimits {
             max_definitions: 1024,
             max_type_references: 8192,
             max_request_bytes: 16 << 20,
             max_allocation_requests: 8192,
             max_coexisting_source_and_request_bytes: 32 << 20,
             max_work: 2_000_000_000,
-        },
+        }),
     }
 }
 fn tl() -> TypeProjectionLimits {
@@ -552,7 +552,8 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         let functions =
-            encode_function_bindings(&types, &finputs, previous, limits().binding, c).unwrap();
+            encode_function_bindings(&types, &finputs, previous, limits().binding.unwrap(), c)
+                .unwrap();
         let mut ainputs = calls
             .iter()
             .enumerate()
@@ -596,7 +597,7 @@ impl Fixture {
             functions.as_wire(),
             &read_types,
             previous,
-            limits().binding,
+            limits().binding.unwrap(),
             c,
         )
         .unwrap();
@@ -608,7 +609,8 @@ impl Fixture {
         )
         .unwrap();
         let mf = materialize_function_bindings(
-            prepare_function_bindings_materialization(&fh, 2 * previous, limits().binding).unwrap(),
+            prepare_function_bindings_materialization(&fh, 2 * previous, limits().binding.unwrap())
+                .unwrap(),
         )
         .unwrap();
         let ma = materialize_aggregate_bindings(
@@ -862,12 +864,12 @@ fn aggregate_both_directions_accept_exact_seven_axes_and_refuse_each_under() {
             ));
         }
         let mut r = limits();
-        r.binding.max_type_references = 5;
+        r.binding.as_mut().unwrap().max_type_references = 5;
         assert!(matches!(
             decode_aggregate_node(&expected(), d, a, SOURCE, r),
             Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
-        r.binding.max_type_references = 6;
+        r.binding.as_mut().unwrap().max_type_references = 6;
         assert!(decode_aggregate_node(&expected(), d, a, SOURCE, r).is_ok());
     });
 }
@@ -1407,7 +1409,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                                 known,
                                 source: SOURCE,
                                 values: v.count(),
-                                limits: limits().node,
+                                limits: Some(limits().node),
                             };
                             if receiving {
                                 parent.count_decode(&raw_calls[i..i + 1], d, &mut w)?;
@@ -1427,7 +1429,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                             known,
                             source: SOURCE,
                             values: v.count(),
-                            limits: limits().node,
+                            limits: Some(limits().node),
                         };
                         if receiving {
                             parent.count_decode(raw_calls, d, &mut w)?;
@@ -1549,7 +1551,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                         known,
                         source: SOURCE,
                         values: v.count(),
-                        limits: l,
+                        limits: Some(l),
                     };
                     if receiving {
                         parent.count_decode(&b.calls, d, &mut w)?;
@@ -1622,7 +1624,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                 known,
                 source: SOURCE,
                 values: v.count(),
-                limits: limits().node,
+                limits: Some(limits().node),
             }
             .count_decode(&over, d, &mut w);
             finish(w, result)

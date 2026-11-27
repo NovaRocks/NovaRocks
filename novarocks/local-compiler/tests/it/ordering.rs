@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::fragment_fixture::{compile, empty_values, numeric_catalogue, options, package};
+use super::fragment_fixture::{compile, empty_values, numeric_catalogue, package};
 use arrow_schema::DataType;
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression::testkit::HarnessControl;
@@ -76,7 +76,6 @@ fn sorted_global_row_assertion_has_a_local_order_preserving_owner() {
         }]),
         Default::default(),
         ConstantPools::empty(),
-        options().constants,
     );
     let program = compile(&numeric_catalogue(), package, &HarnessControl).unwrap();
     let graph = program.graph();

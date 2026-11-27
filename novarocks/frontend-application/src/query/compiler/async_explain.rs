@@ -433,7 +433,6 @@ impl FrontendQueryCompiler {
                     options: query_options,
                     family,
                     carrier: self.query.static_plan_carrier().clone(),
-                    policy: self.constant_policy(),
                     control: encoding_control,
                     #[cfg(novarocks_dev_controls)]
                     rewrite: None,

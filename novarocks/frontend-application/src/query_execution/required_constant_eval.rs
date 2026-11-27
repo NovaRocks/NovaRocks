@@ -32,8 +32,8 @@ use novarocks_expression::{
 use novarocks_expression_contract::RootScope;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use novarocks_functions::{
-    AggregateStateAllocator, CompileKernelControl, ConstantCreationFailure, ConstantPolicy,
-    ConstantPool, ConstantValue, KernelDiagnostic, KernelFailure, PureEngineFunctionCatalog,
+    AggregateStateAllocator, CompileKernelControl, ConstantCreationFailure, ConstantPool,
+    ConstantValidation, ConstantValue, KernelDiagnostic, KernelFailure, PureEngineFunctionCatalog,
     ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use novarocks_sql::compiler::{
@@ -63,7 +63,7 @@ pub(crate) use resources::with_root_value_creation;
 #[derive(Clone)]
 pub struct RequiredConstantInterpreter {
     functions: Arc<PureEngineFunctionCatalog>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 }
 impl fmt::Debug for RequiredConstantInterpreter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -72,7 +72,7 @@ impl fmt::Debug for RequiredConstantInterpreter {
     }
 }
 impl RequiredConstantInterpreter {
-    pub fn new(functions: Arc<PureEngineFunctionCatalog>, policy: ConstantPolicy) -> Self {
+    pub fn new(functions: Arc<PureEngineFunctionCatalog>, policy: ConstantValidation) -> Self {
         Self { functions, policy }
     }
 

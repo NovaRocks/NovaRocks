@@ -10,7 +10,7 @@ use novarocks_execution::runtime::execution_runtime::{
     ExchangeFlowLimits, ExecutionRuntime, ExecutionRuntimeConfig,
 };
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
-use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
+use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_memory::MemoryAuthority;
 use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
@@ -146,7 +146,6 @@ impl CompiledStaticPlan {
         decode_limits: PackageDecodeLimits,
         functions: Arc<PureEngineFunctionCatalog>,
         providers: Arc<PureProviderProgramCatalog<E>>,
-        constants: ConstantPolicy,
     ) -> Self
     where
         E: std::error::Error
@@ -165,7 +164,6 @@ impl CompiledStaticPlan {
             decode_limits,
             functions,
             providers,
-            constants,
         ));
         Self {
             compiler,
@@ -2135,7 +2133,6 @@ mod tests {
         // admission with a small package bound, and a sealed RAND-only subset.
         let mut limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
         limits.wire.max_input_bytes = 64;
-        let constants = limits.constant_policy;
         let metadata = test_execution_function_set();
         let mut builder = EngineFunctionCatalogBuilder::new();
         builder
@@ -2183,7 +2180,6 @@ mod tests {
             limits,
             Arc::new(functions),
             Arc::new(providers),
-            constants,
         );
 
         let services = compose_backend_application_services(

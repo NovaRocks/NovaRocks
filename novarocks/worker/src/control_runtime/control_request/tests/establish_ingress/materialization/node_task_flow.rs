@@ -163,7 +163,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 required: RequiredContracts::default(),
                 constants: ConstantPools::empty(),
                 fragment,
-                statement_constant_policy: policy,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -229,7 +229,7 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: NonZeroUsize::new(1),
                 kernel_abi: KernelAbiVersion::CURRENT,
-                constants: policy,
+                constants: novarocks_functions::ConstantValidation::bounded(policy),
             },
             &CompileControl,
         )

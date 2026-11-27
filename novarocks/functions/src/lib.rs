@@ -162,7 +162,7 @@ pub use kernel_input::{
 pub use lambda_rows::*;
 pub use novarocks_constant_contract::{
     ConstantCreationFailure, ConstantError, ConstantOwnerResourceFacts, ConstantPolicy,
-    ConstantPool, ConstantResourceFacts, ConstantValue,
+    ConstantPool, ConstantResourceFacts, ConstantValidation, ConstantValue,
 };
 pub use novarocks_type_contract::{
     AggregateStateArgumentContract, AggregateStateFormatId as AggregateStateFormatIdentity,

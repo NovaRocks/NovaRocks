@@ -181,7 +181,7 @@ impl WriterSchemaProjectionLimits {
 pub(crate) struct WriterSchemaNodeAdmission {
     pub(crate) base: Model,
     pub(crate) values: usize,
-    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) limits: Option<NodeProjectionLimits>,
 }
 impl WriterSchemaNodeAdmission {
     /// Commit one completed contribution before lending this same node to the
@@ -199,19 +199,27 @@ impl WriterSchemaNodeAdmission {
             resources::add(merged.delegated_work, child.cumulative_work_upper_bound)?;
         Ok(merged)
     }
-    fn remaining(self, source: usize, child: WriterSchemaProjectionFacts) -> Result<usize, Error> {
+    fn remaining(
+        self,
+        source: usize,
+        child: WriterSchemaProjectionFacts,
+    ) -> Result<Option<usize>, Error> {
         let merged = self.merge(child)?;
         let facts = merged.numerical_facts(source, self.values, self.limits)?;
         self.limits
-            .max_work
-            .checked_sub(facts.cumulative_work_upper_bound)
-            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            .map(|limits| {
+                limits
+                    .max_work
+                    .checked_sub(facts.cumulative_work_upper_bound)
+                    .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            })
+            .transpose()
     }
 }
 #[derive(Clone, Copy)]
 struct ProjectionContext {
     source: usize,
-    limits: WriterSchemaProjectionLimits,
+    limits: Option<WriterSchemaProjectionLimits>,
     parent: Option<WriterSchemaNodeAdmission>,
 }
 type SchemaAdmit<'a> =
@@ -241,14 +249,16 @@ impl<'a> Count<'a> {
         &mut self,
         source: usize,
         types: usize,
-        limits: WriterSchemaProjectionLimits,
+        limits: Option<WriterSchemaProjectionLimits>,
     ) -> Result<WriterSchemaProjectionFacts, Error> {
-        if self.names > limits.max_name_bytes {
+        if limits.is_some_and(|limits| self.names > limits.max_name_bytes) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
-        let f = self
-            .model
-            .numerical_facts(source, types, limits.resources())?;
+        let f = self.model.numerical_facts(
+            source,
+            types,
+            limits.map(WriterSchemaProjectionLimits::resources),
+        )?;
         let mut facts = WriterSchemaProjectionFacts {
             field_count: f.list_item_count,
             name_bytes: self.names,
@@ -261,11 +271,13 @@ impl<'a> Count<'a> {
         };
         if self.admit.is_some() {
             self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
-            resources::check_cap(self.work_peak, limits.max_work)?;
+            if let Some(limits) = limits {
+                resources::check_cap(self.work_peak, limits.max_work)?;
+            }
             facts.cumulative_work_upper_bound = self.work_peak;
         }
         if let Some(parent) = self.parent {
-            parent.remaining(source, facts)?;
+            let _ = parent.remaining(source, facts)?;
         }
         if let Some(admit) = self.admit.as_mut() {
             admit(&facts)?;
@@ -278,12 +290,16 @@ impl<'a> Count<'a> {
         right: &FunctionValueType,
         source: usize,
         roots: usize,
-        limits: WriterSchemaProjectionLimits,
+        limits: Option<WriterSchemaProjectionLimits>,
     ) -> Result<(), Error> {
         let prefix = type_binding_prefix_work_upper_bound_in(left, right, source)?;
         let mut current = self.model;
         current.delegated_work = resources::add(current.delegated_work, prefix.work_upper_bound())?;
-        let facts = current.numerical_facts(source, roots, limits.resources())?;
+        let facts = current.numerical_facts(
+            source,
+            roots,
+            limits.map(WriterSchemaProjectionLimits::resources),
+        )?;
         self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
         self.numerical_facts(source, roots, limits)?;
         Ok(())
@@ -295,7 +311,7 @@ impl<'a> Count<'a> {
         request_base: Option<Model>,
         source: usize,
         roots: usize,
-        limits: WriterSchemaProjectionLimits,
+        limits: Option<WriterSchemaProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<physical_type_v2::ValueTypeCloneFacts, Error> {
         if self.admit.is_none() {
@@ -328,27 +344,36 @@ impl<'a> Count<'a> {
         &mut self,
         source: usize,
         types: usize,
-        limits: WriterSchemaProjectionLimits,
+        limits: Option<WriterSchemaProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<WriterSchemaProjectionFacts, Error> {
         // All originating numerical facts precede any completed gate work.
         // Keep the original successful name step and seven node steps.
         let facts = self.numerical_facts(source, types, limits)?;
-        resources::cap(self.names, limits.max_name_bytes, w)?;
-        self.model.facts(source, types, limits.resources(), w)?;
+        resources::cap(self.names, limits.map(|limits| limits.max_name_bytes), w)?;
+        self.model.facts(
+            source,
+            types,
+            limits.map(WriterSchemaProjectionLimits::resources),
+            w,
+        )?;
         Ok(facts)
     }
     fn remaining(
         &mut self,
         source: usize,
         types: usize,
-        limits: WriterSchemaProjectionLimits,
+        limits: Option<WriterSchemaProjectionLimits>,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<usize, Error> {
+    ) -> Result<Option<usize>, Error> {
         let raw_work = if self.admit.is_some() {
             Some(
                 self.model
-                    .numerical_facts(source, types, limits.resources())?
+                    .numerical_facts(
+                        source,
+                        types,
+                        limits.map(WriterSchemaProjectionLimits::resources),
+                    )?
                     .cumulative_work_upper_bound,
             )
         } else {
@@ -361,12 +386,21 @@ impl<'a> Count<'a> {
             f.cumulative_work_upper_bound = raw_work;
         }
         let child = limits
-            .max_work
-            .checked_sub(f.cumulative_work_upper_bound)
-            .ok_or(CompileControlError::ResourceExhausted)?;
-        Ok(match self.parent {
-            Some(parent) => child.min(parent.remaining(source, f)?),
-            None => child,
+            .map(|limits| {
+                limits
+                    .max_work
+                    .checked_sub(f.cumulative_work_upper_bound)
+                    .ok_or(CompileControlError::ResourceExhausted)
+            })
+            .transpose()?;
+        let parent = self
+            .parent
+            .map(|parent| parent.remaining(source, f))
+            .transpose()?
+            .flatten();
+        Ok(match (child, parent) {
+            (Some(child), Some(parent)) => Some(child.min(parent)),
+            _ => child.or(parent),
         })
     }
 }
@@ -525,7 +559,7 @@ fn preflight_encode(
     ids: &[u32],
     types: &EncodedTypeTable<'_>,
     invoice: usize,
-    l: WriterSchemaProjectionLimits,
+    l: Option<WriterSchemaProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
     preflight_encode_context(
@@ -689,7 +723,7 @@ fn preflight_decode(
     raw: Raw<'_>,
     types: &DecodedTypeTable,
     invoice: usize,
-    l: WriterSchemaProjectionLimits,
+    l: Option<WriterSchemaProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
     preflight_decode_context(
@@ -1003,7 +1037,7 @@ pub(crate) fn read_targets(
 /// and owns entry, header admission and final publication.
 pub(crate) struct WriterSchemaProjection {
     pub(crate) source: usize,
-    pub(crate) limits: WriterSchemaProjectionLimits,
+    pub(crate) limits: Option<WriterSchemaProjectionLimits>,
     pub(crate) parent: WriterSchemaNodeAdmission,
 }
 impl WriterSchemaProjection {
@@ -1224,7 +1258,7 @@ macro_rules! encoding_api {
                 type_ids,
                 types,
                 source_retained_bytes,
-                limits,
+                Some(limits),
                 &mut work,
             );
             let facts = finish(work, result)?;
@@ -1251,7 +1285,7 @@ macro_rules! encoding_api {
                     type_ids,
                     types,
                     source_retained_bytes,
-                    limits,
+                    Some(limits),
                     &mut work,
                 )?;
                 let output = $emit(input, type_ids, &mut work)?;
@@ -1314,7 +1348,7 @@ macro_rules! decoding_api {
                 Raw::$variant(input),
                 types,
                 source_retained_bytes,
-                limits,
+                Some(limits),
                 &mut work,
             );
             let facts = finish(work, result)?;
@@ -1338,7 +1372,7 @@ macro_rules! decoding_api {
                     Raw::$variant(input),
                     types,
                     source_retained_bytes,
-                    limits,
+                    Some(limits),
                     &mut work,
                 )?;
                 let output = $emit(input, types, &mut work)?;

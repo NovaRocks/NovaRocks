@@ -303,7 +303,6 @@ impl MvWritePreparationCustody {
             access,
             session: self.session.clone(),
             carrier: self.kernel.static_plan_carrier().clone(),
-            constant_policy: self.kernel.constant_policy(),
             options: crate::query_execution::contract::synthetic_mv_query_options(&self.execution),
             control,
         }));

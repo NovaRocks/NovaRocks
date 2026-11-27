@@ -254,7 +254,7 @@ impl PlanUnpivotNode {
         output_columns: Vec<OutputColumn>,
         max_output_rows: usize,
         max_output_bytes: usize,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, crate::compiler::SqlCompileError> {
         let node = Self {
@@ -273,7 +273,7 @@ impl PlanUnpivotNode {
     pub(crate) fn validate_against(
         &self,
         input_columns: &[OutputColumn],
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), crate::compiler::SqlCompileError> {
         use crate::compiler::SqlCompileError;
@@ -295,7 +295,7 @@ impl PlanUnpivotNode {
     fn validate_unpivot_core(
         &self,
         input_columns: &[OutputColumn],
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<(), crate::compiler::SqlCompileError> {
         use std::collections::{HashMap, HashSet};
@@ -586,7 +586,7 @@ impl PlanUnpivotNode {
 
 fn scalar_constant_bytes_observed(
     expression: &TypedExpr,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<usize, crate::compiler::SqlCompileError> {
     if !matches!(

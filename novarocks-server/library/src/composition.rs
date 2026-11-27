@@ -599,13 +599,6 @@ pub fn compose_frontend_role_config(
         .unwrap_or_default();
     let default_time_zone = trino_settings.validated_trino_time_zone()?;
     let runtime_config = &config.runtime;
-    let constant_policy = crate::compiled_composition::frontend_constant_policy(
-        runtime_config
-            .frontend_constant_policy
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("runtime.frontend_constant_policy is required for FE"))?
-            .policy(),
-    )?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let failure_backoff_ms = config
@@ -643,7 +636,7 @@ pub fn compose_frontend_role_config(
         native_compatibility_id,
         function_catalog,
         logical_runtime,
-        constant_policy,
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
         static_plan.frontend_carrier(),
         std::sync::Arc::new(static_plan.frontend_required_constant_interpreter()),
         std::sync::Arc::new(provider_manifest.compose_session_property_registry()?),

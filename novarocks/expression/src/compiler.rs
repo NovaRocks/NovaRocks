@@ -22,7 +22,7 @@ use crate::{
 use novarocks_constant_contract::ConstantTableError as ConstantReferenceError;
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, ExprNode};
 use novarocks_functions::{
-    CallEffectInput, ConstantError, ConstantPolicy, ConstantValue, FunctionBindingError,
+    CallEffectInput, ConstantError, ConstantValidation, ConstantValue, FunctionBindingError,
     FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure,
     PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog,
     ScopedExpressionEffects,
@@ -418,7 +418,7 @@ impl<H> From<novarocks_functions::CheckedCallPreparationFailure<H>> for ExprComp
     }
 }
 
-pub(crate) type CallCreation<'a, F> = Option<(&'a F, &'a ConstantPolicy)>;
+pub(crate) type CallCreation<'a, F> = Option<(&'a F, &'a ConstantValidation)>;
 pub(crate) fn validate_call_created<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -452,14 +452,14 @@ pub(crate) fn prepare_call_created<H, F: novarocks_type_contract::ValueSchemaCre
     creation: CallCreation<'_, F>,
 ) -> Result<PureCallSpecialization, ExprCompileFailure<H>> {
     match creation {
-        Some((factory, policy)) => {
+        Some((factory, _)) => {
             // The definition was fully validated by this immutable compiler's
             // first pass. Expected types in this preparation get a separate
             // temporary owner; they never enlarge a published type invoice.
             let mut scope = factory.begin_scope().map_err(ExprCompileFailure::Creator)?;
             catalog
                 .prepare_frozen_with_creator_in(
-                    input, selected, frozen, options, policy, &mut scope, control,
+                    input, selected, frozen, options, &mut scope, control,
                 )
                 .map_err(Into::into)
         }

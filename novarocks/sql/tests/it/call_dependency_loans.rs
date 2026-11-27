@@ -117,7 +117,6 @@ fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constant
     }
     let unit = node.expressions.as_deref().unwrap();
     let request = &unit.requests()[&expression.id];
-    assert_eq!(request.constant_policy, loan.original_constant_policy());
     assert_eq!(
         request.logical_argument_count,
         loan.original_logical_argument_count()

@@ -26,36 +26,22 @@ use std::sync::Arc;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 use novarocks_functions::{
-    ConstantPolicy, EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionDefinition,
-    InstalledPureKernel, PureEngineFunctionCatalog, validate_installed_operator_functions,
+    EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionDefinition, InstalledPureKernel,
+    PureEngineFunctionCatalog, validate_installed_operator_functions,
 };
 use novarocks_native_adapter::backend_application::CompiledStaticPlan;
-use novarocks_plan_codec::physical_package_v2::{
-    FROZEN_CONSTANT_POLICY, PackageDecodeLimits, PackageEncodeLimits,
-};
+use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorCodecError;
 
 use crate::provider_manifest::ServerProviderManifest;
 use crate::static_plan::CompositionControl;
 
-/// FE and BE share the codec owner's structural constant policy. A deployment
-/// cannot silently broaden or narrow the static wire language.
-pub(crate) fn frontend_constant_policy(
-    configured: ConstantPolicy,
-) -> anyhow::Result<ConstantPolicy> {
-    anyhow::ensure!(
-        configured == FROZEN_CONSTANT_POLICY,
-        "runtime.frontend_constant_policy must equal the frozen compiled-package policy; configured={configured:?}; frozen={FROZEN_CONSTANT_POLICY:?}"
-    );
-    Ok(FROZEN_CONSTANT_POLICY)
-}
-
 /// Everything the production backend interpreter is composed from.
 pub(crate) struct CompiledPackage {
     decode_limits: PackageDecodeLimits,
     decode_model: Arc<FragmentDecodeResourceModel>,
-    constants: ConstantPolicy,
+
     functions: Arc<PureEngineFunctionCatalog>,
     providers: Arc<PureProviderProgramCatalog<ConnectorCodecError>>,
 }
@@ -76,7 +62,7 @@ impl CompiledPackage {
         Ok(Self {
             decode_limits: PackageDecodeLimits::FROZEN,
             decode_model: Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl)?),
-            constants: FROZEN_CONSTANT_POLICY,
+
             functions: Arc::new(seal.catalog),
             providers: Arc::new(provider_manifest.compose_pure_program_catalog()?),
         })
@@ -91,8 +77,7 @@ impl CompiledPackage {
         &self,
     ) -> novarocks_frontend_application::CompiledPackageCarrier {
         novarocks_frontend_application::CompiledPackageCarrier::new(
-            self.decode_limits.admission,
-            PackageEncodeLimits::FROZEN,
+            self.decode_limits.plan_limits,
             Arc::clone(&self.decode_model),
             self.decode_limits.wire,
         )
@@ -104,7 +89,6 @@ impl CompiledPackage {
             self.decode_limits.clone(),
             Arc::clone(&self.functions),
             Arc::clone(&self.providers),
-            self.constants,
         )
     }
 
@@ -115,7 +99,7 @@ impl CompiledPackage {
     ) -> novarocks_frontend_application::RequiredConstantInterpreter {
         novarocks_frontend_application::RequiredConstantInterpreter::new(
             Arc::clone(&self.functions),
-            self.constants,
+            novarocks_functions::ConstantValidation::INPUT_DERIVED,
         )
     }
 }
@@ -231,20 +215,6 @@ mod tests {
     use super::*;
     use crate::composition::compose_process_function_set;
     use novarocks_functions::FunctionKind;
-
-    #[test]
-    fn frontend_and_backend_constants_share_one_frozen_policy() {
-        assert_eq!(
-            frontend_constant_policy(FROZEN_CONSTANT_POLICY).unwrap(),
-            PackageDecodeLimits::FROZEN.constant_policy
-        );
-        let mut wider = FROZEN_CONSTANT_POLICY;
-        wider.max_rows += 1;
-        assert!(frontend_constant_policy(wider).is_err());
-        let mut narrower = FROZEN_CONSTANT_POLICY;
-        narrower.max_dictionary_depth -= 1;
-        assert!(frontend_constant_policy(narrower).is_err());
-    }
 
     #[test]
     fn collection_lambda_overloads_are_installed_in_the_production_seal() {

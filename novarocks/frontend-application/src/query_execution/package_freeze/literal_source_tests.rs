@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::extract_checked_packages;
-use crate::query_execution::tests::{
-    complete_dependency_fixture, dependency_fixture_constant_policy,
-};
+use crate::query_execution::tests::complete_dependency_fixture;
 use novarocks_expression_contract::ExprKind;
 use novarocks_sql::compiler::{
     SessionOptimizerSettings, SqlAuthoredPhysicalPlan, SqlCompileControl,
@@ -87,19 +85,11 @@ fn assert_checked_packages_for_source(sql: &str, owner: SqlAuthoredPhysicalPlan)
         &candidate,
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
-        dependency_fixture_constant_policy(),
-        &novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.admission,
+        novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.plan_limits,
         &control,
     )
     .unwrap_or_else(|error| panic!("real literal package extraction for {sql}: {error:#?}"));
     assert_eq!(packages.len(), fragment_count, "{sql}");
-    assert!(
-        packages
-            .values()
-            .all(|package| package.statement_constant_policy()
-                == dependency_fixture_constant_policy()),
-        "{sql}"
-    );
 }
 
 fn assert_real_null_list_cast(

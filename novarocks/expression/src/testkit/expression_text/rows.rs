@@ -302,7 +302,6 @@ impl TypedText<'_> {
                 parameters: &self.parameters,
             },
             self.functions,
-            self.constant_policy,
             self.decimal_overflow_policy,
             &mut work,
         )?;

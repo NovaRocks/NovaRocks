@@ -392,12 +392,13 @@ impl Counts {
         )?;
         add(twice(writes)?, 8)
     }
-    fn check(&self, limits: BindingSourceLimits) -> Result<(), TypeViewError> {
-        if self.functions > limits.max_functions
-            || self.aggregates > limits.max_aggregates
-            || self.arguments > limits.max_arguments
-            || self.parameters > limits.max_lambda_parameters
-            || self.results > limits.max_relation_results
+    fn check(&self, limits: Option<BindingSourceLimits>) -> Result<(), TypeViewError> {
+        if let Some(limits) = limits
+            && (self.functions > limits.max_functions
+                || self.aggregates > limits.max_aggregates
+                || self.arguments > limits.max_arguments
+                || self.parameters > limits.max_lambda_parameters
+                || self.results > limits.max_relation_results)
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -415,7 +416,7 @@ impl Counts {
 struct CountPass<'buffers, 'source, 'control> {
     sources: &'buffers BindingSources<'source>,
     counts: Counts,
-    limits: BindingSourceLimits,
+    limits: Option<BindingSourceLimits>,
     prefix: SourceInputPrefix<'source, 'control, 5>,
     copy_work: usize,
 }
@@ -516,7 +517,7 @@ impl<'source> BindingVisitor<'source> for FillPass<'_, '_, 'source> {
 pub(crate) fn collect_binding_sources_in<'source>(
     package: &'source p::FragmentPackage,
     types: &PackageTypeViews<'source>,
-    limits: BindingSourceLimits,
+    limits: impl Into<Option<BindingSourceLimits>>,
     budget: &mut TypeViewBudget<'source, 'source, '_>,
     work: &mut CompileCheckpoints<'source>,
 ) -> Result<BindingSources<'source>, TypeViewError> {
@@ -537,7 +538,7 @@ pub(crate) fn collect_binding_sources_in<'source>(
     let mut count = CountPass {
         sources: &sources,
         counts: Counts::default(),
-        limits,
+        limits: limits.into(),
         prefix,
         copy_work,
     };

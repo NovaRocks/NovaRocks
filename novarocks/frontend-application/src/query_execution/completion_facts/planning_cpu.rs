@@ -104,7 +104,6 @@ pub(crate) struct ReadEncodingInput {
     pub(crate) options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     pub(crate) family: Option<novarocks_result_contract::ClientPresentationFamily>,
     pub(crate) carrier: CompiledPackageCarrier,
-    pub(crate) policy: novarocks_physical_plan::ConstantPolicy,
     pub(crate) control: SqlCompileControl,
     #[cfg(novarocks_dev_controls)]
     pub(crate) rewrite: Option<ReadRewriteInput>,
@@ -150,7 +149,7 @@ pub(crate) struct LogicalFinishInput {
     pub(crate) required_constants: Arc<crate::RequiredConstantInterpreter>,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub(crate) policy: novarocks_functions::ConstantPolicy,
+    pub(crate) policy: novarocks_functions::ConstantValidation,
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) level: ExplainLevel,
 }
@@ -607,7 +606,6 @@ impl PlanningCpuOriginal {
             candidate,
             access,
             &input.carrier,
-            input.policy,
             &input.control,
             &input.capacity,
         )

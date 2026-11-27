@@ -553,7 +553,7 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
                     pipeline_dop: NonZeroUsize::MIN,
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
-                    constants: interpreter.constants,
+                    constants: novarocks_functions::ConstantValidation::INPUT_DERIVED,
                 },
                 creation,
                 &mut temporary,
@@ -997,6 +997,7 @@ fn type_tail_frozen_invoice_covers_actual_native_factory_callbacks() {
             novarocks_plan_codec::physical_package_v2::decode_fragment_package_with_factory_and_funding(
                 &select_one_producer().0, &interpreter.model, &interpreter.decode_limits,
                 &mut observed, &factory, &Control, &mut invoices,
+                None,
             )
         }).unwrap();
         assert_eq!(invoices.calls, 2, "each original namespace body executes once");

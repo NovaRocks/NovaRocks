@@ -49,8 +49,8 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -61,7 +61,7 @@ fn policy() -> ConstantPolicy {
         max_metadata_bytes: 4096,
         max_library_validation_work: 1000000,
         max_library_validation_bytes: 1048576,
-    }
+    })
 }
 fn integer() -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, true)
@@ -77,7 +77,6 @@ fn request(arguments: Vec<StaticFunctionArgument<ConstantReference>>) -> Physica
         logical_argument_count: arguments.len(),
         arguments: arguments.into_boxed_slice(),
         expected_result_type: None,
-        constant_policy: policy(),
     }
 }
 fn value(
@@ -158,10 +157,7 @@ fn original_none_some_selected_ordinals_and_result_constraint_remain_distinct() 
     // A data-only aggregate channel boundary; no signature or invocation is
     // inferred from it. The third static channel is retained in original order.
     source.logical_argument_count = 2;
-    source.constant_policy.max_rows = 0;
-    source.constant_policy.max_retained_buffer_bytes = 0;
     let materialized = materialize(&source, &pools, &Control::default()).unwrap();
-    assert_eq!(materialized.constant_policy(), source.constant_policy);
     let request = materialized.request();
     assert_eq!(request.logical_argument_count, 2);
     assert!(request.expected_result_type.is_none());

@@ -20,7 +20,7 @@ use crate::analysis::{ExprKind, UnpivotConstant};
 use crate::compiler::SqlCompileError;
 use arrow::array::{ArrayRef, StringArray, StructArray};
 use arrow::datatypes::{Field, Fields};
-use novarocks_functions::{ConstantPolicy, ConstantPool, ConstantValue};
+use novarocks_functions::{ConstantPool, ConstantValidation, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
 };
@@ -62,7 +62,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
+fn policy() -> ConstantValidation {
     crate::constant::test_constant_policy()
 }
 fn cv(array: ArrayRef, ty: FunctionValueType, ordinal: u32) -> ConstantValue {

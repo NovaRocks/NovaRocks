@@ -53,7 +53,7 @@ pub(crate) fn shape_insert_source_with_constants(
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<
     Option<(
@@ -75,7 +75,7 @@ pub(crate) fn shape_insert_source_with_constants(
 struct ConstantSource<'a> {
     typed_write: bool,
     capture: Option<(
-        novarocks_functions::ConstantPolicy,
+        novarocks_functions::ConstantValidation,
         &'a dyn novarocks_type_contract::PureCompileControl,
     )>,
     path: Vec<novarocks_sql::compiler::SqlConstantQueryStep>,
@@ -117,7 +117,7 @@ fn shape_insert_source_in(
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
     capture: Option<(
-        novarocks_functions::ConstantPolicy,
+        novarocks_functions::ConstantValidation,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
     typed_write: bool,
@@ -405,7 +405,7 @@ fn shape_row_in<'a>(
     width: usize,
     columns: &[ColumnDef],
     capture: Option<(
-        novarocks_functions::ConstantPolicy,
+        novarocks_functions::ConstantValidation,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
     typed_write: bool,
@@ -458,7 +458,7 @@ fn shape_row_in<'a>(
 fn variant_constant_value(
     bytes: &[u8],
     target: novarocks_type_contract::FunctionValueType,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::ConstantValue, String> {
     use novarocks_type_contract::CompilePhase;
@@ -1019,7 +1019,7 @@ pub(crate) fn shape_typed_write_source(
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
     capture: Option<(
-        novarocks_functions::ConstantPolicy,
+        novarocks_functions::ConstantValidation,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
 ) -> Result<
@@ -1088,7 +1088,7 @@ pub(crate) fn capture_typed_write_constants(
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<novarocks_sql::compiler::SqlExpressionConstants>, String> {
     use novarocks_sql::compiler::SqlConstantQueryStep as Step;

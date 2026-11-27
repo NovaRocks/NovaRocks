@@ -67,7 +67,6 @@ fn finish_fixture_units(
     source_pools: novarocks_physical_plan::ConstantPools,
 ) -> novarocks_physical_plan::ConstantPools {
     let mut constants = source_pools;
-    let policy = options(1).constants;
     if !authors.is_empty() {
         register_call_requests(builder.unit(author_node).unwrap(), authors, &mut constants);
     }
@@ -78,7 +77,6 @@ fn finish_fixture_units(
             functions,
             &constants,
             parameters,
-            policy,
             &mut work,
         );
     }
@@ -105,7 +103,6 @@ fn finish_fixture_units(
             },
             &constants,
             parameters,
-            policy,
             &mut work,
         );
         builder.install_unit(node, Arc::new(unit)).unwrap();
@@ -150,7 +147,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,

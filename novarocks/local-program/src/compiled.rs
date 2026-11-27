@@ -155,7 +155,6 @@ pub enum LocalProgramCompileError {
     Sink(crate::StaticSinkError),
     InvalidExpression,
     TooManyDefinitions,
-    TooManyConstantBytes,
 }
 impl From<crate::StaticSinkError> for LocalProgramCompileError {
     fn from(cause: crate::StaticSinkError) -> Self {
@@ -211,9 +210,6 @@ impl fmt::Display for LocalProgramCompileError {
             Self::TooManyDefinitions => {
                 f.write_str("compiled unit table exceeds the shared definition limit")
             }
-            Self::TooManyConstantBytes => {
-                f.write_str("compiled unit table exceeds the shared constant backing limit")
-            }
             Self::InvalidExpression => {
                 f.write_str("local expression root is absent from its program unit")
             }
@@ -258,7 +254,6 @@ impl std::error::Error for LocalProgramCompileError {
             Self::Channels(error) => Some(error),
             Self::Sink(error) => Some(error),
             Self::TooManyDefinitions
-            | Self::TooManyConstantBytes
             | Self::InvalidExpression
             | Self::MissingSink
             | Self::ExchangeInputMismatch(_)
@@ -359,7 +354,7 @@ impl LocalProgram {
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         facts: CompiledProgramFacts,
-        mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
         retained_factory: Option<&F>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
@@ -375,13 +370,7 @@ impl LocalProgram {
         if graph.sink().is_none() {
             return Err(LocalProgramCompileError::MissingSink.into());
         }
-        {
-            let creator = temporary.as_mut().map(|scope| {
-                &mut **scope as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>
-            });
-            let mut creation = crate::creation::ProgramCreation { creator };
-            validate_unit_budgets(&units, &mut creation, &mut work)?;
-        }
+        validate_unit_definitions(&units, &mut work)?;
         for node in graph.nodes() {
             node.kind().try_for_each_expression(|reference, demand| {
                 work.step()?;
@@ -525,14 +514,11 @@ impl LocalProgram {
     }
 }
 
-/// Preserve the previous fragment-wide definition and constant-backing axes.
-/// Unit table positions are definitions even when their Arc is shared. Constant
-/// storage uses the original immutable pool's array identity and public facts.
-fn validate_unit_budgets<H>(
+/// Unit table positions are definitions even when their Arc is shared.
+fn validate_unit_definitions(
     units: &[std::sync::Arc<novarocks_expression::CompiledExprSet>],
-    temporary: &mut crate::creation::ProgramCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
+) -> Result<(), LocalProgramCompileError> {
     let mut definitions = 0usize;
     for unit in units {
         work.step()?;
@@ -540,38 +526,6 @@ fn validate_unit_budgets<H>(
             .checked_add(unit.definitions().nodes().len())
             .filter(|count| *count <= novarocks_expression::MAX_STATIC_EXPRESSIONS)
             .ok_or(LocalProgramCompileError::TooManyDefinitions)?;
-    }
-    let mut arrays = BTreeSet::new();
-    let mut bytes = 0usize;
-    for unit in units {
-        work.step()?;
-        for definition in unit.definitions().nodes() {
-            work.step()?;
-            if let novarocks_expression::StaticExprKind::Constant(value) = definition.kind() {
-                let array = std::sync::Arc::as_ptr(value.pool().array()) as *const () as usize;
-                work.step()?;
-                if !arrays.contains(&array) {
-                    temporary.before_tree_insert::<LocalProgramCompileError, usize, ()>(
-                        arrays.len(),
-                        work,
-                    )?;
-                    arrays.insert(array);
-                    let facts = value.pool().resource_facts();
-                    let retained = facts
-                        .retained_buffer_capacity_bytes
-                        .checked_add(facts.metadata_bytes)
-                        .and_then(|bytes| usize::try_from(bytes).ok())
-                        .ok_or(LocalProgramCompileError::TooManyConstantBytes)?;
-                    bytes = bytes
-                        .checked_add(retained)
-                        .filter(|bytes| {
-                            *bytes <= novarocks_expression::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES
-                        })
-                        .ok_or(LocalProgramCompileError::TooManyConstantBytes)?;
-                    work.step()?;
-                }
-            }
-        }
     }
     work.flush()?;
     Ok(())

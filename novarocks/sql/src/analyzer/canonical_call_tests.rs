@@ -19,7 +19,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field};
-use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
+use novarocks_functions::{ConstantValidation, FunctionArgumentType, FunctionResultType};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
     PureCompileControl, TemporalPrecision, TemporalType, ValueLogicalType,
@@ -82,7 +82,7 @@ impl PlannerTableProvider for SourceCatalog {
 fn analyze(
     sql: &str,
     source: &SourceCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> Result<ResolvedQuery, AnalyzeError> {
     let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(

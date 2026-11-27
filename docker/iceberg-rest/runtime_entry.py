@@ -403,21 +403,6 @@ mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
 '''
-        if role == "fe":
-            value += '''
-[runtime.frontend_constant_policy]
-# Frozen compiled-package constant policy (ADR-0185); no deployment override.
-max_rows = 4096
-max_array_nodes = 4096
-max_logical_elements = 65536
-max_retained_buffer_bytes = 8388608
-max_type_depth = 64
-max_type_nodes = 4096
-max_dictionary_depth = 8
-max_metadata_bytes = 65536
-max_library_validation_work = 33554432
-max_library_validation_bytes = 33554432
-'''
         purpose = "metadata" if role == "fe" else "data"
         if object_store:
             value += f'''\n[[connector.credentials]]

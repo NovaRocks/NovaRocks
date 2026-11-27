@@ -356,7 +356,6 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: crate::test_constants::policy(),
             constants: p::ConstantPools::empty(),
             version: p::PlanVersionId::try_new([7; 16]).unwrap(),
             required: p::RequiredContracts {

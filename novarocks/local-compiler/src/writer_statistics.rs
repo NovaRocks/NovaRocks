@@ -907,14 +907,13 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         phase,
     };
     let token = match creation {
-        Some((factory, policy)) => {
+        Some((factory, _)) => {
             let mut scope = factory
                 .begin_scope()
                 .map_err(crate::expressions::ExpressionCreationFailure::Creator)?;
             novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
                 functions.metadata(),
                 source,
-                policy,
                 &mut scope,
                 work.control(),
             )?

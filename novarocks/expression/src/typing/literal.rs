@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cell::Cell, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field};
-use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantError, ConstantValidation, ConstantValue};
 use novarocks_functions::temporal_value::{
     ParsedTemporal, parse_time_literal, parse_timestamp_literal,
 };
@@ -35,24 +35,13 @@ use novarocks_type_contract::{
 
 use super::{CarrierConversion, LiteralValue, TypingError, admit_syntax_constant};
 
-// Compilation admits permanent constant bytes and parser scratch against the
-// original statement's ConstantPolicy, independently of its work checkpoints.
+// Pure literal author checks the actual allocation layout and compile work.
+// JSON owns its parser and output backing through the normal construction path.
 struct LiteralJsonWork<'a, 'c> {
     compile: &'a mut CompileCheckpoints<'c>,
-    policy: ConstantPolicy,
-    scratch: &'a Cell<usize>,
 }
-struct LiteralScratch<'a> {
-    live: &'a Cell<usize>,
-    bytes: usize,
-}
-impl Drop for LiteralScratch<'_> {
-    fn drop(&mut self) {
-        self.live.set(self.live.get() - self.bytes);
-    }
-}
-impl<'a> JsonWork for LiteralJsonWork<'a, '_> {
-    type Reservation = LiteralScratch<'a>;
+impl JsonWork for LiteralJsonWork<'_, '_> {
+    type Reservation = ();
 
     fn step(&mut self) -> Result<(), KernelFailure> {
         self.compile.step().map_err(KernelFailure::CompileControl)
@@ -62,34 +51,17 @@ impl<'a> JsonWork for LiteralJsonWork<'a, '_> {
         self.compile
             .flush()
             .map_err(KernelFailure::CompileControl)?;
-        let live = self
-            .scratch
-            .get()
-            .checked_add(bytes)
-            .filter(|live| {
-                u64::try_from(*live)
-                    .is_ok_and(|live| live <= self.policy.max_library_validation_bytes)
+        std::alloc::Layout::array::<u8>(bytes)
+            .map(|_| ())
+            .map_err(|_| {
+                KernelFailure::CompileControl(CompileControlError::from_domain(
+                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+                ))
             })
-            .ok_or(KernelFailure::ResourceExhausted)?;
-        self.scratch.set(live);
-        Ok(LiteralScratch {
-            live: self.scratch,
-            bytes,
-        })
     }
 
     fn reserve_output(&mut self, bytes: usize) -> Result<(), KernelFailure> {
-        self.compile
-            .flush()
-            .map_err(KernelFailure::CompileControl)?;
-        let retained = bytes
-            .checked_add(size_of::<[i64; 2]>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(KernelFailure::ResourceExhausted)?;
-        if retained > self.policy.max_retained_buffer_bytes {
-            return Err(KernelFailure::ResourceExhausted);
-        }
-        Ok(())
+        self.reserve(bytes)
     }
 }
 
@@ -118,7 +90,7 @@ impl TypedLiteral {
     pub(super) fn checked(
         value: LiteralValue,
         value_type: FunctionValueType,
-        policy: ConstantPolicy,
+        policy: ConstantValidation,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, TypingError> {
         work.flush()?;
@@ -243,12 +215,7 @@ pub(super) fn type_literal(
             }
             if target.logical_type() == ValueLogicalType::Json {
                 work.flush()?;
-                let scratch = Cell::new(0);
-                let mut json_work = LiteralJsonWork {
-                    compile: work,
-                    policy: context.constant_policy,
-                    scratch: &scratch,
-                };
+                let mut json_work = LiteralJsonWork { compile: work };
                 let bytes =
                     json_value::parse(value, &mut json_work).map_err(|error| match error {
                         JsonError::InvalidText(_) | JsonError::Depth => {
@@ -265,8 +232,9 @@ pub(super) fn type_literal(
                             TypingError::JsonLiteralValidation(KernelFailure::from_domain(cause))
                         }
                     })?;
-                let end = i64::try_from(bytes.len())
-                    .map_err(|_| ConstantError::Limit("JSON literal exceeds its Arrow offset"))?;
+                let end = i64::try_from(bytes.len()).map_err(|_| {
+                    ConstantError::offset_extent(bytes.len() as u64, i64::MAX as u64)
+                })?;
                 let array = LargeBinaryArray::new(
                     OffsetBuffer::new(vec![0i64, end].into()),
                     Buffer::from_vec(bytes),
@@ -277,7 +245,7 @@ pub(super) fn type_literal(
                     Arc::new(Field::new("literal", DataType::LargeBinary, false)),
                     target.clone(),
                     array.to_data(),
-                    context.constant_policy,
+                    novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
                     CompilePhase::FunctionSpecialization,
                     work.control(),
                 )?;
@@ -406,4 +374,106 @@ fn infer_decimal_literal_type(s: &str) -> Result<DataType, TypingError> {
     let precision = precision as u8;
     let scale = scale as i8;
     Ok(DataType::Decimal128(precision, scale))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typing::TypingContext;
+    use novarocks_type_contract::{DecimalOverflowPolicy, PureCompileControl};
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_literal_types_past_the_retired_parser_scratch_limit() {
+        use std::cell::Cell;
+
+        struct Scratch<'a> {
+            current: &'a Cell<usize>,
+            bytes: usize,
+        }
+        impl Drop for Scratch<'_> {
+            fn drop(&mut self) {
+                self.current.set(self.current.get() - self.bytes);
+            }
+        }
+
+        struct LegacyScratch<'a>(&'a Cell<usize>);
+        impl<'a> JsonWork for LegacyScratch<'a> {
+            type Reservation = Scratch<'a>;
+
+            fn step(&mut self) -> Result<(), KernelFailure> {
+                Ok(())
+            }
+
+            fn reserve(&mut self, bytes: usize) -> Result<Self::Reservation, KernelFailure> {
+                let next = self
+                    .0
+                    .get()
+                    .checked_add(bytes)
+                    .filter(|&next| next <= 32 << 20)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                self.0.set(next);
+                Ok(Scratch {
+                    current: self.0,
+                    bytes,
+                })
+            }
+
+            fn reserve_output(&mut self, _: usize) -> Result<(), KernelFailure> {
+                Ok(())
+            }
+        }
+
+        let content = format!("[{}[]]", "[],".repeat(262_143));
+        assert_eq!(content.len(), 786_433);
+        let current = Cell::new(0);
+        let mut old = LegacyScratch(&current);
+        assert!(matches!(
+            json_value::parse(&content, &mut old),
+            Err(JsonError::Host(KernelFailure::ResourceExhausted))
+        ));
+        assert_eq!(current.get(), 0);
+
+        let catalog =
+            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                .unwrap();
+        let context = TypingContext {
+            catalog: &catalog,
+            constant_policy: ConstantValidation::INPUT_DERIVED,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        };
+        let mut compile =
+            CompileCheckpoints::try_new(&Control, CompilePhase::FunctionSpecialization).unwrap();
+        let LiteralEmission::Constant { value_type, value } = type_literal(
+            &context,
+            LiteralSyntax::TypedString {
+                name: "JSON",
+                value: &content,
+            },
+            &mut compile,
+        )
+        .unwrap() else {
+            panic!("typed JSON retains its original constant")
+        };
+        assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+        assert_eq!(value_type.data_type(), &DataType::LargeBinary);
+        let bytes = value.try_binary().unwrap().unwrap();
+        assert_eq!(
+            json_value::format(
+                bytes,
+                &mut LiteralJsonWork {
+                    compile: &mut compile
+                }
+            )
+            .unwrap(),
+            content
+        );
+        compile.finish().unwrap();
+    }
 }

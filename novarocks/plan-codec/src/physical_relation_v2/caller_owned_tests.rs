@@ -424,7 +424,7 @@ fn relation_caller_owned_known_root_and_dictionary_requests_precede_late_control
                 admission: Some(Admission {
                     definitions: 1,
                     source: SOURCE,
-                    limits: bounded,
+                    limits: Some(bounded),
                     callback: &mut admission,
                 }),
                 ..Model::default()
@@ -747,7 +747,7 @@ fn relation_numeric_policy_keeps_plain_shape_but_in_resource_without_observation
         admission: Some(Admission {
             definitions: 1,
             source: SOURCE,
-            limits: limits(),
+            limits: Some(limits()),
             callback: &mut admit,
         }),
         ..Model::default()

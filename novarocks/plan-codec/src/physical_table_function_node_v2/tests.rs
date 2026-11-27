@@ -165,7 +165,10 @@ fn node_limits() -> TableFunctionNodeProjectionLimits {
     let mut binding = binding_limits();
     binding.max_coexisting_source_and_request_bytes = 16 << 20;
     binding.max_work = 2_000_000_000;
-    TableFunctionNodeProjectionLimits { node, binding }
+    TableFunctionNodeProjectionLimits {
+        node,
+        binding: Some(binding),
+    }
 }
 fn property() -> p::PhysicalProperties {
     p::PhysicalProperties {
@@ -409,7 +412,7 @@ impl Fixture {
             &types,
             &binding_inputs,
             64 << 10,
-            node_limits().binding,
+            node_limits().binding.unwrap(),
             control,
         )
         .unwrap();
@@ -417,13 +420,17 @@ impl Fixture {
             functions.as_wire(),
             &read_types,
             64 << 10,
-            node_limits().binding,
+            node_limits().binding.unwrap(),
             control,
         )
         .unwrap();
         let materialized = materialize_function_bindings(
-            prepare_function_bindings_materialization(&headers, 128 << 10, node_limits().binding)
-                .unwrap(),
+            prepare_function_bindings_materialization(
+                &headers,
+                128 << 10,
+                node_limits().binding.unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let mut empty_binding = binding_limits();
@@ -741,7 +748,7 @@ fn actual_source_floors_include_wire_capacity_and_foreign_receiving_headers_refu
             read.functions().as_wire(),
             read.types(),
             64 << 10,
-            node_limits().binding,
+            node_limits().binding.unwrap(),
             &control,
         )
         .unwrap();
@@ -749,7 +756,7 @@ fn actual_source_floors_include_wire_capacity_and_foreign_receiving_headers_refu
             prepare_function_bindings_materialization(
                 &foreign_headers,
                 128 << 10,
-                node_limits().binding,
+                node_limits().binding.unwrap(),
             )
             .unwrap(),
         )

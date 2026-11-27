@@ -23,7 +23,7 @@ use arrow::{
     array::{Array, Int64Array, StringArray},
     datatypes::DataType,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
+use novarocks_constant_contract::{ConstantPool, ConstantValidation, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
@@ -60,20 +60,22 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
+fn policy() -> ConstantValidation {
     // Explicit fixture ceiling; this is not a deployable profile or MEM grant.
-    ConstantPolicy {
-        max_rows: 4,
-        max_array_nodes: 16,
-        max_logical_elements: 1 << 20,
-        max_retained_buffer_bytes: 8 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 64,
-        max_dictionary_depth: 8,
-        max_metadata_bytes: 65536,
-        max_library_validation_work: 64 << 20,
-        max_library_validation_bytes: 64 << 20,
-    }
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 4,
+            max_array_nodes: 16,
+            max_logical_elements: 1 << 20,
+            max_retained_buffer_bytes: 8 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 64,
+            max_dictionary_depth: 8,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        },
+    )
 }
 fn selected(array: &dyn Array, ordinal: u32) -> ConstantValue {
     let ty = FunctionValueType::new(array.data_type().clone(), false);

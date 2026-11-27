@@ -522,8 +522,8 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
     let bindings = encode_provider_bindings(&bindings, SOURCE, binding_limits(), &control).unwrap();
     let payloads =
         encode_connector_payloads(&payloads, SOURCE, payload_limits(), &control).unwrap();
-    let limits = crate::physical_package_v2::PackageEncodeLimits::FROZEN.reads;
-    let receiver_limits = crate::physical_package_v2::PackageDecodeLimits::FROZEN.reads;
+    let limits = None;
+    let receiver_limits = None;
     let total_version_bytes = sources
         .iter()
         .map(|source| source.input_version.as_bytes().len())

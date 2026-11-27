@@ -19,74 +19,53 @@
 //! retain their own frozen limits. Snapshot data is a separate final component
 //! funded by its actual creator, without a whole-DTO size quota.
 
-use super::binding_sources::{BindingSourceLimits, collect_binding_sources_in};
-use super::definition_sources::{DefinitionSourceLimits, collect_definition_sources_in};
+use super::binding_sources::collect_binding_sources_in;
+use super::definition_sources::collect_definition_sources_in;
 use super::nodes::{NodeDispatchLimits, NodeEncodeContext, prepare_node_encode_in};
-use super::provider_sources::{
-    ProviderSourceError, ProviderSourceLimits, collect_provider_sources_in,
-};
-use super::type_views::{
-    TypeViewBudget, TypeViewError, TypeViewLimits, collect_package_type_views_in,
-};
+use super::provider_sources::{ProviderSourceError, collect_provider_sources_in};
+use super::type_views::{TypeViewBudget, TypeViewError, collect_package_type_views_in};
 use crate::physical_aggregate_binding_v2::encode_aggregate_bindings_in;
-use crate::physical_binding_v2::{
-    BindingCodecError, BindingProjectionLimits, encode_function_bindings_in,
-};
-use crate::physical_call_requests_v2::{
-    CallRequestCodecError, CallRequestProjectionLimits, prepare_call_requests_encode_in,
-};
+use crate::physical_binding_v2::{BindingCodecError, encode_function_bindings_in};
+use crate::physical_call_requests_v2::{CallRequestCodecError, prepare_call_requests_encode_in};
 use crate::physical_connector_payload_v2::{
-    ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, encode_connector_payloads_in,
+    ConnectorPayloadCodecError, encode_connector_payloads_in,
 };
 use crate::physical_constant_v2::{
-    ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits, PhysicalConstantCodecError,
-    prepare_constant_namespace_write_in,
+    ConstantWriteRequest, PhysicalConstantCodecError, encode_constant_namespace_input_derived_in,
 };
-use crate::physical_control_v2::{
-    ControlCodecError, ControlProjectionLimits, encode_expression_control_observed,
-};
+use crate::physical_control_v2::{ControlCodecError, encode_expression_control_observed};
 use crate::physical_cuts_v2::{
     CutsProjectionLimits, EncodedCutsContext, encode_fragment_cuts_observed,
 };
-use crate::physical_expression_v2::{
-    ExpressionCodecError, ExpressionProjectionLimits, prepare_expression_definitions_in,
-};
+use crate::physical_expression_v2::{ExpressionCodecError, prepare_expression_definitions_in};
 use crate::physical_fragment_envelope_v2::prepare_fragment_envelope_encode_in;
-use crate::physical_node_v2::{NodeCodecError, NodeProjectionLimits};
+use crate::physical_node_v2::NodeCodecError;
 use crate::physical_package_metadata_v2::{
     PackageMetadataCodecError, encode_package_metadata_observed,
 };
 use crate::physical_provider_binding_v2::{
-    ProviderBindingCodecError, ProviderBindingProjectionLimits, encode_joint_provider_bindings_in,
+    ProviderBindingCodecError, encode_joint_provider_bindings_in,
 };
-use crate::physical_provider_read_v2::{
-    ProviderReadCodecError, ProviderReadProjectionLimits, encode_provider_reads_in,
-};
+use crate::physical_provider_read_v2::{ProviderReadCodecError, encode_provider_reads_in};
 use crate::physical_public_source_schema_v2::{
     PublicSourceSchemaCodecError, encode_public_source_schemas_pure_in,
     encoded_public_source_schemas_backing_bytes,
 };
 use crate::physical_read_scan_v2::{
-    ReadScanCodecError, ReadScanEncodeContext, ReadScanProjectionLimits, encode_read_scans_observed,
+    ReadScanCodecError, ReadScanEncodeContext, encode_read_scans_observed,
 };
-use crate::physical_relation_v2::{
-    RelationCodecError, RelationProjectionLimits, encode_relations_in,
-};
+use crate::physical_relation_v2::{RelationCodecError, encode_relations_in};
 use crate::physical_result_v2::prepare_result_encode_in;
 use crate::physical_schema_v2::{SchemaCodecError, prepare_schemas_encode_observed_in};
 use crate::physical_semantics_v2::{
-    ParameterProjectionLimits, SemanticsCodecError, encode_frozen_calls_observed,
-    encode_frozen_pruning_observed, prepare_semantic_parameters_encode_observed_in,
+    SemanticsCodecError, encode_frozen_calls_observed, encode_frozen_pruning_observed,
+    prepare_semantic_parameters_encode_observed_in,
 };
-use crate::physical_type_v2::{
-    PackageTypeProjectionLimits, TypeCodecError, encode_borrowed_type_namespaces_sources_in,
-};
-use crate::physical_value_v2::{ValueCodecError, ValueProjectionLimits, encode_values_observed_in};
+use crate::physical_type_v2::{TypeCodecError, encode_borrowed_type_namespaces_sources_in};
+use crate::physical_value_v2::{ValueCodecError, encode_values_observed_in};
 use crate::physical_writer_recipe_v2::{
-    WriterRecipeCodecError, WriterRecipeEncodeContext, WriterRecipeProjectionLimits,
-    encode_writer_recipes_observed,
+    WriterRecipeCodecError, WriterRecipeEncodeContext, encode_writer_recipes_observed,
 };
-use crate::physical_writer_schema_v2::WriterSchemaProjectionLimits;
 use novarocks_physical_plan as p;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -95,37 +74,6 @@ use novarocks_type_contract::{
 #[cfg(test)]
 use prost::Message;
 use std::{cell::Cell, fmt};
-
-/// Host-provided component limits. No field has a default; the FE owner
-/// chooses them. `source_retained_bytes` is the checked package's retained
-/// backing, invoiced once to every component that requires a source floor.
-#[derive(Clone, Copy, Debug)]
-pub struct PackageEncodeLimits {
-    pub source_retained_bytes: usize,
-    pub views: TypeViewLimits,
-    pub binding_sources: BindingSourceLimits,
-    pub provider_sources: ProviderSourceLimits,
-    pub definition_sources: DefinitionSourceLimits,
-    /// Metadata, schemas, envelope, calls, pruning, result and node headers.
-    pub node: NodeProjectionLimits,
-    pub types: PackageTypeProjectionLimits,
-    pub bindings: BindingProjectionLimits,
-    pub provider_bindings: ProviderBindingProjectionLimits,
-    pub payloads: ConnectorPayloadProjectionLimits,
-    pub reads: ProviderReadProjectionLimits,
-    pub relations: RelationProjectionLimits,
-    pub constant_records: ConstantWriteProjectionLimits,
-    pub constants: ConstantNamespaceProjectionLimits,
-    pub parameters: ParameterProjectionLimits,
-    pub values: ValueProjectionLimits,
-    pub expressions: ExpressionProjectionLimits,
-    pub requests: CallRequestProjectionLimits,
-    pub writer_schema: WriterSchemaProjectionLimits,
-    pub control: ControlProjectionLimits,
-    pub cuts: CutsProjectionLimits,
-    pub scans: ReadScanProjectionLimits,
-    pub writers: WriterRecipeProjectionLimits,
-}
 
 #[derive(Debug)]
 pub enum PackageEncodeError {
@@ -260,7 +208,6 @@ impl std::error::Error for PackageEncodeError {
 /// Encode one checked package on its own Encode scope of `control`.
 pub fn encode_fragment_package(
     package: &p::FragmentPackage,
-    limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
     let mut request = |_: std::alloc::Layout| Ok::<_, std::convert::Infallible>(());
@@ -270,13 +217,12 @@ pub fn encode_fragment_package(
         &mut request,
         &mut opaque,
     );
-    encode_fragment_package_with_creator(package, limits, &mut creation, control)
+    encode_fragment_package_with_creator(package, &mut creation, control)
         .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 pub fn encode_fragment_package_with_creator<H>(
     package: &p::FragmentPackage,
-    limits: &PackageEncodeLimits,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     control: &dyn PureCompileControl,
 ) -> Result<
@@ -288,21 +234,26 @@ pub fn encode_fragment_package_with_creator<H>(
         .map_err(|e| ProjectionFailure::Codec(PackageEncodeError::Control(e)))?;
     let result = (|| {
         let mut original_host = None;
-        let encoded =
-            encode_fragment_package_structural_in(package, limits, &mut work, &mut |layout| {
-                if layout.size() == 0 {
-                    return Ok(());
+        let encoded = encode_fragment_package_structural_in(package, &mut work, &mut |request| {
+            let admitted = match request {
+                ConstantWriteRequest::Layout(layout) if layout.size() != 0 => {
+                    creation.request_layout(layout)
                 }
-                match creation.request_layout(layout) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        original_host = Some(error);
-                        Err(PackageEncodeError::Control(
-                            CompileControlError::ResourceExhausted,
-                        ))
-                    }
+                ConstantWriteRequest::OpaqueUpperBound(bytes) if bytes != 0 => {
+                    creation.observe_opaque_upper_bound(bytes)
                 }
-            });
+                _ => Ok(()),
+            };
+            match admitted {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    original_host = Some(error);
+                    Err(PackageEncodeError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))
+                }
+            }
+        });
         if let Some(error) = original_host {
             return Err(ProjectionFailure::Host(error));
         }
@@ -320,13 +271,9 @@ pub fn encode_fragment_package_with_creator<H>(
 
 fn encode_fragment_package_structural_in<'s>(
     package: &'s p::FragmentPackage,
-    l: &PackageEncodeLimits,
     work: &mut CompileCheckpoints<'s>,
-    snapshot_header_allocation: &mut dyn FnMut(
-        std::alloc::Layout,
-    ) -> Result<(), PackageEncodeError>,
+    request: &mut dyn FnMut(ConstantWriteRequest) -> Result<(), PackageEncodeError>,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
-    let source = l.source_retained_bytes;
     let fragment = package.fragment();
     if fragment.nodes().values().any(|node| {
         matches!(
@@ -340,30 +287,17 @@ fn encode_fragment_package_structural_in<'s>(
         return Err(super::system_relation::SystemRelationError::Deferred.into());
     }
 
-    // Source collection on one budget. The budget gates its own limits; its
-    // parent hook is the sender itself, which keeps no second ledger.
+    // This collector borrows the package's original sources. Its allocation
+    // facts cover only the local request geometry for its indexes.
     let mut collection = |_: &_| Ok(());
-    let mut budget = TypeViewBudget::new_in(package, source, l.views, &mut collection, work)?;
+    let mut budget = TypeViewBudget::new_input_derived_in(package, &mut collection, work)?;
     let views = collect_package_type_views_in(&mut budget, work)?;
     let writer_types = views.writer_sources_in(&mut budget, work)?;
-    let bindings =
-        collect_binding_sources_in(package, &views, l.binding_sources, &mut budget, work)?;
-    let providers = collect_provider_sources_in(
-        package,
-        &views,
-        &writer_types,
-        l.provider_sources,
-        &mut budget,
-        work,
-    )?;
-    let definitions = collect_definition_sources_in(
-        package,
-        &views,
-        &bindings,
-        l.definition_sources,
-        &mut budget,
-        work,
-    )?;
+    let bindings = collect_binding_sources_in(package, &views, None, &mut budget, work)?;
+    let providers =
+        collect_provider_sources_in(package, &views, &writer_types, None, &mut budget, work)?;
+    let definitions =
+        collect_definition_sources_in(package, &views, &bindings, None, &mut budget, work)?;
     let arguments = bindings.argument_inputs_in(&mut budget, work)?;
     let function_inputs = arguments.function_inputs_in(&mut budget, work)?;
     let aggregate_inputs = bindings.aggregate_inputs_in(&mut budget, work)?;
@@ -389,7 +323,7 @@ fn encode_fragment_package_structural_in<'s>(
     // upper bound and inline header join every later invoice once
     // (conservative: temporary requests are included).
     let requested = Cell::new(0usize);
-    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
+    let mut unit_roots = 0;
     macro_rules! seen {
         ($field:ident) => {
             &mut |f: &_| {
@@ -397,11 +331,24 @@ fn encode_fragment_package_structural_in<'s>(
                 Ok(())
             }
         };
+        ($field:ident, funded) => {
+            &mut |facts: &_| {
+                let bytes = facts.$field;
+                if bytes > requested.get() {
+                    request(ConstantWriteRequest::OpaqueUpperBound(
+                        bytes - requested.get(),
+                    ))
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                    requested.set(bytes);
+                }
+                Ok(())
+            }
+        };
     }
     let (metadata, _) = encode_package_metadata_observed(
         package,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -412,7 +359,7 @@ fn encode_fragment_package_structural_in<'s>(
         views.source_fields(),
         &writer_types,
         source,
-        l.types,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -421,7 +368,7 @@ fn encode_fragment_package_structural_in<'s>(
         &types,
         &function_inputs,
         source,
-        l.bindings,
+        None,
         seen!(request_bytes_upper_bound),
         work,
     )?;
@@ -431,7 +378,7 @@ fn encode_fragment_package_structural_in<'s>(
         &functions,
         &aggregate_inputs,
         source,
-        l.bindings,
+        None,
         seen!(request_bytes_upper_bound),
         work,
     )?;
@@ -439,16 +386,16 @@ fn encode_fragment_package_structural_in<'s>(
     let provider_bindings = encode_joint_provider_bindings_in(
         providers.provider_inputs(),
         source,
-        l.provider_bindings,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &provider_bindings)?;
     let payloads = encode_connector_payloads_in(
         providers.payload_inputs(),
         source,
-        l.payloads,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &payloads)?;
@@ -457,8 +404,8 @@ fn encode_fragment_package_structural_in<'s>(
         &provider_bindings,
         &payloads,
         source,
-        l.reads,
-        seen!(allocation_request_bytes_upper_bound),
+        None,
+        seen!(allocation_request_bytes_upper_bound, funded),
         work,
     )?;
     source = grow(source, &requested, &reads)?;
@@ -467,7 +414,7 @@ fn encode_fragment_package_structural_in<'s>(
         &reads,
         &types,
         source,
-        l.relations,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -476,7 +423,7 @@ fn encode_fragment_package_structural_in<'s>(
         provider_inputs.schemas(),
         &types,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -489,22 +436,24 @@ fn encode_fragment_package_structural_in<'s>(
             &public_source_schemas,
         )?)
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let constants = prepare_constant_namespace_write_in(
+    let constants = encode_constant_namespace_input_derived_in(
         package.constants(),
         definitions.constant_type_ids(),
         &types,
-        source,
-        l.constant_records,
-        l.constants,
-        seen!(new_allocation_request_bytes_upper_bound),
+        request,
         work,
-    )?
-    .emit_in(seen!(new_allocation_request_bytes_upper_bound), work)?;
+    )
+    .map_err(|error| match error {
+        crate::host_projection_v2::ProjectionFailure::Codec(cause) => {
+            PackageEncodeError::from(cause)
+        }
+        crate::host_projection_v2::ProjectionFailure::Host(cause) => cause,
+    })?;
     source = grow(source, &requested, &constants)?;
     let (parameters, _) = prepare_semantic_parameters_encode_observed_in(
         package.parameters(),
         source,
-        l.parameters,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -515,7 +464,7 @@ fn encode_fragment_package_structural_in<'s>(
         &payloads,
         &types,
         source,
-        l.values,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -526,31 +475,30 @@ fn encode_fragment_package_structural_in<'s>(
         &request_ids,
         package.constants(),
         source,
-        l.requests,
+        None,
         &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
-            unit_totals.requests_prefix(facts, l.requests)?;
             requested.set(requested.get().max(facts.request_bytes_upper_bound));
             Ok(())
         },
         work,
     )?;
-    unit_totals.requests_commit(call_requests_token.facts(), l.requests)?;
+
     let call_requests = call_requests_token.emit_in(seen!(request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &call_requests)?;
     let (envelope, _) = prepare_fragment_envelope_encode_in(
         fragment,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
     .emit_in(seen!(allocation_request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &envelope)?;
     let dispatch = NodeDispatchLimits {
-        node: l.node,
-        binding: l.bindings,
-        relation: l.relations,
-        writer_schema: l.writer_schema,
+        node: None,
+        binding: None,
+        relation: None,
+        writer_schema: None,
     };
     let mut nodes = Vec::new();
     nodes
@@ -573,9 +521,8 @@ fn encode_fragment_package_structural_in<'s>(
             package.parameters(),
             package.constants(),
             source,
-            l.expressions,
+            None,
             &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
-                unit_totals.expressions_prefix(facts, l.expressions, false)?;
                 requested.set(
                     requested
                         .get()
@@ -587,7 +534,6 @@ fn encode_fragment_package_structural_in<'s>(
         )?
         .emit_in(
             &mut |facts: &crate::physical_expression_v2::ExpressionNamespaceWriteFacts| {
-                unit_totals.expressions_prefix(facts, l.expressions, false)?;
                 requested.set(
                     requested
                         .get()
@@ -597,7 +543,7 @@ fn encode_fragment_package_structural_in<'s>(
             },
             work,
         )?;
-        unit_totals.expressions_commit(expressions.facts(), l.expressions, false)?;
+
         source = grow(source, &requested, &expressions)?;
         let context = NodeEncodeContext {
             values: &values,
@@ -615,11 +561,11 @@ fn encode_fragment_package_structural_in<'s>(
         )?
         .emit_in(seen!(allocation_request_bytes_upper_bound), work)?;
         if let Some(unit) = node.expressions.as_deref() {
-            unit_totals.roots(unit.roots().len())?;
+            super::unit_headers::admit_fragment_roots(&mut unit_roots, unit.roots().len())?;
             let _ = super::unit_headers::encode(
                 unit,
                 source,
-                l.node,
+                None,
                 seen!(allocation_request_bytes_upper_bound),
                 work,
             )?;
@@ -682,12 +628,11 @@ fn encode_fragment_package_structural_in<'s>(
                 });
                 work.step()?;
             }
-            let (control, control_facts) = encode_expression_control_observed(
+            let (control, _) = encode_expression_control_observed(
                 unit.control_flow(),
                 source,
-                l.control,
+                None,
                 &mut |facts: &crate::physical_control_v2::ControlProjectionFacts| {
-                    unit_totals.control_prefix(facts, l.control)?;
                     requested.set(
                         requested
                             .get()
@@ -697,14 +642,13 @@ fn encode_fragment_package_structural_in<'s>(
                 },
                 work,
             )?;
-            unit_totals.control_commit(&control_facts, l.control)?;
+
             source = grow(source, &requested, &control)?;
-            let (claims, claim_facts) = crate::physical_semantics_v2::encode_expression_claims_in(
+            let (claims, _) = crate::physical_semantics_v2::encode_expression_claims_in(
                 unit,
                 source,
-                l.node,
+                None,
                 &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
-                    unit_totals.semantics_prefix(facts, l.node)?;
                     requested.set(
                         requested
                             .get()
@@ -714,24 +658,22 @@ fn encode_fragment_package_structural_in<'s>(
                 },
                 work,
             )?;
-            unit_totals.semantics_commit(&claim_facts, l.node)?;
+
             source = grow(source, &requested, &claims)?;
-            let (requests, request_facts) =
-                crate::physical_call_requests_v2::encode_unit_requests_in(
-                    unit,
-                    &types,
-                    &unit_request_ids,
-                    package.constants(),
-                    source,
-                    l.requests,
-                    &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
-                        unit_totals.requests_prefix(facts, l.requests)?;
-                        requested.set(requested.get().max(facts.request_bytes_upper_bound));
-                        Ok(())
-                    },
-                    work,
-                )?;
-            unit_totals.requests_commit(&request_facts, l.requests)?;
+            let (requests, _) = crate::physical_call_requests_v2::encode_unit_requests_in(
+                unit,
+                &types,
+                &unit_request_ids,
+                package.constants(),
+                source,
+                None,
+                &mut |facts: &crate::physical_call_requests_v2::CallRequestProjectionFacts| {
+                    requested.set(requested.get().max(facts.request_bytes_upper_bound));
+                    Ok(())
+                },
+                work,
+            )?;
+
             source = grow(source, &requested, &requests)?;
             encoded.expressions = Some(wire::ExpressionUnit {
                 ports,
@@ -746,12 +688,11 @@ fn encode_fragment_package_structural_in<'s>(
         source = add(source, requested.replace(0))?;
         nodes.push(encoded);
     }
-    let (calls, call_facts) = encode_frozen_calls_observed(
+    let (calls, _) = encode_frozen_calls_observed(
         package.calls(),
         source,
-        l.node,
+        None,
         &mut |facts: &crate::physical_node_v2::NodeProjectionFacts| {
-            unit_totals.semantics_prefix(facts, l.node)?;
             requested.set(
                 requested
                     .get()
@@ -761,12 +702,12 @@ fn encode_fragment_package_structural_in<'s>(
         },
         work,
     )?;
-    unit_totals.semantics_commit(&call_facts, l.node)?;
+
     source = grow(source, &requested, &calls)?;
     let (pruning, _) = encode_frozen_pruning_observed(
         package.pruning(),
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -778,7 +719,10 @@ fn encode_fragment_package_structural_in<'s>(
             types: &types,
             type_ids: &cut_ids,
             source_retained_bytes: source,
-            limits: l.cuts,
+            limits: CutsProjectionLimits {
+                node: None,
+                binding: None,
+            },
         },
         seen!(allocation_request_bytes_upper_bound),
         work,
@@ -789,7 +733,7 @@ fn encode_fragment_package_structural_in<'s>(
         definitions.result_type_ids(),
         &values,
         source,
-        l.node,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?
@@ -804,7 +748,7 @@ fn encode_fragment_package_structural_in<'s>(
             source_schemas: provider_inputs.source_schemas(),
         },
         source,
-        l.scans,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -817,7 +761,7 @@ fn encode_fragment_package_structural_in<'s>(
             types: &types,
         },
         source,
-        l.writers,
+        None,
         seen!(allocation_request_bytes_upper_bound),
         work,
     )?;
@@ -831,7 +775,7 @@ fn encode_fragment_package_structural_in<'s>(
             &provider_bindings,
             &payloads,
             source,
-            l.writers,
+            None,
             work,
         )?
         .0
@@ -840,7 +784,7 @@ fn encode_fragment_package_structural_in<'s>(
         package,
         &views,
         &mut budget,
-        snapshot_header_allocation,
+        &mut |layout| request(ConstantWriteRequest::Layout(layout)),
         work,
     )?;
     // Namespaces borrow earlier ones; release them in reverse dependency order.
@@ -879,9 +823,6 @@ fn encode_fragment_package_structural_in<'s>(
         provider_payloads,
         read_references,
         relations,
-        source_constant_policy: Some(crate::physical_call_requests_v2::encode_source_policy(
-            package.statement_constant_policy(),
-        )),
         calls: Some(calls),
         pruning: Some(pruning),
         parameters: Some(parameters),

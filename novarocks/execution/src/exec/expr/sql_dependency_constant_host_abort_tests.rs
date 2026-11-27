@@ -22,7 +22,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int8Type};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use novarocks_functions::{ConstantPolicy, ConstantPool};
+use novarocks_functions::{ConstantPool, ConstantValidation};
 use novarocks_physical_plan::ConstantPoolId;
 use novarocks_plan_codec::{
     host_projection_v2::{AdmissionRefusal, ProjectionFailure},
@@ -96,8 +96,8 @@ fn limits() -> ConstantWriteProjectionLimits {
         },
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 4096,
         max_array_nodes: 4096,
         max_logical_elements: 65536,
@@ -108,7 +108,7 @@ fn policy() -> ConstantPolicy {
         max_metadata_bytes: 65536,
         max_library_validation_work: 32 * 1024 * 1024,
         max_library_validation_bytes: 32 * 1024 * 1024,
-    }
+    })
 }
 fn pool(array: ArrayRef, logical: ValueLogicalType) -> ConstantPool {
     let ty =

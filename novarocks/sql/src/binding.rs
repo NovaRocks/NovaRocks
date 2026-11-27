@@ -151,7 +151,7 @@ impl SqlFunctionBinding {
         name: &str,
         args: &[crate::analysis::TypedExpr],
         policy: novarocks_type_contract::DecimalOverflowPolicy,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, novarocks_functions::FunctionBindingError> {
         let resolved =

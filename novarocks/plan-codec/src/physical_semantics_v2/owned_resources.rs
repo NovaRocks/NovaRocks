@@ -60,17 +60,18 @@ impl<'a> Projection<'a> {
     }
     pub(super) fn observed(
         source: usize,
-        limits: NodeProjectionLimits,
+        limits: impl Into<Option<NodeProjectionLimits>>,
         admit: &'a mut Admission<'a>,
         known: usize,
     ) -> Result<Self, Error> {
+        let limits = limits.into();
         let value = Self {
             model: Model::default(),
             source,
-            limits: Some(limits),
+            limits,
             admit: Some(admit),
             known,
-            input_derived: false,
+            input_derived: limits.is_none(),
         };
         Ok(value)
     }
@@ -89,14 +90,18 @@ impl<'a> Projection<'a> {
     }
     pub(super) fn gate(&mut self) -> Result<(), Error> {
         if self.input_derived {
-            if self.source < self.known {
+            if self.admit.is_none() && self.source < self.known {
                 return Err(Error::InvalidShape(
                     "semantic source invoice omits original backing",
                 ));
             }
-            self.model
-                .numerical_input_derived_facts(self.source, 0)
+            let facts = self
+                .model
+                .numerical_input_derived_facts(self.source.max(self.known), 0)
                 .map_err(numerical)?;
+            if let Some(admit) = self.admit.as_mut() {
+                admit(&facts)?;
+            }
         }
         if let Some(limits) = self.limits {
             if self.source < self.known {
@@ -118,7 +123,7 @@ impl<'a> Projection<'a> {
         if self.input_derived {
             return self
                 .model
-                .numerical_input_derived_facts(self.source, 0)
+                .numerical_input_derived_facts(self.source.max(self.known), 0)
                 .map_err(numerical);
         }
         self.model

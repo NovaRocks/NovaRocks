@@ -248,18 +248,19 @@ fn intrinsic_runtime_description(
     let node = fragment.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
     let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
-    let policy = novarocks_functions::ConstantPolicy {
-        max_rows: 8,
-        max_array_nodes: 32,
-        max_logical_elements: 4096,
-        max_retained_buffer_bytes: 4 << 20,
-        max_type_depth: 16,
-        max_type_nodes: 64,
-        max_dictionary_depth: 4,
-        max_metadata_bytes: 65536,
-        max_library_validation_work: 64 << 20,
-        max_library_validation_bytes: 64 << 20,
-    };
+    let policy =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 8,
+            max_array_nodes: 32,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 4 << 20,
+            max_type_depth: 16,
+            max_type_nodes: 64,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 64 << 20,
+            max_library_validation_bytes: 64 << 20,
+        });
     let source = novarocks_functions::ConstantValue::from_i64(
         std::sync::Arc::new(ty.try_to_field("fixture").unwrap()),
         ty.clone(),
@@ -341,7 +342,7 @@ fn intrinsic_runtime_description(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap(), policy)
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap())
         .with_semantic_parameters(
             SemanticParameters::try_new([(
                 SemanticParameterId::new(u32::MAX),

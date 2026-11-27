@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use novarocks_functions::{
-    AggregateKernelPhase, AggregatePreparationOptions, ConstantPolicy, FunctionBindingError,
+    AggregateKernelPhase, AggregatePreparationOptions, ConstantValidation, FunctionBindingError,
     FunctionBindingRequest, FunctionBindingSelection, MAX_CALL_EFFECT_ARGUMENTS,
     PureCallPreparation, ScopedRelationalEffects,
 };
@@ -152,7 +152,7 @@ impl<'entry, 'source> AuthoredPhysicalWriterRequest<'entry, 'source> {
     pub fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {
         self.entry.captured().binding().decimal_overflow_policy()
     }
-    pub fn constant_policy(&self) -> ConstantPolicy {
+    pub fn constant_policy(&self) -> ConstantValidation {
         self.entry.captured().constant_policy()
     }
     /// The caller admits the opaque full-type clone and owns its original

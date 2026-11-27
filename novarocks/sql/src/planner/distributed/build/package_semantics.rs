@@ -24,7 +24,7 @@ use std::fmt;
 use super::expression_occurrences::ExpressionOccurrenceError;
 use super::lowered_draft::SqlSourceJournalError;
 use super::physical_fragment_effects::PhysicalFragmentEffectsError;
-use novarocks_physical_plan::{FrozenPruningError, PhysicalCallSite};
+use novarocks_physical_plan::FrozenPruningError;
 use novarocks_type_contract::CompileControlError;
 #[cfg(test)]
 use novarocks_type_contract::{CompilePhase, PureCompileControl};
@@ -45,18 +45,6 @@ pub enum PackageSemanticsError {
         cast: Option<(arrow::datatypes::DataType, arrow::datatypes::DataType)>,
     },
     Pruning(String),
-    /// A captured call's constant policy differs from the statement policy.
-    PolicyMismatch(PhysicalCallSite),
-    /// Package extraction must use the exact policy already frozen by SQL.
-    StatementPolicyMismatch,
-    ExpressionPolicyMismatch {
-        node: novarocks_physical_plan::NodeId,
-        invocation: novarocks_type_contract::ExpressionUseId,
-    },
-    /// The actual standalone source has no relational node identity.
-    StandaloneExpressionPolicyMismatch {
-        invocation: novarocks_type_contract::ExpressionUseId,
-    },
     InvalidSource(&'static str),
 }
 impl fmt::Display for PackageSemanticsError {
@@ -73,24 +61,6 @@ impl fmt::Display for PackageSemanticsError {
                 None => source.fmt(f),
             },
             Self::Pruning(detail) => write!(f, "package pruning: {detail}"),
-            Self::ExpressionPolicyMismatch { node, invocation } => write!(
-                f,
-                "captured constant policy differs from the statement policy at node {} invocation {}",
-                node.get(),
-                invocation.get()
-            ),
-            Self::StandaloneExpressionPolicyMismatch { invocation } => write!(
-                f,
-                "captured constant policy differs from the statement policy at standalone scalar unit invocation {}",
-                invocation.get()
-            ),
-            Self::StatementPolicyMismatch => {
-                f.write_str("statement constant policy differs from its authored SQL source")
-            }
-            Self::PolicyMismatch(site) => write!(
-                f,
-                "captured constant policy differs from the statement policy at {site:?}"
-            ),
             Self::InvalidSource(detail) => f.write_str(detail),
         }
     }
@@ -117,10 +87,6 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
             Self::Effects(_) => (FailureClass::Invariant, 9),
             Self::UnsupportedCapability(_) => (FailureClass::Unsupported, 10),
             Self::Pruning(_) => (FailureClass::Invariant, 11),
-            Self::PolicyMismatch(_)
-            | Self::StatementPolicyMismatch
-            | Self::ExpressionPolicyMismatch { .. }
-            | Self::StandaloneExpressionPolicyMismatch { .. } => (FailureClass::Invariant, 12),
             Self::InvalidSource(_) => (FailureClass::Invariant, 13),
         };
         FailureFact::new(

@@ -26,7 +26,7 @@ use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_expression::ComparisonSite as ProgramComparisonSite;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionBindingRequest,
+    CallEffectInput, EngineFunctionCatalogBuilder, FunctionBindingRequest,
     FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
@@ -97,18 +97,20 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -159,7 +161,6 @@ fn seal_units(
     selected: Option<&Arc<FunctionBindingSelection>>,
     request: Option<FunctionBindingRequest<'_>>,
     rand_definitions: &[ExprId],
-    policy: ConstantPolicy,
 ) -> Result<(), FixtureError> {
     if let Some(selected) = selected {
         let declaration = functions
@@ -188,7 +189,6 @@ fn seal_units(
                     arguments: Box::default(),
                     logical_argument_count: original.logical_argument_count,
                     expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy: policy,
                 },
             )?;
             draft.definition_control(
@@ -282,7 +282,6 @@ struct Fixture {
     rand_selected: Option<Arc<FunctionBindingSelection>>,
     rand_request: Option<FunctionBindingRequest<'static>>,
     rand_definitions: Vec<ExprId>,
-    constant_policy: ConstantPolicy,
     parameters: SemanticParameters,
 }
 fn input_constant(
@@ -522,7 +521,6 @@ fn fixture(
         rand_selected.as_ref(),
         rand_request,
         &rand_definitions,
-        options().constants,
     )?;
     let fragment = builder.finish_definition(
         NodeId::new(0),
@@ -542,7 +540,6 @@ fn fixture(
         rand_selected,
         rand_request,
         rand_definitions,
-        constant_policy: options().constants,
         parameters: SemanticParameters::default(),
     })
 }
@@ -582,7 +579,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                 required: RequiredContracts::default(),
                 constants,
                 fragment: fixture.fragment,
-                statement_constant_policy: fixture.constant_policy,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: fixture.parameters,

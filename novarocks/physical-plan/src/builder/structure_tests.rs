@@ -208,7 +208,6 @@ fn function_unit(
             arguments: Box::default(),
             logical_argument_count: 0,
             expected_result_type: None,
-            constant_policy: crate::tests::constant_fixture::policy(),
         },
     )?;
     draft.definition_control(
@@ -415,7 +414,7 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
         version: PlanVersionId::try_new([9; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,
-        statement_constant_policy: crate::tests::constant_fixture::policy(),
+
         pruning,
         cuts: FragmentCuts::default(),
         result: None,

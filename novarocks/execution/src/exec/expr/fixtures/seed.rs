@@ -366,7 +366,6 @@ fn package_with_dictionary(
         functions,
         &constants,
         &parameters,
-        options(1).constants,
         &mut work,
     );
     let no_authors = BTreeMap::new();
@@ -387,7 +386,6 @@ fn package_with_dictionary(
             },
             &constants,
             &parameters,
-            options(1).constants,
             &mut work,
         );
         builder.install_unit(node, Arc::new(unit)).unwrap();
@@ -452,7 +450,7 @@ fn package_with_dictionary(
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters,

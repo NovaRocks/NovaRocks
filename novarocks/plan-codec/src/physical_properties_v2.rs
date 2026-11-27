@@ -30,7 +30,7 @@ use novarocks_type_contract::{
 };
 use std::{alloc::Layout, fmt, mem::size_of};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalPropertyProjectionLimits {
     pub max_value_references: usize,
     pub max_allocation_requests: usize,
@@ -181,8 +181,11 @@ fn fact_axes(
 /// Admit every known property axis before a containing node observes work.
 pub(crate) fn check_properties_numerical_facts(
     result: PhysicalPropertyProjectionFacts,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
 ) -> Result<(), Error> {
+    let Some(limits) = limits.into() else {
+        return Ok(());
+    };
     for (actual, maximum) in fact_axes(result, limits) {
         if actual > maximum {
             return Err(CompileControlError::ResourceExhausted.into());
@@ -192,9 +195,12 @@ pub(crate) fn check_properties_numerical_facts(
 }
 fn admit_facts(
     result: PhysicalPropertyProjectionFacts,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let Some(limits) = limits.into() else {
+        return Ok(result);
+    };
     for (actual, maximum) in fact_axes(result, limits) {
         cap(actual, maximum, work)?;
     }
@@ -328,7 +334,7 @@ fn exact32(input: &[u8]) -> Result<[u8; 32], Error> {
 pub(crate) fn preflight_encode_observed(
     input: &physical::PhysicalProperties,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     admit_facts(
@@ -490,7 +496,7 @@ pub(crate) fn emit_distribution_observed(
 pub(crate) fn encode_observed(
     input: &physical::PhysicalProperties,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::PhysicalProperties, PhysicalPropertyProjectionFacts), Error> {
     let facts = preflight_encode_observed(input, source, limits, work)?;
@@ -731,7 +737,7 @@ fn decode_source_core(
 pub(crate) fn preflight_decode_observed(
     input: &wire::PhysicalProperties,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     admit_facts(
@@ -879,7 +885,7 @@ pub(crate) fn validate_properties_source_observed(
 pub(crate) fn decode_observed(
     input: &wire::PhysicalProperties,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
     (
@@ -925,7 +931,7 @@ fn finish<T>(work: CompileCheckpoints<'_>, result: Result<T, Error>) -> Result<T
 pub(crate) fn preflight_distribution_encode_observed(
     input: &physical::Distribution,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     admit_facts(
@@ -1003,7 +1009,7 @@ fn distribution_encode_numerical_facts_core(
 pub(crate) fn preflight_distribution_decode_observed(
     input: &wire::Distribution,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     admit_facts(
@@ -1048,7 +1054,7 @@ fn distribution_decode_numerical_facts_core(
 pub(crate) fn encode_distribution_observed(
     input: &physical::Distribution,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::Distribution, PhysicalPropertyProjectionFacts), Error> {
     let facts = preflight_distribution_encode_observed(input, source, limits, work)?;
@@ -1058,7 +1064,7 @@ pub(crate) fn encode_distribution_observed(
 pub(crate) fn decode_distribution_observed(
     input: &wire::Distribution,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+    limits: impl Into<Option<PhysicalPropertyProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::Distribution, PhysicalPropertyProjectionFacts), Error> {
     let facts = preflight_distribution_decode_observed(input, source, limits, work)?;

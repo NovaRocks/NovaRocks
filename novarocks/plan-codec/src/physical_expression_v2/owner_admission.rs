@@ -29,7 +29,7 @@ pub(super) type Admit<'a> = dyn FnMut(&Facts) -> Result<(), CompileControlError>
 pub(super) struct Admission<'borrow, 'callback> {
     pub(super) parent: Option<&'borrow mut Admit<'callback>>,
     pub(super) source: usize,
-    pub(super) limits: Limits,
+    pub(super) limits: Option<Limits>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Arithmetic(pub(super) bool);
@@ -74,30 +74,31 @@ impl Admission<'_, '_> {
     }
     pub(super) fn fixed(&mut self, facts: &Facts) -> Result<(), Error> {
         if let Some(parent) = &mut self.parent {
-            let l = self.limits;
-            for (actual, maximum) in [
-                (facts.definition_count, l.max_definitions),
-                (facts.type_reference_count, l.max_type_references),
-                (
-                    facts.expression_reference_count,
-                    l.max_expression_references,
-                ),
-                (
-                    facts.new_allocation_requests_upper_bound,
-                    l.max_new_allocation_requests,
-                ),
-                (
-                    facts.new_allocation_request_bytes_upper_bound,
-                    l.max_new_allocation_request_bytes,
-                ),
-                (
-                    facts.coexisting_source_and_request_bytes_upper_bound,
-                    l.max_coexisting_source_and_request_bytes,
-                ),
-                (facts.cumulative_work_upper_bound, l.max_cumulative_work),
-            ] {
-                if actual > maximum {
-                    return Err(CompileControlError::ResourceExhausted.into());
+            if let Some(l) = self.limits {
+                for (actual, maximum) in [
+                    (facts.definition_count, l.max_definitions),
+                    (facts.type_reference_count, l.max_type_references),
+                    (
+                        facts.expression_reference_count,
+                        l.max_expression_references,
+                    ),
+                    (
+                        facts.new_allocation_requests_upper_bound,
+                        l.max_new_allocation_requests,
+                    ),
+                    (
+                        facts.new_allocation_request_bytes_upper_bound,
+                        l.max_new_allocation_request_bytes,
+                    ),
+                    (
+                        facts.coexisting_source_and_request_bytes_upper_bound,
+                        l.max_coexisting_source_and_request_bytes,
+                    ),
+                    (facts.cumulative_work_upper_bound, l.max_cumulative_work),
+                ] {
+                    if actual > maximum {
+                        return Err(CompileControlError::ResourceExhausted.into());
+                    }
                 }
             }
             parent(facts)?;
@@ -126,15 +127,19 @@ impl Admission<'_, '_> {
         self.gate(facts)?;
         cap(
             facts.cumulative_work_upper_bound,
-            self.limits.max_cumulative_work,
+            self.limits.map(|limits| limits.max_cumulative_work),
             work,
         )
     }
-    pub(super) fn remaining(&self, facts: &Facts) -> Result<usize, Error> {
+    pub(super) fn remaining(&self, facts: &Facts) -> Result<Option<usize>, Error> {
         self.limits
-            .max_cumulative_work
-            .checked_sub(facts.cumulative_work_upper_bound)
-            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            .map(|limits| {
+                limits
+                    .max_cumulative_work
+                    .checked_sub(facts.cumulative_work_upper_bound)
+                    .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            })
+            .transpose()
     }
 }
 pub(super) fn same_control(

@@ -480,12 +480,12 @@ impl RecipeRoot {
             .map_err(|error| refused(&error))?;
         // Full-plan extraction proves exact fragment coverage and preserves
         // the original plan's version/result/constants/parameters/metadata.
-        let mut packages = p::extract_fragment_packages(
+        let mut packages = p::extract_fragment_packages_input_derived(
             plan,
             &BTreeMap::new(),
             &BTreeMap::new(),
             &[(id, pruning)].into(),
-            &[(id, *carrier.admission())].into(),
+            carrier.plan_limits(),
             control,
         )
         .map_err(|error| match error {
@@ -1361,7 +1361,7 @@ pub(crate) fn count_description() -> (
         )
         .unwrap();
     let version = PlanVersionId::try_new([9; 16]).unwrap();
-    let mut plan = PlanBuilder::new(version, crate::application::test_constant_policy());
+    let mut plan = PlanBuilder::new(version);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

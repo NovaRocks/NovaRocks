@@ -127,7 +127,6 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: crate::test_constants::policy(),
             constants: p::ConstantPools::empty(),
             version: p::PlanVersionId::try_new([19; 16]).unwrap(),
             required: p::RequiredContracts::default(),

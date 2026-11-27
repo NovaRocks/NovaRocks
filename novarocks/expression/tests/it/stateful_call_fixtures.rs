@@ -22,7 +22,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation};
 use novarocks_expression::{
     CompiledExprSet, EvaluationEnvironment, ScopeLayouts,
     testkit::{
@@ -58,18 +58,20 @@ impl StatefulFixture {
 }
 
 // The original FB+LC fixture compiled under this small constant policy.
-const POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 16,
-    max_array_nodes: 128,
-    max_logical_elements: 1024,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    },
+);
 
 fn functions(
     actual: &EngineFunctionCatalog,
@@ -160,14 +162,7 @@ fn checked_fixture(
     register_call_requests(&mut draft, authors, &mut constants);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(
-        &mut draft,
-        catalogue,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
+    declare_call_controls(&mut draft, catalogue, &constants, &parameters, &mut work);
 
     // The original physical input was the first Project after zero-column
     // Values. Those non-result columns were named local_1_{ordinal}.
@@ -191,7 +186,6 @@ fn checked_fixture(
         authors,
         &constants,
         &parameters,
-        POLICY,
         &mut work,
     );
     work.finish().unwrap();

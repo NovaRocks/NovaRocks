@@ -336,7 +336,7 @@ fn scan_occurrence_is_unique_without_splitting_provider_relation_identity() {
             _ => unreachable!(),
         }
     );
-    let mut valid = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut valid = PlanBuilder::new(version());
     valid.add_fragment(first).unwrap();
     valid.add_fragment(second).unwrap();
     valid.finish().expect("distinct scan occurrences are valid");
@@ -353,7 +353,7 @@ fn scan_occurrence_is_unique_without_splitting_provider_relation_identity() {
         ProviderReadOccurrenceId::new(13),
     )
     .unwrap();
-    let mut duplicate = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut duplicate = PlanBuilder::new(version());
     duplicate.add_fragment(duplicate_first).unwrap();
     duplicate.add_fragment(duplicate_second).unwrap();
     let error = duplicate.finish().unwrap_err().to_string();
@@ -611,7 +611,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -735,7 +735,7 @@ fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -811,7 +811,7 @@ fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -889,7 +889,7 @@ fn broadcast_edge_plan(
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -1119,7 +1119,7 @@ fn metadata_relation_retains_its_closed_source_contract() {
         )
     };
     let fragment = build(relation.clone()).unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     let plan = plan.finish().unwrap();
     assert!(matches!(
@@ -1256,7 +1256,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         )
         .unwrap();
 
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(producer).unwrap();
     builder.add_fragment(consumer).unwrap();
     builder
@@ -1710,7 +1710,7 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(receiver).unwrap();
     plan.add_edge(Edge {
@@ -2241,7 +2241,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         false,
         &mut fixture_constants,
     );
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     for _ in 0..=MAX_ANNOTATIONS {
         plan.add_annotation(PlanAnnotation {
@@ -2261,7 +2261,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         false,
         &mut fixture_constants,
     );
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     plan.add_annotation(PlanAnnotation {
         subject: AnnotationSubject::Plan,

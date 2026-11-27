@@ -31,9 +31,7 @@ use novarocks_execution::runtime::scalar_memory::{
     test_support::{RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest},
 };
 use novarocks_expression::ScalarCallFailure;
-use novarocks_functions::{
-    ConstantPolicy, ConstantPool, EvaluatedArgument, SelectedValues, Selection,
-};
+use novarocks_functions::{ConstantPool, EvaluatedArgument, SelectedValues, Selection};
 use novarocks_memory::lane::global_store;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -103,7 +101,7 @@ fn pool(value: Option<i64>) -> ConstantPool {
         std::sync::Arc::new(ty.try_to_field("original-bitwise-selected-pool").unwrap()),
         ty.clone(),
         array(vec![Some(1), value]).to_data(),
-        ConstantPolicy {
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
             max_rows: 8,
             max_array_nodes: 8,
             max_logical_elements: 64,
@@ -114,7 +112,7 @@ fn pool(value: Option<i64>) -> ConstantPool {
             max_metadata_bytes: 1024,
             max_library_validation_work: 4096,
             max_library_validation_bytes: 8192,
-        },
+        }),
         CompilePhase::Validate,
         &ConstantControl,
     )

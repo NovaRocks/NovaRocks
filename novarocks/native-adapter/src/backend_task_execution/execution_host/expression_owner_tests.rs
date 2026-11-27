@@ -446,7 +446,7 @@ fn compile_traced_in(
                 compiled.scope(RootScope::AllPorts)
             },
         },
-        source.package.statement_constant_policy(),
+        novarocks_functions::ConstantValidation::INPUT_DERIVED,
         &source.functions,
         ExprCreation {
             temporary,

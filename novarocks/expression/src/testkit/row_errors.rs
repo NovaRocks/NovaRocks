@@ -34,7 +34,7 @@ use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
-    ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId,
+    ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId,
     FunctionKind, FunctionOverloadId, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
     PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
@@ -119,19 +119,21 @@ fn author(
 ) -> ClaimAuthor {
     ClaimAuthor::with_exact_eager_binding(functions, name, arguments, constant_policy(), &Control)
 }
-fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
+fn constant_policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    )
 }
 fn integer_constant(ty: &FunctionValueType, value: i32) -> ConstantValue {
     ConstantValue::from_i32(
@@ -284,14 +286,7 @@ pub fn program(shape: Shape) -> Program {
     register_call_requests(&mut builder, &authors, &mut constants);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
-    declare_call_controls(
-        &mut builder,
-        &functions,
-        &constants,
-        &parameters,
-        constant_policy(),
-        &mut work,
-    );
+    declare_call_controls(&mut builder, &functions, &constants, &parameters, &mut work);
     let sealed = builder
         .seal(
             vec![ExprPort {
@@ -312,7 +307,6 @@ pub fn program(shape: Shape) -> Program {
         &authors,
         &constants,
         &parameters,
-        constant_policy(),
         &mut work,
     );
     work.finish().unwrap();

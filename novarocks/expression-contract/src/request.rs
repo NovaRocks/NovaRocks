@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::ValueType;
-use novarocks_constant_contract::{ConstantPolicy, ConstantReference};
+use novarocks_constant_contract::ConstantReference;
 use novarocks_function_contract::{FunctionArgument, FunctionBindingRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,8 +25,6 @@ pub struct PhysicalCallRequest {
     pub logical_argument_count: usize,
     /// The original request's optional constraint, never its selected result.
     pub expected_result_type: Option<ValueType>,
-    /// Source admission facts, not a receiver allocation grant.
-    pub constant_policy: ConstantPolicy,
 }
 impl PhysicalCallRequest {
     pub fn request(&self) -> FunctionBindingRequest<'_, ConstantReference> {

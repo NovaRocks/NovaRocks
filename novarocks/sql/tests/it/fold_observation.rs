@@ -21,7 +21,7 @@ use crate::fixtures::{compile_table_free, expression_sources, session, text};
 use arrow::array::BinaryArray;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, ExprNode, RootOrdinal};
-use novarocks_functions::{ConstantPolicy, ConstantValue};
+use novarocks_functions::{ConstantValidation, ConstantValue};
 use novarocks_physical_plan::ConstantPools;
 use novarocks_sql::compiler::{
     SqlAuthoredScalarUnit, SqlCompileControl, SqlCompileError, SqlCompileProgressError,
@@ -42,7 +42,7 @@ pub(super) struct FoldReceipt {
     constants: ConstantPools,
     pub(super) result: Option<ConstantValue>,
     pub(super) parameters: novarocks_type_contract::SemanticParameters,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 }
 
 impl FoldReceipt {

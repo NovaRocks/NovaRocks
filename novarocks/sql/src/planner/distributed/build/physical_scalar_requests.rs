@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
+    ConstantValidation, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
     FunctionKind, FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_type_contract::{
@@ -118,7 +118,7 @@ impl AuthoredPhysicalScalarRequest<'_> {
             }
         }
     }
-    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+    pub fn captured_constant_policy(&self) -> Option<ConstantValidation> {
         match &self.source {
             ScalarRequestSource::OwnedPhysical { .. } => None,
             ScalarRequestSource::BorrowedCanonical { captured, .. } => {
@@ -255,7 +255,7 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
     source: &'a ExprNode,
     expressions: super::unit_source::UnitDefinitions<'_>,
     pools: &ConstantPools,
-    literal_policy: ConstantPolicy,
+    literal_policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalScalarRequest<'a>, PhysicalScalarRequestError> {
     work.step()?;

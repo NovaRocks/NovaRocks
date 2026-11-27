@@ -1,5 +1,5 @@
 ---
-id: ADR-0276
+id: ADR-0277
 title: "Third-party encoding buffers use transport headroom"
 domain: [memory-governance, native-transport]
 status: active

@@ -32,7 +32,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
+use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_compiler::{
     FragmentCreationError, LocalCompileOptions, ProviderPreparationError,
     compile_fragment_with_creation, compile_fragment_with_creation_and_project_metadata_host,
@@ -270,6 +270,8 @@ impl NativeCompiledMetadataLoan<'_> {
 /// restricted to the Native owner that already has the tracker and controls.
 pub struct CompiledTypeScopes<'borrow, 'control> {
     inner: crate::native_type_construction::NativeTypeFactory<'borrow, 'control>,
+    #[cfg(novarocks_dev_controls)]
+    value_observation: Option<crate::task_execution_observation::PreparedTaskValueObservation>,
 }
 impl<'borrow, 'control> CompiledTypeScopes<'borrow, 'control> {
     pub(crate) fn new(
@@ -277,7 +279,18 @@ impl<'borrow, 'control> CompiledTypeScopes<'borrow, 'control> {
     ) -> Self {
         Self {
             inner: crate::native_type_construction::NativeTypeFactory::new(creation),
+            #[cfg(novarocks_dev_controls)]
+            value_observation: None,
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_value_observation(
+        mut self,
+        value_observation: Option<crate::task_execution_observation::PreparedTaskValueObservation>,
+    ) -> Self {
+        self.value_observation = value_observation;
+        self
     }
 }
 pub struct CompiledTypeScope<'borrow> {
@@ -373,7 +386,6 @@ pub struct CompiledPackageInterpreter<E: Error + Send + Sync + 'static> {
     decode_limits: PackageDecodeLimits,
     functions: Arc<PureEngineFunctionCatalog>,
     providers: Arc<PureProviderProgramCatalog<E>>,
-    constants: ConstantPolicy,
 }
 
 impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
@@ -382,14 +394,12 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
         decode_limits: PackageDecodeLimits,
         functions: Arc<PureEngineFunctionCatalog>,
         providers: Arc<PureProviderProgramCatalog<E>>,
-        constants: ConstantPolicy,
     ) -> Self {
         Self {
             model: model.into(),
             decode_limits,
             functions,
             providers,
-            constants,
         }
     }
 }
@@ -442,6 +452,21 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
         project_host: Option<&mut ProjectMetadataHost<'_>>,
     ) -> Result<CompiledTaskProgram, CompiledPackageError> {
         let native = type_host.is_some() && project_host.is_some();
+        #[cfg(novarocks_dev_controls)]
+        let mut records = Vec::new();
+        #[cfg(novarocks_dev_controls)]
+        let mut remember_record = |id, body_bytes| {
+            if records.try_reserve(1).is_ok() {
+                records.push((id, body_bytes));
+            }
+        };
+        #[cfg(novarocks_dev_controls)]
+        let record_observer = type_scopes.value_observation.as_ref().map(|_| {
+            &mut remember_record
+                as &mut novarocks_plan_codec::physical_package_v2::ConstantRecordObserver<'_>
+        });
+        #[cfg(not(novarocks_dev_controls))]
+        let record_observer = None;
         let package = match type_host {
             Some(type_host) => decode_fragment_package_with_factory_and_funding(
                 package,
@@ -451,6 +476,7 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
                 type_scopes,
                 control,
                 &mut NativeTypeFunding(type_host),
+                record_observer,
             ),
             None => decode_fragment_package_with_factory(
                 package,
@@ -487,6 +513,11 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             .then_some(NonZeroUsize::MIN);
         let validated = validate_fragment_providers(Arc::new(package), &self.providers, control)
             .map_err(provider_preparation_failure)?;
+        #[cfg(novarocks_dev_controls)]
+        let original = type_scopes
+            .value_observation
+            .as_ref()
+            .map(|_| Arc::clone(validated.package()));
         use novarocks_type_contract::ValueSchemaCreationFactory;
         let mut temporary = type_scopes
             .begin_scope()
@@ -495,7 +526,7 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             pipeline_dop: options.pipeline_dop,
             root_sink_dop,
             kernel_abi: KernelAbiVersion::CURRENT,
-            constants: self.constants,
+            constants: novarocks_functions::ConstantValidation::INPUT_DERIVED,
         };
         let program = match project_host {
             Some(project_host) => compile_fragment_with_creation_and_project_metadata_host(
@@ -526,6 +557,12 @@ impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterp
             }
             FragmentCreationError::Compile(source) => CompiledPackageError::Compile(source),
         })?;
+        #[cfg(novarocks_dev_controls)]
+        if let Some(observation) = type_scopes.value_observation.as_ref()
+            && let Some(original) = original
+        {
+            observation.emit_values(&original, &records, &program);
+        }
         Ok(if native {
             CompiledTaskProgram::native(program, runtime_filters, multicast_edges)
         } else {

@@ -24,7 +24,7 @@ use crate::{
     StaticExprKind, compile_expr_set_pure,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, i256};
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantValue};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression_contract::{
     BinaryOperator, BoundExprSet, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal,
     RootScope, UnitLimits, ValueId,
@@ -107,19 +107,21 @@ fn catalogue() -> PureEngineFunctionCatalog {
     // Independent exact installed records seal only these actual test owners.
     builder.seal_pure(manifest).unwrap()
 }
-pub fn fixture_constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
+pub fn fixture_constant_policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+    )
 }
 fn author(
     functions: &PureEngineFunctionCatalog,
@@ -237,14 +239,7 @@ impl SinglePortFixture {
         register_call_requests(&mut unit, &authors, &mut constants);
         let mut work =
             CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-        declare_call_controls(
-            &mut unit,
-            &functions,
-            &constants,
-            &parameters,
-            fixture_constant_policy(),
-            &mut work,
-        );
+        declare_call_controls(&mut unit, &functions, &constants, &parameters, &mut work);
 
         // Preserve the checked source unit when its cast recipes were observed.
         // Its declared Port(0) is empty; the output unit sees the actual typed shape.
@@ -264,7 +259,6 @@ impl SinglePortFixture {
                     &BTreeMap::new(),
                     &constants,
                     &parameters,
-                    fixture_constant_policy(),
                     &mut work,
                 )?)
             }
@@ -277,7 +271,6 @@ impl SinglePortFixture {
             &authors,
             &constants,
             &parameters,
-            fixture_constant_policy(),
             &mut work,
         )?;
         work.finish().unwrap();
@@ -1401,7 +1394,6 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
         &functions,
         &source_pools,
         &parameters,
-        fixture_constant_policy(),
         &mut work,
     );
     let sealed = builder.seal(vec![input], &mut work).unwrap();
@@ -1411,7 +1403,6 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
         &authors,
         &source_pools,
         &parameters,
-        fixture_constant_policy(),
         &mut work,
     );
     work.finish().unwrap();

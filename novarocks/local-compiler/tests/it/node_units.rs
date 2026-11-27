@@ -22,7 +22,7 @@ use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_constant_contract::{ConstantPoolId, ConstantPools, ConstantReference};
 use novarocks_expression_contract::{ExprKind, RootScope};
-use novarocks_functions::{ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder};
+use novarocks_functions::{ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -39,8 +39,8 @@ impl PureCompileControl for Control {
         Ok(())
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
         max_logical_elements: 1024,
@@ -51,7 +51,7 @@ fn policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn node_units_keep_the_actual_column_after_a_repeated_publication() {
                 required: RequiredContracts::default(),
                 constants: pools,
                 fragment,
-                statement_constant_policy: policy(),
+
                 pruning: FrozenFragmentPruning::try_new(FragmentId::new(37), vec![], &c).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),

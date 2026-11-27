@@ -100,7 +100,7 @@ pub(crate) use statement_system_relation::statement_system_relation_site;
 
 // The request profile has one owner; application test fixtures may author
 // their explicit ceiling without a second default or translation vocabulary.
-pub use novarocks_functions::ConstantPolicy;
+pub use novarocks_functions::ConstantValidation;
 
 /// SQL's read-only observation of statement cancellation.
 ///
@@ -1145,7 +1145,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
 
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) table_sequence: Option<&'a table_sequence::TableSequencePass>,
@@ -1189,7 +1189,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         functions: &'a dyn SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -1228,7 +1228,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         environment: SqlPlanningEnvironment,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
 
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -1304,11 +1304,11 @@ pub struct SqlAnalyzedQuery {
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 }
 
 impl SqlAnalyzedQuery {
-    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
     pub(crate) fn root_allow_throw_exception(&self) -> bool {
@@ -1366,7 +1366,7 @@ impl<'a> SqlOptimizeRequest<'a> {
         &self.analyzed.semantic_settings
     }
 
-    pub fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.analyzed.constant_policy
     }
 
@@ -1473,7 +1473,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub functions: &'a dyn SqlFunctionCatalog,
 
     pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
 }
@@ -1486,7 +1486,7 @@ pub struct SqlMvRefreshAnalysisContext<'a> {
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: SqlCompileControl,
 }
 
@@ -1578,7 +1578,7 @@ fn imv_refresh_explain_request<'a>(
     functions: &'a dyn SqlFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
 
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
     SqlAnalyzeRequest::new(

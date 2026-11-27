@@ -58,7 +58,7 @@ struct OwnedWireReply {
     _ownership: Option<NativeRootSendOwnership>,
 }
 
-// Design: ADR-0276 (docs/adr/ADR-0276-third-party-encoding-buffers-use-transport-headroom.md)
+// Design: ADR-0277 (docs/adr/ADR-0277-third-party-encoding-buffers-use-transport-headroom.md)
 #[derive(Clone, Copy)]
 enum RootFrameEncoding {
     Ready {

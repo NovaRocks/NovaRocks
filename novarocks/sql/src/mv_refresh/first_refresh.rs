@@ -330,7 +330,7 @@ pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
 
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
 }
@@ -444,7 +444,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
 
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
 }
@@ -647,7 +647,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
 
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: crate::compiler::SqlCompileControl,
 }
 
@@ -883,7 +883,7 @@ pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
 
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: crate::compiler::SqlCompileControl,
 }
 
@@ -1052,7 +1052,7 @@ fn canonical_incremental_change_stream_request<'a>(
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
 
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -1223,7 +1223,7 @@ fn build_join_incremental_refresh_logical_plan(
     factory: crate::column_id::ColumnRefFactory,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1778,7 +1778,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
 
     sql_semantics: crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -1807,7 +1807,7 @@ fn build_join_first_refresh_append_logical_plan(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -4569,8 +4569,7 @@ mod tests {
         let catalog = crate::compiler::SqlPlannerTableSnapshot::new(&tables);
         let functions = crate::functions::builtin_sql_function_catalog();
         let control = crate::compiler::SqlCompileControl::unbounded();
-        let mut constant_policy = crate::constant::test_constant_policy();
-        constant_policy.max_rows = 37;
+        let constant_policy = crate::constant::test_constant_validation(37);
         let request = plain_join_first_refresh_logical_request(
             query,
             None,

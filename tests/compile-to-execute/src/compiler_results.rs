@@ -297,7 +297,6 @@ fn source_packages_with_reads(
     source: &SqlAuthoredPhysicalPlan,
     reads: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
-    source.require_statement_constant_policy(policy()).unwrap();
     let pruning = source
         .plan()
         .fragments()
@@ -347,7 +346,7 @@ pub fn compile_options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        constants: policy(),
+        constants: policy().into(),
     }
 }
 pub fn compiler_results(

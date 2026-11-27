@@ -3687,7 +3687,7 @@ fn select_scalar_binding_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::ResolvedFunctionBinding, AnalyzeError> {
     crate::analysis::select_scalar_function(function_catalog, name, args, constant_policy, control)
@@ -3699,7 +3699,7 @@ pub(super) fn resolve_scalar_binding_at(
     name: &str,
     args: &[TypedExpr],
     span: Span,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let binding = select_scalar_binding_with_catalog(
         finalizer.catalog,
@@ -3716,7 +3716,7 @@ fn finish_selected_scalar_call(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     selected: &novarocks_functions::ResolvedFunctionBinding,
     args: &[TypedExpr],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::ResolvedFunctionBinding, AnalyzeError> {
     let arguments = args
@@ -3743,7 +3743,7 @@ pub(super) fn resolved_scalar_call_at(
     name: &str,
     args: Vec<TypedExpr>,
     span: Span,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<TypedExpr, AnalyzeError> {
     let function_catalog = finalizer.catalog;
     let control = finalizer.control;
@@ -3937,7 +3937,7 @@ fn coerce_selected_function_argument(
     finalizer: &super::BindingFinalizer<'_>,
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;
@@ -4153,7 +4153,7 @@ pub(super) fn bind_window_function_call_with_catalog(
     args: Vec<TypedExpr>,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
     let finalizer =
@@ -4166,7 +4166,7 @@ fn bind_window_call(
     name: &str,
     args: Vec<TypedExpr>,
     span: Span,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
     let function_catalog = finalizer.catalog;
     let control = finalizer.control;
@@ -4244,7 +4244,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     name: &str,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     let finalizer =
@@ -4263,7 +4263,7 @@ fn bind_legacy_scalar_call(
     name: &str,
     args: Vec<TypedExpr>,
     span: Span,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     let function_catalog = finalizer.catalog;
     let control = finalizer.control;
@@ -4366,7 +4366,7 @@ pub(super) fn resolve_aggregate_function_call(
     args: &[TypedExpr],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let finalizer =
@@ -4453,7 +4453,7 @@ pub(super) fn resolve_aggregate_function_call_with_order(
     distinct: bool,
     args: &[TypedExpr],
     function_order_by: &[SortItem],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     purpose: super::QueryAnalysisPurpose,
     site: AggregateCallSite,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {

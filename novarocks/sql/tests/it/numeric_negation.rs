@@ -132,9 +132,6 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
                 .unwrap()
                 .is_some()
         );
-        source
-            .require_statement_constant_policy(source.plan().statement_constant_policy())
-            .unwrap();
         check_pure_call_definitions_observed(&source, &Control).unwrap();
         for fragment in source.plan().fragments().values() {
             fragment

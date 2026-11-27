@@ -239,7 +239,7 @@ fn cast_package_with_cells(
                 required: RequiredContracts::default(),
                 fragment,
                 constants,
-                statement_constant_policy: policy(),
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::default(),

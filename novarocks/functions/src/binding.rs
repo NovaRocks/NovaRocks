@@ -112,7 +112,6 @@ pub struct CheckedCallEffectInput<'a> {
     catalog: &'a EngineFunctionCatalog,
     binding: &'a FunctionBindingDefinition,
     input: crate::CallEffectInput<'a>,
-    constant_policy: &'a crate::ConstantPolicy,
 }
 impl std::fmt::Debug for CheckedCallEffectInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -124,11 +123,10 @@ impl<'a> CheckedCallEffectInput<'a> {
     pub(crate) fn require_input(
         &self,
         input: crate::CallEffectInput<'_>,
-        policy: &crate::ConstantPolicy,
     ) -> Result<(), FunctionBindingError> {
-        if !self.input.same_borrow(input) || self.constant_policy != policy {
+        if !self.input.same_borrow(input) {
             return Err(invalid_binding(
-                "checked selection differs from its original call input or constant policy",
+                "checked selection differs from its original call input",
             ));
         }
         Ok(())
@@ -149,7 +147,7 @@ impl<'a> CheckedCallEffectInput<'a> {
         declaration: &FunctionBindingDeclaration,
         input: crate::CallEffectInput<'_>,
     ) -> Result<(), FunctionBindingError> {
-        self.require_input(input, self.constant_policy)?;
+        self.require_input(input)?;
         if !std::ptr::eq(self.binding.declaration.as_ref(), declaration) {
             return Err(invalid_binding(
                 "checked selection borrows a different registered owner",
@@ -164,7 +162,7 @@ impl<'a> CheckedCallEffectInput<'a> {
         resolver: &dyn FunctionBindingResolver,
         input: crate::CallEffectInput<'_>,
     ) -> Result<(), FunctionBindingError> {
-        self.require_input(input, self.constant_policy)?;
+        self.require_input(input)?;
         if !std::ptr::addr_eq(self.binding.resolver.pure_author(), resolver) {
             return Err(invalid_binding(
                 "checked selection borrows a different original binding author",
@@ -177,7 +175,7 @@ impl<'a> CheckedCallEffectInput<'a> {
         resolver: &crate::builtin::catalogue::BuiltinScalarResolver,
         input: crate::CallEffectInput<'_>,
     ) -> Result<(), FunctionBindingError> {
-        self.require_input(input, self.constant_policy)?;
+        self.require_input(input)?;
         let same = match &self.binding.resolver.0 {
             BindingResolverOwnerKind::FixedScalar(owner) => std::ptr::eq(owner.as_ref(), resolver),
             BindingResolverOwnerKind::ArrayOrder(owner) => {
@@ -1477,7 +1475,6 @@ impl EngineFunctionCatalog {
     pub(crate) fn check_call_effect_input_with_creator_in<'a, H>(
         &'a self,
         input: crate::CallEffectInput<'a>,
-        constant_policy: &'a crate::ConstantPolicy,
         creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
     ) -> Result<CheckedCallEffectInput<'a>, FunctionBindingCreationFailure<H>> {
@@ -1489,13 +1486,10 @@ impl EngineFunctionCatalog {
             control,
             Some(creation),
         )?;
-        // The original function request has no policy field. The caller loans
-        // its actual already-admitted source policy; it grants no new capacity.
         Ok(CheckedCallEffectInput {
             catalog: self,
             binding,
             input,
-            constant_policy,
         })
     }
 

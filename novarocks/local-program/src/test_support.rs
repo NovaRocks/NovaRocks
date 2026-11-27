@@ -176,7 +176,7 @@ pub(crate) fn read_unit(
             ports: &[scope],
             all_ports: None,
         },
-        policy(),
+        novarocks_functions::ConstantValidation::bounded(policy()),
         &catalog,
         &mut work,
     )
@@ -234,7 +234,7 @@ pub(crate) fn constant_unit(
             ports: &[],
             all_ports: None,
         },
-        policy(),
+        novarocks_functions::ConstantValidation::bounded(policy()),
         &catalog,
         &mut work,
     )
@@ -498,7 +498,6 @@ pub(crate) fn large_static_unit(count: usize) -> Arc<novarocks_expression::Compi
             ]),
             logical_argument_count: 3,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -590,7 +589,7 @@ pub(crate) fn large_static_unit(count: usize) -> Arc<novarocks_expression::Compi
             ports: &scopes,
             all_ports: None,
         },
-        policy(),
+        novarocks_functions::ConstantValidation::bounded(policy()),
         &catalog,
         &mut w,
     )

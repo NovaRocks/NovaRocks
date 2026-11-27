@@ -20,7 +20,7 @@ use super::*;
 fn invoke(
     f: &Fixture,
     control: &Control,
-    caps: ExpressionProjectionLimits,
+    caps: impl Into<Option<ExpressionProjectionLimits>>,
 ) -> Result<
     (
         ExpressionNamespaceWriteFacts,
@@ -70,6 +70,13 @@ fn caller_owned_sender_preserves_all_original_sixteen_scalar_payloads_and_facts(
     assert_eq!(actual.1.len(), 16);
     assert_eq!(actual.1.last().unwrap().id, 15);
 }
+#[test]
+fn input_derived_expression_sender_preserves_wire_and_admitted_geometry() {
+    let f = all_kinds();
+    let explicit = invoke(&f, &Control::default(), limits()).unwrap();
+    assert_eq!(invoke(&f, &Control::default(), None).unwrap(), explicit);
+}
+
 #[test]
 fn caller_owned_sender_seven_exact_axes_and_one_under_replay_actual_source() {
     let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
@@ -224,7 +231,7 @@ fn caller_owned_literal_captured_comparer_preserves_original_facts_and_primary_r
         let mut admission = Admission {
             parent: Some(&mut admit),
             source: SOURCE,
-            limits: caps,
+            limits: Some(caps),
         };
         let result = compare_types(
             &node.ty,

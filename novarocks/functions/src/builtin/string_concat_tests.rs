@@ -421,10 +421,12 @@ fn string_concat_output_layout_is_checked_before_any_output_request() {
         output_capacity(usize::MAX, 0),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert_eq!(
-        output_capacity(1, i32::MAX as usize + 1),
-        Err(KernelFailure::ResourceExhausted)
-    );
+    use novarocks_failure_contract::{FailureProjection, RepresentationBoundary};
+    let unsupported = output_capacity(1, i32::MAX as usize + 1).unwrap_err();
+    let facts = unsupported.failure_fact().representation().unwrap();
+    assert_eq!(facts.boundary, RepresentationBoundary::SingleOutput);
+    assert_eq!(facts.required, Some(i32::MAX as u64 + 1));
+    assert_eq!(facts.extent_limit, Some(i32::MAX as u64));
     assert!(output_capacity(0, 0).is_ok());
     assert!(output_capacity(320, 1024).is_ok());
 }

@@ -291,12 +291,14 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
         parameters,
         pools,
         source_retained_bytes,
-        limits,
+        Some(limits),
         None,
         &mut work,
     );
     finish(work, result)
 }
+/// Passing None derives checked projection facts from the received definitions
+/// and their original namespaces, with admission supplied by the caller.
 pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
     input: ExpressionDefinitionInput<'wire>,
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
@@ -305,7 +307,7 @@ pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
     parameters: &'loan SemanticParameters,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: ExpressionProjectionLimits,
+    limits: impl Into<Option<ExpressionProjectionLimits>>,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
@@ -318,7 +320,7 @@ pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
         parameters,
         pools,
         source_retained_bytes,
-        limits,
+        limits.into(),
         Some(admit),
         work,
     )
@@ -331,7 +333,7 @@ fn decode_core<'loan, 'wire, 'control>(
     parameters: &'loan SemanticParameters,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: ExpressionProjectionLimits,
+    limits: Option<ExpressionProjectionLimits>,
     parent: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
@@ -517,7 +519,7 @@ fn preflight(
         let mut initial = admission.numeric(initial_facts(count))?;
         admission.gate(&mut initial)?;
     }
-    cap(count, limits.max_definitions, work)?;
+    cap(count, limits.map(|limits| limits.max_definitions), work)?;
     // Admit the count walk and index build before any source traversal/reserve.
     let mut facts = admission.numeric(initial_facts(count))?;
     facts.coexisting_source_and_request_bytes_upper_bound =
@@ -560,7 +562,7 @@ fn preflight(
             )?;
             cap(
                 facts.expression_reference_count,
-                limits.max_expression_references,
+                limits.map(|limits| limits.max_expression_references),
                 work,
             )
         })?;
@@ -583,7 +585,11 @@ fn preflight(
         }
         admission.gate(&mut facts)?;
         work.step()?;
-        cap(facts.type_reference_count, limits.max_type_references, work)?;
+        cap(
+            facts.type_reference_count,
+            limits.map(|limits| limits.max_type_references),
+            work,
+        )?;
     }
     // Header and lambda carrier lookups use the original BTree owner. The
     // reference count measures source IDs; repeated delegate costs accumulate
@@ -784,10 +790,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 work.step()?;
                 work.flush()?;
                 let pool = pool.ok_or_else(|| shape("expression constant pool is unknown"))?;
-                let retained =
-                    usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
-                        .map_err(|_| shape("constant retained extent is unrepresentable"))?;
-                cap(retained, self.source_retained_bytes, work)?;
+                if admission.limits.is_some() {
+                    let retained =
+                        usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+                            .map_err(|_| shape("constant retained extent is unrepresentable"))?;
+                    cap(retained, self.source_retained_bytes, work)?;
+                }
                 let verified = if let Some(captured) = captured {
                     captured?.ok_or_else(|| shape("expression constant pool is unknown"))?
                 } else {

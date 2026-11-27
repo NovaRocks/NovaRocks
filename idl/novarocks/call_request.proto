@@ -32,9 +32,8 @@ message OriginalCallRequest {
   repeated OriginalFunctionArgument arguments = 2;
   optional uint32 logical_argument_count = 3; // Required; zero is valid.
   optional uint32 expected_result_value_type_id = 4; // Absent retains None.
-  SourceConstantPolicy constant_policy = 5; // Required source data, not a grant.
-  reserved 6;
-  reserved "request_id";
+  reserved 5, 6;
+  reserved "constant_policy", "request_id";
 }
 
 message CallRequestDefinition {
@@ -49,13 +48,14 @@ message CallRequestDefinition {
 
 
 // The unit owns this local definition key; argument facts use the same shared
-// grammar, type table, constant pool namespace and sender policy as relations.
+// grammar, type table and constant pool namespace as relations.
 message UnitCallRequest {
   optional uint32 definition_id = 1;
   repeated OriginalFunctionArgument arguments = 2;
   optional uint32 logical_argument_count = 3;
   optional uint32 expected_result_value_type_id = 4;
-  SourceConstantPolicy constant_policy = 5;
+  reserved 5;
+  reserved "constant_policy";
 }
 
 message OriginalFunctionArgument {
@@ -69,21 +69,6 @@ message OriginalValueArgument {
   optional uint32 value_type_id = 1; // Required complete FVT; zero/MAX are valid.
   // Absent is nonconstant; a present reference to a NULL row remains Some.
   ConstantReference constant = 2;
-}
-
-// Every field requires presence; all numeric zero values are preserved. These
-// original sender facts cannot replace receiving limits or memory admission.
-message SourceConstantPolicy {
-  optional uint64 max_rows = 1;
-  optional uint64 max_array_nodes = 2;
-  optional uint64 max_logical_elements = 3;
-  optional uint64 max_retained_buffer_bytes = 4;
-  optional uint32 max_type_depth = 5;
-  optional uint64 max_type_nodes = 6;
-  optional uint32 max_dictionary_depth = 7;
-  optional uint64 max_metadata_bytes = 8;
-  optional uint64 max_library_validation_work = 9;
-  optional uint64 max_library_validation_bytes = 10;
 }
 
 // Constants of one exact value type share one pool. Each pool is a standard

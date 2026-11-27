@@ -157,30 +157,41 @@ pub(crate) fn prepare_recursive_pool_write_pure_in<'pool, 'control>(
     pool: &'pool ConstantPool,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedPureRecursivePoolWriter<'pool, 'control>, TypeCodecError> {
+    ipc_flat_pool_v2::validate_pure_pool_source(pool, work)?;
+    let (prepared, _) = prepare_from_input(
+        pool,
+        |field, work| {
+            ipc_schema_v2::preflight_writer_pure_in(field, work)
+                .map_err(HostError::<std::convert::Infallible>::from)
+        },
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)?;
+    Ok(PreparedPureRecursivePoolWriter {
+        pool,
+        prepared,
+        control: work.control(),
+    })
+}
+
+fn prepare_from_input<'pool, H>(
+    pool: &'pool ConstantPool,
+    preflight_schema: impl FnOnce(
+        &arrow::datatypes::Field,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<ipc_schema_v2::SchemaPreflight, HostError<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Prepared<'pool>, ipc_schema_v2::SchemaPreflight), HostError<H>> {
     work.flush()?;
-    if pool.source_owner().is_none() {
-        novarocks_constant_contract::validate_pure_borrowed_source_in(pool.field(), work).map_err(
-            |error| match error {
-                novarocks_constant_contract::ConstantError::Control(cause) => {
-                    TypeCodecError::Control(cause)
-                }
-                _ => TypeCodecError::ResourceSource(
-                    "pure borrowed pool has no original metadata custody",
-                ),
-            },
-        )?;
-    }
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
         && cfg!(target_endian = "little"))
     {
-        return Err(shape(
-            "recursive writer source model does not match this target",
-        ));
+        return Err(shape("recursive writer source model does not match this target").into());
     }
     let geometry = geometry::inspect_pure(pool.data(), work)?;
-    let schema = ipc_schema_v2::preflight_writer_pure_in(pool.field(), work)?;
+    let schema = preflight_schema(pool.field(), work)?;
     let construction = ipc_flat_pool_v2::construction_from_counts(
         &schema,
         geometry.nodes,
@@ -190,16 +201,30 @@ pub(crate) fn prepare_recursive_pool_write_pure_in<'pool, 'control>(
     )?;
     std::alloc::Layout::array::<u8>(construction.stream_backing)
         .map_err(|_| shape("recursive writer stream request is not representable"))?;
-    Ok(PreparedPureRecursivePoolWriter {
-        pool,
-        prepared: Prepared {
+    Ok((
+        Prepared {
             geometry,
             facts: None,
             construction,
             schema: None,
         },
-        control: work.control(),
-    })
+        schema,
+    ))
+}
+
+pub(crate) fn encode_recursive_pool_input_derived_in<H>(
+    pool: &ConstantPool,
+    request: &mut ipc_schema_v2::WriteRequest<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, HostError<H>> {
+    let (prepared, schema) = prepare_from_input(
+        pool,
+        |field, work| ipc_schema_v2::preflight_constant_schema_in(field, request, work),
+        work,
+    )?;
+    let schema =
+        ipc_schema_v2::emit_constant_schema_with_requests_in(pool.field(), schema, request, work)?;
+    emit_record(pool, &prepared, schema, Some(request), work)
 }
 
 fn finish<T>(
@@ -756,7 +781,20 @@ fn emit_prepared_core<H>(
             None => ipc_schema_v2::encode_single_field_schema_pure_in(pool.field(), work)?,
         }
     };
+    emit_record(pool, prepared, schema, None, work)
+}
+
+fn emit_record<H>(
+    pool: &ConstantPool,
+    prepared: &Prepared<'_>,
+    schema: Vec<u8>,
+    mut request: Option<&mut ipc_schema_v2::WriteRequest<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, HostError<H>> {
     work.flush()?;
+    if let Some(request) = request.as_deref_mut() {
+        ipc_flat_pool_v2::request_record_backing_in(&prepared.construction, request, work)?;
+    }
     let mut batch = ipc_flat_pool_v2::reserve(prepared.construction.batch_backing, work)?;
     ipc_flat_pool_v2::initialize_to(&mut batch, prepared.construction.batch_backing, work)?;
     work.flush()?;
@@ -765,6 +803,13 @@ fn emit_prepared_core<H>(
     header::emit(pool.data(), &prepared.geometry, &mut builder, work)?;
     if builder.mut_finished_buffer().0.len() != prepared.construction.batch_backing {
         return Err((shape("recursive batch builder grew beyond admitted backing")).into());
+    }
+    if let Some(request) = request {
+        ipc_flat_pool_v2::request_writer_vec_in(
+            prepared.construction.stream_backing,
+            request,
+            work,
+        )?;
     }
     let mut output = ipc_flat_pool_v2::reserve(prepared.construction.stream_backing, work)?;
     ipc_flat_pool_v2::frame(&mut output, &schema, work)?;

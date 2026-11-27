@@ -117,18 +117,6 @@ fn request(
         logical_argument_count: args.len(),
         arguments: args,
         expected_result_type: None,
-        constant_policy: p::ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 32,
-            max_logical_elements: 128,
-            max_retained_buffer_bytes: 65536,
-            max_type_depth: 16,
-            max_type_nodes: 128,
-            max_dictionary_depth: 8,
-            max_metadata_bytes: 4096,
-            max_library_validation_work: 1_000_000,
-            max_library_validation_bytes: 1_000_000,
-        },
     }
 }
 fn effects(kind: FunctionKind, proof_scope: CallProofScope) -> CallEffects {
@@ -557,7 +545,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 Arc::new(Field::new("body", DataType::Int64, false)),
                 int(),
                 Int64Array::from(vec![42]).to_data(),
-                request(Box::default()).constant_policy,
+                novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
                 CompilePhase::Validate,
                 &Setup,
             )
@@ -566,7 +554,6 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         .unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: request(Box::default()).constant_policy,
             constants: pools,
             version: p::PlanVersionId::try_new([3; 16]).unwrap(),
             required: p::RequiredContracts {
@@ -746,7 +733,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
         .with_calls_observed(vec![], &Setup)
         .unwrap();
     let mut pools = p::ConstantPools::empty();
-    let policy = request(Box::default()).constant_policy;
+    let policy = novarocks_constant_contract::ConstantValidation::INPUT_DERIVED;
     let pool = novarocks_constant_contract::ConstantPool::try_new(
         Arc::new(Field::new("original\0pool", DataType::Int64, true)),
         nullable,
@@ -759,7 +746,6 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     pools.insert(pool_id, pool).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: request(Box::default()).constant_policy,
             version: p::PlanVersionId::try_new([4; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
@@ -821,7 +807,7 @@ pub(in crate::physical_package_v2) fn values_package(
         Arc::new(Field::new("cells", DataType::Int64, false)),
         int(),
         Int64Array::from_iter_values(0..16).to_data(),
-        request(Box::default()).constant_policy,
+        novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
         CompilePhase::Validate,
         &Setup,
     )
@@ -925,7 +911,6 @@ pub(in crate::physical_package_v2) fn values_package_with_pool(
     pools.insert(pool_id, pool).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            statement_constant_policy: request(Box::default()).constant_policy,
             version: p::PlanVersionId::try_new([5; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
@@ -1641,8 +1626,8 @@ fn project(
                 type_ids: &cut_ids,
                 source_retained_bytes: SOURCE,
                 limits: CutsProjectionLimits {
-                    node: node_limits(),
-                    binding: binding_limits(),
+                    node: Some(node_limits()),
+                    binding: Some(binding_limits()),
                 },
             },
             &mut |f: &NodeProjectionFacts| {

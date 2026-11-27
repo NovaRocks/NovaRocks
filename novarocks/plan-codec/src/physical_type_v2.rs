@@ -186,10 +186,11 @@ pub struct PackageTypeProjectionFacts {
 pub fn decode_package_type_table_observed(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source_retained_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, TypeCodecError> {
+    let limits = limits.into();
     decode::decode_package(package, source_retained_bytes, limits, admit, work)
 }
 
@@ -281,7 +282,7 @@ impl PackageTypeMaterializationScope for DirectTypeMaterialization {
 pub fn decode_package_type_table_with_host_observed<G: PackageTypeMaterializationScope>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source_retained_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
     host: &mut G,
@@ -289,17 +290,19 @@ pub fn decode_package_type_table_with_host_observed<G: PackageTypeMaterializatio
     DecodedTypeTable,
     crate::host_projection_v2::ProjectionFailure<TypeCodecError, G::HostError>,
 > {
+    let limits = limits.into();
     decode::decode_package_with_funding(package, source_retained_bytes, limits, admit, work, host)
 }
 
 pub(crate) fn decode_package_type_table_with_funding_in<H>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
     funding: &mut dyn PackageTypeFundingScope<H>,
 ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    let limits = limits.into();
     decode::decode_package_with_funding(package, source, limits, admit, work, funding)
 }
 
@@ -309,12 +312,13 @@ pub fn decode_package_type_table_with_factory_and_funding_in<
 >(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: &F,
     work: &mut CompileCheckpoints<'_>,
     funding: &mut dyn PackageTypeFundingScope<H>,
 ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    let limits = limits.into();
     decode::decode_package_with_factory_and_funding(
         package, source, limits, creation, factory, work, funding,
     )
@@ -326,10 +330,11 @@ pub fn decode_package_type_table_with_storage_observed(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source_retained_bytes: usize,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, TypeCodecError> {
+    let limits = limits.into();
     decode::decode_package_with_storage(
         package,
         source_retained_bytes,
@@ -345,10 +350,11 @@ pub fn decode_package_type_table_with_storage_observed(
 pub fn decode_package_type_table_with_creator_in<H>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     original_source_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    let limits = limits.into();
     decode::decode_package_with_creator(package, original_source_bytes, limits, creation, work)
 }
 
@@ -360,11 +366,12 @@ pub fn decode_package_type_table_with_factory_in<
 >(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     original_source_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: &F,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    let limits = limits.into();
     decode::decode_package_with_factory(
         package,
         original_source_bytes,
@@ -970,16 +977,17 @@ pub(super) fn combine_namespace_facts(
 }
 pub(super) fn validate_namespace_facts(
     f: &PackageTypeProjectionFacts,
-    l: PackageTypeProjectionLimits,
+    l: impl Into<Option<PackageTypeProjectionLimits>>,
 ) -> Result<(), CompileControlError> {
-    if f.definition_count > l.max_definitions
-        || f.expanded_node_count > l.max_expanded_nodes
-        || f.string_bytes > l.max_string_bytes
-        || f.allocation_requests_upper_bound > l.max_allocation_requests
-        || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
-        || f.coexisting_source_and_request_bytes_upper_bound
-            > l.max_coexisting_source_and_request_bytes
-        || f.cumulative_work_upper_bound > l.max_work
+    if let Some(l) = l.into()
+        && (f.definition_count > l.max_definitions
+            || f.expanded_node_count > l.max_expanded_nodes
+            || f.string_bytes > l.max_string_bytes
+            || f.allocation_requests_upper_bound > l.max_allocation_requests
+            || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
+            || f.coexisting_source_and_request_bytes_upper_bound
+                > l.max_coexisting_source_and_request_bytes
+            || f.cumulative_work_upper_bound > l.max_work)
     {
         Err(CompileControlError::ResourceExhausted)
     } else {
@@ -1928,10 +1936,11 @@ pub(crate) fn encode_borrowed_type_namespaces_sources_in<'source>(
     source_fields: &'source [(u32, &'source Arc<Field>)],
     writers: &'source [WriterTypeSource<'source>],
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let limits = limits.into();
     let mut completed = PackageTypeProjectionFacts::default();
     let table = encode::encode_writer_sources(
         ValueRootSources::Borrowed(values),

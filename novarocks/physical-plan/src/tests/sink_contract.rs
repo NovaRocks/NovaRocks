@@ -1097,7 +1097,7 @@ fn finish_router_writer_fixture(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     if let Some((node, _)) = layout {
         let draft = novarocks_connector_contract::ConnectorWriteLayoutRecipeDraft::try_new(
             novarocks_connector_contract::ConnectorWriteBinding::new(
@@ -2168,7 +2168,7 @@ fn writer_projected_values_cannot_be_transported_by_an_edge() {
     let invalid = PhysicalPlan::from(crate::plan::PhysicalPlanParts {
         constants: plan.constants().clone(),
         parameters: plan.parameters().clone(),
-        statement_constant_policy: plan.statement_constant_policy(),
+
         version: plan.version(),
         fragments: plan.fragments().clone(),
         edges,

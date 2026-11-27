@@ -101,7 +101,6 @@ pub(crate) fn encode_state_interpretation(
     })
 }
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) fn decode_state_interpretation(
     raw: &wire::AggregateStateInterpretation,
     work: &mut CompileCheckpoints<'_>,
@@ -280,7 +279,7 @@ pub fn encode_aggregate_bindings<'loan, 'source>(
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
     inputs: &'loan [AggregateBindingInput<'source>],
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     control: &dyn PureCompileControl,
 ) -> Result<EncodedAggregateBindings<'loan, 'source>, BindingCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
@@ -288,7 +287,7 @@ pub fn encode_aggregate_bindings<'loan, 'source>(
         types,
         functions,
         inputs,
-        (source_retained_bytes, limits, Policy(false)),
+        (source_retained_bytes, limits.into(), Policy(false)),
         &mut |_| Ok(()),
         &mut work,
     );
@@ -312,7 +311,7 @@ pub fn encode_aggregate_bindings_in<'loan, 'source>(
     functions: &'loan EncodedFunctionBindings<'loan, 'source>,
     inputs: &'loan [AggregateBindingInput<'source>],
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedAggregateBindings<'loan, 'source>, BindingCodecError> {
@@ -320,7 +319,7 @@ pub fn encode_aggregate_bindings_in<'loan, 'source>(
         types,
         functions,
         inputs,
-        (source_retained_bytes, limits, Policy(true)),
+        (source_retained_bytes, limits.into(), Policy(true)),
         admit,
         work,
     )?;
@@ -340,10 +339,18 @@ fn add(left: usize, right: usize) -> Result<usize, BindingCodecError> {
     left.checked_add(right)
         .ok_or_else(|| invalid("aggregate projection arithmetic overflow"))
 }
-fn remaining(maximum: usize, used: usize) -> Result<usize, BindingCodecError> {
-    maximum
-        .checked_sub(used)
-        .ok_or_else(|| invalid("aggregate work exceeds its envelope"))
+fn remaining(
+    limits: Option<BindingProjectionLimits>,
+    used: usize,
+) -> Result<Option<usize>, BindingCodecError> {
+    limits
+        .map(|limits| {
+            limits
+                .max_work
+                .checked_sub(used)
+                .ok_or_else(|| invalid("aggregate work exceeds its envelope"))
+        })
+        .transpose()
 }
 fn bytes<T>(count: usize) -> Result<usize, BindingCodecError> {
     Layout::array::<T>(count)
@@ -374,7 +381,7 @@ fn preflight(
     types: &EncodedTypeTable<'_>,
     functions: &EncodedFunctionBindings<'_, '_>,
     inputs: &[AggregateBindingInput<'_>],
-    envelope: (usize, BindingProjectionLimits, Policy),
+    envelope: (usize, Option<BindingProjectionLimits>, Policy),
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
@@ -406,7 +413,7 @@ fn preflight(
             "aggregate and function bindings use different type emissions",
         ));
     }
-    if inputs.len() > limits.max_definitions {
+    if limits.is_some_and(|limits| inputs.len() > limits.max_definitions) {
         return Err(invalid("aggregate definition count exceeds its envelope"));
     }
     let table = types.as_wire();
@@ -446,11 +453,12 @@ fn preflight(
         )?,
     )?;
     let floor = add(visible_wire_floor, original_namespace_floor)?;
-    if source < floor {
+    if limits.is_some() && source < floor {
         return Err(invalid(
             "aggregate source invoice omits borrowed namespace storage",
         ));
     }
+    let source = source.max(floor);
     let add = sum;
     let mul = product;
     let mut facts = BindingProjectionFacts {
@@ -471,7 +479,7 @@ fn preflight(
         refresh(&mut facts, source, base, 0, policy)?;
         policy.gate(&facts, limits, admit)?;
     }
-    if base > limits.max_work {
+    if limits.is_some_and(|limits| base > limits.max_work) {
         return Err(invalid("aggregate work exceeds its envelope"));
     }
     let mut previous = None;
@@ -481,16 +489,17 @@ fn preflight(
         if let Some(receipt) = &input.source.state_interpretation {
             request::<wire::AggregateStateOrderKey>(receipt.order_keys.len(), &mut facts, policy)?;
             chunks = add(chunks, receipt.order_keys.len())?;
-            if source
-                < add(
-                    size_of::<AggregateBinding>(),
-                    add(
-                        state.len(),
-                        bytes::<novarocks_type_contract::AggregateStateOrderKey>(
-                            receipt.order_keys.len(),
+            if limits.is_some()
+                && source
+                    < add(
+                        size_of::<AggregateBinding>(),
+                        add(
+                            state.len(),
+                            bytes::<novarocks_type_contract::AggregateStateOrderKey>(
+                                receipt.order_keys.len(),
+                            )?,
                         )?,
-                    )?,
-                )?
+                    )?
             {
                 return Err(invalid(
                     "aggregate source invoice omits original state interpretation",
@@ -518,7 +527,7 @@ fn preflight(
             return Err(invalid("aggregate source has non-aggregate function kind"));
         }
         // Aliased aggregate owners are not summed as independent backing.
-        if source < add(size_of::<AggregateBinding>(), state.len())? {
+        if limits.is_some() && source < add(size_of::<AggregateBinding>(), state.len())? {
             return Err(invalid(
                 "aggregate source invoice omits original aggregate backing",
             ));
@@ -532,18 +541,20 @@ fn preflight(
         refresh(&mut facts, source, base, chunks, policy)?;
         policy.gate(&facts, limits, admit)?;
     }
-    if facts.type_reference_count > limits.max_type_references {
+    if limits.is_some_and(|limits| facts.type_reference_count > limits.max_type_references) {
         return Err(invalid("aggregate type references exceed their envelope"));
     }
-    if facts.request_bytes_upper_bound > limits.max_request_bytes
-        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+    if let Some(limits) = limits
+        && (facts.request_bytes_upper_bound > limits.max_request_bytes
+            || facts.allocation_requests_upper_bound > limits.max_allocation_requests)
     {
         return Err(invalid("aggregate output requests exceed their envelope"));
     }
     facts.coexisting_source_and_request_bytes_upper_bound =
         add(source, facts.request_bytes_upper_bound)?;
-    if facts.coexisting_source_and_request_bytes_upper_bound
-        > limits.max_coexisting_source_and_request_bytes
+    if let Some(limits) = limits
+        && (facts.coexisting_source_and_request_bytes_upper_bound
+            > limits.max_coexisting_source_and_request_bytes)
     {
         return Err(invalid("aggregate coexistence exceeds its envelope"));
     }
@@ -555,7 +566,7 @@ fn preflight(
         )?,
     )?;
     policy.gate(&facts, limits, admit)?;
-    if facts.cumulative_work_upper_bound > limits.max_work {
+    if limits.is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work) {
         return Err(invalid("aggregate work exceeds its envelope"));
     }
     Ok(facts)
@@ -585,7 +596,7 @@ fn validate(
     types: &EncodedTypeTable<'_>,
     functions: &EncodedFunctionBindings<'_, '_>,
     inputs: &[AggregateBindingInput<'_>],
-    envelope: (usize, BindingProjectionLimits, Policy),
+    envelope: (usize, Option<BindingProjectionLimits>, Policy),
     facts: &mut BindingProjectionFacts,
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -602,7 +613,7 @@ fn validate(
                         &input.source.function,
                         function,
                         source,
-                        limits.max_work - base,
+                        remaining(limits, base)?,
                         &mut |prefix| {
                             facts.cumulative_work_upper_bound = policy.add(
                                 base,
@@ -640,7 +651,7 @@ fn validate(
                         &input.source.intermediate_type,
                         intermediate,
                         source,
-                        limits.max_work - base,
+                        remaining(limits, base)?,
                         &mut |prefix| {
                             facts.cumulative_work_upper_bound = policy.add(
                                 base,
@@ -678,7 +689,7 @@ fn validate(
                 &input.source.function,
                 function,
                 source,
-                remaining(limits.max_work, facts.cumulative_work_upper_bound)?,
+                remaining(limits, facts.cumulative_work_upper_bound)?,
                 work,
             )?;
             facts.cumulative_work_upper_bound = add(
@@ -697,7 +708,7 @@ fn validate(
                 &input.source.intermediate_type,
                 intermediate,
                 source,
-                remaining(limits.max_work, facts.cumulative_work_upper_bound)?,
+                remaining(limits, facts.cumulative_work_upper_bound)?,
                 work,
             )?;
             facts.cumulative_work_upper_bound = add(
@@ -718,7 +729,7 @@ fn encode(
     types: &EncodedTypeTable<'_>,
     functions: &EncodedFunctionBindings<'_, '_>,
     inputs: &[AggregateBindingInput<'_>],
-    envelope: (usize, BindingProjectionLimits, Policy),
+    envelope: (usize, Option<BindingProjectionLimits>, Policy),
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<

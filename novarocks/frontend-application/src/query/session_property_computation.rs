@@ -73,7 +73,7 @@ pub(crate) struct SessionPropertyCpuInput {
     pub(crate) window: ResultWindowAlias,
     pub(crate) catalog: Arc<RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>>,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
-    pub(crate) policy: novarocks_functions::ConstantPolicy,
+    pub(crate) policy: novarocks_functions::ConstantValidation,
 }
 pub(crate) struct PreparedSessionProperties {
     pub(crate) staged: SessionSqlState,
@@ -553,7 +553,7 @@ struct SessionPropertyEvaluation<'a> {
     window: &'a ResultWindowAlias,
     catalog: &'a RwLock<novarocks_sql::planning::catalog::PlannerMemoryCatalog>,
     functions: &'a Arc<dyn SqlFunctionCatalog>,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     parameters: Option<&'a novarocks_sql::compiler::SqlPreparedParameters>,
 }
 
