@@ -328,10 +328,6 @@ impl ConnectorMutationMatchContract {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "observe the original match field roles"
-    )]
     pub fn try_new_observed(
         owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
