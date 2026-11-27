@@ -3006,7 +3006,36 @@ fn assert_keyed_apply_layout_needs_rebuild(
     rest_uri: &str,
     metadata: &serde_json::Value,
 ) -> Result<()> {
+    use super::mv_uea7_documents::wire::Graph;
+
     require_nonaggregate_management_after_restart(context, conn, catalog, "orders_mv")?;
+    let before_refusal = load_metadata(context, rest_uri, "ns", "orders_mv")?;
+    let original = Graph::from_metadata(metadata)?;
+    let readmitted = Graph::from_metadata(&before_refusal)?;
+    assert_keyed_mv_layout(&before_refusal, &readmitted, true)?;
+    ensure!(
+        metadata["table-uuid"].as_str().is_some()
+            && before_refusal["table-uuid"] == metadata["table-uuid"],
+        "readmission changed the original MV table UUID"
+    );
+    ensure!(
+        before_refusal["current-schema-id"] == metadata["current-schema-id"]
+            && before_refusal["schemas"] == metadata["schemas"],
+        "readmission changed the original keyed MV schema"
+    );
+    let original_publication = original
+        .snapshots
+        .iter()
+        .find(|(id, _)| Some(*id) == original.current)
+        .and_then(|(_, record)| record.as_ref())
+        .context("original keyed MV has no Current publication")?;
+    ensure!(
+        readmitted.snapshots.iter().any(|(id, record)| {
+            Some(*id) == readmitted.current && record.as_ref() == Some(original_publication)
+        }),
+        "readmission did not carry the exact old keyed publication to Current"
+    );
+
     assert_content_refresh_explain(context, conn, "NeedsRebuild")?;
     context.action("reject a refresh against the old required apply key");
     let error = conn
@@ -3023,7 +3052,7 @@ fn assert_keyed_apply_layout_needs_rebuild(
         public.message
     );
     let after_refusal = load_metadata(context, rest_uri, "ns", "orders_mv")?;
-    assert_rest_snapshot_state_unchanged(metadata, &after_refusal)?;
+    assert_rest_snapshot_state_unchanged(&before_refusal, &after_refusal)?;
     execute(
         context,
         conn,

@@ -92,10 +92,6 @@ struct Frame {
 }
 
 impl ContentApplyStages {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Each installed stage and Task owner is explicit"
-    )]
     pub(crate) fn new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,

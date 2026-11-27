@@ -826,6 +826,7 @@ async fn prepare_frontend_first_refresh_write(
             source,
             &planning_pin,
             &projection,
+            None,
             attempt.publication_id,
             repartition_transition.and_then(|transition| transition.configuration.as_ref()),
             &connector_context,
@@ -1285,6 +1286,7 @@ async fn prepare_metadata_only_publication(
             source,
             &planning_pin,
             &projection,
+            None,
             attempt.publication_id,
             None,
             connector_context,
@@ -1794,14 +1796,31 @@ async fn prepare_frontend_incremental_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let projection = io.definition(source, &target).await?;
-    let projection = if replay.is_some() {
-        StoredKeyedMvProjection {
-            mv_id: projection.mv_id,
-            facts: novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(original_current.clone())?,
+    let ready = io.definition(source, &target).await?;
+    let (projection, recovery_management) = if let Some(fence) = replay {
+        let installed = ready.facts.source_revision();
+        if installed.target != original_current.view.table
+            || installed.target_object_id != original_current.view.object_id
+            || installed.deployment_owner != original_current.deployment_owner
+            || installed.process_incarnation != original_current.process_incarnation
+            || ready.facts.versions() != &original_current.versions
+            || ready
+                .facts
+                .publication()
+                .is_some_and(|record| &record.publication_id != fence.publication())
+        {
+            return Err("MV strict recovery lost the installed management binding".into());
         }
+        fence.verify(original_current)?;
+        (
+            StoredKeyedMvProjection {
+                mv_id: ready.mv_id,
+                facts: novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(original_current.clone())?,
+            },
+            Some(ready),
+        )
     } else {
-        projection
+        (ready, None)
     };
 
     let interpretation = projection.facts.interpretation();
@@ -2134,6 +2153,13 @@ async fn prepare_frontend_incremental_write(
             source,
             &rewrite,
             &target_binding,
+            recovery_management.as_ref().map(|ready| {
+                // Management still owns its installed dependencies. The
+                // Provider write is fenced against the proved Current.
+                ready
+                    .facts
+                    .management_dependencies(target_binding.planning_pin().control_runtime_id())
+            }),
             target,
             contract,
             attempt,
@@ -2260,6 +2286,7 @@ async fn prepare_frontend_incremental_write(
                 source,
                 target_binding.planning_pin(),
                 rewrite.mv_definition.as_ref(),
+                None,
                 attempt.publication_id,
                 None,
                 &connector_context,
@@ -2436,6 +2463,7 @@ async fn prepare_frontend_incremental_write(
         source,
         &rewrite,
         &target_binding,
+        None,
         target,
         contract,
         attempt,
@@ -2459,6 +2487,9 @@ async fn prepare_canonical_incremental_write(
     source: &IcebergMvCorePorts,
     rewrite: &IcebergMvRewriteContext,
     target_binding: &MvTargetBinding,
+    recovery_management_dependencies: Option<
+        novarocks_mv_application::management::ManagementDependencySet,
+    >,
     target: IcebergMvTarget,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
@@ -2490,6 +2521,7 @@ async fn prepare_canonical_incremental_write(
             source,
             target_binding.planning_pin(),
             rewrite.mv_definition.as_ref(),
+            recovery_management_dependencies,
             attempt.publication_id,
             None,
             &connector_context,

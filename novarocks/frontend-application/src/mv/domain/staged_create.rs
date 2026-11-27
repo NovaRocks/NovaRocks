@@ -32,8 +32,8 @@ use std::sync::Arc;
 use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
-    ManagementEntrance, ManagementEntranceObligation, ManagementRequest, ManagementTimestamp,
-    ProcessIncarnation,
+    ManagementDependencySet, ManagementEntrance, ManagementEntranceObligation, ManagementRequest,
+    ManagementTimestamp, ProcessIncarnation,
 };
 use novarocks_mv_application::persistence::codec::{DefinitionDocument, InterpretationDocument};
 use novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision;
@@ -2264,6 +2264,7 @@ struct MvPublicationAdmissionInput {
     entrance: ManagementEntrance,
     planning: ConnectorControlPlanningPin,
     projection: novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    management_dependencies: ManagementDependencySet,
     publication_id: LakePublicationId,
     configuration: Option<MvRefreshPropertyChanges>,
     context: ConnectorRequestContext,
@@ -2463,6 +2464,7 @@ pub(crate) async fn admit_mv_publication_async_in(
     entrance: &ManagementEntrance,
     planning: &ConnectorControlPlanningPin,
     projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    management_dependencies: ManagementDependencySet,
     publication_id: LakePublicationId,
     configuration: Option<&MvRefreshPropertyChanges>,
     context: &ConnectorRequestContext,
@@ -2475,6 +2477,7 @@ pub(crate) async fn admit_mv_publication_async_in(
         entrance: entrance.clone(),
         planning: planning.clone(),
         projection: projection.clone(),
+        management_dependencies,
         publication_id,
         configuration: configuration.cloned(),
         context: context.clone(),
@@ -2498,12 +2501,7 @@ pub(crate) async fn admit_mv_publication_async_in(
             source.target.clone(),
             Some(source.target_object_id.clone()),
             ConnectorDocumentManagementOperation::Publication,
-            Some(
-                input
-                    .projection
-                    .facts
-                    .management_dependencies(input.planning.control_runtime_id()),
-            ),
+            Some(input.management_dependencies.clone()),
             EffectScope::CATALOG_COMMIT,
         )
         .map_err(|error| {
@@ -2708,11 +2706,15 @@ mod tests {
             .unwrap();
         let receiving = MvPublicationAdmissionReceiving::new();
         let publication_id = LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).unwrap();
+        let management_dependencies = projection
+            .facts
+            .management_dependencies(planning.control_runtime_id());
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let mut future = std::pin::pin!(admit_mv_publication_async_in(
             &entrance,
             &planning,
             &projection,
+            management_dependencies.clone(),
             publication_id,
             None,
             &context,
@@ -2734,6 +2736,7 @@ mod tests {
                 &entrance,
                 &planning,
                 &projection,
+                management_dependencies,
                 publication_id,
                 None,
                 &context,

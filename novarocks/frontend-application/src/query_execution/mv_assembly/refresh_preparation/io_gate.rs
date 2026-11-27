@@ -46,6 +46,7 @@ use crate::mv::domain::staged_create::{
     AdmittedMvPublication, CurrentProjectionRegistration, MvPublicationAdmissionReceiving,
 };
 use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
+use novarocks_mv_application::management::ManagementDependencySet;
 use novarocks_mv_application::persistence::keyed_documents::{
     MvKeyedDocumentProjection, MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection,
 };
@@ -104,6 +105,7 @@ enum Request {
         source: IcebergMvCorePorts,
         planning_pin: ConnectorControlPlanningPin,
         projection: StoredKeyedMvProjection,
+        management_dependencies: ManagementDependencySet,
         id: novarocks_spi::connector::LakePublicationId,
         configuration: Option<MvRefreshPropertyChanges>,
         context: ConnectorRequestContext,
@@ -650,6 +652,7 @@ impl MvRefreshPreparationIo {
                         source,
                         planning_pin,
                         projection,
+                        management_dependencies,
                         id,
                         configuration,
                         context,
@@ -660,6 +663,7 @@ impl MvRefreshPreparationIo {
                                     entrance,
                                     &planning_pin,
                                     &projection,
+                                    management_dependencies,
                                     id,
                                     configuration.as_ref(),
                                     &context,
@@ -1063,6 +1067,7 @@ impl MvRefreshPreparationIo {
         source: &IcebergMvCorePorts,
         planning_pin: &ConnectorControlPlanningPin,
         projection: &StoredKeyedMvProjection,
+        recovery_management_dependencies: Option<ManagementDependencySet>,
         id: novarocks_spi::connector::LakePublicationId,
         configuration: Option<&MvRefreshPropertyChanges>,
         context: &ConnectorRequestContext,
@@ -1072,6 +1077,11 @@ impl MvRefreshPreparationIo {
                 source: source.clone(),
                 planning_pin: planning_pin.clone(),
                 projection: projection.clone(),
+                management_dependencies: recovery_management_dependencies.unwrap_or_else(|| {
+                    projection
+                        .facts
+                        .management_dependencies(planning_pin.control_runtime_id())
+                }),
                 id,
                 configuration: configuration.cloned(),
                 context: context.clone(),
