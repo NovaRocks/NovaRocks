@@ -46,7 +46,7 @@ use novarocks_spi::connector::document_storage::{
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlPlanningPin, ConnectorExactSemanticRevision,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectId, LakePublicationId,
+    ConnectorTableObjectId, KeyedDocumentView, LakePublicationId,
 };
 
 #[path = "staged_create/create_original.rs"]
@@ -376,31 +376,44 @@ pub(crate) async fn install_published_current_projection_async_in(
     .await
 }
 
-pub(crate) async fn install_metadata_only_current_projection_async_in(
-    entrance: &ManagementEntrance,
-    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+pub(crate) enum CurrentRenewal {
+    MetadataOnly(
+        Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
+    ),
+    PublishedContent {
+        target: novarocks_mv_application::product::MvTarget,
+        expected: Box<KeyedDocumentView>,
+        previous: ManagementDependencySet,
+    },
+}
+
+pub(crate) async fn renew_admitted_current_projection_async_in(
+    services: CurrentProjectionServices<'_, '_>,
     catalog: CatalogHandle,
-    expected: Arc<
-        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
-    >,
+    renewal: CurrentRenewal,
     context: ConnectorRequestContext,
-    metadata_cpu: &CurrentProjectionMetadataCpu,
-    registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
+    let (target, convergence) = match renewal {
+        CurrentRenewal::MetadataOnly(expected) => (
+            expected.target(),
+            MvConvergence::MetadataOnlyCurrent { expected },
+        ),
+        CurrentRenewal::PublishedContent {
+            target,
+            expected,
+            previous,
+        } => (
+            target,
+            MvConvergence::PublishedContent { expected, previous },
+        ),
+    };
     install_current_projection_async_in(
-        CurrentProjectionServices {
-            entrance,
-            readiness,
-            connector_control,
-            metadata_cpu,
-            registration,
-        },
+        services,
         catalog,
-        expected.target(),
+        target,
         uuid::Uuid::now_v7(),
         None,
-        MvConvergence::MetadataOnlyCurrent { expected },
+        convergence,
         context,
     )
     .await
@@ -489,6 +502,11 @@ enum MvConvergence {
         expected: std::sync::Arc<
             novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
         >,
+    },
+    /// Same-owner content Current advanced while this entrance stayed open.
+    PublishedContent {
+        expected: Box<KeyedDocumentView>,
+        previous: ManagementDependencySet,
     },
     /// An effect this process committed must be re-observed before management
     /// reopens.
@@ -1420,6 +1438,19 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
+            MvConvergence::PublishedContent { expected, previous } => {
+                let (observed, admission, _) = self
+                    .entrance
+                    .observe_exact_keyed_admission_async(
+                        &documents,
+                        observation,
+                        expected,
+                        previous,
+                    )
+                    .await
+                    .map_err(MvProjectionError::from)?;
+                return Ok((observed, admission));
+            }
             MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
                 self.entrance.begin_committed_convergence(
                     &table,
@@ -1643,6 +1674,11 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                     ));
                 }
                 return Ok((observed, admission));
+            }
+            MvConvergence::PublishedContent { .. } => {
+                return Err(conflict(
+                    "Published content renewal requires the original async observation".into(),
+                ));
             }
             MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
                 self.entrance.begin_committed_convergence(

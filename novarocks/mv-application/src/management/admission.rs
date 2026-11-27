@@ -1061,6 +1061,46 @@ impl ManagementEntrance {
         ),
         crate::persistence::documents::MvDocumentError,
     > {
+        self.observe_keyed_admission_async_inner(lease, request, None)
+            .await
+    }
+
+    /// Renew an already admitted target only from the expected provider Current
+    /// while the entrance still holds the caller's previously admitted dependencies.
+    pub async fn observe_exact_keyed_admission_async(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        expected: &novarocks_spi::connector::KeyedDocumentView,
+        previous: &ManagementDependencySet,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+            SlotChangeConvergence,
+        ),
+        crate::persistence::documents::MvDocumentError,
+    > {
+        self.observe_keyed_admission_async_inner(lease, request, Some((expected, previous)))
+            .await
+    }
+
+    async fn observe_keyed_admission_async_inner(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        exact: Option<(
+            &novarocks_spi::connector::KeyedDocumentView,
+            &ManagementDependencySet,
+        )>,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+            SlotChangeConvergence,
+        ),
+        crate::persistence::documents::MvDocumentError,
+    > {
         use crate::persistence::{
             documents::MvDocumentError,
             keyed_documents::{
@@ -1074,6 +1114,11 @@ impl ManagementEntrance {
         if self.revoke_foreign_current_management(&view, &catalog)? {
             return Err(MvDocumentError::Contract(
                 "keyed observation Current management names another owner or incarnation".into(),
+            ));
+        }
+        if exact.is_some_and(|(expected, _)| expected != &view) {
+            return Err(MvDocumentError::Contract(
+                "keyed observation Current differs from the expected view".into(),
             ));
         }
         let documents = resolve_current_keyed_documents(view, catalog)?;
@@ -1116,6 +1161,11 @@ impl ManagementEntrance {
             .ok_or_else(|| {
                 MvDocumentError::Contract("keyed observation target admission is closed".into())
             })?;
+        if exact.is_some_and(|(_, previous)| previous != &current.dependencies) {
+            return Err(MvDocumentError::Contract(
+                "keyed observation previously admitted dependencies changed".into(),
+            ));
+        }
         current.dependencies = documents.management_dependencies(control);
         let admission = MvCurrentManagementAdmission {
             target: documents.management_target.clone(),

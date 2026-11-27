@@ -31,11 +31,15 @@ CREATE SCHEMA mvmeta_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvmeta_${uuid0}.ns_${uuid0}.fact (k VARCHAR, v BIGINT) WITH (format_version = 3);
+CREATE TABLE mvmeta_${uuid0}.ns_${uuid0}.fact (k VARCHAR, v BIGINT, payload VARCHAR) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10);
+-- Keep unchanged filtered rows in files outside the small refresh window.
+INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact
+SELECT 'excluded', -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR))))
+FROM TABLE(sequence(1, 4096)) AS cold(id);
+INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('east', 10);
 
 -- query 5
 -- @skip_result_check=true
@@ -50,21 +54,25 @@ REFRESH MATERIALIZED VIEW mv_filtered;
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact VALUES ROW('west', -1);
+INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('west', -1);
 
 -- query 8
+-- @result_contains=MV refresh: ContentLocate
+EXPLAIN REFRESH MATERIALIZED VIEW mv_filtered;
+
+-- query 9
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=2,slot-changes=0,metadata-only-last=true,full-refreshes=1
 REFRESH MATERIALIZED VIEW mv_filtered;
 
--- query 9
+-- query 10
 -- @skip_result_check=true
 -- @result_contains=east
 -- @result_contains=10
 -- @result_not_contains=west
 SELECT k, v FROM mv_filtered ORDER BY k, v;
 
--- query 10
+-- query 11
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvmeta_${uuid0}.ns_${uuid0};

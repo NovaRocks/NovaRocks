@@ -43,7 +43,8 @@ use super::captured_sources::CapturedRefreshSources;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::refresh::pending_fence::PendingFence;
 use crate::mv::domain::staged_create::{
-    AdmittedMvPublication, CurrentProjectionRegistration, MvPublicationAdmissionReceiving,
+    AdmittedMvPublication, CurrentProjectionRegistration, CurrentProjectionServices,
+    CurrentRenewal, MvPublicationAdmissionReceiving,
 };
 use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::management::ManagementDependencySet;
@@ -113,8 +114,7 @@ enum Request {
     InstallCurrent {
         source: IcebergMvCorePorts,
         catalog: novarocks_spi::connector::CatalogHandle,
-        expected:
-            Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
+        renewal: CurrentRenewal,
         context: ConnectorRequestContext,
     },
 
@@ -681,17 +681,28 @@ impl MvRefreshPreparationIo {
                     Request::InstallCurrent {
                         source,
                         catalog,
-                        expected,
+                        renewal,
                         context,
                     } => {
                         let view = source
                             .readiness()
                             .in_requests(Arc::clone(&services.requests));
-                        let result=match source.management_entrance() {
-                            Ok(entrance)=>crate::mv::domain::staged_create::install_metadata_only_current_projection_async_in(
-                                entrance,&view,source.connector_control(),catalog,expected,context,&current_metadata_cpu,&registration
-                            ).await.map_err(projection_error),
-                            Err(error)=>Err(contract_error(error)),
+                        let result = match source.management_entrance() {
+                            Ok(entrance) => crate::mv::domain::staged_create::renew_admitted_current_projection_async_in(
+                                CurrentProjectionServices {
+                                    entrance,
+                                    readiness: &view,
+                                    connector_control: source.connector_control(),
+                                    metadata_cpu: &current_metadata_cpu,
+                                    registration: &registration,
+                                },
+                                catalog,
+                                renewal,
+                                context,
+                            )
+                            .await
+                            .map_err(projection_error),
+                            Err(error) => Err(contract_error(error)),
                         };
                         Response::InstallCurrent(result)
                     }
@@ -1099,16 +1110,14 @@ impl MvRefreshPreparationIo {
         &self,
         source: &IcebergMvCorePorts,
         catalog: novarocks_spi::connector::CatalogHandle,
-        expected: Arc<
-            novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
-        >,
+        renewal: CurrentRenewal,
         context: ConnectorRequestContext,
     ) -> Result<(), MvApplicationError> {
         let Response::InstallCurrent(result) = self
             .exchange(Request::InstallCurrent {
                 source: source.clone(),
                 catalog,
-                expected,
+                renewal,
                 context,
             })
             .await

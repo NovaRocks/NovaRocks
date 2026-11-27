@@ -76,17 +76,21 @@ SELECT id FROM source_view ORDER BY id;
 INSERT INTO replacement VALUES (3);
 
 -- query 15
--- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=6,full-refreshes=2,append-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
-REFRESH MATERIALIZED VIEW target_mv;
+-- @result_contains=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 16
-SELECT id FROM target_mv ORDER BY id;
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=7,full-refreshes=3,full-refresh-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 17
-SELECT id FROM source_view ORDER BY id;
+SELECT id FROM target_mv ORDER BY id;
 
 -- query 18
+SELECT id FROM source_view ORDER BY id;
+
+-- query 19
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.target_mv;

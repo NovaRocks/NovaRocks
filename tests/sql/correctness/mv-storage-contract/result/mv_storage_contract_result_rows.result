@@ -1,21 +1,21 @@
--- query 9
+-- query 10
 -- types	varchar	bigint
 k	v
 west	20
 
--- query 13
--- types	varchar	bigint
-k	v
-north	30
-west	20
-
--- query 16
+-- query 15
 -- types	varchar	bigint
 k	v
 north	30
 west	20
 
--- query 20
+-- query 18
+-- types	varchar	bigint
+k	v
+north	30
+west	20
+
+-- query 23
 -- types	bigint
 row_count
 0

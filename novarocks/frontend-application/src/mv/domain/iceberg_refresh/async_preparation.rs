@@ -16,12 +16,14 @@
 // under the License.
 
 use super::*;
+use crate::mv::domain::staged_create::{CurrentRenewal, metadata_only_current_matches};
 use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError as RefreshError;
 use crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo;
 use novarocks_mv_application::persistence::identity::DocumentRevision;
 use novarocks_mv_application::persistence::rebuild_classification::{
     DefinitionAnalysisFailure, RebuildEvidence, ReplacementEvidence,
 };
+use novarocks_mv_application::persistence::resolution::ApplicablePublication;
 use novarocks_query_application::sql::session::registry::SessionPropertyInputs;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorProviderBindingKey,
@@ -348,13 +350,9 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .original_operation_control()
         .check_active()
         .map_err(RefreshError::from)?;
-    // Preparation normally only observes the currently admitted catalog and
-    // MV facts. A snapshot fence may rebuild sealed Current only as a
-    // read-only candidate; this path has no authority to readmit management
-    // readiness and therefore still fails the refresh.
-    // Metadata maintenance may renew an existing admission only while its
-    // carrier facts remain identical. This observation cannot recover an old
-    // document format or reopen management without explicit readmission.
+    // A fresh Current can renew an open management entrance after metadata
+    // maintenance or when a non-aggregate publication landed. Other snapshot
+    // changes may only install a read-only candidate.
     let (closed, observed_current) =
         reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
             .await?;
@@ -2264,13 +2262,38 @@ async fn reobserve_current_management_before_refresh(
         .await?
     {
         let expected = &ready.projection.facts;
-        if expected.metadata_version() != &observed.view.metadata_version
-            && crate::mv::domain::staged_create::metadata_only_current_matches(expected, &observed)
+        let previous = expected.source_revision();
+        let renewal = if expected.metadata_version() == &observed.view.metadata_version {
+            None
+        } else if metadata_only_current_matches(expected, &observed) {
+            Some(CurrentRenewal::MetadataOnly(Arc::new(expected.clone())))
+        } else if schema.exact_schema().metadata_version == observed.view.metadata_version
+            && !expected.interpretation().is_aggregate()
+            && !observed.interpretation.is_aggregate()
+            && matches!(
+                observed.applicable_publication(),
+                ApplicablePublication::Bound(_)
+            )
+            && observed.eligibility().rewrite_serving
+            && observed.view.table == previous.target
+            && observed.view.object_id == previous.target_object_id
+            && observed.deployment_owner == previous.deployment_owner
+            && observed.process_incarnation == previous.process_incarnation
+            && observed.publication_revision != previous.publication_revision
         {
+            Some(CurrentRenewal::PublishedContent {
+                target: expected.target(),
+                expected: Box::new(observed.view.clone()),
+                previous: expected.management_dependencies(documents.control_runtime_id()),
+            })
+        } else {
+            None
+        };
+        if let Some(renewal) = renewal {
             io.install_current(
                 source,
                 request.catalog_handle.clone(),
-                Arc::new(expected.clone()),
+                renewal,
                 context.clone(),
             )
             .await?;
