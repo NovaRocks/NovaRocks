@@ -28,11 +28,8 @@ use super::{
 };
 use crate::{
     TaskRootDrainPermit,
-    root_result_channel::{
-        RootCapacityRefusal, RootChannelError, RootDeliveryOwner, RootMetadataReservation,
-    },
+    root_result_channel::{RootChannelError, RootDeliveryOwner, RootMetadataReservation},
 };
-use novarocks_execution::runtime::task::io::ResultWriteAdmission;
 use novarocks_execution_contract::{
     AbortParticipation, AcquireParticipationAdmissionTicket, AdmissionTicketId, CreateTask,
     EstablishParticipation, ParticipationRef, QuiesceParticipation, ReleaseParticipation,
@@ -743,14 +740,6 @@ impl WorkerRootRead {
     }
     pub fn accepted_consumed(&self) -> u64 {
         self.original.accepted_consumed()
-    }
-    pub fn try_reserve_native_send_backing(
-        &self,
-    ) -> Result<ResultWriteAdmission, RootChannelError> {
-        self.original.try_reserve_native_send_backing()
-    }
-    pub fn native_send_backing_refusal(&self) -> Result<RootCapacityRefusal, RootChannelError> {
-        self.original.native_send_backing_refusal()
     }
     pub async fn read(self) -> Result<WorkerRootDelivery, WorkerRootReadError> {
         let original = self

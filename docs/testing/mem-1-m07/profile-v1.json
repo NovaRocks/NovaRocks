@@ -173,10 +173,9 @@
     "terminal_positions": 1,
     "segment_backing_capacity_bytes": 1052672,
     "live_send_holders": 2,
-    "independent_payload_copies_per_send": 2,
     "fixed_schema_cursor_driver_capacity_bytes": 1048576,
     "actual_exit_deadline_ms": 2000,
-    "shared_transport_charge": "existing process retained budget, reserved control/connection classes before root growth; no second allocator wallet",
+    "shared_transport_charge": "the Root wallet funds its segments, input, scratch and fixed metadata; process headroom covers tonic encoding buffers",
     "worst_input_admission": "one root final upstream pull token; reserve complete exact overlap before growth, other DOP drivers wait without a final pending input",
     "retired_segment_tail_positions": 2
   },

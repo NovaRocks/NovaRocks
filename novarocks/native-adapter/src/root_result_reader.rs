@@ -17,20 +17,18 @@
 
 //! Owned, transport-independent Native root reads. No RPC is installed here.
 //!
-//! The consumer must retain the returned owner beside every independently
-//! allocated wire backing, through Body and the last physical DATA alias.
+//! The consumer retains the returned delivery and metadata owner through
+//! the response body and the last physical DATA alias.
 //! Pure protobuf projection or handler return is not a send-exit receipt.
 
 use std::alloc::Layout;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_execution_contract::root_result::{
     RootReadDeferral, RootReadDeferred, RootReadRefusal, RootResultRead, RootResultReply,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
-use novarocks_result_contract::RootProfileV1;
 use novarocks_worker::root_result_channel::{
     RootChannelError, RootDeliveryOwner, RootMetadataReservation,
 };
@@ -46,41 +44,16 @@ pub enum NativeRootReadResponse {
     Refused(Box<RootReadRefusal>),
 }
 
-/// Full copy credit follows the send owner; logical encoded length cannot
-/// shrink it. The same owner keeps the existing root delivery position live.
+/// The original delivery position and fixed metadata follow the send owner.
 pub struct NativeRootSendOwnership {
     resources: Option<Arc<NativeRootSendResources>>,
 }
 
 struct NativeRootSendResources {
     // Physical wire backings live in the caller's wrapper, before this owner.
-    // Credit and delivery exit precede the fixed wrapper metadata reservation.
+    // Delivery exits before the fixed wrapper metadata reservation.
     _delivery: RootDeliveryOwner,
-    backing: NativeRootSendBacking,
-    _metadata: Option<RootMetadataReservation>,
-}
-
-enum NativeRootSendBacking {
-    Payload(ResultWriteCredit),
-    // ACK-only has no data-position dependency. Its complete two-copy
-    // envelope and wrapper share one original fixed metadata reservation.
-    ControlMetadata(RootMetadataReservation),
-}
-
-impl NativeRootSendOwnership {
-    pub fn backing_capacity_bytes(&self) -> usize {
-        match &self
-            .resources
-            .as_ref()
-            .expect("live root send owner")
-            .backing
-        {
-            NativeRootSendBacking::Payload(credit) => credit.bytes(),
-            NativeRootSendBacking::ControlMetadata(_reservation) => {
-                2 * RootProfileV1::ENVELOPE_BYTES
-            }
-        }
-    }
+    _metadata: RootMetadataReservation,
 }
 
 impl Clone for NativeRootSendOwnership {
@@ -97,8 +70,8 @@ impl Drop for NativeRootSendOwnership {
     fn drop(&mut self) {
         // No Weak, raw Arc, or Deref escapes this strong-only handle. Pinned
         // std Arc::into_inner drops its implicit Weak (freeing the allocation)
-        // before returning the last Resources value. Only then can its copy
-        // credit, delivery position and metadata reservation physically exit.
+        // before returning the last Resources value. Only then can its
+        // delivery position and metadata reservation physically exit.
         let resources = Arc::into_inner(self.resources.take().expect("live root send owner"));
         drop(resources);
     }
@@ -126,7 +99,7 @@ impl NativeRootResultReply {
 
 /// Exact local wrapper layout under the workspace's pinned Rust 1.98.1 Arc
 /// representation. No callback, schema tree, or opaque allocator is guessed.
-/// Worker owns and covers its existing delivery/credit issuer scaffolds.
+/// Worker owns and covers its existing delivery issuer scaffolding.
 pub fn native_root_send_metadata_bytes() -> usize {
     #[repr(C, align(2))]
     struct ArcHeader {
@@ -372,18 +345,10 @@ impl NativeRootResultReader {
             Err(error) => return worker_refusal(request, error, "begin"),
         };
         tracing::debug!(task = ?request.root_task(), wanted = ?request.wanted(), consumed = request.consumed(), data_wait = ?request.max_wait(), deadline = ?deadline, "Native Root admitted original read");
-        // ACK retires queue ownership before data-copy admission. It cannot
-        // wait for the data budget that its own retirement makes available.
-        // Metadata precedes ACK and every reply/Arc projection; ACK-only's
-        // complete two-copy envelope is included in this same reservation.
-        let ack_only = request.wanted().is_none();
-        let metadata_bytes = native_root_send_metadata_bytes()
-            .checked_add(if ack_only {
-                2 * RootProfileV1::ENVELOPE_BYTES
-            } else {
-                0
-            })
-            .and_then(|bytes| bytes.checked_add(transport_metadata_bytes));
+        // Reserve the Root-owned metadata before ACK and reply/Arc projection.
+        // Encoding buffers belong to the transport.
+        let metadata_bytes =
+            native_root_send_metadata_bytes().checked_add(transport_metadata_bytes);
         let Some(metadata_bytes) = metadata_bytes else {
             return refusal(request, RootChannelError::SendGeometry);
         };
@@ -418,29 +383,6 @@ impl NativeRootResultReader {
                 accepted_consumed: admitted.accepted_consumed(),
             };
         }
-        let (backing, metadata) = if ack_only {
-            (NativeRootSendBacking::ControlMetadata(metadata), None)
-        } else {
-            let credit = match admitted.try_reserve_native_send_backing() {
-                Ok(ResultWriteAdmission::Granted(credit)) => credit,
-                Ok(ResultWriteAdmission::Blocked) => {
-                    return match admitted.native_send_backing_refusal() {
-                        Ok(cause) => deferred(
-                            request,
-                            RootReadDeferral::SendBackingBusy(cause.resource_facts()),
-                        ),
-                        Err(error) => refusal(request, error),
-                    };
-                }
-                Err(RootChannelError::Closed) => {
-                    return NativeRootReadResponse::AwaitTerminalControl {
-                        accepted_consumed: admitted.accepted_consumed(),
-                    };
-                }
-                Err(error) => return refusal(request, error),
-            };
-            (NativeRootSendBacking::Payload(credit), Some(metadata))
-        };
         let delivery = match admitted.read().await {
             Ok(delivery) => delivery,
             Err(error) => return worker_refusal(request, error, "read"),
@@ -488,7 +430,6 @@ impl NativeRootResultReader {
             reply,
             ownership: NativeRootSendOwnership {
                 resources: Some(Arc::new(NativeRootSendResources {
-                    backing,
                     _delivery: guard,
                     _metadata: metadata,
                 })),

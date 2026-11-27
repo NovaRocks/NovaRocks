@@ -3846,11 +3846,10 @@ pub(crate) mod terminal_observation_tests {
         let (fixture, _budget, _limits) = input_resource_fixture(FrozenRootOutput::CountOnly);
         let channel = fixture.session.channel();
         let bytes = fixture.session.shared.authority.required_bytes();
-        let ResultWriteAdmission::Granted(first) = channel.try_reserve(bytes).unwrap() else {
-            panic!("first real retained credit")
-        };
-        let ResultWriteAdmission::Granted(second) = channel.try_reserve(bytes).unwrap() else {
-            panic!("second real retained credit")
+        // A single credit fills enough of the byte wallet to refuse one more
+        // input. Its sibling reservation position is still available.
+        let ResultWriteAdmission::Granted(credit) = channel.try_reserve(2 * bytes).unwrap() else {
+            panic!("real retained byte pressure using one position")
         };
         assert!(
             matches!(
@@ -3875,7 +3874,7 @@ pub(crate) mod terminal_observation_tests {
         let self_notifications = notifications.load(Ordering::SeqCst);
         // This is the real channel credit's budget release and original
         // budget->channel->WakeBridge path, not a fabricated notification.
-        drop(first);
+        drop(credit);
         let after_funding = observable.generation();
         let funding_notifications = notifications.load(Ordering::SeqCst);
         let admitted = fixture.session.try_acquire_input();
@@ -3884,7 +3883,6 @@ pub(crate) mod terminal_observation_tests {
         };
         let grant_exit = permit.retire();
         drop(permit);
-        drop(second);
         drop(subscription);
         fixture.session.finish_input().unwrap();
         fixture.release();

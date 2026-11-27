@@ -714,7 +714,6 @@ fn encode_support_geometry(
         root_terminal_positions: value.root_terminal_positions,
         root_segment_backing_capacity_bytes: value.root_segment_backing_capacity_bytes,
         root_live_send_holders: value.root_live_send_holders,
-        root_independent_payload_copies_per_send: value.root_independent_payload_copies_per_send,
         root_fixed_schema_cursor_driver_capacity_bytes: value
             .root_fixed_schema_cursor_driver_capacity_bytes,
         root_actual_exit_deadline_ms: value.root_actual_exit_deadline_ms,

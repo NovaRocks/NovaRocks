@@ -178,9 +178,6 @@ pub fn decode_response(
                 Some(Reason::SendMetadataBusy(r)) => RootReadDeferral::SendMetadataBusy(
                     decode_resource_facts(&r, p.field("send_metadata_busy"))?,
                 ),
-                Some(Reason::SendBackingBusy(r)) => RootReadDeferral::SendBackingBusy(
-                    decode_resource_facts(&r, p.field("send_backing_busy"))?,
-                ),
                 _ => return Err(invalid(p, "deferred root read requires a closed reason")),
             };
             return Ok(RootReadResponse::Deferred(RootReadDeferred::for_request(
@@ -298,9 +295,6 @@ pub fn encode_response(
                 }
                 RootReadDeferral::SendMetadataBusy(r) => {
                     Reason::SendMetadataBusy(encode_resource_facts(r))
-                }
-                RootReadDeferral::SendBackingBusy(r) => {
-                    Reason::SendBackingBusy(encode_resource_facts(r))
                 }
             };
             WireResult::Deferred(wire::RootReadDeferred {
@@ -611,7 +605,6 @@ mod tests {
             RootReadDeferral::Preparing,
             RootReadDeferral::ReadHoldersBusy(facts),
             RootReadDeferral::SendMetadataBusy(facts),
-            RootReadDeferral::SendBackingBusy(facts),
         ] {
             results.push(RootReadResponse::Deferred(RootReadDeferred::for_request(
                 &request, reason,
