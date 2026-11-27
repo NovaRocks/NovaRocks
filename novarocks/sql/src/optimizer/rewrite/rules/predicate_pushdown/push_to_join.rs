@@ -702,7 +702,7 @@ fn factor_common_eq_from_or(
             }
             let in_all = branch_conjuncts[1..]
                 .iter()
-                .all(|conjs| conjs.iter().any(|c| *c == *candidate));
+                .all(|conjs| conjs.contains(candidate));
             if in_all {
                 common_eqs.push(*candidate);
             }
