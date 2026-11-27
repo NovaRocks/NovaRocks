@@ -129,7 +129,8 @@ USE ${case_db};
 with t1 as (
  select json_parse('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
 ),t2 as (
- select price_list,transform(cast(price_list as array<json>), x -> get_json_string(x,'$.open_id')) as  fields
+ select price_list,
+        transform(CAST(price_list AS ARRAY(ROW(open_id VARCHAR, num INTEGER))), x -> x.open_id) AS fields
  from t1  
 )
 select * from t2 

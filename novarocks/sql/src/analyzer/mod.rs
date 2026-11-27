@@ -87,7 +87,9 @@ mod scope;
 mod subquery_rewrite;
 
 pub mod iceberg_metadata;
-mod iceberg_partitions;
+#[cfg(test)]
+#[path = "iceberg_partitions_tests.rs"]
+mod iceberg_metadata_partitions_tests;
 pub mod iceberg_ref;
 pub(crate) mod mv_lineage;
 
@@ -8524,26 +8526,6 @@ mod tests {
                 ),
             }
         }
-
-        fn metadata_table_def(
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-            metadata_table_type: SqlMetadataTableKind,
-        ) -> TableDef {
-            let mut table_def = Self::table_def(catalog, database, table);
-            table_def.columns = metadata_table_columns(&metadata_table_type);
-            table_def.source = sql_test_scan_source(
-                catalog.unwrap_or("default_catalog"),
-                database,
-                table,
-                SqlScanKind::Metadata {
-                    kind: metadata_table_type,
-                    version: SqlTableVersionSelector::Current,
-                },
-            );
-            table_def
-        }
     }
 
     impl crate::catalog::PlannerTableProvider for CatalogAwareTestCatalog {
@@ -8557,26 +8539,6 @@ mod tests {
                 catalog,
                 database,
                 Self::table_def(catalog, database, table),
-            ))
-        }
-
-        fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-            Some(self)
-        }
-    }
-
-    impl IcebergMetadataTableProvider for CatalogAwareTestCatalog {
-        fn get_iceberg_metadata_table(
-            &self,
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-            metadata_table_type: SqlMetadataTableKind,
-        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
-                catalog,
-                database,
-                Self::metadata_table_def(catalog, database, table, metadata_table_type),
             ))
         }
     }
@@ -8615,125 +8577,168 @@ mod tests {
         assert_eq!(scan.table.name, "ice_db_orders");
     }
 
+    #[derive(Default)]
+    struct PartitionsLookupCatalog {
+        lookups: std::cell::Cell<usize>,
+        extra_predicate: &'static str,
+    }
+
+    impl crate::catalog::PlannerTableProvider for PartitionsLookupCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            Err("partitions fixture requires a metadata lookup".into())
+        }
+
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+    }
+
+    impl IcebergMetadataTableProvider for PartitionsLookupCatalog {
+        fn get_iceberg_metadata_table(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            metadata_table_type: SqlMetadataTableKind,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            use crate::catalog::SqlViewColumn;
+            use crate::planning::catalog::{bind_derived_metadata_view, resolved_metadata_table};
+            use novarocks_type_contract::FunctionValueType;
+
+            assert_eq!((catalog, database, table), (Some("ice"), "db", "orders"));
+            assert_eq!(metadata_table_type, SqlMetadataTableKind::Files);
+            self.lookups.set(self.lookups.get() + 1);
+            let slot = SqlTableBindingId::new_for_test(73);
+            let columns = [
+                ("content", DataType::Int32),
+                ("record_count", DataType::Int64),
+                ("file_size_in_bytes", DataType::Int64),
+            ]
+            .map(|(name, data_type)| {
+                ColumnDef::from_value_type(
+                    name.into(),
+                    FunctionValueType::new(data_type, false),
+                    None,
+                )
+                .unwrap()
+            });
+            let source = resolved_metadata_table(
+                catalog.unwrap(),
+                database,
+                table,
+                metadata_table_type,
+                columns.into(),
+                vec![],
+                slot,
+            );
+            let view_columns = [
+                ("record_count", true),
+                ("file_count", false),
+                ("total_size", true),
+            ]
+            .map(|(name, nullable)| SqlViewColumn {
+                name: name.into(),
+                value_type: FunctionValueType::new(DataType::Int64, nullable),
+            });
+            bind_derived_metadata_view(
+                source,
+                slot,
+                "orders$partitions",
+                format!(
+                    r#"SELECT sum(record_count) AS record_count, count(*) AS file_count,
+                       sum(file_size_in_bytes) AS total_size FROM "ice"."db"."orders$files"
+                       WHERE content = 0 {} HAVING count(*) > 0"#,
+                    self.extra_predicate,
+                )
+                .into(),
+                std::sync::Arc::from(view_columns),
+            )
+        }
+    }
+
     #[test]
     fn analyzer_uses_files_metadata_provider_for_partitions_view() {
-        struct MetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::catalog::PlannerTableProvider for MetadataModeCatalog {
-            fn resolve_table_for_analysis(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
-            }
-
-            fn resolve_quoted_iceberg_metadata(
-                &self,
-                name: &novarocks_parser::ast::ObjectName,
-                catalog: Option<&str>,
-                database: &str,
-            ) -> Option<crate::catalog::QuotedMetadataTable> {
-                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
-                    name, catalog, database, self,
-                )
-            }
-
-            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-                Some(self)
-            }
-        }
-
-        impl IcebergMetadataTableProvider for MetadataModeCatalog {
-            fn get_iceberg_metadata_table(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-                metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Files);
-                CatalogAwareTestCatalog.get_iceberg_metadata_table(
-                    catalog,
-                    database,
-                    table,
-                    metadata_table_type,
-                )
-            }
-        }
-
-        let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
+        let catalog = PartitionsLookupCatalog::default();
         let query = parse_native_query("SELECT record_count FROM ice.db.\"orders$partitions\"")
             .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
-        assert!(
-            catalog.0.get(),
-            "Files metadata provider was not requested by the partitions view"
+        assert_eq!(
+            catalog.lookups.get(),
+            1,
+            "partitions must consume one Files lookup"
         );
     }
 
     #[test]
     fn analyzer_uses_lowercase_catalog_for_metadata_provider() {
-        struct LowercaseMetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::catalog::PlannerTableProvider for LowercaseMetadataModeCatalog {
-            fn resolve_table_for_analysis(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
-            }
-
-            fn resolve_quoted_iceberg_metadata(
-                &self,
-                name: &novarocks_parser::ast::ObjectName,
-                catalog: Option<&str>,
-                database: &str,
-            ) -> Option<crate::catalog::QuotedMetadataTable> {
-                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
-                    name, catalog, database, self,
-                )
-            }
-
-            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-                Some(self)
-            }
-        }
-
-        impl IcebergMetadataTableProvider for LowercaseMetadataModeCatalog {
-            fn get_iceberg_metadata_table(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-                metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                assert_eq!(catalog, Some("ice"));
-                assert_eq!(database, "db");
-                assert_eq!(table, "orders");
-                self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Files);
-                CatalogAwareTestCatalog.get_iceberg_metadata_table(
-                    catalog,
-                    database,
-                    table,
-                    metadata_table_type,
-                )
-            }
-        }
-
-        let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
+        let catalog = PartitionsLookupCatalog::default();
         let query = parse_native_query("SELECT record_count FROM ICE.DB.\"ORDERS$partitions\"")
             .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
-        assert!(
-            catalog.0.get(),
-            "Files metadata provider was not requested by the partitions view"
+        assert_eq!(
+            catalog.lookups.get(),
+            1,
+            "partitions must consume one canonical Files lookup"
         );
+    }
+
+    #[test]
+    fn mv_definition_effects_include_derived_metadata_view_bodies() {
+        let sql = r#"SELECT record_count FROM ice.db."orders$partitions""#;
+        let query = parse_native_query(sql).expect("parse");
+        for (extra_predicate, diagnostic) in [
+            (
+                "AND IF(false, random() < 0e0, true)",
+                "volatile function 'random'",
+            ),
+            (
+                "AND CURRENT_SCHEMA IS NOT NULL",
+                "depend on the caller's session",
+            ),
+        ] {
+            let catalog = PartitionsLookupCatalog {
+                extra_predicate,
+                ..PartitionsLookupCatalog::default()
+            };
+            let error = analyze_mv_definition(
+                &query,
+                &catalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .err()
+            .expect("metadata view effects must participate in definition admission");
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::MvDefinitionEffect
+            );
+            assert!(error.message().contains(diagnostic), "{error}");
+            let span = error.span().expect("caller relation position");
+            assert_eq!(
+                &sql[span.start()..span.end()],
+                r#"ice.db."orders$partitions""#
+            );
+            assert!(
+                error
+                    .stored_view_definition_source()
+                    .is_some_and(|body| body.contains(extra_predicate))
+            );
+            assert_eq!(catalog.lookups.get(), 1);
+        }
     }
 
     #[test]

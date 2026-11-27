@@ -89,7 +89,6 @@ use crate::scan_model::{
 use crate::schema_facts::row_lineage_enabled;
 use crate::typed_read::codec::public_read_schema;
 use crate::typed_read::column_handle::{corrupt, invalid, unsupported};
-use crate::typed_read::publish_read_schema_with_metadata;
 #[cfg(test)]
 use crate::typed_read::read_static_facts::decode_sha256_hex;
 use crate::typed_read::read_static_facts::iceberg_final_static_facts;
@@ -100,10 +99,8 @@ use crate::typed_read::{
     IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
     IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableReference,
     IcebergTableHandle, IcebergTableHandleParams, ROW_LINEAGE_METADATA_COLUMNS,
-    SystemManifestSplit, SystemManifestSplitSource, SystemManifestSplitSourceParams,
-    SystemRelationSplit, TrinoManifestFile, bounds_row_type, change_op_column_handle,
-    derived_row_type_json, partition_row_type_with_metadata, plan_change_window_splits,
-    system_relation_columns_with_metadata,
+    SystemManifestSplit, SystemManifestSplitSource, SystemRelationSplit, SystemTableScan,
+    TrinoManifestFile, change_op_column_handle, plan_change_window_splits,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -859,6 +856,7 @@ impl IcebergTypedBoundary {
     /// frozen from, so the load is verified against both before its schema is
     /// used: a location that has been reused by another table would otherwise
     /// answer with some other relation's columns.
+    #[cfg(test)]
     fn system_relation_metadata(
         &self,
         reference: &IcebergSystemTableReference,
@@ -881,6 +879,12 @@ impl IcebergTypedBoundary {
         let physical = self
             .load_pinned_relation_async(reference.schema_table_name())
             .await?;
+        reference.verify_loaded_metadata(physical.table.metadata())?;
+        if physical.table.metadata_location() != Some(reference.metadata_file_location()) {
+            return Err(corrupt(
+                "iceberg pinned metadata location differs from the system scan",
+            ));
+        }
         let table = physical.table.clone();
         let control = self.request_context.clone();
         let result = (async move {
@@ -2175,7 +2179,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         )?;
                 return Ok(Some(
                     novarocks_spi::connector::read_stack::adapter::ProviderReadOpenedRelation::new(
-                        crate::typed_read::IcebergRuntimeRelation::SystemTable(reference),
+                        crate::typed_read::IcebergRuntimeRelation::SystemTable(
+                            SystemTableScan::from_metadata(reference, metadata)?,
+                        ),
                         Some(distribution),
                     ),
                 ));
@@ -2355,19 +2361,18 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 ));
                 columns
             }
-            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
-                let metadata = self.system_relation_metadata(reference)?;
-                system_relation_columns_with_metadata(reference.system_table_type(), &metadata)?
-                    .into_iter()
-                    .map(|column| {
-                        (
-                            column.base_column_identity().name().to_string(),
-                            column,
-                            false,
-                        )
-                    })
-                    .collect()
-            }
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) => scan
+                .columns()
+                .iter()
+                .cloned()
+                .map(|column| {
+                    (
+                        column.base_column_identity().name().to_string(),
+                        column,
+                        false,
+                    )
+                })
+                .collect(),
             crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                 let schema = handle.parse_table_schema()?;
                 let mut columns = Vec::new();
@@ -2435,14 +2440,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
     > {
         match table {
-            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
-                creation.work(1)?;
-                let metadata = self.system_relation_metadata(reference)?;
-                creation.work(1)?;
-                publish_read_schema_with_metadata(
-                    reference.system_table_type(),
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) => {
+                crate::typed_read::system_page_source::publish_read_schema_from_facts(
+                    scan.system_table_type(),
                     columns,
-                    &metadata,
+                    scan.table_schema(),
+                    scan.partitions(),
                     creation,
                 )
             }
@@ -2562,7 +2565,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             },
         )?;
         Ok(Some(ProviderReadSystemTablePlan::new(
-            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference),
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(SystemTableScan::from_metadata(
+                reference, metadata,
+            )?),
             distribution,
         )))
     }
@@ -2769,8 +2774,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                 crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => Ok(Box::new(
                     IcebergRuntimeSplitSource::new(self.change_window_split_source(handle).await?),
                 )),
-                crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
-                    self.system_relation_runtime_split_source(reference).await
+                crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) => {
+                    self.system_relation_runtime_split_source(scan).await
                 }
                 crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                     let enumeration_handle = if columns.is_empty() {
@@ -3174,15 +3179,10 @@ impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeSystemRelationSour
 impl IcebergTypedBoundary {
     async fn system_relation_runtime_split_source(
         &self,
-        reference: &IcebergSystemTableReference,
+        scan: &SystemTableScan,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        if matches!(
-            reference.system_table_type(),
-            crate::typed_read::IcebergSystemTableType::Snapshots
-                | crate::typed_read::IcebergSystemTableType::History
-                | crate::typed_read::IcebergSystemTableType::Refs
-                | crate::typed_read::IcebergSystemTableType::Manifests
-        ) {
+        let reference = scan.reference();
+        if reference.system_table_type().unit_hint() == SystemTableUnitHint::SingleUnit {
             return Ok(Box::new(RuntimeSystemRelationSource {
                 split: Some(SystemRelationSplit::try_new(reference.clone())?),
             }));
@@ -3190,52 +3190,8 @@ impl IcebergTypedBoundary {
         if reference.snapshot_id().is_none() {
             return Ok(Box::new(RuntimeSystemRelationSource { split: None }));
         }
-        let physical = self
-            .load_pinned_relation_async(reference.schema_table_name())
-            .await?;
-        reference.verify_loaded_metadata(physical.table.metadata())?;
-        let metadata = physical.table.metadata().clone();
-        let specs = partition_specs_of(&metadata);
-        let table_schema = metadata.current_schema().as_ref().clone();
-        let mut partition_spec_jsons = BTreeMap::new();
-        for spec in &specs {
-            partition_spec_jsons.insert(
-                spec.spec_id(),
-                serde_json::to_string(spec).map_err(|error| {
-                    corrupt(format!(
-                        "iceberg partition spec is not serializable: {error}"
-                    ))
-                })?,
-            );
-        }
-        let source = SystemManifestSplitSource::try_new(SystemManifestSplitSourceParams {
-            table_has_variant_history: crate::manifest::table_has_variant_history(&metadata),
-            manifests: self.pinned_snapshot_manifests(reference).await?,
-            table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
-                corrupt(format!("iceberg table schema is not serializable: {error}"))
-            })?,
-            metadata_table_schema_json:
-                crate::typed_read::system_page_source::system_relation_schema_json_with_metadata(
-                    reference.system_table_type(),
-                    &metadata,
-                )?,
-            partition_spec_jsons,
-            partition_column_type_json: partition_row_type_with_metadata(&metadata)?
-                .as_ref()
-                .map(derived_row_type_json)
-                .transpose()?,
-            partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
-                &table_schema,
-                &specs,
-            )?
-            .field_ids(),
-            bounds_column_type_json: bounds_row_type(&table_schema)?
-                .as_ref()
-                .map(derived_row_type_json)
-                .transpose()?,
-            encryption_key_id: None,
-            reference: reference.clone(),
-        })?;
+        let manifests = self.pinned_snapshot_manifests(reference).await?;
+        let source = SystemManifestSplitSource::try_new(scan, manifests)?;
         Ok(Box::new(IcebergRuntimeSplitSource::new(source)))
     }
 }
@@ -4066,18 +4022,6 @@ async fn plan_pinned_snapshot(
         prepared,
     )
     .await
-}
-
-/// Every partition spec a table has ever had, in the order the metadata holds
-/// them.
-///
-/// A metadata relation's `partition` column is the union across specs, so the
-/// whole set is handed over rather than the default spec alone.
-fn partition_specs_of(metadata: &TableMetadata) -> Vec<PartitionSpec> {
-    metadata
-        .partition_specs_iter()
-        .map(|spec| spec.as_ref().clone())
-        .collect()
 }
 
 /// The manifest-list entries of one pinned snapshot.
@@ -5040,10 +4984,11 @@ pub(crate) mod final_static_facts_tests {
         )
         .expect("reference");
 
-        let facts = iceberg_final_static_facts(
-            &crate::typed_read::IcebergRuntimeRelation::SystemTable(reference),
-        )
-        .expect("system facts");
+        let facts =
+            iceberg_final_static_facts(&crate::typed_read::IcebergRuntimeRelation::SystemTable(
+                SystemTableScan::empty_for_test(reference),
+            ))
+            .expect("system facts");
 
         assert!(!facts.input_version().as_bytes().is_empty());
         assert_ne!(facts.selection_digest(), [0; 32]);
@@ -5599,11 +5544,13 @@ mod attempt_access_tests {
         let missing = template.for_request(request_context(&missing_resources));
         let absent = missing.relation_has_row_lineage(&handle).unwrap_err();
         assert_eq!(absent.kind(), ConnectorErrorKind::InvalidRequest);
-        let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = &metadata_relation
+        let crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) = &metadata_relation
         else {
             panic!("prepared system relation");
         };
-        let absent = missing.system_relation_metadata(reference).unwrap_err();
+        let absent = missing
+            .system_relation_metadata(scan.reference())
+            .unwrap_err();
         assert_eq!(absent.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(*loads.lock().unwrap(), observed_loads);
         // A fresh typed control for the SAME request must still borrow that

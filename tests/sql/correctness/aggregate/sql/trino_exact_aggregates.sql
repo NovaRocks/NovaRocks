@@ -56,3 +56,12 @@ FROM (VALUES (1, CAST(NULL AS INTEGER)), (CAST(NULL AS INTEGER), 2)) t(x,v);
 -- query 8
 SELECT bool_or(x) AS some_true, bool_and(x) AS all_true, every(x) AS all_true_alias
 FROM (VALUES true, false, CAST(NULL AS BOOLEAN)) t(x);
+
+-- query 9
+SELECT CAST(min(id) AS VARCHAR) AS least_uuid, CAST(max(id) AS VARCHAR) AS greatest_uuid,
+       to_hex(min(bytes)) AS least_bytes, to_hex(max(bytes)) AS greatest_bytes
+FROM (VALUES
+    (CAST('80000000-0000-0000-0000-000000000000' AS UUID), X'80'),
+    (CAST('7fffffff-ffff-ffff-ffff-ffffffffffff' AS UUID), X'7FFF'),
+    (CAST(NULL AS UUID), CAST(NULL AS VARBINARY))
+) t(id, bytes);

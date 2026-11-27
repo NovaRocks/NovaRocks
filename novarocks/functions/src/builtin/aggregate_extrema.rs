@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact selected fixed-width extrema with inline state and original four phases.
-//! Utf8 retained state belongs to its own kernel; OVER folds through this one.
+//! Variable-width retained state belongs to its own kernel.
 
 use super::temporal_output::TemporalOutputBuilder;
 use crate::kernel_control::{internal, invalid};
@@ -47,6 +47,7 @@ pub(super) enum ExtremaValue {
     F64(f64),
     I128(i128),
     I256(i256),
+    Uuid([u8; 16]),
     Temporal(TemporalValue),
 }
 #[derive(Debug)]
@@ -187,8 +188,16 @@ fn read(
             let bytes: [u8; 16] = array
                 .value(row)
                 .try_into()
-                .map_err(|_| internal("MIN/MAX signed BE value width differs"))?;
-            ExtremaValue::I128(i128::from_be_bytes(bytes))
+                .map_err(|_| internal("MIN/MAX fixed byte value width differs"))?;
+            match binding.logical_type() {
+                ValueLogicalType::LargeInt => ExtremaValue::I128(i128::from_be_bytes(bytes)),
+                ValueLogicalType::Uuid => ExtremaValue::Uuid(bytes),
+                _ => {
+                    return Err(internal(
+                        "MIN/MAX fixed byte carrier has no supported domain",
+                    ));
+                }
+            }
         }
         _ => return Err(internal("MIN/MAX prepared carrier is unsupported")),
     };
@@ -219,6 +228,7 @@ fn update(
         }
         (Some(ExtremaValue::I128(a)), ExtremaValue::I128(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::I256(a)), ExtremaValue::I256(b)) => Some(b.cmp(&a)),
+        (Some(ExtremaValue::Uuid(a)), ExtremaValue::Uuid(b)) => Some(b.cmp(&a)),
         (Some(ExtremaValue::Temporal(a)), ExtremaValue::Temporal(b)) => {
             let declaration =
                 temporal.ok_or_else(|| internal("MIN/MAX temporal state has no declaration"))?;
@@ -607,7 +617,9 @@ fn build<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
                 })
             }
             DataType::Boolean => build_bits(states, work),
-            DataType::FixedSizeBinary(16) => build_largeint(states, work),
+            DataType::FixedSizeBinary(16) => {
+                build_fixed_bytes(states, binding.logical_type(), work)
+            }
             _ => Err(internal("MIN/MAX output carrier is not implemented")),
         }
     })
@@ -658,8 +670,9 @@ fn build_bits<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
     work.flush()?;
     Ok(output)
 }
-fn build_largeint<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
+fn build_fixed_bytes<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
     states: I,
+    domain: ValueLogicalType,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let rows = states.len();
@@ -679,13 +692,17 @@ fn build_largeint<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
             ));
         }
         let bytes = if let Some(value) = state {
-            let ExtremaValue::I128(value) = value else {
-                return Err(internal(
-                    "MIN/MAX signed BE state differs from exact output",
-                ));
+            let bytes = match (domain, value) {
+                (ValueLogicalType::LargeInt, ExtremaValue::I128(value)) => value.to_be_bytes(),
+                (ValueLogicalType::Uuid, ExtremaValue::Uuid(value)) => *value,
+                _ => {
+                    return Err(internal(
+                        "MIN/MAX fixed byte state differs from exact output",
+                    ));
+                }
             };
             valid[emitted / 8] |= 1 << (emitted % 8);
-            value.to_be_bytes()
+            bytes
         } else {
             [0; 16]
         };
@@ -702,7 +719,7 @@ fn build_largeint<'a, I: ExactSizeIterator<Item = &'a Option<ExtremaValue>>>(
     }
     work.flush()?;
     let output = FixedSizeBinaryArray::try_new(16, Buffer::from(values), Some(nulls(valid, rows)))
-        .map_err(|_| internal("MIN/MAX signed BE output shape differs"))?;
+        .map_err(|_| internal("MIN/MAX fixed byte output shape differs"))?;
     let output = Arc::new(output) as ArrayRef;
     work.flush()?;
     Ok(output)

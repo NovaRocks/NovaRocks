@@ -74,15 +74,19 @@ select null in (json_parse(js),json_object('a':1 RETURNING JSON)) from ${case_db
 select null not in (json_parse(js), json_object('a':3 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 10
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 select json_parse(js) in (1,3,json_object('a':2 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 11
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 select json_parse(js) not in (2,3) from ${case_db}.sc2 order by 1;
 
 -- query 12
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 select json_parse(js) in (1,3,v1,json_object('a':11 RETURNING JSON)) from ${case_db}.sc2 order by 1;
 
 -- query 13
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR,1
 select json_parse(js) not in (2,3,v1) from ${case_db}.sc2 order by 1;
 
 -- query 14

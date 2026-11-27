@@ -12,6 +12,6 @@ _col0	_col1
 [true]	[true]
 
 -- query 13
--- legacy
+-- types	json	array(varchar)
 price_list	fields
-[{"num": 1, "open_id": "aaa"}, {"num": 2, "open_id": "bbb"}, {"num": 3, "open_id": "ccc"}]	["aaa","bbb","ccc"]
+[{"open_id":"aaa","num":1},{"open_id":"bbb","num":2},{"open_id":"ccc","num":3}]	["aaa","bbb","ccc"]

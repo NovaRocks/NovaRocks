@@ -35,36 +35,35 @@ CREATE TABLE ${case_db}.map_test (
   map1 MAP<DECIMAL(16,3), VARCHAR(30)>,
   map2 MAP<INT, ARRAY<VARCHAR>>,
   map3 MAP<VARCHAR, MAP<INT, VARCHAR(30)>>,
-  map4 MAP<INT, JSON>,
   map5 MAP<INT, ROW(c INT, b VARCHAR)>
 ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.map_test VALUES
-  (0, MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY[['1','2']]), MAP(ARRAY['1'], ARRAY[MAP(ARRAY[1], ARRAY['abc'])]), MAP(ARRAY[1], ARRAY[json_object('name':'abc','age':23)]), MAP(ARRAY[0], ARRAY[row(1,'a')]));
+  (0, MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY['ab']), MAP(ARRAY[0], ARRAY[['1','2']]), MAP(ARRAY['1'], ARRAY[MAP(ARRAY[1], ARRAY['abc'])]), MAP(ARRAY[0], ARRAY[row(1,'a')]));
 
 -- query 4
 -- @skip_result_check=true
--- iceberg: map keys must be non-null; dropped null-key entries from map1/map4/map5 (int keys -> empty map)
+-- iceberg: map keys must be non-null; dropped null-key entries from map1/map5 (int keys -> empty map)
 INSERT INTO ${case_db}.map_test VALUES
-  ROW(1, MAP(ARRAY[1], ARRAY[null]), map(), MAP(ARRAY[1], ARRAY[[]]), MAP(ARRAY['11', ''], ARRAY[MAP(ARRAY[1], ARRAY['abc']), MAP(ARRAY[2], ARRAY[null])]), map(), map());
+  ROW(1, MAP(ARRAY[1], ARRAY[null]), map(), MAP(ARRAY[1], ARRAY[[]]), MAP(ARRAY['11', ''], ARRAY[MAP(ARRAY[1], ARRAY['abc']), MAP(ARRAY[2], ARRAY[null])]), map());
 
 -- query 5
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; every entry here had a null key, dropped them all (empty maps)
 INSERT INTO ${case_db}.map_test VALUES
-  ROW(2, map(), map(), map(), map(), map(), map());
+  ROW(2, map(), map(), map(), map(), map());
 
 -- query 6
 -- @skip_result_check=true
 -- iceberg: map keys must be non-null; dropped the trailing null-key entry from each map (kept the non-null entry)
 INSERT INTO ${case_db}.map_test VALUES
-  (3, MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY[['3',null]]), MAP(ARRAY['3'], ARRAY[MAP(ARRAY[3], ARRAY['a33c'])]), MAP(ARRAY[1], ARRAY[json_object('name':'abc','age':23)]), MAP(ARRAY[3], ARRAY[row(3,'a')]));
+  (3, MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY['']), MAP(ARRAY[3], ARRAY[['3',null]]), MAP(ARRAY['3'], ARRAY[MAP(ARRAY[3], ARRAY['a33c'])]), MAP(ARRAY[3], ARRAY[row(3,'a')]));
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO ${case_db}.map_test VALUES ROW(4, null, null, null, null, null, null);
+INSERT INTO ${case_db}.map_test VALUES ROW(4, null, null, null, null, null);
 
 -- ========== INNER JOIN (same type) ==========
 
@@ -99,16 +98,21 @@ FROM ${case_db}.map_test t CROSS JOIN ${case_db}.map_test s WHERE s.map1 = t.map
 ORDER BY t.pk;
 
 -- ========== MAP<INT, JSON> same-type equi-join ==========
--- StarRocks FE rejects this; NovaRocks supports it by comparing the
--- MAP entries element-wise (the JSON values are the inner value type,
--- and same-text JSON literals compare equal). The result depends on
--- the seed data's JSON literal canonicalisation, so verify the query
--- succeeds rather than pinning a row count.
+-- Use a typed VALUES relation so the JSON comparison is independent of
+-- the Iceberg type mapping. This positive case requires JSON key support.
 
 -- query 13
 -- @skip_result_check=true
+WITH json_maps(pk, map4) AS (
+    VALUES
+        (0, MAP(ARRAY[1], ARRAY[JSON '{"name":"abc","age":23}'])),
+        (1, CAST(map() AS MAP(INTEGER, JSON))),
+        (2, CAST(map() AS MAP(INTEGER, JSON))),
+        (3, MAP(ARRAY[1], ARRAY[JSON '{"name":"abc","age":23}'])),
+        (4, CAST(NULL AS MAP(INTEGER, JSON)))
+)
 SELECT t.map4, s.map4
-FROM ${case_db}.map_test t JOIN ${case_db}.map_test s ON s.map4 = t.map4
+FROM json_maps t JOIN json_maps s ON s.map4 = t.map4
 ORDER BY t.pk;
 
 -- ========== FE error: cross-type MAP comparison ==========

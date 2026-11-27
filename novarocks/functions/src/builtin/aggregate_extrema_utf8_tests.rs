@@ -242,12 +242,12 @@ impl Fixture {
             control,
         )
     }
-    fn kernel(&self, phase: AggregateKernelPhase) -> Utf8ExtremaKernel {
+    fn kernel(&self, phase: AggregateKernelPhase) -> BytesExtremaKernel {
         let prepared = self.prepare(phase, &CompileControl::default()).unwrap();
         let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
             panic!("actual aggregate handle")
         };
-        Utf8ExtremaKernel {
+        BytesExtremaKernel {
             contract: handle.contract().clone(),
             operation: if self.id.as_str() == "builtin.aggregate/min/v1" {
                 ExtremaOperation::Min
@@ -259,10 +259,10 @@ impl Fixture {
 }
 
 fn apply(
-    kernel: &Utf8ExtremaKernel,
+    kernel: &BytesExtremaKernel,
     args: &[EvaluatedArgument<'_>],
     selection: Selection<'_>,
-) -> Utf8ExtremaState {
+) -> BytesExtremaState {
     let control = RuntimeControl::default();
     let mut state = kernel.create_state(&control).unwrap();
     let input =
@@ -606,7 +606,7 @@ fn utf8_extrema_distinct_is_idempotent_order_and_foreign_sources_refuse() {
         let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
             panic!()
         };
-        let kernel = Utf8ExtremaKernel {
+        let kernel = BytesExtremaKernel {
             contract: handle.contract().clone(),
             operation: if name == "min" {
                 ExtremaOperation::Min
@@ -794,11 +794,11 @@ fn utf8_extrema_merge_and_emission_keep_seven_causes_and_real_ordinary_tails() {
     );
     runtime_prefixes(|control| kernel.build_final([].into_iter(), control), true);
     struct Wrong<'a> {
-        inner: std::slice::Iter<'a, Utf8ExtremaState>,
+        inner: std::slice::Iter<'a, BytesExtremaState>,
         declared: usize,
     }
     impl<'a> Iterator for Wrong<'a> {
-        type Item = &'a Utf8ExtremaState;
+        type Item = &'a BytesExtremaState;
         fn next(&mut self) -> Option<Self::Item> {
             self.inner.next()
         }

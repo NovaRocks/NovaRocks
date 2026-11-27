@@ -83,7 +83,7 @@ pub(super) fn validate_program_columns(
             ));
         }
         match relation {
-            IcebergRuntimeRelation::SystemTable(reference) => {
+            IcebergRuntimeRelation::SystemTable(scan) => {
                 // System Arrow schemas have their own exact timestamp/map/JSON
                 // source. Mirror them through the same original forward author,
                 // rather than applying ordinary Iceberg table storage mapping.
@@ -103,21 +103,38 @@ pub(super) fn validate_program_columns(
                         .fields()
                         .get(ordinal)
                         .ok_or_else(|| invalid("missing system source occurrence"))?;
-                    let field = &public.schema().fields()[ordinal];
-                    if !equal_text(field.name(), shape.name(), work)?
-                        || field.is_nullable() != shape.is_nullable()
-                    {
-                        return Err(invalid("system source occurrence name/NULL differs"));
-                    }
+                    // Preserve the original nested-projection refusal before
+                    // matching the top-level handle against the frozen scan.
                     let declaration = check_system_column(
-                        reference.system_table_type(),
+                        scan.system_table_type(),
                         column,
                         shape,
                         public.logical_types()[ordinal],
                         work,
                     )?;
+                    let mut expected = None;
+                    for (index, canonical) in scan.columns().iter().enumerate() {
+                        work.step()?;
+                        if canonical.base_field_id() == column.base_field_id() {
+                            expected = Some((canonical, &scan.source_schema().fields()[index]));
+                            break;
+                        }
+                    }
+                    let (canonical, expected_shape) = expected.ok_or_else(|| {
+                        invalid("system column does not belong to the frozen scan")
+                    })?;
+                    compare_handle(column, canonical, work)?;
+                    typed_compare::shape(expected_shape.data_type(), shape.data_type(), work)?;
+                    let field = &public.schema().fields()[ordinal];
+                    if !equal_text(field.name(), shape.name(), work)?
+                        || !equal_text(shape.name(), expected_shape.name(), work)?
+                        || field.is_nullable() != shape.is_nullable()
+                        || shape.is_nullable() != expected_shape.is_nullable()
+                    {
+                        return Err(invalid("system source occurrence name/NULL differs"));
+                    }
                     crate::typed_read::system_page_source::validate_system_column_value(
-                        reference.system_table_type(),
+                        scan.system_table_type(),
                         &declaration,
                         shape,
                         field,
@@ -984,7 +1001,7 @@ mod tests {
         .unwrap()
     }
     fn system() -> IcebergRuntimeRelation {
-        IcebergRuntimeRelation::SystemTable(
+        IcebergRuntimeRelation::SystemTable(crate::typed_read::SystemTableScan::empty_for_test(
             IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
                 schema_table_name: name(),
                 system_table_type: IcebergSystemTableType::Files,
@@ -993,7 +1010,7 @@ mod tests {
                 snapshot_id: Some(11),
             })
             .unwrap(),
-        )
+        ))
     }
 
     #[test]
@@ -1518,13 +1535,20 @@ mod tests {
             let fields = crate::typed_read::system_relation_schema(kind, &schema, &[]).unwrap();
             let columns = crate::typed_read::system_relation_columns(kind, &schema, &[]).unwrap();
             let relation = IcebergRuntimeRelation::SystemTable(
-                IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
-                    schema_table_name: name(),
-                    system_table_type: kind,
-                    metadata_file_location: "s3://warehouse/metadata/v1.json".into(),
-                    table_uuid: "00000000-0000-0000-0000-000000000007".into(),
-                    snapshot_id: Some(11),
-                })
+                crate::typed_read::SystemTableScan::from_facts(
+                    IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
+                        schema_table_name: name(),
+                        system_table_type: kind,
+                        metadata_file_location: "s3://warehouse/metadata/v1.json".into(),
+                        table_uuid: "00000000-0000-0000-0000-000000000007".into(),
+                        snapshot_id: Some(11),
+                    })
+                    .unwrap(),
+                    crate::iceberg::spec::FormatVersion::V2,
+                    schema.clone(),
+                    [],
+                    false,
+                )
                 .unwrap(),
             );
             // Reversing output must not renumber the original synthetic IDs.
@@ -1659,13 +1683,20 @@ mod tests {
             assert!(field.is_nullable());
         }
         let relation = IcebergRuntimeRelation::SystemTable(
-            IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
-                schema_table_name: name(),
-                system_table_type: kind,
-                metadata_file_location: "s3://warehouse/metadata/v1.json".into(),
-                table_uuid: "00000000-0000-0000-0000-000000000007".into(),
-                snapshot_id: Some(11),
-            })
+            crate::typed_read::SystemTableScan::from_facts(
+                IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
+                    schema_table_name: name(),
+                    system_table_type: kind,
+                    metadata_file_location: "s3://warehouse/metadata/v1.json".into(),
+                    table_uuid: "00000000-0000-0000-0000-000000000007".into(),
+                    snapshot_id: Some(11),
+                })
+                .unwrap(),
+                crate::iceberg::spec::FormatVersion::V2,
+                schema.clone(),
+                specs.iter().cloned(),
+                false,
+            )
             .unwrap(),
         );
         let public = system_public(kind, vec![Arc::clone(&fields.fields()[at])]);

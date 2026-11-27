@@ -47,9 +47,12 @@ SELECT count(*) AS n_ancestors
   WHERE is_current_ancestor = TRUE;
 
 -- query 7
+SELECT * FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metahist_${uuid0}$history" LIMIT 0;
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metahist_${uuid0};
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

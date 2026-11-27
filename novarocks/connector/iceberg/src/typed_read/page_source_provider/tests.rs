@@ -505,7 +505,12 @@ fn the_provider_streams_a_data_split_and_refuses_a_pair_it_cannot_read() {
         },
     )
     .expect("reference");
-    let mismatched = match open(&IcebergRuntimeRelation::SystemTable(reference), &data) {
+    let mismatched = match open(
+        &IcebergRuntimeRelation::SystemTable(crate::typed_read::SystemTableScan::empty_for_test(
+            reference,
+        )),
+        &data,
+    ) {
         Ok(_) => panic!("a mismatched relation and split open no stream"),
         Err(error) => error,
     };
