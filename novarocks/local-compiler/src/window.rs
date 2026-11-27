@@ -47,9 +47,9 @@ use novarocks_functions::{
     WindowCallOptions,
 };
 use novarocks_local_program::{
-    AnalyticOutputColumn, ProgramCallSite, ProgramNodeId, ProgramNodeKind, StaticLayout,
-    StaticWindowFunction, WindowBoundary, WindowFrame as ProgramWindowFrame, WindowFunctionKind,
-    WindowType,
+    AnalyticOutputColumn, ProgramCallSite, ProgramNodeId, ProgramNodeKind, StaticAggregateOrder,
+    StaticLayout, StaticWindowFunction, WindowBoundary, WindowFrame as ProgramWindowFrame,
+    WindowFunctionKind, WindowType,
 };
 use novarocks_physical_plan::{
     AggregatePhase, FragmentPackage, FunctionArgumentType, NodeId, NodeKind, NullOrdering,
@@ -413,6 +413,24 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
             function_order_by.push(lowered(&key.expr, "missing lowered function sort key")?);
             work.step()?;
         }
+        let aggregate_order = if aggregate_binding.is_some() {
+            let mut is_asc_order = Vec::new();
+            let mut nulls_first = Vec::new();
+            reserve_vec(&mut is_asc_order, item.order_by.len(), work)?;
+            reserve_vec(&mut nulls_first, item.order_by.len(), work)?;
+            for key in &item.order_by {
+                is_asc_order.push(key.direction == SortDirection::Ascending);
+                nulls_first.push(key.null_ordering == NullOrdering::First);
+                work.step()?;
+            }
+            Some(StaticAggregateOrder {
+                is_asc_order,
+                nulls_first,
+                is_distinct: item.distinct,
+            })
+        } else {
+            None
+        };
         let frozen = frozen_frame(package, frame.as_ref(), work)?;
         let state_interpretation = aggregate_binding
             .as_ref()
@@ -433,7 +451,7 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
         work.flush()?;
         functions.push(StaticWindowFunction {
             frozen_aggregate,
-            kind: WindowFunctionKind::Prepared,
+            kind: WindowFunctionKind::Prepared { aggregate_order },
             args: inputs,
             function_order_by,
             state_interpretation,

@@ -127,7 +127,7 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 
-use arrow_array::{Array, Int64Array, ListArray};
+use arrow_array::{Array, ListArray};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::Field;
 fn kernel_source(

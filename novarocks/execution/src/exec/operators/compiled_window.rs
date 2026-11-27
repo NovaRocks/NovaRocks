@@ -228,7 +228,7 @@ impl CompiledWindowProcessorFactory {
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
                 .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
-            if !matches!(function.kind, WindowFunctionKind::Prepared) {
+            if !matches!(function.kind, WindowFunctionKind::Prepared { .. }) {
                 return Err(program_binding_failure(
                     PlanBindingKind::InvalidAssignment,
                     format!(

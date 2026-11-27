@@ -815,7 +815,7 @@ fn validate_window(
         return Err(ProgramResolvedCallsError::WrongWindow);
     }
     let frame = source.frame.as_ref().map(convert_frame).transpose()?;
-    let prepared = matches!(source.kind, WindowFunctionKind::Prepared);
+    let prepared = matches!(source.kind, WindowFunctionKind::Prepared { .. });
     let frame_matches = match (contract.options().frame(), frame.as_ref()) {
         (Some(expected), Some(actual)) => expected == actual,
         (None, None) => !prepared,
@@ -848,29 +848,30 @@ fn validate_window(
                 is_asc_order,
                 nulls_first,
             } => check_order(aggregate, is_asc_order, nulls_first, *is_distinct, work)?,
-            WindowFunctionKind::Prepared if source.state_interpretation.is_some() => {
-                let facts = source
-                    .state_interpretation
-                    .as_ref()
-                    .expect("checked state facts");
-                if aggregate.distinct() != facts.distinct
-                    || aggregate.order_keys().len() != facts.order_keys.len()
-                {
-                    return Err(ProgramResolvedCallsError::WrongOrder);
-                }
-                for (actual, expected) in aggregate.order_keys().iter().zip(facts.order_keys.iter())
-                {
-                    work.step()?;
-                    if (actual.ascending, actual.nulls_first)
-                        != (expected.ascending, expected.nulls_first)
-                    {
-                        return Err(ProgramResolvedCallsError::WrongOrder);
-                    }
-                }
+            WindowFunctionKind::Prepared {
+                aggregate_order: Some(order),
+            } => check_order(
+                aggregate,
+                &order.is_asc_order,
+                &order.nulls_first,
+                order.is_distinct,
+                work,
+            )?,
+            WindowFunctionKind::Prepared {
+                aggregate_order: None,
+            } => {
+                return Err(ProgramResolvedCallsError::WrongOrder);
             }
             _ => check_order(aggregate, &[], &[], false, work)?,
         }
-    } else if source.state_interpretation.is_some() {
+    } else if source.state_interpretation.is_some()
+        || matches!(
+            source.kind,
+            WindowFunctionKind::Prepared {
+                aggregate_order: Some(_)
+            }
+        )
+    {
         return Err(ProgramResolvedCallsError::WrongOrder);
     }
     if source.args.len() != contract.logical_argument_types().len()

@@ -383,7 +383,9 @@ pub enum WindowFunctionKind {
     /// Compiled programs only: the call is exactly the prepared window kernel
     /// attached at its `ProgramCallSite::Window`. The compiler never derives a
     /// legacy kind from a function name, and the legacy runtime refuses it.
-    Prepared,
+    Prepared {
+        aggregate_order: Option<StaticAggregateOrder>,
+    },
 }
 impl WindowFunctionKind {
     /// Whether IGNORE NULLS can be a fact of this call kind.
@@ -395,7 +397,7 @@ impl WindowFunctionKind {
                 | Self::LastValue
                 | Self::Lead
                 | Self::Lag
-                | Self::Prepared
+                | Self::Prepared { .. }
         )
     }
 }
@@ -2484,7 +2486,7 @@ fn validate_shape(
                 }
             }
             for function in functions {
-                let prepared = matches!(function.kind, WindowFunctionKind::Prepared);
+                let prepared = matches!(function.kind, WindowFunctionKind::Prepared { .. });
                 let bad = (function.ignore_nulls && !function.kind.admits_ignore_nulls())
                     || (prepared && function.frame.is_none());
                 work.step()?;

@@ -1249,7 +1249,9 @@ fn prepared_window_graph(frame: Option<WindowFrame>) -> Result<Fixture, LocalPro
                 functions: vec![StaticWindowFunction {
                     // This fixture declares a window-only prepared call.
                     frozen_aggregate: None,
-                    kind: WindowFunctionKind::Prepared,
+                    kind: WindowFunctionKind::Prepared {
+                        aggregate_order: None,
+                    },
                     args: vec![crate::test_support::root(0, 0)],
                     function_order_by: vec![],
                     state_interpretation: None,

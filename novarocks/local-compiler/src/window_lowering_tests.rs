@@ -902,7 +902,7 @@ fn every_window_call_lowers_to_a_prepared_call_with_its_own_explicit_frame() {
     assert!(
         functions
             .iter()
-            .all(|call| matches!(call.kind, WindowFunctionKind::Prepared))
+            .all(|call| matches!(call.kind, WindowFunctionKind::Prepared { .. }))
     );
     assert_eq!(
         functions
@@ -1180,7 +1180,7 @@ fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
     let calls = program.resolved_calls().calls();
     for (call, name) in ["sum", "min", "max", "sum"].into_iter().enumerate() {
         let function = &functions[call];
-        assert!(matches!(function.kind, WindowFunctionKind::Prepared));
+        assert!(matches!(function.kind, WindowFunctionKind::Prepared { .. }));
         assert!(function.aggregate_binding.is_some());
         let resolved = &calls[&ProgramCallSite::Window {
             node,
