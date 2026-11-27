@@ -217,3 +217,14 @@ checked_decimal_rounding
 -- types	decimal(4, 2)
 checked_decimal_rounding
 12.35
+
+-- query 67
+-- types	bigint	bigint	bigint	bigint
+leading_month	month_component	leading_hour	second_component
+25	1	36	-59
+
+-- query 68
+-- types	integer	bigint	bigint	bigint	bigint
+id	leading_month	month_component	leading_hour	second_component
+1	25	1	36	-59
+2	NULL	NULL	NULL	NULL

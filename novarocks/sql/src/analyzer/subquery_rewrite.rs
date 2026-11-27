@@ -612,14 +612,15 @@ impl<'a> AnalyzerContext<'a> {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
-        let resolved = super::resolve_expr::resolve_aggregate_function_call(
-            self.function_catalog,
+        let resolved = super::resolve_expr::resolve_aggregate_function_call_with_order(
+            &self.binding_finalizer(),
             "max",
+            false,
             std::slice::from_ref(&marker_argument),
-            novarocks_parser::Span::new(0, 0),
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            &[],
+            novarocks_parser::SYNTHETIC,
             self.constant_policy,
-            self.control,
+            self.purpose,
         )?;
         let marker_query = match null_source_col {
             Some(source_col) => value_form_null_marker_query(
@@ -1881,36 +1882,45 @@ impl<'a> AnalyzerContext<'a> {
         };
         let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
             .iter()
-            .map(|expr| match self.analyze_expr(expr, scope) {
-                Ok(expr) => Ok(expr),
-                Err(error) if error.control_error().is_some() => Err(error),
-                Err(error) => {
-                    if !select
-                        .having
-                        .as_ref()
-                        .is_some_and(|having| expr_contains_placeholder(having, sq_info.id))
-                    {
-                        return Err(error);
+            .map(
+                |expr| match self.effects.try_scope(|| self.analyze_expr(expr, scope)) {
+                    Ok(expr) => {
+                        self.effects.admit_selected_scope()?;
+                        Ok(expr)
                     }
-                    let mut aliases = scope.clone();
-                    for item in &select.projection {
-                        self.check_control()?;
-                        aliases.add_column_with_id(
-                            None,
-                            &item.output_name,
-                            item.output_column_id,
-                            item.expr.value_type.clone(),
-                        );
+                    Err(error) if error.control_error().is_some() => Err(error),
+                    Err(error) => {
+                        if !select
+                            .having
+                            .as_ref()
+                            .is_some_and(|having| expr_contains_placeholder(having, sq_info.id))
+                        {
+                            return Err(error);
+                        }
+                        let mut aliases = scope.clone();
+                        for item in &select.projection {
+                            self.check_control()?;
+                            aliases.add_column_with_id(
+                                None,
+                                &item.output_name,
+                                item.output_column_id,
+                                item.expr.value_type.clone(),
+                            );
+                        }
+                        let adopted = self.effects.try_scope(|| {
+                            let typed = self.analyze_expr(expr, &aliases)?;
+                            let typed = self.substitute_select_aliases(typed, &select.projection);
+                            if super::resolve_expr::is_json_in_subquery_operand(&typed, &aliases) {
+                                Ok(typed)
+                            } else {
+                                Err(error)
+                            }
+                        })?;
+                        self.effects.admit_selected_scope()?;
+                        Ok(adopted)
                     }
-                    let typed = self.analyze_expr(expr, &aliases)?;
-                    let typed = self.substitute_select_aliases(typed, &select.projection);
-                    if super::resolve_expr::is_json_in_subquery_operand(&typed, &aliases) {
-                        Ok(typed)
-                    } else {
-                        Err(error)
-                    }
-                }
-            })
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
 
         let (resolved_sub, inner_scope) = match analyzed_right {
@@ -2021,10 +2031,11 @@ impl<'a> AnalyzerContext<'a> {
                     .function_catalog
                     .resolve_json_canonical_key_binding(&argument, self.control)
                     .map_err(AnalyzeError::function_binding)?;
-                key_bindings.push(crate::binding::SqlFunctionBinding::new(
+                key_bindings.push(self.binding_finalizer().finish(
                     binding,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                ));
+                    "JSON IN key",
+                    in_expr_ast.span(),
+                )?);
             }
             let mark_key_bindings = Some(
                 key_bindings
@@ -2744,13 +2755,11 @@ impl<'a> AnalyzerContext<'a> {
                         },
                     ];
                     let binding = super::resolve_expr::resolve_scalar_binding_at(
-                        self.function_catalog,
+                        &self.binding_finalizer(),
                         "coalesce",
                         &args,
                         subquery_span,
-                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
                         self.constant_policy,
-                        self.control,
                     )?;
                     Ok(TypedExpr {
                         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -3007,6 +3016,7 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
             purpose: self.purpose,
+            effects: self.effects.clone(),
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
             statement_relation: self.statement_relation,
@@ -3220,12 +3230,18 @@ impl<'a> AnalyzerContext<'a> {
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in group_by_exprs {
             self.check_control()?;
-            match self.analyze_expr(gb_expr, &merged_scope) {
-                Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(
-                    typed,
-                    &inner_scope,
-                    outer_scope,
-                )),
+            match self
+                .effects
+                .try_scope(|| self.analyze_expr(gb_expr, &merged_scope))
+            {
+                Ok(typed) => {
+                    self.effects.admit_selected_scope()?;
+                    group_by.push(qualify_inner_shadowing_column_refs(
+                        typed,
+                        &inner_scope,
+                        outer_scope,
+                    ));
+                }
                 Err(error) if error.control_error().is_some() => return Err(error),
                 Err(_) => {
                     let mut alias_scope = merged_scope.clone();
@@ -3238,7 +3254,10 @@ impl<'a> AnalyzerContext<'a> {
                             item.expr.value_type.clone(),
                         );
                     }
-                    let typed = self.analyze_expr(gb_expr, &alias_scope)?;
+                    let typed = self
+                        .effects
+                        .try_scope(|| self.analyze_expr(gb_expr, &alias_scope))?;
+                    self.effects.admit_selected_scope()?;
                     group_by.push(qualify_inner_shadowing_column_refs(
                         self.substitute_select_aliases(typed, &projection),
                         &inner_scope,
@@ -3264,13 +3283,18 @@ impl<'a> AnalyzerContext<'a> {
         let having = match &select.having {
             Some(expr) => {
                 let prior_subqueries = self.collected_subqueries.borrow().len();
-                let analyzed = self.analyze_expr(expr, &merged_scope);
+                let analyzed = self
+                    .effects
+                    .try_scope(|| self.analyze_expr(expr, &merged_scope));
                 match analyzed {
-                    Ok(h) => Some(qualify_inner_shadowing_column_refs(
-                        self.require_boolean_predicate(h, "HAVING clause", expr.span())?,
-                        &inner_scope,
-                        outer_scope,
-                    )),
+                    Ok(h) => {
+                        self.effects.admit_selected_scope()?;
+                        Some(qualify_inner_shadowing_column_refs(
+                            self.require_boolean_predicate(h, "HAVING clause", expr.span())?,
+                            &inner_scope,
+                            outer_scope,
+                        ))
+                    }
                     Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         self.collected_subqueries
@@ -3286,7 +3310,10 @@ impl<'a> AnalyzerContext<'a> {
                                 item.expr.value_type.clone(),
                             );
                         }
-                        let h = self.analyze_expr(expr, &alias_scope)?;
+                        let h = self
+                            .effects
+                            .try_scope(|| self.analyze_expr(expr, &alias_scope))?;
+                        self.effects.admit_selected_scope()?;
                         Some(qualify_inner_shadowing_column_refs(
                             self.require_boolean_predicate(
                                 self.substitute_select_aliases(h, &projection),

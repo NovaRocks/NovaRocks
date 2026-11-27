@@ -106,7 +106,11 @@ fn aggregate(
         result.nullable(),
     );
     output.value_type = result.clone();
-    let mut binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let mut binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     if let Some(source) = state_interpretation {
         binding = binding.with_aggregate_state_source(source);
     }

@@ -148,6 +148,35 @@ fn public_overloads_follow_the_trino_collection_string_and_aggregate_owners() {
 }
 
 #[test]
+fn interval_fields_publish_their_sql_signatures_from_installed_overloads() {
+    let catalog = shared_installed_builtin_owner_catalogue();
+    let public = catalog.public_function_overloads().collect::<Vec<_>>();
+    for (family, arguments, names) in [
+        (
+            "interval_year_month",
+            "interval year to month",
+            &["year", "month"][..],
+        ),
+        (
+            "interval_day_time",
+            "interval day to second",
+            &["day", "day_of_month", "hour", "minute", "second"][..],
+        ),
+    ] {
+        for name in names {
+            let identity = format!("builtin.scalar/{name}/{family}/v1");
+            let row = public
+                .iter()
+                .find(|row| row.overload_id.as_str() == identity)
+                .expect("installed interval field must be public");
+            assert_eq!(row.name, *name);
+            assert_eq!((row.return_type, row.argument_types), ("bigint", arguments));
+            assert!(row.deterministic);
+        }
+    }
+}
+
+#[test]
 fn derived_owner_publishes_distinct_real_call_shapes() {
     use DataType::{Decimal128, Float64, Int32, Int64};
     let catalog = shared_installed_builtin_owner_catalogue();

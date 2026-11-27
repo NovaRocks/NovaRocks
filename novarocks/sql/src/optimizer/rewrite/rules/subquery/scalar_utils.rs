@@ -760,7 +760,11 @@ pub(super) fn assert_true(
         .map(|id| crate::optimizer::scalar::function_argument(arena, *id, control))
         .collect::<Result<Vec<_>, _>>()?;
     let selected = crate::functions::bind_assert_true(function_catalog, &arguments, control)?;
-    let binding = crate::binding::SqlFunctionBinding::new(selected, policy);
+    let binding = crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
+        selected,
+        policy,
+    );
     arena.intern_observed(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,

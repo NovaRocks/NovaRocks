@@ -27,3 +27,9 @@ pub mod mv;
 pub mod mv_aggregate_layout;
 pub(crate) mod mv_persistence;
 pub mod query_execution;
+
+/// Proof of a new binding authored after SQL analysis.
+pub(crate) struct BindingAuthority(());
+
+const BINDING_AUTHORITY: crate::binding::PlanBindingAuthority =
+    crate::binding::PlanBindingAuthority::Planning(crate::planning::BindingAuthority(()));

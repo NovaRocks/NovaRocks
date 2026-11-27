@@ -3063,7 +3063,11 @@ fn build_statistics_connector_physical(
                 requirement.input().data_type()
             )),
         })?;
-        let resolved = crate::binding::SqlFunctionBinding::new(resolved, decimal_overflow_policy);
+        let resolved = crate::binding::SqlFunctionBinding::from_plan(
+            crate::planning::BINDING_AUTHORITY,
+            resolved,
+            decimal_overflow_policy,
+        );
         let result_type = crate::functions::aggregate_result_type(&resolved);
         if result_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
             || *result_type.data_type() != arrow::datatypes::DataType::Binary

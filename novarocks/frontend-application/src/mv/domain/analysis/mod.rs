@@ -21,8 +21,7 @@ pub mod refresh_property;
 
 use novarocks_parser::ast::{Ident, Query, Relation, SetExpr};
 use novarocks_sql::planning::mv::{
-    SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
-    strip_catalog_from_three_part_names,
+    SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, strip_catalog_from_three_part_names,
 };
 use novarocks_sql::semantic::{ObjectName, TableColumnDef};
 use novarocks_types::naming::normalize_identifier;
@@ -104,48 +103,6 @@ fn prepare_mv_select_with_catalog_paths(
         resolved_refs,
         query_for_analysis,
     })
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn finish_mv_analysis<T>(
-    prepared: PreparedMvSelect,
-    source: T,
-) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError>
-where
-    T: SqlResolvedMvRefreshInputSource,
-{
-    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source)?;
-    let output_columns = refresh_input.analysis_facts().output_columns;
-    Ok(MvAnalysis {
-        resolved_refs: prepared.resolved_refs,
-        output_columns,
-        refresh_input,
-    })
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
-    query: &Query,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    register: Register,
-    analyze: Analyze,
-) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError>
-where
-    Register: FnOnce(&[ResolvedTableRef]) -> Result<(), String>,
-    Analyze: FnOnce(&Query) -> Result<T, String>,
-    T: SqlResolvedMvRefreshInputSource,
-{
-    let prepared = prepare_mv_select(query, current_catalog, current_database)?;
-    register(prepared.resolved_refs())?;
-    let source = analyze(prepared.query_for_analysis())?;
-    finish_mv_analysis(prepared, source)
 }
 
 fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {

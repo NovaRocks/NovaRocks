@@ -16,7 +16,8 @@
 // under the License.
 
 use novarocks_type_contract::{
-    PICOS_PER_DAY, PICOS_PER_MINUTE, PICOS_PER_SECOND, TemporalValue, TimeZoneKey,
+    IntervalField, IntervalQualifier, PICOS_PER_DAY, PICOS_PER_MINUTE, PICOS_PER_SECOND,
+    TemporalValue, TimeZoneKey,
 };
 
 use super::date_shift::ShiftError;
@@ -71,6 +72,52 @@ impl Field {
             Self::YearOfWeek => iso_week_year(days, year).0,
             _ => return Err(ShiftError::ForeignValue),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IntervalExtraction {
+    divisor: i64,
+    modulus: Option<i64>,
+}
+
+impl IntervalExtraction {
+    pub(super) fn new(field: Field, qualifier: IntervalQualifier) -> Result<Self, ShiftError> {
+        const MONTHS_PER_YEAR: i64 = 12;
+        const PICOS_PER_HOUR: i64 = 60 * PICOS_PER_MINUTE;
+        let (field, divisor, parent) = match (qualifier.is_year_month(), field) {
+            (true, Field::Year) => (IntervalField::Year, MONTHS_PER_YEAR, None),
+            (true, Field::Month) => (IntervalField::Month, 1, Some(MONTHS_PER_YEAR)),
+            (false, Field::Day) => (IntervalField::Day, PICOS_PER_DAY, None),
+            (false, Field::Hour) => (IntervalField::Hour, PICOS_PER_HOUR, Some(PICOS_PER_DAY)),
+            (false, Field::Minute) => (
+                IntervalField::Minute,
+                PICOS_PER_MINUTE,
+                Some(PICOS_PER_HOUR),
+            ),
+            (false, Field::Second) => (
+                IntervalField::Second,
+                PICOS_PER_SECOND,
+                Some(PICOS_PER_MINUTE),
+            ),
+            _ => return Err(ShiftError::ForeignValue),
+        };
+        Ok(Self {
+            divisor,
+            modulus: parent.filter(|_| field != qualifier.start()),
+        })
+    }
+
+    pub(super) fn evaluate(self, value: Value) -> Result<i64, ShiftError> {
+        let total = match value {
+            Value::Temporal(TemporalValue::IntervalYearMonth(months)) => i128::from(months),
+            Value::Temporal(TemporalValue::IntervalDayTime(value)) => value.as_picos(),
+            _ => return Err(ShiftError::ForeignValue),
+        };
+        let component = self
+            .modulus
+            .map_or(total, |parent| total % i128::from(parent));
+        i64::try_from(component / i128::from(self.divisor)).map_err(|_| ShiftError::Arithmetic)
     }
 }
 

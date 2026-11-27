@@ -760,7 +760,8 @@ mod tests {
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> TypedExpr {
         let args = vec![col_ref(source)];
-        let binding = crate::analysis::resolve_function_binding(
+        let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+            crate::optimizer::BINDING_AUTHORITY,
             crate::functions::builtin_sql_function_catalog(),
             "abs",
             &args,
@@ -816,7 +817,13 @@ mod tests {
                 args: (args).into(),
                 distinct: false,
                 order_by: (order_by).into(),
-                resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
+                resolved: crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Optimizer(
+                        crate::optimizer::BindingAuthority(()),
+                    ),
+                    resolved,
+                    policy,
+                ),
             },
         }
     }

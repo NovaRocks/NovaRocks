@@ -1460,7 +1460,13 @@ mod call_policy_tests {
                 args: (args.clone()).into(),
                 distinct: false,
                 order_by: (vec![]).into(),
-                resolved: crate::binding::SqlFunctionBinding::new(selected.clone(), policy),
+                resolved: crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Planner(
+                        crate::planner::BindingAuthority(()),
+                    ),
+                    selected.clone(),
+                    policy,
+                ),
             },
             value_type: result_type.clone(),
         };
@@ -1546,7 +1552,8 @@ mod call_policy_tests {
             &control,
         )
         .unwrap();
-        let binding = crate::binding::SqlFunctionBinding::new(
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::planner::BINDING_AUTHORITY,
             selected.clone(),
             DecimalOverflowPolicy::OutputNull,
         );
@@ -1599,7 +1606,10 @@ mod call_policy_tests {
                 args: (vec![argument]).into(),
                 distinct: false,
                 order_by: (vec![]).into(),
-                resolved: crate::binding::SqlFunctionBinding::new(
+                resolved: crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Planner(
+                        crate::planner::BindingAuthority(()),
+                    ),
                     selected,
                     DecimalOverflowPolicy::ReportError,
                 ),
@@ -2047,7 +2057,10 @@ mod call_policy_tests {
                     args: (vec![argument]).into(),
                     distinct: false,
                     order_by: (vec![]).into(),
-                    resolved: crate::binding::SqlFunctionBinding::new(
+                    resolved: crate::binding::SqlFunctionBinding::from_plan(
+                        crate::binding::PlanBindingAuthority::Planner(
+                            crate::planner::BindingAuthority(()),
+                        ),
                         selected,
                         DecimalOverflowPolicy::OutputNull,
                     ),

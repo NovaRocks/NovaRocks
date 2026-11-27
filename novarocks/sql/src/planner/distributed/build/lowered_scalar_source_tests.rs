@@ -118,7 +118,7 @@ pub(in crate::planner::distributed::build) fn lower_call(
             name: "lower".into(),
             args: (vec![argument]).into(),
             distinct: false,
-            binding: SqlFunctionBinding::new(resolved, decimal),
+            binding: SqlFunctionBinding::from_test(resolved, decimal),
             volatility,
         },
         value_type: ty,
@@ -330,7 +330,7 @@ fn bound_lambda_fixture(
             args: expressions.into(),
             distinct: false,
             volatility: resolved.semantics.volatility,
-            binding: SqlFunctionBinding::new(resolved, decimal),
+            binding: SqlFunctionBinding::from_test(resolved, decimal),
         },
     }
 }

@@ -370,7 +370,11 @@ pub(in crate::planner::distributed::build) fn table_fixture(
             .unwrap();
         outputs.push(output);
     }
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let input = column(1, "outer", DataType::Int64, false);
     let source = PhysicalPlanNode {
         kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
@@ -409,7 +413,11 @@ pub(in crate::planner::distributed::build) fn window_fixture(
         panic!("aggregate window scalar")
     };
     let result = result.clone();
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let input = column(1, "k", DataType::Int64, false);
     let mut output = column(
         2,
@@ -1030,7 +1038,11 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         ]
         .into_boxed_slice(),
     );
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let PhysicalPlanKind::Window(payload) = &mut source.kind else {
         unreachable!()
     };

@@ -439,13 +439,15 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
         let span = novarocks_parser::Span::new(7, 21);
         let execute = |control: &dyn PureCompileControl| {
             super::resolve_expr::resolved_scalar_call_at(
-                crate::functions::builtin_sql_function_catalog(),
+                &super::BindingFinalizer::ordinary(
+                    crate::functions::builtin_sql_function_catalog(),
+                    DecimalOverflowPolicy::ReportError,
+                    control,
+                ),
                 "date",
                 vec![argument.clone()],
                 span,
-                DecimalOverflowPolicy::ReportError,
                 crate::constant::test_constant_policy(),
-                control,
             )
         };
         let good = Trace::default();

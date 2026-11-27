@@ -100,6 +100,7 @@ pub(crate) enum PlannedConversion {
     },
 }
 pub(crate) fn plan_conversion(
+    authority: crate::binding::PlanBindingAuthority,
     functions: &dyn SqlFunctionCatalog,
     source: &FunctionValueType,
     target: &FunctionValueType,
@@ -153,11 +154,14 @@ pub(crate) fn plan_conversion(
         ));
     }
     let tail = (result != target).then(step);
-    let binding = SqlFunctionBinding::new_with_conversion_constraint(
+    let binding = SqlFunctionBinding::from_plan_with_constraint(
+        authority,
         binding,
         policy,
-        intermediate,
-        target.clone(),
+        crate::binding::SqlResultConstraintOrigin::ValueDomainConversion {
+            final_target: target.clone(),
+        },
+        Some(intermediate),
     );
     Ok(PlannedConversion::ValueConversion { binding, tail })
 }

@@ -644,7 +644,10 @@ mod tests {
                 .unwrap();
             crate::common::binary_operator::typed_call(
                 operator,
-                crate::binding::SqlFunctionBinding::new(
+                crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Optimizer(
+                        crate::optimizer::BindingAuthority(()),
+                    ),
                     resolved,
                     DecimalOverflowPolicy::ReportError,
                 ),

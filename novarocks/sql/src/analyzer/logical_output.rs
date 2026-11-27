@@ -235,6 +235,7 @@ mod scalar_domain_tests {
     ) -> AnalyzerContext<'a> {
         AnalyzerContext {
             purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             statement_relation: None,
