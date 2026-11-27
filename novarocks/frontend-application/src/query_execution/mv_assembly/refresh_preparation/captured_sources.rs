@@ -124,6 +124,13 @@ impl CapturedRefreshSource {
     pub(crate) fn metadata(&self) -> Result<ConnectorTableMetadata, PreparationError> {
         Ok(self.to_receipt()?.to_metadata().clone())
     }
+    pub(crate) fn sql_metadata(&self) -> Result<ConnectorTableMetadata, PreparationError> {
+        if self.snapshot.is_some() {
+            self.metadata()
+        } else {
+            Ok(self.observed.clone())
+        }
+    }
     pub(crate) fn receipts(&self) -> Vec<ConnectorPreparedSourceRead> {
         self.receipts
             .lock()

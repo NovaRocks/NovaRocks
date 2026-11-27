@@ -294,6 +294,7 @@ async fn explain_original_inner(
                 rebuild_layout: None,
                 recovery_publication: None,
                 connector_control: ports.connector_control(),
+                storage_observation: ports.storage_observation(),
                 connector_context: context,
                 projection: Arc::new(projection),
                 pin: &pin,

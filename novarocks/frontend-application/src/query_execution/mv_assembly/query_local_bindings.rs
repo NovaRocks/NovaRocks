@@ -332,11 +332,7 @@ pub(crate) fn freeze_captured_source_overlays(
 > {
     let mut overlays = Vec::new();
     for (base, captured) in sources.bindings() {
-        let metadata = if captured.snapshot.is_some() {
-            captured.metadata()?
-        } else {
-            captured.observed.clone()
-        };
+        let metadata = captured.sql_metadata()?;
         let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
             metadata, captured.planning_pin.clone())?;
         if let Some(snapshot) = captured.snapshot {

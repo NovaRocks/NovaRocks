@@ -973,6 +973,7 @@ async fn prepare_frontend_first_refresh_write(
                 RefreshRewriteInputs {
                     recovery_publication: None,
                     connector_control: source.connector_control(),
+                    storage_observation: source.storage_observation(),
                     connector_context: &connector_context,
                     projection: Arc::new(projection.clone()),
                     rebuild_layout: rebuild.map(|rebuild| {
@@ -1936,6 +1937,7 @@ async fn prepare_frontend_incremental_write(
                 rebuild_layout: None,
                 recovery_publication: replay.and_then(|fence| fence.recovery_publication()),
                 connector_control: source.connector_control(),
+                storage_observation: source.storage_observation(),
                 connector_context: &connector_context,
                 projection: Arc::new(projection),
                 pin: &pin,

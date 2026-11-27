@@ -48,12 +48,12 @@ use novarocks_sql::compiler::{
     SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
     SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvBaseContractFacts,
-    SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts, SqlImvBranchContractFacts,
-    SqlImvExpressionFacts, SqlImvExpressionKindFacts, SqlImvJoinContractFacts,
-    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvQualifiedFieldFacts,
-    SqlImvRefreshHistoryFacts, SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle,
-    SqlImvSchemaContractFacts, SqlImvTargetColumnsFacts, SqlImvTargetContractFacts,
-    SqlImvTargetVisibleColumnFacts, SqlMvRelationOccurrenceId,
+    SqlImvBaseSnapshotFacts, SqlImvBranchContractFacts, SqlImvExpressionFacts,
+    SqlImvExpressionKindFacts, SqlImvJoinContractFacts, SqlImvOutputColumnFacts,
+    SqlImvPartitionFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
+    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
+    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
+    SqlMvRelationOccurrenceId,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
@@ -80,7 +80,7 @@ pub struct MvRewriteAnalysisFacts {
     pub join: Option<SqlImvJoinContractFacts>,
     pub partition: Option<SqlImvPartitionFacts>,
     pub aggregate: Option<MvRewriteAggregateAnalysis>,
-    pub(crate) source_fields: BTreeMap<u32, Vec<MvPhysicalFieldFacts>>,
+    pub(crate) sql_source_fields: BTreeMap<u32, Vec<novarocks_sql::compiler::SqlImvBaseFieldFacts>>,
     pub(crate) direct_output_sources:
         crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
 }
@@ -612,7 +612,7 @@ impl IcebergMvRewriteContext {
     }
 }
 
-pub(super) fn occurrence_table(
+pub(in crate::mv::domain) fn occurrence_table(
     value: &novarocks_mv_application::persistence::codec::BindingOccurrence,
 ) -> TableIdentity {
     TableIdentity {
@@ -747,19 +747,10 @@ fn sql_schema_facts(
                 occurrence_table(occurrence).fqn(),
                 Some(occurrence.qualifier_at_binding.clone()),
                 analysis
-                    .source_fields
+                    .sql_source_fields
                     .get(&occurrence.occurrence_id)
-                    .into_iter()
-                    .flatten()
-                    .map(|field| {
-                        SqlImvBaseFieldFacts::try_new(
-                            Bytes::copy_from_slice(field.field_id.as_bytes()),
-                            field.name.clone(),
-                            arrow_type_from_provider_type(&field.source_type)?,
-                            field.nullable,
-                        )
-                    })
-                    .collect::<Result<_, String>>()?,
+                    .cloned()
+                    .ok_or("MV rewrite lacks the prepared SQL fields for a D occurrence")?,
             )
         })
         .collect::<Result<_, String>>()?;
