@@ -1545,13 +1545,46 @@ impl MvContentPendingRecovery {
             "automatic slot readmission lost the exact committed ContentLocate record"
         );
         let readmitted_counts = proxy.mutation_counts("ns", Self::TARGET);
+        assert_content_refresh_explain(context, &mut conn, "MetadataOnly")?;
         refresh(context, &mut conn, Self::TARGET)?;
         let refreshed = load_metadata(context, rest_uri, "ns", Self::TARGET)?;
-        assert_rest_snapshot_state_unchanged(&admitted, &refreshed)?;
+        let (metadata_snapshot, metadata_record) = current_content_publication(&refreshed)?;
+        let metadata_commit = refreshed["snapshots"]
+            .as_array()
+            .context("the metadata-only refresh has no snapshot list")?
+            .iter()
+            .find(|entry| entry["snapshot-id"].as_i64() == Some(metadata_snapshot))
+            .context("the metadata-only refresh has no Current snapshot")?;
         ensure!(
-            proxy.mutation_counts("ns", Self::TARGET) == readmitted_counts,
-            "refresh dispatched another target mutation for a ContentLocate window already committed"
+            metadata_record != record
+                && metadata_commit["parent-snapshot-id"] == admitted["current-snapshot-id"]
+                && [
+                    "added-data-files",
+                    "deleted-data-files",
+                    "added-delete-files",
+                    "removed-delete-files",
+                    "added-records",
+                    "deleted-records",
+                    "added-position-deletes",
+                    "removed-position-deletes",
+                ]
+                .into_iter()
+                .all(|key| metadata_commit["summary"][key].is_null()
+                    || metadata_commit["summary"][key] == "0"),
+            "the next refresh repeated the already committed data delta: {metadata_commit}"
         );
+        require_content_commit_count(
+            readmitted_counts,
+            proxy.mutation_counts("ns", Self::TARGET),
+            1,
+        )?;
+        assert_rows(
+            context,
+            &mut conn,
+            Self::MV_READ,
+            &window.expected,
+            "validate data after the metadata-only successor",
+        )?;
 
         execute(
             context,
@@ -1576,6 +1609,7 @@ impl MvContentPendingRecovery {
                 "committed_snapshot": snapshot,
                 "readmitted_snapshot": admitted["current-snapshot-id"],
                 "publication": record.frame,
+                "metadata_only_successor": metadata_commit,
                 "added_records": summary["added-records"],
                 "added_position_deletes": positional,
                 "deleted_records": removed,
