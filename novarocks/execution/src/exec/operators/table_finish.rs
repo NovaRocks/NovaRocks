@@ -5874,6 +5874,7 @@ mod tests {
                     operators,
                     &sources,
                     lp::CompiledProgramFacts {
+                        input_completion: novarocks_local_program::InputCompletion::MayShortCircuit,
                         writes: first.write_recipes().clone(),
                         exchange_inputs: first.exchange_inputs().clone(),
                         scan_inputs: first.scan_inputs().clone(),

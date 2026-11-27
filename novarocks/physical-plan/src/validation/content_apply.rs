@@ -60,7 +60,7 @@ pub(super) fn validate_content_apply(
                     && target.contains(&target_key)
                     && matches!(
                         (binding(weighted_key), binding(target_key), binding(output)),
-                        (Some(left), Some(right), Some(out)) if left == right && left == out
+                        (Some(left), Some(right), Some(out)) if left == right && left == out && crate::supports_result_content_key(left.data_type())
                     )
             })
     {

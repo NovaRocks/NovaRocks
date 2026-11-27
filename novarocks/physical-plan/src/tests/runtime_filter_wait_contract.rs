@@ -934,6 +934,7 @@ fn replace_source_fragment(
     let mut parts = crate::plan::FragmentParts {
         summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),

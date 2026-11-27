@@ -38,7 +38,7 @@ use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
     SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
-    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
+    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts,
     SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
     SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
     SqlImvJoinContractFacts, SqlImvOutputColumnFacts, SqlImvPartitionFacts,
@@ -664,15 +664,6 @@ fn sql_schema_facts(
                 )
             })
             .collect::<Result<_, _>>()?,
-        apply_key.name.clone(),
-        match interpretation
-            .apply_key_kind()
-            .ok_or("keyed rewrite requires an apply key")?
-        {
-            ApplyKeyKind::BaseRowId => SqlImvApplyKeySourceFacts::BaseRowId,
-            ApplyKeyKind::JoinRowKey => SqlImvApplyKeySourceFacts::JoinRowKey,
-            ApplyKeyKind::GroupRowId => SqlImvApplyKeySourceFacts::GroupRowId,
-        },
         analysis.partition.clone(),
     )?;
     SqlImvSchemaContractFacts::try_new(

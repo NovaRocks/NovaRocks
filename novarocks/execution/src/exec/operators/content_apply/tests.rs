@@ -230,6 +230,7 @@ fn net_weights_drive_distinct_location_selection_and_tail_counts() {
                 &mut next_turn(1),
                 &mut conversions,
                 &work,
+                || Ok(false),
             )
             .unwrap()
         {
@@ -302,3 +303,5 @@ fn net_weight_overflow_is_a_failure() {
     assert!(add_weight(i64::MAX, 1).is_err());
     assert!(add_weight(i64::MIN, -1).is_err());
 }
+
+mod graph;

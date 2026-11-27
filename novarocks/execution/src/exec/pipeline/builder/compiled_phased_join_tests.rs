@@ -385,6 +385,45 @@ fn b3_b0_control_finishes_without_unadmitted_probe_input_or_upstream_eos() {
     assert!(runtime.error().is_none());
 }
 #[test]
+fn empty_build_in_drain_fragment_waits_for_probe_eos() {
+    for spec in [
+        Spec::hash(JoinKind::Inner, false),
+        Spec::nested(JoinKind::Inner, false),
+    ] {
+        let mut packages = packages(&drain_input_join_plan(spec, &LEFT_ROWS, &[]));
+        let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+        assert_eq!(
+            program.input_completion(),
+            novarocks_local_program::InputCompletion::MustDrain
+        );
+        let (mut probe, _, runtime, construction) = empty_build_probe(&program);
+        let error = runtime.error_state();
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut step = DriverStep::new(&error, &mut turn, &mut conversions);
+        assert!(matches!(
+            probe.poll_control(&mut step).unwrap(),
+            ControlStep::Active
+        ));
+        let mut driver = TestDriver::new(probe.as_mut(), &runtime);
+        driver
+            .input_without_output(input(&program, &construction, true, &LEFT_ROWS[..1]))
+            .unwrap();
+        driver
+            .input_without_output(input(&program, &construction, true, &LEFT_ROWS[1..]))
+            .unwrap();
+        driver.signal_eos().unwrap();
+        assert!(matches!(
+            driver.advance_to_boundary().unwrap().next,
+            NextStep::Finished
+        ));
+        probe.begin_exit().unwrap();
+        probe.close().unwrap();
+        assert!(runtime.error().is_none());
+    }
+}
+
+#[test]
 fn b3_b0_retains_receiver_owned_throwing_probe_key_and_original_required_error() {
     let mut packages = packages(&overflow_plan(Overflow::ProbeKey));
     let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);

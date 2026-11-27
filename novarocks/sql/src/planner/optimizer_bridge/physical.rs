@@ -377,6 +377,9 @@ impl BridgeCtx<'_> {
                 grouping_fn_ids: op.grouping_fn_ids.clone(),
                 virtual_tuple_id: None,
             })),
+            Operator::PhysicalContentApply(op) => Ok(PhysicalPlanKind::ContentApply {
+                route_keys: op.route_keys.clone(),
+            }),
             Operator::PhysicalChangeEventExpand(op) => {
                 let events = op
                     .events
@@ -704,6 +707,7 @@ fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
         | Operator::PhysicalDistribution(_) => expect_arity(node, operator_name(&node.op), 1),
 
         Operator::PhysicalHashJoin(_)
+        | Operator::PhysicalContentApply(_)
         | Operator::PhysicalNestLoopJoin(_)
         | Operator::PhysicalCTEAnchor(_) => expect_arity(node, operator_name(&node.op), 2),
 
@@ -777,6 +781,7 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalCTEConsume(_) => "PhysicalCTEConsume",
         Operator::PhysicalRepeat(_) => "PhysicalRepeat",
         Operator::PhysicalChangeEventExpand(_) => "PhysicalChangeEventExpand",
+        Operator::PhysicalContentApply(_) => "PhysicalContentApply",
         Operator::PhysicalUnion(_) => "PhysicalUnion",
         Operator::PhysicalIntersect(_) => "PhysicalIntersect",
         Operator::PhysicalExcept(_) => "PhysicalExcept",

@@ -952,6 +952,14 @@ pub(super) fn provider_relation_need_from_sql_scan(
             to_snapshot_id: *to_snapshot_id,
         },
         SqlScanKind::PinnedFileSet => ProviderReadRelationNeed::PinnedFileSet { relation },
+        SqlScanKind::MvContentTarget {
+            target_table_uuid,
+            target_snapshot_id,
+        } => ProviderReadRelationNeed::MvContentTarget {
+            relation,
+            target_table_uuid: target_table_uuid.clone(),
+            target_snapshot_id: *target_snapshot_id,
+        },
         SqlScanKind::MvTargetState { facts } => ProviderReadRelationNeed::MvTarget {
             relation,
             target_table_uuid: facts.target_table_uuid.clone(),

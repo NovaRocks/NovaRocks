@@ -114,12 +114,8 @@ impl AnalyzerContext<'_> {
         })?;
         crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let mut query = super::query_prepass::preanalyze(query)
+        let query = super::query_prepass::preanalyze(query)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let retain_row_id = self.purpose.retains_view_row_lineage();
-        if retain_row_id {
-            append_refresh_row_id(&mut query, view, span)?;
-        }
         let catalog = SavedViewCatalog {
             inner: self.catalog,
             catalog: &view.default_catalog,
@@ -133,20 +129,6 @@ impl AnalyzerContext<'_> {
         );
         self.view_stack.pop();
         let mut resolved = result.map_err(|error| stored_body_error(view, error, span))?;
-        let row_id = if retain_row_id {
-            let field = resolved
-                .output_columns
-                .last_mut()
-                .filter(|field| {
-                    field.field_name.as_deref() == Some(crate::common::ICEBERG_ROW_ID_COL)
-                        && field.value_type.data_type() == &arrow::datatypes::DataType::Int64
-                })
-                .ok_or_else(|| AnalyzeError::internal("MV view lost its original row identity"))?;
-            field.is_internal = true;
-            Some(field.clone())
-        } else {
-            None
-        };
         let source = resolved
             .output_columns
             .iter()
@@ -295,22 +277,6 @@ impl AnalyzerContext<'_> {
                     is_internal: false,
                 });
             }
-            if let Some(row_id) = &row_id {
-                projection.push(AnalyzedProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: row_id.column_id,
-                            qualifier: Some(inner_alias.clone()),
-                            column: row_id.name.clone(),
-                        },
-                        value_type: row_id.value_type.clone(),
-                    },
-                    output_name: row_id.name.clone(),
-                    field_name: row_id.field_name.clone(),
-                    output_column_id: row_id.column_id,
-                });
-                output_columns.push(row_id.clone());
-            }
             resolved = ResolvedQuery {
                 body: QueryBody::Select(ResolvedSelect {
                     from: Some(Relation::Subquery {
@@ -335,13 +301,7 @@ impl AnalyzerContext<'_> {
                 local_cte_ids: Vec::new(),
             };
         }
-        self.expose_view_relation(
-            resolved,
-            &view.identity,
-            alias,
-            relation_name,
-            row_id.as_ref(),
-        )
+        self.expose_view_relation(resolved, &view.identity, alias, relation_name)
     }
 
     pub(super) fn analyze_derived_metadata_view(
@@ -443,7 +403,7 @@ impl AnalyzerContext<'_> {
             }
         }
         work.finish().map_err(AnalyzeError::control)?;
-        self.expose_view_relation(resolved, &view.identity, alias, relation_name, None)
+        self.expose_view_relation(resolved, &view.identity, alias, relation_name)
     }
 
     fn analyze_isolated_view_body(
@@ -488,7 +448,6 @@ impl AnalyzerContext<'_> {
         identity: &TableIdentity,
         alias: Option<super::resolve_from::RelationAlias<'_>>,
         relation_name: &str,
-        row_id: Option<&AnalyzedOutputField>,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         let qualifier = alias
             .map_or(relation_name, |alias| alias.name.value.as_str())
@@ -503,12 +462,7 @@ impl AnalyzerContext<'_> {
         }
         let mut scope = self.new_scope();
         for field in &fields {
-            if row_id.is_some_and(|row_id| field.is_internal && field.column_id == row_id.column_id)
-            {
-                scope.add_hidden_field(&qualifier, field);
-            } else {
-                scope.add_field(Some(&qualifier), field);
-            }
+            scope.add_field(Some(&qualifier), field);
         }
         Ok((
             Relation::Subquery {
@@ -577,45 +531,6 @@ impl PlannerTableProvider for DerivedViewCatalog<'_> {
             },
         })
     }
-}
-
-fn append_refresh_row_id(
-    query: &mut ast::Query,
-    view: &SqlViewDefinition,
-    span: Span,
-) -> Result<(), AnalyzeError> {
-    let row_id = crate::common::ICEBERG_ROW_ID_COL;
-    let unsupported = || {
-        AnalyzeError::unsupported_query_shape(
-            format!(
-                "View '{}' cannot carry MV source row identity",
-                view.identity.fqn()
-            ),
-            span,
-        )
-    };
-    if view
-        .columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(row_id))
-    {
-        return Err(unsupported());
-    }
-    let mut body = query.body.as_mut();
-    while let ast::SetExpr::Query(nested) = body {
-        body = nested.query.body.as_mut();
-    }
-    let ast::SetExpr::Select(select) = body else {
-        return Err(unsupported());
-    };
-    if select.distinct || select.group_by.is_some() || select.having.is_some() {
-        return Err(unsupported());
-    }
-    select.projection.push(novarocks_parser::build::item(
-        novarocks_parser::build::identifier(novarocks_parser::build::ident(row_id, false)),
-        Some(novarocks_parser::build::ident(row_id, false)),
-    ));
-    Ok(())
 }
 
 fn same_public_name(

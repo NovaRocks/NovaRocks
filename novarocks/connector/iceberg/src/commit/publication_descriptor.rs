@@ -27,6 +27,12 @@ use uuid::Uuid;
 pub(crate) enum AttributionPlan {
     ObserveOnly,
     KeyedSnapshot(super::mv_dispatch::KeyedSnapshotSelection),
+    KeyedSlotChange {
+        table_uuid: Uuid,
+        snapshot_id: i64,
+        parent: Option<i64>,
+        slots: Vec<(String, String)>,
+    },
     Snapshot {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -63,6 +69,7 @@ pub(crate) enum PositiveAttributionObservation {
         table_uuid: Uuid,
         observed: super::mv_dispatch::KeyedSnapshotObservation,
     },
+    KeyedSlotWriter(KeyedSlotWriterObservation),
     SnapshotMarker {
         table_uuid: Uuid,
         snapshot_id: i64,
@@ -91,6 +98,16 @@ pub(crate) enum PositiveAttributionObservation {
         operation_id: String,
     },
 }
+/// The provider's D14 resolver compares this exact selected snapshot and slot
+/// against a fresh observation of the original table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyedSlotWriterObservation {
+    pub table_uuid: Uuid,
+    pub snapshot_id: i64,
+    pub parent: Option<i64>,
+    pub slot: (String, String),
+}
+
 use super::write_stack::control::{
     ICEBERG_WRITE_SESSION_MARKER_PROPERTY, MANAGED_REPARTITION_EFFECT_SUMMARY_KEY,
 };
@@ -171,6 +188,20 @@ impl AttributionPlan {
                 },
             ) => *table_uuid == selection.table_uuid && selection.matches(observed),
             (
+                Self::KeyedSlotChange {
+                    table_uuid,
+                    snapshot_id,
+                    parent,
+                    slots,
+                },
+                PositiveAttributionObservation::KeyedSlotWriter(observed),
+            ) => {
+                *table_uuid == observed.table_uuid
+                    && *snapshot_id == observed.snapshot_id
+                    && *parent == observed.parent
+                    && slots.binary_search(&observed.slot).is_ok()
+            }
+            (
                 Self::Snapshot {
                     table_uuid: a,
                     snapshot_id: b,
@@ -240,7 +271,8 @@ impl AttributionPlan {
     fn table_uuid(&self) -> Option<Uuid> {
         match self {
             Self::KeyedSnapshot(selection) => Some(selection.table_uuid),
-            Self::Snapshot { table_uuid, .. }
+            Self::KeyedSlotChange { table_uuid, .. }
+            | Self::Snapshot { table_uuid, .. }
             | Self::ManagedRepartition { table_uuid, .. }
             | Self::Property { table_uuid, .. }
             | Self::ExactMetadata { table_uuid, .. } => Some(*table_uuid),
@@ -500,6 +532,11 @@ impl PublicationDescriptor {
                 _ => {}
             }
         }
+        if matches!(attribution, AttributionPlan::ObserveOnly)
+            && let Some(slot_change) = keyed_slot_attribution(request, table_uuid)?
+        {
+            attribution = slot_change;
+        }
         let bytes = request.canonical_rest_bytes()?;
         let mut descriptor = Self::catalog_with_key(
             request.artifacts().attempt().operation().to_bytes(),
@@ -536,6 +573,63 @@ impl PublicationDescriptor {
         Ok(())
     }
 }
+fn keyed_slot_attribution(
+    request: &FrozenRequest,
+    table_uuid: Uuid,
+) -> Result<Option<AttributionPlan>> {
+    use crate::commit::slot_change::SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY;
+    use crate::document_storage::keyed::{envelope, keys};
+    use crate::iceberg::TableUpdate;
+
+    let Some(snapshot_id) = request.ref_snapshot_after("main") else {
+        return Ok(None);
+    };
+    let Some(parent) = request.updates().iter().find_map(|update| match update {
+        TableUpdate::AddSnapshot { snapshot }
+            if snapshot.snapshot_id() == snapshot_id
+                && snapshot
+                    .summary()
+                    .additional_properties
+                    .get(SLOT_CHANGE_SNAPSHOT_SUMMARY_KEY)
+                    .is_some_and(|value| value == "true") =>
+        {
+            Some(snapshot.parent_snapshot_id())
+        }
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let mut slots = Vec::new();
+    for update in request.updates() {
+        if let TableUpdate::SetProperties { updates } = update {
+            for (key, value) in updates {
+                if !matches!(
+                    keys::parse_key(key, false).map_err(super::slot_change::document_error)?,
+                    Some(keys::DocumentKey::Slot(_))
+                ) {
+                    continue;
+                }
+                let (name, slot) = envelope::decode_slot(key, value)
+                    .map_err(super::slot_change::document_error)?;
+                if slot.writer == Some(snapshot_id) {
+                    slots.push((name.owner, name.name));
+                }
+            }
+        }
+    }
+    if slots.is_empty() {
+        return Ok(None);
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    Ok(Some(AttributionPlan::KeyedSlotChange {
+        table_uuid,
+        snapshot_id,
+        parent,
+        slots,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

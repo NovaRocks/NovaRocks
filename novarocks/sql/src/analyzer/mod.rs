@@ -770,16 +770,11 @@ impl GroupingSyntax {
 pub(crate) enum QueryAnalysisPurpose {
     Ordinary,
     MaterializedViewDefinition,
-    FirstRefreshViewRowLineage,
 }
 
 impl QueryAnalysisPurpose {
     fn is_mv_definition(self) -> bool {
         matches!(self, Self::MaterializedViewDefinition)
-    }
-
-    fn retains_view_row_lineage(self) -> bool {
-        matches!(self, Self::FirstRefreshViewRowLineage)
     }
 }
 
@@ -4897,6 +4892,7 @@ mod tests {
                 SqlScanKind::Delta { .. } => 5,
                 SqlScanKind::MvTargetState { .. } => 6,
                 SqlScanKind::MvTargetLocator { .. } => 7,
+                SqlScanKind::MvContentTarget { .. } => 9,
             }])
         {
             ordinal = ordinal.wrapping_mul(16_777_619) ^ u32::from(byte);

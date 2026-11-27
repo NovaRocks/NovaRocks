@@ -279,6 +279,43 @@ impl fmt::Debug for NativeTaskExecutionHost {
 type NativeInboundCloseFacts =
     Arc<Mutex<Option<Box<[novarocks_execution_contract::ExchangeStreamClose]>>>>;
 
+#[cfg(novarocks_dev_controls)]
+fn drop_content_apply_insert(
+    controls: &crate::test_controls::NativeTestControls,
+    identity: TaskIdentity,
+    task_key: UniqueId,
+    driver_id: i32,
+) -> novarocks_execution::runtime::task::ExecutionResult<bool> {
+    let evidence = |detail: String| {
+        novarocks_functions::KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+            &format!("ContentApply test control: {detail}"),
+        ))
+    };
+    let Some(scope) = controls
+        .claim_task(
+            novarocks_failpoint::QueryLifecycleFaultKind::MvContentApplyDropInsert,
+            identity,
+            false,
+        )
+        .map_err(evidence)?
+    else {
+        return Ok(false);
+    };
+    scope.record_hit().map_err(evidence)?;
+    tracing::info!(
+        "{} execution_id={}:{}:{} driver_id={} task_key={:x}:{:x} token={}",
+        novarocks_failpoint::observation_marker::MV_CONTENT_APPLY_INSERT_DROPPED,
+        scope.execution_id.query_id().high(),
+        scope.execution_id.query_id().low(),
+        scope.execution_id.attempt_id().get(),
+        driver_id,
+        task_key.high(),
+        task_key.low(),
+        scope.token,
+    );
+    Ok(true)
+}
+
 /// One task's execution-side state, from `install_receiver` to
 /// `remove_receiver`.
 struct TaskRuntime {
@@ -1142,6 +1179,10 @@ impl NativeTaskExecutionHost {
             context = context.with_join_build_control(Some(Arc::new(
                 crate::join_build_test_control::JoinBuildHold::new(identity, Arc::clone(controls)),
             )));
+            let controls = Arc::clone(controls);
+            context = context.with_content_apply_insert_control(Arc::new(move |driver_id| {
+                drop_content_apply_insert(&controls, identity, descriptor_task_key, driver_id)
+            }));
         }
         #[cfg(novarocks_dev_controls)]
         if let Some(observations) = self.queries.observation_controls()

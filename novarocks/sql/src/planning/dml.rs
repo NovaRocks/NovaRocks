@@ -489,6 +489,11 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    pub(crate) fn require_input_drain(mut self) -> Self {
+        self.0.input_completion = novarocks_physical_plan::FragmentInputCompletion::MustDrain;
+        self
+    }
+
     /// Carry the Provider route's original placement preference into planning.
     pub fn with_write_layout(
         mut self,
@@ -625,6 +630,7 @@ impl DmlWritePlanInput {
         )?;
         Ok(Self(
             crate::planner::distributed::write::contract::SqlWritePlanInput {
+                input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                 contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
                 position_materialization: None,
                 write_layout:
@@ -1324,6 +1330,7 @@ pub struct DmlFinalChangeStreamCompileRequest<'a> {
 }
 
 pub(crate) struct DmlFinalChangeStreamSealContext {
+    pub(crate) input_completion: novarocks_physical_plan::FragmentInputCompletion,
     pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     pub(crate) shape: DmlWritePlanShape,
     pub(crate) final_write: DmlFinalWritePlanContext,
@@ -1374,6 +1381,7 @@ pub struct DmlFinalChangeStreamPlan {
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    input_completion: novarocks_physical_plan::FragmentInputCompletion,
     constant_policy: novarocks_functions::ConstantValidation,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -1399,6 +1407,7 @@ impl DmlChangeStreamCompletion {
             crate::planner::distributed::build::FinalChangeStreamWriteLowering {
                 reads,
                 dag: self.dag,
+                input_completion: self.input_completion,
                 auxiliary: &self.auxiliary,
                 targets: finalized_targets.0,
             },
@@ -1436,6 +1445,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    input_completion: novarocks_physical_plan::FragmentInputCompletion,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
@@ -1500,6 +1510,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     )?;
     Ok((
         DmlChangeStreamCompletion {
+            input_completion,
             constant_policy,
             root_allow_throw_exception,
             functions,
@@ -1610,6 +1621,7 @@ pub fn begin_final_dml_change_stream(
         compiled.sealed_functions,
         keyed_assert,
         request.shape,
+        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
         constant_policy,
@@ -1675,6 +1687,7 @@ pub fn compile_final_dml_change_stream(
         compiled.sealed_functions,
         DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: keyed_assert,
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
             shape: request.shape,
             final_write: request.final_write,
         },
@@ -1812,6 +1825,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         crate::planner::distributed::build::FinalChangeStreamWriteLowering {
             reads,
             dag,
+            input_completion: context.input_completion,
             auxiliary: &auxiliary,
             targets: finalized_targets.0,
         },

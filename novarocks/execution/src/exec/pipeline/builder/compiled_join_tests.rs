@@ -672,7 +672,25 @@ pub(super) fn single_plan_with_dop(
     right: &[Row],
     pipeline_dop: u32,
 ) -> PhysicalPlan {
-    single_plan_with_predicate(spec, left, right, pipeline_dop, false)
+    single_plan_with_predicate(
+        spec,
+        left,
+        right,
+        pipeline_dop,
+        false,
+        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
+    )
+}
+
+pub(super) fn drain_input_join_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
+    single_plan_with_predicate(
+        spec,
+        left,
+        right,
+        1,
+        false,
+        novarocks_physical_plan::FragmentInputCompletion::MustDrain,
+    )
 }
 
 fn single_plan_with_predicate(
@@ -681,6 +699,7 @@ fn single_plan_with_predicate(
     right: &[Row],
     pipeline_dop: u32,
     checked_right: bool,
+    input_completion: novarocks_physical_plan::FragmentInputCompletion,
 ) -> PhysicalPlan {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
 
@@ -689,6 +708,7 @@ fn single_plan_with_predicate(
             SINGLE,
             &fixture_sources,
         );
+    builder.set_input_completion(input_completion);
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
         &mut builder,
@@ -3616,7 +3636,14 @@ fn nested_loop_left_mark_preserves_a_late_required_error_after_true() {
     let mut rhs = vec![(None, Some(0)); 530];
     rhs.push((None, Some(1)));
     let spec = Spec::nested(JoinKind::LeftMark, true);
-    let plan = single_plan_with_predicate(spec, &[(None, Some(10))], &rhs, 1, true);
+    let plan = single_plan_with_predicate(
+        spec,
+        &[(None, Some(10))],
+        &rhs,
+        1,
+        true,
+        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
+    );
     let mut packages = packages(&plan);
     let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
     let output = ResultSinkBuffer::new();

@@ -83,17 +83,16 @@ pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
-    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
-    SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
-    SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
-    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
-    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvPartitionFieldFacts,
-    SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
-    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
-    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
-    SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts,
-    SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
-    SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
+    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvBaseContractFacts,
+    SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts, SqlImvBranchContractFacts, SqlImvContentField,
+    SqlImvExpressionFacts, SqlImvExpressionKindFacts, SqlImvJoinContractFacts, SqlImvJoinKindFacts,
+    SqlImvJoinPredicateFacts, SqlImvOutputColumnFacts, SqlImvPartitionFacts,
+    SqlImvPartitionFieldFacts, SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts,
+    SqlImvRefreshHistoryFacts, SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle,
+    SqlImvSchemaContractFacts, SqlImvTargetColumnsFacts, SqlImvTargetContractFacts,
+    SqlImvTargetVisibleColumnFacts, SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
+    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput,
+    SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
 pub(crate) use statement_system_relation::StatementSystemRelationSource;
 pub(crate) use statement_system_relation::statement_system_relation_site;
@@ -2051,8 +2050,6 @@ impl SqlCompiler {
             root_semantics = root_semantics.imv_output(
                 &crate::planner::plan_output_columns(&logical_plan)?,
                 input.snapshot(),
-                &change_stream,
-                true,
             )?;
             factory = std::rc::Rc::try_unwrap(factory_cell)
                 .map_err(|_| {
@@ -2177,6 +2174,13 @@ impl SqlCompiler {
         let root_distribution = match &intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
                 resolve_root_distribution_requirement(&logical_plan, root_distribution)?
+            }
+            SqlCompileIntent::ChangeStreamWrite
+                if matches!(logical_plan.kind, crate::planner::logical::LogicalPlanKind::ContentApply(_)) =>
+            {
+                // The content owner publishes its independent summary through
+                // the same fragment as the change-stream router.
+                Some(crate::optimizer::property::DistributionSpec::Any)
             }
             _ => None,
         };

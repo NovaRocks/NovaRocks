@@ -490,6 +490,12 @@ pub(crate) struct RepeatOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ContentApplyOp {
+    pub(crate) route_keys: Box<[u32]>,
+    pub(crate) output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ChangeEventExpandOp {
     pub(crate) events: Vec<ChangeEventSpec>,
     pub(crate) output_columns: Vec<OutputColumn>,
@@ -688,6 +694,7 @@ pub(crate) enum Operator {
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
     LogicalChangeEventExpand(ChangeEventExpandOp),
+    LogicalContentApply(ContentApplyOp),
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),
     LogicalCTEConsume(CTEConsumeOp),
@@ -716,6 +723,7 @@ pub(crate) enum Operator {
     PhysicalCTEConsume(CTEConsumeOp),
     PhysicalRepeat(RepeatOp),
     PhysicalChangeEventExpand(ChangeEventExpandOp),
+    PhysicalContentApply(ContentApplyOp),
     PhysicalUnion(UnionOp),
     PhysicalIntersect(IntersectOp),
     PhysicalExcept(ExceptOp),
@@ -748,6 +756,7 @@ impl Operator {
                 | Operator::LogicalTableFunction(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalChangeEventExpand(_)
+                | Operator::LogicalContentApply(_)
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)

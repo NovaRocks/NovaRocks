@@ -17,6 +17,9 @@
 
 //! Task-local content weights, live-position claims, and tail verification.
 
+mod stages;
+pub(crate) use stages::{ContentApplyFactory, ContentApplyPhase, ContentApplyStages};
+
 use std::{
     hash::{BuildHasher, RandomState},
     num::NonZeroUsize,
@@ -592,6 +595,7 @@ impl ContentApplyTail {
         turn: &mut TurnWork,
         conversions: &mut ValueConversionContext,
         work: &BulkWork<'_>,
+        drop_insert: impl FnOnce() -> ExecutionResult<bool>,
     ) -> ExecutionResult<Option<ExportedKeys>> {
         let mut next = self.next;
         let mut copies = self.copies;
@@ -622,7 +626,10 @@ impl ContentApplyTail {
         let output = if keys.is_empty() {
             None
         } else {
-            Some(index.export(&keys, work)?)
+            let first = usize::from(drop_insert()?);
+            (first < keys.len())
+                .then(|| index.export(&keys[first..], work))
+                .transpose()?
         };
         self.next = next;
         self.copies = copies;

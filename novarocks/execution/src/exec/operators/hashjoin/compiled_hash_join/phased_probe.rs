@@ -562,7 +562,9 @@ impl TransformKernel for JoinProbe {
             self.release();
             return Ok(ControlStep::Withdrawn);
         }
-        if self.load_if_published()?
+        if self.declaration.program.input_completion()
+            == novarocks_local_program::InputCompletion::MayShortCircuit
+            && self.load_if_published()?
             && self.preparation()?.definition.empty_output_on_b0()
             && self
                 .loaded

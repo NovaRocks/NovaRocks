@@ -643,9 +643,12 @@ fn validate_readmission_capture(
 pub(crate) struct CurrentProjectionRegistration {
     capture: Arc<current_metadata_cpu::CurrentMetadataCapture>,
     receiving: Arc<novarocks_spi::connector::ConnectorCatalogMutationReceiving>,
+    reconciliation: Arc<novarocks_spi::connector::ConnectorCatalogMutationReceiving>,
     preparation: std::sync::OnceLock<CurrentRegistrationPreparation>,
     admission: std::sync::OnceLock<ConnectorDocumentManagementAdmission>,
     call: std::sync::Mutex<CurrentRegistrationCall>,
+    slot_evidence: Arc<std::sync::OnceLock<novarocks_spi::connector::UnknownCommitEvidence>>,
+    non_aggregate_readmission: std::sync::OnceLock<ManagementEntrance>,
     state:
         std::sync::Mutex<Option<novarocks_mv_application::management::ManagementObservationState>>,
     health: novarocks_query_application::api::StatementNativeHealthFailure,
@@ -659,6 +662,28 @@ struct CurrentRegistrationPreparation {
     context: ConnectorRequestContext,
     operation_id: ConnectorMutationOperationId,
     responsibility: EffectResponsibility,
+}
+
+fn incarnation_slot_evidence(
+    documents: &ConnectorDocumentStorage,
+    request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    evidence: novarocks_spi::connector::ExternalMutationEvidence,
+) -> Result<novarocks_spi::connector::UnknownCommitEvidence, novarocks_spi::connector::ConnectorError>
+{
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, UnknownCommitIdentity};
+    let decoded = documents.decode_keyed_slot_change_evidence(request, evidence)?;
+    let expected = novarocks_mv_application::persistence::keyed_documents::management_slot_name()
+        .map_err(|error| {
+        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    })?;
+    if !matches!(&decoded.identity, UnknownCommitIdentity::SlotWriter { slot } if slot == &expected)
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV registration evidence is for another slot",
+        ));
+    }
+    Ok(decoded)
 }
 
 type CurrentRegistrationFuture = std::pin::Pin<
@@ -786,9 +811,14 @@ impl CurrentProjectionRegistration {
         Self {
             capture: current_metadata_cpu::new_current_metadata_capture(),
             receiving: Arc::new(novarocks_spi::connector::ConnectorCatalogMutationReceiving::new()),
+            reconciliation: Arc::new(
+                novarocks_spi::connector::ConnectorCatalogMutationReceiving::new(),
+            ),
             preparation: std::sync::OnceLock::new(),
             admission: std::sync::OnceLock::new(),
             call: std::sync::Mutex::new(CurrentRegistrationCall::default()),
+            slot_evidence: Arc::new(std::sync::OnceLock::new()),
+            non_aggregate_readmission: std::sync::OnceLock::new(),
             state: std::sync::Mutex::new(None),
             health:
                 novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
@@ -813,7 +843,10 @@ impl CurrentProjectionRegistration {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .in_foreign;
-        (unproven || self.receiving.foreign_exit_unproven()).then(|| self.health.clone())
+        (unproven
+            || self.receiving.foreign_exit_unproven()
+            || self.reconciliation.foreign_exit_unproven())
+        .then(|| self.health.clone())
     }
     fn install_state(
         &self,
@@ -905,12 +938,13 @@ impl CurrentProjectionRegistration {
             return Poll::Pending;
         }
         drop(call);
-        let observation = self.receiving.observation();
-        if !observation.dispatched() {
-            return Poll::Ready(());
-        }
-        if !observation.provider_exited() || self.receiving.foreign_exit_unproven() {
-            return Poll::Pending;
+        for receiving in [&self.receiving, &self.reconciliation] {
+            let observation = receiving.observation();
+            if observation.dispatched()
+                && (!observation.provider_exited() || receiving.foreign_exit_unproven())
+            {
+                return Poll::Pending;
+            }
         }
         Poll::Ready(())
     }
@@ -925,11 +959,16 @@ impl CurrentProjectionRegistration {
         };
         use std::task::Poll;
         std::task::ready!(self.poll_registration_physical_closed(cx));
-        let observation = self.receiving.observation();
-        if !observation.dispatched() {
+        let original = self.receiving.observation();
+        if !original.dispatched() {
             return Poll::Ready(());
         }
-        match observation.validated_outcome() {
+        let reconciled = self.reconciliation.observation();
+        let outcome = match original.validated_outcome() {
+            Some(Ok(O::CommitUnknown { .. })) => reconciled.validated_outcome(),
+            original => original,
+        };
+        match outcome {
             Some(Ok(O::KnownCommitted {
                 cleanup: F::Complete,
                 ..
@@ -960,11 +999,30 @@ impl CurrentProjectionRegistration {
         // No formatting, callback or owner destruction occurs under this lock.
         let (needed, validated, dispatched) = {
             let observation = self.receiving.observation();
+            let reconciled = self.reconciliation.observation();
+            let validated = match (
+                observation.validated_outcome(),
+                reconciled.validated_outcome(),
+            ) {
+                (
+                    Some(Ok(O::CommitUnknown { .. })),
+                    Some(Ok(settled @ (O::KnownCommitted { .. } | O::KnownUncommitted { .. }))),
+                ) => Some(Ok(settled)),
+                (original, _) => original,
+            };
+            let needed = observation.needed_committed().or_else(|| {
+                if matches!(
+                    observation.validated_outcome(),
+                    Some(Ok(O::CommitUnknown { .. }))
+                ) {
+                    reconciled.needed_committed()
+                } else {
+                    None
+                }
+            });
             (
-                observation.needed_committed().cloned(),
-                observation
-                    .validated_outcome()
-                    .map(|outcome| outcome.cloned().map_err(Clone::clone)),
+                needed.cloned(),
+                validated.map(|outcome| outcome.cloned().map_err(Clone::clone)),
                 observation.dispatched(),
             )
         };
@@ -1034,6 +1092,22 @@ impl CurrentProjectionRegistration {
             R::ContractFailure { error, .. } => Err(current_projection_connector(error)),
         };
         Poll::Ready((disposition, result))
+    }
+}
+
+impl Drop for CurrentProjectionRegistration {
+    fn drop(&mut self) {
+        if let Some(entrance) = self.non_aggregate_readmission.get()
+            && let Some(state) = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            // Successful installation already consumed authorization. A refused
+            // observation only releases its own token after original retirement.
+            let _ = entrance.abandon_observation(state);
+        }
     }
 }
 
@@ -1115,21 +1189,67 @@ impl OriginalManagedTargetCurrentSource<'_> {
             .planning
             .derive_mutation_lease()
             .map_err(current_projection_connector)?;
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationOperation, ConnectorCatalogMutationReconcileRequest,
+            ConnectorCatalogMutationRequest, ExternalMutationOutcome,
+        };
         let receiving = Arc::clone(&self.registration.receiving);
         let context = original.context.clone();
-        // The original future is installed before its first factory/poll. It
-        // owns only exact input/receiving aliases, never its outer Source.
+        let resolve_slot = !observed.interpretation.is_aggregate();
+        let probe = resolve_slot.then(|| {
+            let documents = original.documents.clone();
+            let request = keyed_request(
+                &documents,
+                original.observed.view.table.clone(),
+                original.observed.view.object_id.clone(),
+                context.clone().after_external_effect(),
+            );
+            (
+                documents,
+                request,
+                Arc::clone(&self.registration.slot_evidence),
+                Arc::clone(&self.registration.reconciliation),
+            )
+        });
+        let request = ConnectorCatalogMutationRequest {
+            operation_id,
+            target: original.documents.owner().clone(),
+            operation: ConnectorCatalogMutationOperation::KeyedDocuments { intent },
+            context,
+        };
+        // Both Provider Futures use the exact original request and generation.
+        // The independent receiver reports its actual cleanup and local exit.
         let future: CurrentRegistrationFuture = Box::pin(async move {
-            mutation
-                .execute_operation_async_in(
-                    operation_id,
-                    novarocks_spi::connector::ConnectorCatalogMutationOperation::KeyedDocuments {
-                        intent,
-                    },
-                    context,
-                    receiving.as_ref(),
-                )
-                .await
+            let result = mutation.execute_async_in(request.clone(), &receiving).await;
+            if let Some((documents, observation, slot_evidence, reconciliation)) = probe {
+                let external = match receiving.observation().validated_outcome() {
+                    Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. }))
+                        if evidence.operation_id() == operation_id =>
+                    {
+                        Some(evidence.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(external) = external {
+                    let evidence =
+                        incarnation_slot_evidence(&documents, observation, external.clone())?;
+                    assert!(
+                        slot_evidence.set(evidence).is_ok(),
+                        "one original slot witness"
+                    );
+                    mutation
+                        .reconcile_async_in(
+                            &request,
+                            ConnectorCatalogMutationReconcileRequest {
+                                evidence: external,
+                                context: request.context.clone(),
+                            },
+                            &reconciliation,
+                        )
+                        .await?;
+                }
+            }
+            result
         });
         {
             let mut call = self
@@ -1144,8 +1264,25 @@ impl OriginalManagedTargetCurrentSource<'_> {
             call.future = Some(future);
             call.call_installed = true;
         }
-        let (disposition, result) =
-            std::future::poll_fn(|cx| self.registration.poll_needed(cx)).await;
+        let (disposition, result) = std::future::poll_fn(|cx| {
+            let needed = self.registration.poll_needed(cx);
+            if resolve_slot
+                && matches!(
+                    &needed,
+                    std::task::Poll::Ready((EffectDisposition::CommitUnknown, _))
+                )
+                && !self
+                    .registration
+                    .call
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .actual_exit
+            {
+                return std::task::Poll::Pending;
+            }
+            needed
+        })
+        .await;
         let recorded = self
             .registration
             .call
@@ -1153,13 +1290,29 @@ impl OriginalManagedTargetCurrentSource<'_> {
             .unwrap_or_else(|p| p.into_inner())
             .terminal_recorded;
         if !recorded {
-            state
-                .record_registration_terminal(
-                    original.responsibility.clone().record_terminal(disposition),
-                )
-                .map_err(|error| {
-                    current_projection_conflict(format!("record MV registration: {error:?}"))
-                })?;
+            if resolve_slot && disposition == EffectDisposition::CommitUnknown {
+                if let Some(evidence) = self.registration.slot_evidence.get() {
+                    self.entrance
+                        .retain_unknown_incarnation_registration(
+                            state,
+                            &original.responsibility,
+                            evidence.clone(),
+                        )
+                        .map_err(|error| {
+                            current_projection_conflict(format!(
+                                "retain MV incarnation slot evidence: {error}"
+                            ))
+                        })?;
+                }
+            } else {
+                state
+                    .record_registration_terminal(
+                        original.responsibility.clone().record_terminal(disposition),
+                    )
+                    .map_err(|error| {
+                        current_projection_conflict(format!("record MV registration: {error:?}"))
+                    })?;
+            }
             self.registration
                 .call
                 .lock()
@@ -1275,6 +1428,16 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         .map_err(|e| conflict(format!("begin MV Current convergence: {e:?}")))?;
         let mut state = self.registration.install_state(state)?;
         if let MvConvergence::Readmission { permits, .. } = &self.convergence {
+            if permits.is_empty() {
+                self.registration
+                    .non_aggregate_readmission
+                    .set(self.entrance.clone())
+                    .map_err(|_| {
+                        current_projection_conflict(
+                            "MV non-aggregate readmission custody was already installed",
+                        )
+                    })?;
+            }
             for permit in permits {
                 state
                     .accept_readmission_permit(permit.clone())
@@ -1379,9 +1542,10 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .map_err(conflict)?;
         let admission = self
             .entrance
-            .install_observed_target(
+            .install_observed_target_with_kind(
                 &state,
                 observed.management_dependencies(lease.control_runtime_id()),
+                observed.interpretation.is_aggregate(),
             )
             .map_err(|e| conflict(format!("install MV admission: {e:?}")))?;
         Ok((observed, admission))
@@ -1579,9 +1743,10 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .map_err(conflict)?;
         let admission = self
             .entrance
-            .install_observed_target(
+            .install_observed_target_with_kind(
                 &state,
                 observed.management_dependencies(lease.control_runtime_id()),
+                observed.interpretation.is_aggregate(),
             )
             .map_err(|e| conflict(format!("install MV admission: {e:?}")))?;
         Ok((observed, admission))

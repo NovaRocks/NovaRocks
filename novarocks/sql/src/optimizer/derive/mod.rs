@@ -187,6 +187,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalCTEProduce(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalRepeat(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalChangeEventExpand(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalContentApply(_) => PhysicalPropertySet::any(),
         Operator::PhysicalTableFunction(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalWindow(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalNestLoopJoin(o) => o.derive_output(scalars, children_outputs),
@@ -252,6 +253,8 @@ pub(crate) fn derive_required(
             o.derive_required(scalars, parent_required, num_children)
         }
         Operator::PhysicalRepeat(o) => o.derive_required(scalars, parent_required, num_children),
+        // Exact paired exchanges are authored together by contract lowering.
+        Operator::PhysicalContentApply(_) => vec![PhysicalPropertySet::any(); num_children],
         Operator::PhysicalChangeEventExpand(o) => {
             o.derive_required(scalars, parent_required, num_children)
         }

@@ -2239,20 +2239,9 @@ fn create_known_uncommitted_can_retry_but_create_unknown_cannot() {
             .acquire(create(EffectIdentity::from_bytes([25; 16])), || false)
             .err()
             .unwrap(),
-        ManagementAdmissionError::EffectUnsettled
+        ManagementAdmissionError::NameIsolated
     );
-    assert_eq!(
-        entrance
-            .begin_readmission(
-                exact_target.table(),
-                ManagementContinuation::SameOwner {
-                    previous_incarnation: incarnation("inc-a"),
-                },
-            )
-            .unwrap()
-            .phase(),
-        ManagementObservationPhase::AwaitingEffectClosure
-    );
+    assert!(entrance.unsettled_effects(exact_target.table()).is_empty());
 }
 
 #[test]
@@ -2302,14 +2291,14 @@ fn create_intent_marks_before_stage_binds_once_and_blocks_a_lost_response() {
     drop(lease);
 
     // The staged response was lost before an exact target could be bound. The
-    // old intent remains an Unknown barrier rather than being treated as an
+    // old intent isolates the name rather than being treated as an
     // absent table or retried with another caller-generated UUID.
     assert_eq!(
         entrance
             .acquire(request(EffectIdentity::from_bytes([72; 16])), || false)
             .err()
             .unwrap(),
-        ManagementAdmissionError::EffectUnsettled
+        ManagementAdmissionError::NameIsolated
     );
 
     let mut escaped = keyed_management_view(&exact, "deployment-a", "inc-a", 1);
@@ -2339,18 +2328,10 @@ fn create_intent_marks_before_stage_binds_once_and_blocks_a_lost_response() {
         entrance.resolve_unbound_create_as_unknown(fresh).unwrap(),
         exact
     );
-    assert_eq!(entrance.unsettled_effects(exact.table()).len(), 1);
+    assert!(entrance.unsettled_effects(exact.table()).is_empty());
     assert_eq!(
-        entrance
-            .begin_readmission(
-                exact.table(),
-                ManagementContinuation::SameOwner {
-                    previous_incarnation: incarnation("inc-a"),
-                },
-            )
-            .unwrap()
-            .phase(),
-        ManagementObservationPhase::AwaitingEffectClosure
+        entrance.check_name_isolation(exact.table()),
+        Err(ManagementAdmissionError::NameIsolated)
     );
 }
 
@@ -2667,7 +2648,7 @@ fn unknown_drop_blocks_same_name_create_and_retains_exact_effect() {
                 || false,
             )
             .err(),
-        Some(ManagementAdmissionError::EffectUnsettled)
+        Some(ManagementAdmissionError::NameIsolated)
     );
 }
 
@@ -3220,6 +3201,7 @@ fn startup_evidence(isolated: &str, isolated_at_ms: u64) -> StartupIsolationEvid
             nonce: StartupNonce::parse("launch-1").unwrap(),
             isolated_incarnations: [incarnation(isolated)].into_iter().collect(),
             scope: StartupIsolationScope::Deployment,
+            all_other_incarnations_settled: false,
             isolated_at: ManagementTimestamp::from_unix_millis(isolated_at_ms),
             source: "supervisor recorded the previous process exited".to_string(),
         },
@@ -4840,4 +4822,396 @@ async fn async_keyed_drop_preserves_the_original_pending_observation_and_exact_g
         .unwrap();
     assert!(first.matches(&second));
     drop(management);
+}
+
+fn starting_entrance(
+    policy: RemoteEffectPolicy,
+    clock: &VirtualManagementClock,
+) -> ManagementEntrance {
+    ManagementEntrance::new_starting(
+        owner("deployment-a"),
+        incarnation("inc-a"),
+        clock.now().unwrap(),
+        policy,
+        Arc::new(clock.clone()),
+    )
+}
+
+fn create_name(target: &ManagedMvTarget, effect: u8) -> ManagementRequest {
+    ManagementRequest::for_create_intent(
+        CreateIntent::try_new(
+            target.catalog().clone(),
+            target.table().clone(),
+            EffectIdentity::from_bytes([effect; 16]),
+        )
+        .unwrap(),
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+    )
+}
+
+#[test]
+fn name_operations_wait_for_complete_discovery_before_early_drop_observation() {
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(1_000));
+    let entrance = starting_entrance(RemoteEffectPolicy::default(), &clock);
+    let target = target("mv", b"object");
+    assert_eq!(
+        entrance.check_name_startup_grace(),
+        Err(ManagementAdmissionError::StartupGrace {
+            state: NameStartupGrace::Discovering,
+        })
+    );
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    assert_eq!(
+        entrance
+            .acquire(drop_request(&target, &dependencies), || false)
+            .err(),
+        Some(ManagementAdmissionError::StartupGrace {
+            state: NameStartupGrace::Discovering
+        })
+    );
+    assert_eq!(
+        entrance.acquire(create_name(&target, 47), || false).err(),
+        Some(ManagementAdmissionError::StartupGrace {
+            state: NameStartupGrace::Discovering
+        })
+    );
+    entrance.finish_startup_discovery(true);
+    let ended = entrance.take_name_startup_transition().unwrap();
+    assert_eq!(
+        ended.state,
+        NameStartupGrace::Ended(NameStartupGraceEnd::NoRestartEvidence)
+    );
+    assert!(ended.discovery_complete);
+    assert!(entrance.take_name_startup_transition().is_none());
+    assert!(entrance.acquire(create_name(&target, 47), || false).is_ok());
+}
+
+#[test]
+fn incomplete_startup_discovery_needs_both_remote_guarantees() {
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(1_000));
+    let one_path = starting_entrance(
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), None).unwrap(),
+        &clock,
+    );
+    one_path.finish_startup_discovery(false);
+    let both_paths = starting_entrance(
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap(),
+        &clock,
+    );
+    both_paths.note_incomplete_startup_discovery();
+    both_paths.finish_startup_discovery(true);
+    let active = both_paths.name_startup_observation();
+    assert!(!active.discovery_complete);
+    assert_eq!(
+        active.state,
+        NameStartupGrace::Active {
+            until: Some(ManagementTimestamp::from_unix_millis(66_000))
+        }
+    );
+    clock.set(ManagementTimestamp::from_unix_millis(65_999));
+    assert!(both_paths.check_name_startup_grace().is_err());
+    clock.set(ManagementTimestamp::from_unix_millis(66_000));
+    assert!(both_paths.check_name_startup_grace().is_ok());
+    assert_eq!(
+        both_paths.name_startup_observation().state,
+        NameStartupGrace::Ended(NameStartupGraceEnd::Lifetime)
+    );
+    assert_eq!(
+        one_path.name_startup_observation().state,
+        NameStartupGrace::Active { until: None }
+    );
+}
+
+#[test]
+fn a_deployment_settlement_declaration_ends_name_startup_grace_for_this_launch_only() {
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(1_000));
+    let entrance = starting_entrance(RemoteEffectPolicy::default(), &clock);
+    entrance.note_startup_incarnation(&incarnation("inc-old"));
+    entrance.note_startup_incarnation(entrance.incarnation());
+    entrance.finish_startup_discovery(true);
+    let nonce = StartupNonce::parse("test-launch").unwrap();
+    let declare = |isolated: &str, scope, settled| StartupIsolationDeclaration {
+        deployment: entrance.owner().clone(),
+        for_incarnation: entrance.incarnation().clone(),
+        nonce: nonce.clone(),
+        isolated_incarnations: std::collections::BTreeSet::from([incarnation(isolated)]),
+        scope,
+        all_other_incarnations_settled: settled,
+        isolated_at: clock.now().unwrap(),
+        source: "deployment operator".into(),
+    };
+    let accept = |declaration| {
+        StartupIsolationEvidence::try_accept(
+            declaration,
+            entrance.owner(),
+            entrance.incarnation(),
+            &nonce,
+            clock.now().unwrap(),
+        )
+    };
+    let isolation = accept(declare("inc-old", StartupIsolationScope::Deployment, false)).unwrap();
+    entrance.accept_name_startup_declaration(&isolation);
+    assert!(entrance.check_name_startup_grace().is_err());
+    let incomplete = accept(declare(
+        "inc-unknown",
+        StartupIsolationScope::Deployment,
+        true,
+    ))
+    .unwrap();
+    entrance.accept_name_startup_declaration(&incomplete);
+    assert!(entrance.check_name_startup_grace().is_err());
+    assert_eq!(
+        accept(declare(
+            "inc-old",
+            StartupIsolationScope::Targets(std::collections::HashSet::from([table("mv")])),
+            true,
+        )),
+        Err(StartupIsolationError::SettlementRequiresDeploymentScope)
+    );
+    let settled = accept(declare("inc-old", StartupIsolationScope::Deployment, true)).unwrap();
+    entrance.accept_name_startup_declaration(&settled);
+    entrance.accept_name_startup_declaration(&isolation);
+    assert_eq!(
+        entrance.name_startup_observation().state,
+        NameStartupGrace::Ended(NameStartupGraceEnd::Declaration)
+    );
+    assert!(entrance.check_name_startup_grace().is_ok());
+    assert_eq!(
+        entrance.name_startup_observation().prior_incarnations,
+        std::collections::BTreeSet::from([incarnation("inc-old")])
+    );
+}
+
+#[test]
+fn a_lost_create_isolates_same_name_through_both_remote_effect_windows() {
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(1_000));
+    let entrance = starting_entrance(
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap(),
+        &clock,
+    );
+    entrance.finish_startup_discovery(true);
+    let mv = target("mv", b"object");
+    let other = target("else", b"other");
+    let mut lease = entrance.acquire(create_name(&mv, 50), || false).unwrap();
+    lease
+        .mark_create_intent_dispatched(clock.now().unwrap())
+        .unwrap();
+    clock.set(ManagementTimestamp::from_unix_millis(2_000));
+    drop(lease);
+    assert_eq!(
+        entrance.acquire(create_name(&mv, 51), || false).err(),
+        Some(ManagementAdmissionError::NameIsolated)
+    );
+    assert!(entrance.acquire(create_name(&other, 52), || false).is_ok());
+    clock.set(ManagementTimestamp::from_unix_millis(66_999));
+    assert_eq!(
+        entrance.check_name_isolation(mv.table()),
+        Err(ManagementAdmissionError::NameIsolated)
+    );
+    clock.set(ManagementTimestamp::from_unix_millis(67_000));
+    assert!(entrance.acquire(create_name(&mv, 53), || false).is_ok());
+}
+
+#[test]
+fn a_create_publication_receipt_releases_only_its_original_name() {
+    use novarocks_spi::connector::{
+        ConnectorStagedCreateOperationId, ConnectorStagedCreateReceipt,
+        ConnectorStagedCreateReceiptPhase, ExternalMutationEffect,
+    };
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let mv = target("mv", b"published-object");
+    let mut lease = entrance.acquire(create_name(&mv, 50), || false).unwrap();
+    lease
+        .mark_create_intent_dispatched(ManagementTimestamp::from_unix_millis(100))
+        .unwrap();
+    lease.late_bind_create_target(mv.clone()).unwrap();
+    let receipt = |operation| {
+        ConnectorStagedCreateReceipt::try_new(
+            ConnectorProviderBindingKey {
+                instance_id: mv.table().instance_id.clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+            },
+            ConnectorStagedCreateOperationId::from_bytes([operation; 16]),
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::new(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        lease.observe_applied_create_name(&receipt(51)),
+        Err(ManagementAdmissionError::InvalidEffect)
+    );
+    assert_eq!(
+        entrance.check_name_isolation(mv.table()),
+        Err(ManagementAdmissionError::NameIsolated)
+    );
+    lease.observe_applied_create_name(&receipt(50)).unwrap();
+    assert!(entrance.check_name_isolation(mv.table()).is_ok());
+    assert!(entrance.unsettled_effects(mv.table()).is_empty());
+    assert_eq!(
+        entrance.management_phase(mv.table()),
+        MvManagementPhase::NotObserved
+    );
+}
+
+#[test]
+fn lost_non_aggregate_drop_isolates_the_name_until_exact_absence() {
+    let mv = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let observation = ready_observation_state(mv.clone(), "deployment-a", "inc-a");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target_with_kind(&observation, dependencies.clone(), false)
+        .unwrap();
+    let mut drop_lease = entrance
+        .acquire(drop_request(&mv, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut drop_lease, &mv);
+    drop_lease
+        .record_drop_terminal(EffectDisposition::CommitUnknown)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(mv.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(entrance.unsettled_effects(mv.table()).is_empty());
+    assert_eq!(
+        entrance.acquire(create_name(&mv, 64), || false).err(),
+        Some(ManagementAdmissionError::NameIsolated)
+    );
+    let effect = entrance
+        .unresolved_named_drop(mv.catalog(), mv.table())
+        .unwrap();
+    entrance.observe_named_drop_absence(&catalog(2), mv.table(), effect);
+    entrance.observe_named_drop_absence(
+        mv.catalog(),
+        mv.table(),
+        EffectIdentity::from_bytes([34; 16]),
+    );
+    assert!(entrance.check_name_isolation(mv.table()).is_err());
+    entrance.observe_named_drop_absence(mv.catalog(), mv.table(), effect);
+    assert_eq!(
+        entrance.management_phase(mv.table()),
+        MvManagementPhase::NotObserved
+    );
+    assert!(entrance.acquire(create_name(&mv, 65), || false).is_ok());
+}
+
+#[test]
+fn non_aggregate_readmission_and_unknown_update_do_not_mint_effect_barriers() {
+    let mv = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let old = incarnation("inc-old");
+    entrance
+        .recover_non_aggregate_target(mv.clone(), old.clone())
+        .unwrap();
+    assert_eq!(
+        entrance.non_aggregate_reobservation(mv.table()),
+        Some(old.clone())
+    );
+    let mut observed = entrance
+        .begin_readmission(
+            mv.table(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: old,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        observed.phase(),
+        ManagementObservationPhase::AwaitingFreshObservation
+    );
+    observed
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([91; 16]))
+        .unwrap();
+    assert_eq!(
+        observed
+            .accept_current_observation(fresh_observation(
+                [91; 16],
+                &mv,
+                "deployment-a",
+                "inc-old",
+                1,
+            ))
+            .unwrap(),
+        ManagementObservationPhase::RegistrationRequired(RegistrationRequirement::Incarnation)
+    );
+    let responsibility = EffectResponsibility::new(
+        EffectIdentity::from_bytes([92; 16]),
+        mv.clone(),
+        incarnation("inc-a"),
+        EffectScope::CATALOG_COMMIT,
+        ManagementTimestamp::from_unix_millis(100),
+    );
+    let evidence = novarocks_spi::connector::UnknownCommitEvidence {
+        asserted_parent: Some(1),
+        preselected_snapshot: 2,
+        identity: novarocks_spi::connector::UnknownCommitIdentity::SlotWriter {
+            slot: crate::persistence::keyed_documents::management_slot_name().unwrap(),
+        },
+    };
+    entrance
+        .retain_unknown_incarnation_registration(&observed, &responsibility, evidence.clone())
+        .unwrap();
+    assert!(entrance.unsettled_effects(mv.table()).is_empty());
+    assert_eq!(entrance.pending_slot_changes(mv.table()), 1);
+    assert!(
+        entrance
+            .resolve_slot_changes(mv.catalog(), mv.table(), mv.object_id(), |actual| {
+                assert_eq!(actual, evidence);
+                Ok(novarocks_spi::connector::CommitConclusion::Committed(
+                    novarocks_spi::connector::CommitProof::SlotWriter,
+                ))
+            })
+            .unwrap()
+            .reinstall_current_projection
+    );
+    observed
+        .record_registration_terminal(
+            responsibility.record_terminal(EffectDisposition::KnownCommitted),
+        )
+        .unwrap();
+    observed
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([93; 16]))
+        .unwrap();
+    observed
+        .accept_current_observation(fresh_observation([93; 16], &mv, "deployment-a", "inc-a", 2))
+        .unwrap();
+    entrance
+        .install_observed_target_with_kind(&observed, dependencies.clone(), false)
+        .unwrap();
+
+    let request = ManagementRequest::try_new(
+        mv.catalog().clone(),
+        mv.table().clone(),
+        Some(mv.object_id().clone()),
+        ConnectorDocumentManagementOperation::SingleTargetUpdate,
+        Some(dependencies),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    let mut lease = entrance.acquire(request, || false).unwrap();
+    lease
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([94; 16]),
+            mv.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_COMMIT,
+            ManagementTimestamp::from_unix_millis(120),
+        ))
+        .unwrap();
+    lease
+        .record_terminal(EffectDisposition::CommitUnknown)
+        .unwrap();
+    assert!(entrance.unsettled_effects(mv.table()).is_empty());
+    assert_eq!(
+        entrance.management_phase(mv.table()),
+        MvManagementPhase::AwaitingObservation
+    );
+    assert_eq!(
+        entrance.non_aggregate_reobservation(mv.table()),
+        Some(incarnation("inc-a"))
+    );
 }

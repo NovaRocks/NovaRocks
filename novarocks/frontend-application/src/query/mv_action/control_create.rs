@@ -237,6 +237,17 @@ impl MvCreateStepOriginal {
         Poll::Ready(result)
     }
     fn install_reader(&mut self, owner: &GovernedActionContext<'_>) -> Result<(), MvPhaseFailure> {
+        self.input
+            .ports
+            .management_entrance()
+            .map_err(service)?
+            .check_name_startup_grace()
+            .map_err(|error| {
+                domain_failure(MvApplicationError::new(
+                    MvApplicationErrorKind::Unavailable,
+                    error.to_string(),
+                ))
+            })?;
         let cancellation =
             QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
         let runtime = self.input.services.blocking.runtime().clone();
@@ -416,6 +427,14 @@ impl MvCreateStepOriginal {
             }
             let cancellation =
                 QueryCancellationView::governed(owner.cancellation().clone(), owner.timeout_ms());
+            let name_metadata_cpu = CurrentProjectionMetadataCpu::business(
+                self.cpu.clone(),
+                self.root.clone(),
+                self.window.clone(),
+                cancellation.clone(),
+                self.input.services.blocking.runtime().clone(),
+                self.wake.clone(),
+            );
             self.in_foreign = true;
             let constructed = CreateOriginal::new(CreateOriginalInput {
                 plan,
@@ -426,6 +445,7 @@ impl MvCreateStepOriginal {
                 operation_id: self.operation,
                 context: self.context.clone(),
                 cancellation,
+                name_metadata_cpu,
                 io: self.io.clone(),
                 cpu: p.turn.take().unwrap(),
             });

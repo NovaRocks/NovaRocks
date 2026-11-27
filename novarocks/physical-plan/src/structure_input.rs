@@ -39,6 +39,7 @@ pub struct FragmentStructureInput {
     pub summaries: Box<[crate::SummaryOutput]>,
     pub dop_domain: PipelineDopDomain,
     pub stage_placement: crate::StagePlacementPolicy,
+    pub input_completion: crate::FragmentInputCompletion,
     pub runtime_filters: Box<[RuntimeFilterId]>,
 }
 
@@ -135,6 +136,7 @@ impl Fragment {
             summaries: input.summaries,
             dop_domain: input.dop_domain,
             stage_placement: input.stage_placement,
+            input_completion: input.input_completion,
             runtime_filters: input.runtime_filters,
             call_requests: crate::FragmentCallRequests::unpublished_empty(input.id),
             calls: crate::FrozenFragmentCalls::unpublished_empty(input.id),

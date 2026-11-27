@@ -55,7 +55,8 @@ mod writer_preparation;
 
 pub use compiled::{
     CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledExchangeRouting,
-    CompiledProgramFacts, CompiledScanInput, LocalProgram, LocalProgramCompileError,
+    CompiledProgramFacts, CompiledScanInput, InputCompletion, LocalProgram,
+    LocalProgramCompileError,
 };
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{

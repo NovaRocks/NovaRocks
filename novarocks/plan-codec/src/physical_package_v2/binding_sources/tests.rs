@@ -856,6 +856,7 @@ fn wide_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(320),
             root: node_id,
             values: BTreeMap::from([(

@@ -224,6 +224,8 @@ pub(crate) fn compute_cost(
         Operator::PhysicalWindow(_)
         | Operator::PhysicalRepeat(_)
         | Operator::PhysicalChangeEventExpand(_)
+        | Operator::LogicalContentApply(_)
+        | Operator::PhysicalContentApply(_)
         | Operator::PhysicalUnion(_)
         | Operator::PhysicalIntersect(_)
         | Operator::PhysicalExcept(_)

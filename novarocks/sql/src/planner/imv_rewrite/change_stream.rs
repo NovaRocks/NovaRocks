@@ -33,7 +33,6 @@ use crate::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::planner::imv_rewrite::annotation::ImvExtension;
-use crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor;
 use crate::planner::imv_rewrite::opt_expr_to_plan;
 use crate::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanProjectNode;
@@ -42,7 +41,6 @@ use crate::planner::table::sql_mv_target_state_scan;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImvChangeStreamDescriptor {
     pub(crate) aggregate: Option<AggregateChangeStreamDescriptor>,
-    pub(crate) join_refresh: Option<JoinRefreshDescriptor>,
 }
 
 impl ImvChangeStreamDescriptor {

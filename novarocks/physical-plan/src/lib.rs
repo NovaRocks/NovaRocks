@@ -106,6 +106,48 @@ pub fn grouped_state_topn_key_supported(
         && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
 }
 
+/// Data layouts accepted for exact content identity, including nested values.
+/// Exchange placement can use a smaller subset of those columns.
+pub fn supports_result_content_key(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::{DataType::*, TimeUnit};
+    match data_type {
+        Null
+        | Boolean
+        | Int8
+        | Int16
+        | Int32
+        | Int64
+        | UInt8
+        | UInt16
+        | UInt32
+        | UInt64
+        | Float32
+        | Float64
+        | Date32
+        | Date64
+        | Timestamp(_, _)
+        | Duration(_)
+        | Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        | Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
+        | Decimal128(_, _)
+        | Decimal256(_, _)
+        | Utf8
+        | LargeUtf8
+        | Utf8View
+        | Binary
+        | LargeBinary
+        | BinaryView => true,
+        FixedSizeBinary(width) => *width > 0,
+        List(item) => supports_result_content_key(item.data_type()),
+        Struct(fields) => fields
+            .iter()
+            .all(|field| supports_result_content_key(field.data_type())),
+        Map(entries, _) => matches!(entries.data_type(), Struct(fields)
+            if fields.len() == 2 && fields.iter().all(|field| supports_result_content_key(field.data_type()))),
+        _ => false,
+    }
+}
+
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.

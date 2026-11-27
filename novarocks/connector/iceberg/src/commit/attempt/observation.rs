@@ -31,7 +31,8 @@ use crate::commit::model::{
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use crate::commit::publication_descriptor::{
-    AttributionPlan, PositiveAttributionObservation, PublicationDescriptor,
+    AttributionPlan, KeyedSlotWriterObservation, PositiveAttributionObservation,
+    PublicationDescriptor,
 };
 use crate::commit::staging::StagingBase;
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -175,6 +176,7 @@ struct JournalEntry<R> {
     // before dispatch. It never uses the ordinary business deadline as a cap.
     finalization_deadline_cap: Option<std::time::Instant>,
     positive_proof: Option<CommitProof>,
+    negative_slot_proof: Option<KeyedSlotWriterObservation>,
 }
 struct JournalState<R> {
     entries: BTreeMap<Uuid, JournalEntry<R>>,
@@ -194,14 +196,20 @@ pub(crate) enum RetainedPublicationProjection<R> {
 }
 pub(crate) struct PublicationJournal<R> {
     operation: OperationToken,
+    keyed_operation: Option<Arc<RetainedKeyedOperation>>,
     frontier: u64,
     activity: Option<Arc<crate::activity::GenerationActivity>>,
     state: Arc<Mutex<JournalState<R>>>,
+}
+struct RetainedKeyedOperation {
+    operation: IcebergCommitOperation,
+    observation: novarocks_spi::connector::KeyedDocumentObservationRequest,
 }
 impl<R> Clone for PublicationJournal<R> {
     fn clone(&self) -> Self {
         Self {
             operation: self.operation,
+            keyed_operation: self.keyed_operation.clone(),
             frontier: self.frontier,
             activity: self.activity.clone(),
             state: Arc::clone(&self.state),
@@ -250,12 +258,35 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     ) -> Self {
         Self::new_with_activity(operation, runtime.activity().cloned())
     }
+    /// Retain only an alias of the exact keyed operation. The operation has no
+    /// back-reference to the journal or its externally visible evidence.
+    pub(crate) fn for_keyed_operation(
+        operation: &IcebergCommitOperation,
+        observation: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Self {
+        let mut journal = Self::for_runtime(operation.token(), operation.runtime());
+        journal.keyed_operation = Some(Arc::new(RetainedKeyedOperation {
+            operation: operation.clone(),
+            observation,
+        }));
+        journal
+    }
+
+    pub(crate) fn keyed_observation_request(
+        &self,
+    ) -> Option<&novarocks_spi::connector::KeyedDocumentObservationRequest> {
+        self.keyed_operation
+            .as_ref()
+            .map(|owner| &owner.observation)
+    }
+
     fn new_with_activity(
         operation: OperationToken,
         activity: Option<Arc<crate::activity::GenerationActivity>>,
     ) -> Self {
         Self {
             operation,
+            keyed_operation: None,
             frontier: 0,
             activity,
             state: Arc::new(Mutex::new(JournalState {
@@ -362,6 +393,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         })?;
         Ok(Self {
             operation: self.operation,
+            keyed_operation: self.keyed_operation.clone(),
             frontier,
             activity: self.activity.clone(),
             state: Arc::clone(&self.state),
@@ -422,6 +454,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 cleanup_report: None,
                 finalization_grant: None,
                 positive_proof: None,
+                negative_slot_proof: None,
             },
         );
         state.current.insert(self.frontier, key);
@@ -833,7 +866,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                     // Exact positive observation may prove the effect while
                     // preserving the original Unknown dispatch evidence.
                     EntryPhase::Concluded(DispatchEvidence::Unknown { .. }) => {
-                        entry.positive_proof.is_some()
+                        entry.positive_proof.is_some() || entry.negative_slot_proof.is_some()
                     }
                     _ => false,
                 }
@@ -864,7 +897,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 | DispatchEvidence::Rejected { .. },
             ) => true,
             EntryPhase::Concluded(DispatchEvidence::Unknown { .. }) => {
-                entry.positive_proof.is_some()
+                entry.positive_proof.is_some() || entry.negative_slot_proof.is_some()
             }
             _ => false,
         })
@@ -898,6 +931,87 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .cleanup_after_commit_in(&checked.retained, current)
             .await;
         self.record_entry_cleanup_report(entry, report);
+        Ok(())
+    }
+
+    /// Finish the cleanup of the exact slot effect after this caller appended
+    /// its one D14 proof to the original entry. No new artifact ledger is made.
+    pub(crate) async fn settle_keyed_slot_cleanup_in(
+        &self,
+        entry: JournalEntryRef,
+        current: &ConnectorRequestContext,
+    ) -> std::result::Result<(), ConnectorError> {
+        let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+        let owner = self
+            .keyed_operation
+            .as_ref()
+            .ok_or_else(|| invalid("Keyed cleanup has no original operation"))?;
+        if owner.operation.token() != self.operation || self.current_entry() != Some(entry) {
+            return Err(invalid(
+                "Keyed cleanup belongs to a different operation or entry",
+            ));
+        }
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let same = state
+                .entries
+                .get(&entry.0)
+                .ok_or_else(|| invalid("Keyed cleanup has no original entry"))?;
+            if !matches!(
+                same.checked.descriptor.attribution,
+                AttributionPlan::KeyedSlotChange { .. }
+            ) || (same.positive_proof.is_none() && same.negative_slot_proof.is_none())
+                || same
+                    .cleanup_report
+                    .as_ref()
+                    .is_some_and(|prior| !matches!(prior, IcebergCleanupReport::NotAttempted))
+            {
+                return Err(invalid("Keyed cleanup has no unsettled exact D14 report"));
+            }
+        }
+        let report = match self.entry_phase(entry) {
+            Phase::Committed(_, checked, _) => {
+                owner
+                    .operation
+                    .cleanup_after_commit_in(&checked.retained, current)
+                    .await
+            }
+            Phase::Rejected(..) => {
+                owner
+                    .operation
+                    .cleanup_in(CleanupScope::EntireOperation, current)
+                    .await
+            }
+            _ => {
+                return Err(invalid(
+                    "Keyed cleanup requires the original exact D14 conclusion",
+                ));
+            }
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let same = state
+            .entries
+            .get_mut(&entry.0)
+            .expect("the reconciled entry remains owned");
+        if same
+            .cleanup_report
+            .as_ref()
+            .is_some_and(|prior| !matches!(prior, IcebergCleanupReport::NotAttempted))
+        {
+            return Err(invalid(
+                "Keyed cleanup has already produced an observed report",
+            ));
+        }
+        // The original Unknown did not authorize an attempt. The actual later
+        // report supersedes that unattempted status while preserving dispatch.
+        same.cleanup = report.finalization();
+        same.cleanup_report = Some(report);
         Ok(())
     }
 
@@ -1105,6 +1219,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             entry.phase,
             EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
         ) || entry.positive_proof.is_some()
+            || entry.negative_slot_proof.is_some()
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -1129,6 +1244,10 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 };
                 CommitProof::applied(Some(selection.snapshot))
                     .with_table_uuid(table_uuid.to_string())
+            }
+            PositiveAttributionObservation::KeyedSlotWriter(slot) => {
+                CommitProof::applied(Some(slot.snapshot_id))
+                    .with_table_uuid(slot.table_uuid.to_string())
             }
             PositiveAttributionObservation::SnapshotMarker {
                 table_uuid,
@@ -1159,6 +1278,41 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         entry.positive_proof = Some(proof);
         Ok(())
     }
+    /// Keep the Unknown dispatch fact and independently record the original
+    /// slot operation's exact D14 negative ancestry proof.
+    pub(crate) fn append_negative_slot_proof(
+        &self,
+        entry: JournalEntryRef,
+        observation: KeyedSlotWriterObservation,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entries.get_mut(&entry.0).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Negative proof names another publication",
+            )
+        })?;
+        if !matches!(
+            entry.phase,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+        ) || entry.positive_proof.is_some()
+            || entry.negative_slot_proof.is_some()
+            || !entry.checked.descriptor.attribution.matches_observation(
+                &PositiveAttributionObservation::KeyedSlotWriter(observation.clone()),
+            )
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Negative proof differs from its original slot operation",
+            ));
+        }
+        entry.negative_slot_proof = Some(observation);
+        Ok(())
+    }
+
     pub(crate) fn descriptor(&self) -> Option<PublicationDescriptor> {
         self.current_checked().map(|checked| checked.descriptor)
     }
@@ -1190,6 +1344,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 .positive_proof
             {
                 Some(proof) => Phase::Committed(proof.clone(), checked, entry.finalization.clone()),
+                None if entry.negative_slot_proof.is_some() => {
+                    Phase::Rejected(failure.clone(), entry.cleanup.clone())
+                }
                 None => Phase::Unknown(checked, failure.clone()),
             },
         }
@@ -2866,6 +3023,172 @@ mod tests {
             )
             .unwrap();
         (journal, preparation)
+    }
+
+    #[tokio::test]
+    async fn keyed_slot_d14_settles_only_original_owned_cleanup() {
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorTableIdentity, ConnectorTableObjectId,
+            KeyedDocumentObservationRequest,
+        };
+        for committed in [true, false] {
+            let fixture = Fixture::new();
+            let operation = &fixture.operation;
+            let attempt = operation.begin_attempt().unwrap();
+            let leftover = attempt.allocate(ArtifactKind::Manifest).unwrap();
+            attempt
+                .file_io()
+                .new_output(leftover.path())
+                .unwrap()
+                .write(Bytes::from_static(b"owned original temporary"))
+                .await
+                .unwrap();
+            let path = std::path::Path::new(leftover.path().strip_prefix("file://").unwrap());
+            let received_path = fixture
+                .directory
+                .path()
+                .join("original-slot-received.parquet");
+            std::fs::write(&received_path, b"received original artifact").unwrap();
+            operation
+                .adopt_operation_reference(
+                    ObjectIdentity::new(format!("file://{}", received_path.display())).unwrap(),
+                )
+                .unwrap();
+            let table_uuid = uuid::Uuid::now_v7();
+            let slot = ("test-documents".to_string(), "management".to_string());
+            let (mut journal, context) = catalog_journal_for_operation(
+                operation.token(),
+                AttributionPlan::KeyedSlotChange {
+                    table_uuid,
+                    snapshot_id: 20,
+                    parent: Some(10),
+                    slots: vec![slot.clone()],
+                },
+            );
+            let instance = ConnectorInstanceId::parse("catalog-journal").unwrap();
+            journal.keyed_operation = Some(Arc::new(RetainedKeyedOperation {
+                operation: operation.clone(),
+                observation: KeyedDocumentObservationRequest {
+                    owner: ConnectorProviderBindingKey {
+                        instance_id: instance.clone(),
+                        incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
+                    },
+                    catalog_handle: CatalogHandle::new(
+                        instance.clone(),
+                        CatalogVersion::from_bytes([1; 32]),
+                    ),
+                    target: ConnectorTableIdentity {
+                        instance_id: instance,
+                        namespace: "db".into(),
+                        table: "mv".into(),
+                    },
+                    object_id: ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
+                        table_uuid.as_bytes(),
+                    ))
+                    .unwrap(),
+                    context: context.clone(),
+                },
+            }));
+            let entry = journal.current_entry().unwrap();
+            journal
+                .claim_dispatch()
+                .unwrap()
+                .begin_dispatch(&context, &MemoryDispatchBarrier)
+                .await
+                .unwrap();
+            journal.conclude_entry(
+                entry,
+                DispatchEvidence::Unknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "lost original slot result",
+                    ),
+                    observation: ProtocolObservation::default(),
+                },
+            );
+            journal.record_entry_cleanup_report(entry, IcebergCleanupReport::NotAttempted);
+            let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+                journal.catalog_entry_outcome(entry)
+            else {
+                panic!("the original owner must retain Unknown");
+            };
+            let (observing, original_entry) =
+                PublicationJournal::<String>::from_evidence(&evidence)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(entry, original_entry);
+            assert!(
+                observing
+                    .settle_keyed_slot_cleanup_in(entry, &context)
+                    .await
+                    .is_err()
+            );
+            assert!(path.exists());
+            let proof = KeyedSlotWriterObservation {
+                table_uuid,
+                snapshot_id: 20,
+                parent: Some(10),
+                slot,
+            };
+            let wrong_parent = KeyedSlotWriterObservation {
+                parent: Some(9),
+                ..proof.clone()
+            };
+            if committed {
+                assert!(
+                    observing
+                        .append_positive_proof_with_finalization(
+                            entry.0,
+                            PositiveAttributionObservation::KeyedSlotWriter(wrong_parent),
+                            ExternalMutationFinalization::Complete,
+                        )
+                        .is_err()
+                );
+                observing
+                    .append_positive_proof_with_finalization(
+                        entry.0,
+                        PositiveAttributionObservation::KeyedSlotWriter(proof),
+                        ExternalMutationFinalization::Complete,
+                    )
+                    .unwrap();
+            } else {
+                assert!(
+                    observing
+                        .append_negative_slot_proof(entry, wrong_parent)
+                        .is_err()
+                );
+                observing.append_negative_slot_proof(entry, proof).unwrap();
+            }
+            assert!(path.exists(), "proof is distinct from actual cleanup");
+            observing
+                .settle_keyed_slot_cleanup_in(entry, &context)
+                .await
+                .unwrap();
+            assert!(!path.exists());
+            assert_eq!(received_path.exists(), committed);
+            assert!(
+                observing
+                    .settle_keyed_slot_cleanup_in(entry, &context)
+                    .await
+                    .is_err()
+            );
+            match journal.catalog_entry_outcome(entry) {
+                ExternalMutationOutcome::KnownCommitted {
+                    cleanup: ExternalMutationFinalization::Complete,
+                    ..
+                } => assert!(committed),
+                ExternalMutationOutcome::KnownUncommitted {
+                    cleanup: ExternalMutationFinalization::Complete,
+                    ..
+                } => assert!(!committed),
+                _ => panic!("the same original operation must report actual settled cleanup"),
+            }
+            let state = &journal.state.lock().unwrap().entries[&entry.0];
+            assert!(matches!(
+                state.phase,
+                EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+            ));
+        }
     }
 
     struct FailingBarrier;

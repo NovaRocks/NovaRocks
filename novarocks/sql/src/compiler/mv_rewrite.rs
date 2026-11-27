@@ -528,7 +528,35 @@ impl SqlImvRewriteSnapshotBuilder {
 #[derive(Clone)]
 pub struct SqlImvRewriteSnapshotHandle(Arc<SqlImvRewriteSnapshot>);
 
+/// One exact field in the mapping from a definition output to the target's read domain.
+#[derive(Clone, Debug)]
+pub struct SqlImvContentField {
+    pub storage_field_id: bytes::Bytes,
+    pub read_column: novarocks_types::schema::ColumnDef,
+}
+
 impl SqlImvRewriteSnapshotHandle {
+    pub fn with_content_target(mut self, fields: Vec<SqlImvContentField>) -> Result<Self, String> {
+        let snapshot = &self.0;
+        if snapshot.content_target.is_some()
+            || snapshot.schema_contract.aggregate.is_some()
+            || snapshot.target_snapshot_id.is_none()
+            || snapshot.target_file_metadata.is_none()
+            || fields.len() != snapshot.schema_contract.target.visible_columns.len()
+            || fields
+                .iter()
+                .zip(&snapshot.schema_contract.target.visible_columns)
+                .any(|(field, declared)| field.storage_field_id != declared.target_field_id)
+        {
+            return Err("content target fields differ from the frozen mapped target".into());
+        }
+        let columns = SqlImvTargetColumnsFacts::try_new(
+            fields.into_iter().map(|field| field.read_column).collect(),
+        )?;
+        Arc::make_mut(&mut self.0).content_target = Some(columns.into_columns());
+        Ok(self)
+    }
+
     pub fn with_target_file_metadata(
         mut self,
         metadata: [novarocks_types::schema::ColumnDef; 2],
@@ -779,12 +807,6 @@ pub(crate) struct SqlImvTargetVisibleColumn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SqlImvHiddenApplyKey {
-    pub(crate) column_name: String,
-    pub(crate) source: crate::planner::vocabulary::ApplyKeySource,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvBranchContract {
     pub(crate) branch_id_column_name: String,
 }
@@ -833,7 +855,6 @@ pub(crate) struct SqlImvPartitionDerivationField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvTargetContract {
     pub(crate) visible_columns: Vec<SqlImvTargetVisibleColumn>,
-    pub(crate) hidden_apply_key: SqlImvHiddenApplyKey,
     pub(crate) partition: Option<SqlImvPartitionContract>,
 }
 
@@ -1147,26 +1168,6 @@ impl SqlImvAggregateContractFacts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SqlImvApplyKeySourceFacts {
-    BaseRowId,
-    JoinRowKey,
-    GroupRowId,
-}
-
-impl SqlImvApplyKeySourceFacts {
-    /// Decode the stable persisted spelling without exposing SQL planner
-    /// vocabulary to the persistence adapter.
-    pub fn try_from_persisted_label(label: &str) -> Result<Self, String> {
-        match label {
-            "BaseRowId" | "BASE_ROW_ID" => Ok(Self::BaseRowId),
-            "JoinRowKey" | "JOIN_ROW_KEY" => Ok(Self::JoinRowKey),
-            "GroupRowId" | "GROUP_ROW_ID" => Ok(Self::GroupRowId),
-            _ => Err("IMV hidden apply-key source is unsupported".to_string()),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlImvPartitionTransformFacts {
     Identity,
@@ -1290,12 +1291,9 @@ pub struct SqlImvTargetContractFacts {
 impl SqlImvTargetContractFacts {
     pub fn try_new(
         visible_columns: Vec<SqlImvTargetVisibleColumnFacts>,
-        hidden_apply_key_column_name: String,
-        hidden_apply_key_source: SqlImvApplyKeySourceFacts,
         partition: Option<SqlImvPartitionFacts>,
     ) -> Result<Self, String> {
         if visible_columns.is_empty()
-            || hidden_apply_key_column_name.trim().is_empty()
             || visible_columns.iter().enumerate().any(|(index, column)| {
                 visible_columns[..index].iter().any(|other| {
                     other
@@ -1317,20 +1315,6 @@ impl SqlImvTargetContractFacts {
                     .into_iter()
                     .map(|facts| facts.inner)
                     .collect(),
-                hidden_apply_key: SqlImvHiddenApplyKey {
-                    column_name: hidden_apply_key_column_name,
-                    source: match hidden_apply_key_source {
-                        SqlImvApplyKeySourceFacts::BaseRowId => {
-                            crate::planner::vocabulary::ApplyKeySource::BaseRowId
-                        }
-                        SqlImvApplyKeySourceFacts::JoinRowKey => {
-                            crate::planner::vocabulary::ApplyKeySource::JoinRowKey
-                        }
-                        SqlImvApplyKeySourceFacts::GroupRowId => {
-                            crate::planner::vocabulary::ApplyKeySource::GroupRowId
-                        }
-                    },
-                },
                 partition: partition.map(|facts| facts.inner),
             },
         })
@@ -1575,6 +1559,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     /// exposing an Iceberg schema or Iceberg default-literal values to SQL.
     pub(crate) target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
     pub(crate) target_file_metadata: Option<Arc<[novarocks_types::schema::ColumnDef; 2]>>,
+    pub(crate) content_target: Option<Arc<[novarocks_types::schema::ColumnDef]>>,
     /// SQL projection of the persisted MV planning contract frozen at
     /// admission. Resolving or mutating the serialized contract remains in
     /// the application facade.
@@ -1650,6 +1635,7 @@ impl SqlImvRewriteSnapshot {
             target_table_uuid,
             target_columns,
             target_file_metadata: None,
+            content_target: None,
             schema_contract,
             aggregate_execution,
         })
@@ -1751,11 +1737,10 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                 aggregate: None,
                 branch: None,
                 target: SqlImvTargetContract {
-                    visible_columns: Vec::new(),
-                    hidden_apply_key: SqlImvHiddenApplyKey {
-                        column_name: "__nova_base_row_id".to_string(),
-                        source: crate::planner::vocabulary::ApplyKeySource::BaseRowId,
-                    },
+                    visible_columns: vec![SqlImvTargetVisibleColumn {
+                        output_name: "k".into(),
+                        target_field_id: bytes::Bytes::from_static(b"field-1"),
+                    }],
                     partition: None,
                 },
             }),
@@ -1909,10 +1894,6 @@ pub(crate) fn test_aggregate_snapshot(
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
-                column_name: "__row_id__".to_string(),
-                source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
             partition,
         },
     });
@@ -2133,14 +2114,10 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     target_field_id: bytes::Bytes::from_static(b"field-100"),
                 },
                 SqlImvTargetVisibleColumn {
-                    output_name: "s".to_string(),
+                    output_name: if aggregate { "s" } else { "v" }.to_string(),
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
-                column_name: "__row_id__".to_string(),
-                source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
             partition: None,
         },
     });
@@ -2369,10 +2346,6 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
-                column_name: "__row_id__".to_string(),
-                source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
             partition: None,
         },
     });
@@ -5113,8 +5086,6 @@ mod tests {
                 )
                 .expect("visible target"),
             ],
-            "__nova_base_row_id".to_string(),
-            SqlImvApplyKeySourceFacts::BaseRowId,
             None,
         )
         .expect("target contract");

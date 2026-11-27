@@ -1478,37 +1478,18 @@ async fn explain_counted_with_initial_schema(
     let state = fixture.state.as_ref().unwrap();
     assert!(state.local_health().is_none());
     let explain = state.explain.as_ref().unwrap();
-    if self_join {
-        // B8 already owns the missing installed join-key implementation. This
-        // test proves the preceding window/binding contract, not join execution.
-        let error = result
-            .as_ref()
-            .err()
-            .expect("original B8 capability refusal");
-        assert_eq!(
-            error.user_error().unwrap().code().as_str(),
-            "sql.analyze.unavailable_implementation"
-        );
-        assert!(
-            error.message().contains(
-                "builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy"
-            )
-        );
-        assert!(matches!(explain.result, Some(Err(_))));
-    } else {
-        assert!(matches!(
-            explain.result,
-            Some(Ok(MvRefreshPreparationOutput::Explain(_)))
-        ));
-        let Ok(StatementActionValue::Local(rows)) = &result else {
-            panic!("original EXPLAIN must transfer its rendered Local result")
-        };
-        assert!(rows.row_count() > 0);
-        assert_eq!(
-            rows.columns().map(|column| column.name).collect::<Vec<_>>(),
-            ["Explain String"]
-        );
-    }
+    assert!(matches!(
+        explain.result,
+        Some(Ok(MvRefreshPreparationOutput::Explain(_)))
+    ));
+    let Ok(StatementActionValue::Local(rows)) = &result else {
+        panic!("original EXPLAIN must transfer its rendered Local result")
+    };
+    assert!(rows.row_count() > 0);
+    assert_eq!(
+        rows.columns().map(|column| column.name).collect::<Vec<_>>(),
+        ["Explain String"]
+    );
     assert_eq!(
         source.initial_observations.load(Ordering::SeqCst),
         1,

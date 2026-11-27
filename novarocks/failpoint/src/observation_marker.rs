@@ -129,6 +129,7 @@ marker_registry! {
     MV_CONTENT_TARGET_ENUMERATION_CLOSED => ("NOVAROCKS_MV_CONTENT_TARGET_ENUMERATION_CLOSED", MaterializedView, FaultInjection, ["execution_id", "scan", "token"]),
     MV_CONTENT_APPLY_INSERT_DROPPED => ("NOVAROCKS_MV_CONTENT_APPLY_INSERT_DROPPED", MaterializedView, FaultInjection, ["execution_id", "driver_id", "task_key", "token"]),
     MV_DOCUMENT_EXPIRY_PLANNED => ("NOVAROCKS_MV_DOCUMENT_EXPIRY_PLANNED", MaterializedView, FaultInjection, ["token"]),
+    MV_NAME_STARTUP_GRACE => ("NOVAROCKS_MV_NAME_STARTUP_GRACE", MaterializedView, Unconditional, ["state", "incarnation", "prior_incarnations", "discovery_complete", "end_reason"]),
     MV_PROJECTOR_PHASE => ("NOVAROCKS_MV_PROJECTOR_PHASE", MaterializedView, FaultInjection, ["action", "phase", "publication_id"]),
     MV_RECOVERY_PHASE => ("NOVAROCKS_MV_RECOVERY_PHASE", MaterializedView, FaultInjection, ["phase", "token"]),
     PREPARED_FAILURE_EXIT_RELEASED => ("NOVAROCKS_PREPARED_FAILURE_EXIT_RELEASED", Task, FaultInjection, ["backend", "execution_id", "reason", "stage", "task", "token"]),

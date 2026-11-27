@@ -257,6 +257,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
         let parts = crate::plan::FragmentParts {
             summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
@@ -322,6 +323,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
         Fragment::from(crate::plan::FragmentParts {
             summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),

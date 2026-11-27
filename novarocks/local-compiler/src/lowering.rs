@@ -2326,6 +2326,14 @@ fn lower_with_creation<
         work.control(),
     )?;
     let facts = CompiledProgramFacts {
+        input_completion: match physical.input_completion() {
+            novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit => {
+                novarocks_local_program::InputCompletion::MayShortCircuit
+            }
+            novarocks_physical_plan::FragmentInputCompletion::MustDrain => {
+                novarocks_local_program::InputCompletion::MustDrain
+            }
+        },
         writes: program_writes,
         exchange_inputs,
         scan_inputs,

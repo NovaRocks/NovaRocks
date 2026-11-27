@@ -21,6 +21,7 @@ pub use crate::mv_refresh::{
     AggregateFunctionKind, MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget,
     VisibleAggregateOutput, first_refresh,
 };
+pub use crate::planner::imv_rewrite::content_apply::{ContentKeyInadmissible, content_route_keys};
 pub use crate::planner::vocabulary::ApplyKeySource;
 use novarocks_parser::{
     ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr},
@@ -541,7 +542,7 @@ mod refresh_property_facade_tests {
         .into_refresh_contract()
         .expect("single scan property is supported");
         assert_eq!(facts.base_refs[0].table.fqn(), "ice.sales.orders");
-        assert_eq!(facts.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
+        assert_eq!(facts.shape, SqlImvRefreshShape::ProjectionFilter);
         assert!(facts.aggregate.is_none());
     }
 
@@ -553,7 +554,7 @@ mod refresh_property_facade_tests {
         .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("projection contract");
         assert_eq!(projection.base_refs[0].table.fqn(), "ice.sales.fact_east");
-        assert_eq!(projection.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
+        assert_eq!(projection.shape, SqlImvRefreshShape::ProjectionFilter);
         assert_eq!(projection.aggregate, None);
 
         let union = analyzed_refresh_input(
@@ -561,7 +562,7 @@ mod refresh_property_facade_tests {
         )
         .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("union contract");
-        assert_eq!(union.apply_key, SqlImvApplyKeyFacts::UnionProjectionFilter);
+        assert_eq!(union.shape, SqlImvRefreshShape::UnionProjectionFilter);
         assert_eq!(union.branch, Some(SqlImvBranchFacts { branch_count: 2 }));
     }
 
@@ -573,7 +574,7 @@ mod refresh_property_facade_tests {
         )
         .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("join aggregate contract");
-        assert_eq!(facts.apply_key, SqlImvApplyKeyFacts::JoinAggregateGroupRow);
+        assert_eq!(facts.shape, SqlImvRefreshShape::JoinAggregate);
         assert_eq!(
             facts.aggregate,
             Some(SqlImvAggregateFacts {
@@ -2059,20 +2060,20 @@ pub struct SqlImvRefreshContractFacts {
     /// Ordered, one entry per base scan, in the definition's own canonical
     /// relation order. Two entries may name one table.
     pub base_refs: Vec<SqlImvBaseRelationOccurrence>,
-    pub apply_key: SqlImvApplyKeyFacts,
+    pub shape: SqlImvRefreshShape,
     pub aggregate: Option<SqlImvAggregateFacts>,
     pub join: Option<SqlImvJoinFacts>,
     pub branch: Option<SqlImvBranchFacts>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SqlImvApplyKeyFacts {
+pub enum SqlImvRefreshShape {
     ProjectionFilter,
     UnionProjectionFilter,
     JoinProjectionFilter,
-    AggregateGroupRow,
-    JoinAggregateGroupRow,
-    BranchUnionAggregateGroupRow,
+    Aggregate,
+    JoinAggregate,
+    BranchUnionAggregate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5067,7 +5068,7 @@ impl RefreshFragmentProperty {
             (TargetIdentity::BaseRowId, StateContract::Stateless) => {
                 Ok(SqlImvRefreshContractFacts {
                     base_refs,
-                    apply_key: SqlImvApplyKeyFacts::ProjectionFilter,
+                    shape: SqlImvRefreshShape::ProjectionFilter,
                     aggregate: None,
                     join: None,
                     branch: None,
@@ -5086,7 +5087,7 @@ impl RefreshFragmentProperty {
                 }
                 Ok(SqlImvRefreshContractFacts {
                     base_refs,
-                    apply_key: SqlImvApplyKeyFacts::JoinProjectionFilter,
+                    shape: SqlImvRefreshShape::JoinProjectionFilter,
                     aggregate: None,
                     join: Some(SqlImvJoinFacts { join_key_count }),
                     branch: None,
@@ -5117,7 +5118,7 @@ impl RefreshFragmentProperty {
                 })?;
                 Ok(SqlImvRefreshContractFacts {
                     base_refs,
-                    apply_key: SqlImvApplyKeyFacts::UnionProjectionFilter,
+                    shape: SqlImvRefreshShape::UnionProjectionFilter,
                     aggregate: None,
                     join: None,
                     branch: Some(SqlImvBranchFacts { branch_count }),
@@ -5152,7 +5153,7 @@ impl RefreshFragmentProperty {
                         }
                         Ok(SqlImvRefreshContractFacts {
                             base_refs,
-                            apply_key: SqlImvApplyKeyFacts::AggregateGroupRow,
+                            shape: SqlImvRefreshShape::Aggregate,
                             aggregate: Some(aggregate),
                             join: None,
                             branch: Some(SqlImvBranchFacts { branch_count }),
@@ -5168,7 +5169,7 @@ impl RefreshFragmentProperty {
                         }
                         Ok(SqlImvRefreshContractFacts {
                             base_refs,
-                            apply_key: SqlImvApplyKeyFacts::JoinAggregateGroupRow,
+                            shape: SqlImvRefreshShape::JoinAggregate,
                             aggregate: Some(aggregate),
                             join: Some(SqlImvJoinFacts { join_key_count }),
                             branch: None,
@@ -5177,7 +5178,7 @@ impl RefreshFragmentProperty {
                     // Aggregate directly over a single scan.
                     (None, None) => Ok(SqlImvRefreshContractFacts {
                         base_refs,
-                        apply_key: SqlImvApplyKeyFacts::AggregateGroupRow,
+                        shape: SqlImvRefreshShape::Aggregate,
                         aggregate: Some(aggregate),
                         join: None,
                         branch: None,
@@ -5237,7 +5238,7 @@ impl RefreshFragmentProperty {
                 };
                 Ok(SqlImvRefreshContractFacts {
                     base_refs,
-                    apply_key: SqlImvApplyKeyFacts::BranchUnionAggregateGroupRow,
+                    shape: SqlImvRefreshShape::BranchUnionAggregate,
                     aggregate: Some(SqlImvAggregateFacts {
                         group_key_count,
                         aggregate_count,

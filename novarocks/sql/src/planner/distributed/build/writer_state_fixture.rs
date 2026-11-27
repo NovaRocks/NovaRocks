@@ -254,6 +254,7 @@ pub fn writer_state_source_for_test(
             version(),
             dop(),
             FinalChangeStreamWriteLowering {
+                input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                 reads: None,
                 dag: ChangeStreamWriteDagSpec {
                     effect_output_ordinal: 1,

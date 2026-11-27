@@ -585,9 +585,10 @@ impl Fixture {
         assert_eq!(phase, ManagementObservationPhase::Ready);
         let observed = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         entrance
-            .install_observed_target(
+            .install_observed_target_with_kind(
                 &state,
                 observed.management_dependencies(resolver.binding.control_runtime_id()),
+                true,
             )
             .unwrap();
         caps.events.lock().unwrap().clear();

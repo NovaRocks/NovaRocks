@@ -18,7 +18,10 @@
 //! Domain preparation borrows the original control Body, never a replacement Root.
 use super::*;
 use novarocks_mv_application::{
-    management::{EffectIdentity, EffectResponsibility, EffectScope, ManagementRequest},
+    management::{
+        EffectIdentity, EffectResponsibility, EffectScope, ManagementAdmissionError,
+        ManagementRequest,
+    },
     persistence::{
         documents::MvDocumentError,
         keyed_documents::{
@@ -52,6 +55,20 @@ impl ControlSource {
                 format!("MV control activity admission: {error:?}"),
             ));
         }
+        let drop_entrance = if matches!(&self.request, MvControlRequest::Drop { .. }) {
+            let entrance = body
+                .input
+                .ports
+                .management_entrance()
+                .map_err(invalid)?
+                .clone();
+            entrance
+                .check_name_startup_grace()
+                .map_err(management_failure)?;
+            Some(entrance)
+        } else {
+            None
+        };
         let readiness = body.input.ports.readiness().clone();
         let ready = readiness.in_requests(self.requests.clone());
         let loaded = ready
@@ -98,6 +115,10 @@ impl ControlSource {
             namespace: Arc::from(self.target.namespace()),
             table: Arc::from(self.target.name()),
         };
+        let name_catalog = planning.binding().catalog_handle().map_err(connector)?;
+        let unresolved_drop = drop_entrance
+            .as_ref()
+            .and_then(|entrance| entrance.unresolved_named_drop(name_catalog, &table));
         use crate::mv::domain::staged_create::CaptureFailure;
         let captured = self
             .capture
@@ -116,11 +137,22 @@ impl ControlSource {
             Ok(binding) => binding,
             Err(CaptureFailure::Provider(error))
                 if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound
-                    && matches!(&self.request, MvControlRequest::Drop { statement, .. } if statement.if_exists) =>
+                    && drop_entrance.is_some() =>
             {
+                let entrance = drop_entrance.as_ref().expect("DROP admission is installed");
+                if let Some(effect) = unresolved_drop {
+                    entrance.observe_named_drop_absence(name_catalog, &table, effect);
+                }
+                entrance
+                    .check_name_isolation(&table)
+                    .map_err(management_failure)?;
                 self.check_business_refusal()?;
-                body.drop_readiness = Some(MvKeyedDropReadiness::AlreadyAbsent);
-                return Ok(());
+                if matches!(&self.request, MvControlRequest::Drop { statement, .. } if statement.if_exists)
+                {
+                    body.drop_readiness = Some(MvKeyedDropReadiness::AlreadyAbsent);
+                    return Ok(());
+                }
+                return Err(connector(error));
             }
             Err(error) => {
                 return Err({
@@ -166,6 +198,9 @@ impl ControlSource {
             .clone();
         match &self.request {
             MvControlRequest::Drop { statement, .. } => {
+                entrance
+                    .check_name_isolation(&table)
+                    .map_err(management_failure)?;
                 let observe = |request| async {
                     if loaded.is_none() {
                         entrance
@@ -186,7 +221,7 @@ impl ControlSource {
                 );
                 match waiting.as_mut().await {
                     Ok(lease) => body.management = Some(lease),
-                    Err(error) => body.management_failure = Some(invalid(error)),
+                    Err(error) => body.management_failure = Some(management_failure(error)),
                 }
                 drop(waiting);
                 self.check_business_refusal()?;
@@ -482,6 +517,13 @@ impl ControlSource {
         })();
         foreign.normal = true;
         result
+    }
+}
+fn management_failure(error: ManagementAdmissionError) -> MvProviderFailure {
+    if error.is_retryable_name_admission() {
+        MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
+    } else {
+        invalid(error)
     }
 }
 fn document(error: MvDocumentError) -> MvProviderFailure {

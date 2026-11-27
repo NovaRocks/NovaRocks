@@ -52,6 +52,14 @@ pub(super) fn reconcile_async<'a>(
         let request = &original.request;
         let evidence = &request.evidence;
         let target = validated_reconciliation_target(provider, evidence)?;
+        if evidence.operation_kind() == "keyed-documents"
+            && matches!(
+                &target,
+                IcebergMutationEvidenceTarget::KeyedSlotChange { .. }
+            )
+        {
+            return reconcile_keyed_slot(provider, evidence, &request.context, receiving).await;
+        }
         let namespace = evidence.operation_kind() == "create-namespace"
             && matches!(
                 &target,
@@ -68,7 +76,7 @@ pub(super) fn reconcile_async<'a>(
             );
         if !namespace && !table {
             return Err(unsupported(
-                "asynchronous reconciliation requires ordinary CREATE TABLE or CREATE SCHEMA evidence",
+                "asynchronous reconciliation requires ordinary CREATE TABLE, CREATE SCHEMA or exact slot-change evidence",
             ));
         }
         let (journal, entry, descriptor) = match recover_reconciliation(evidence, &request.context)?
@@ -121,4 +129,121 @@ pub(super) fn reconcile_async<'a>(
             observed,
         ))
     })
+}
+
+async fn reconcile_keyed_slot(
+    provider: &IcebergMetadata,
+    evidence: &ExternalMutationEvidence,
+    context: &ConnectorRequestContext,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<ReconciliationOutcome, ConnectorError> {
+    use crate::commit::publication_descriptor::{
+        KeyedSlotWriterObservation, PositiveAttributionObservation,
+    };
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorDocumentStorageObservation, UnknownCommitIdentity,
+    };
+
+    let (journal, entry, descriptor) = match recover_reconciliation(evidence, context)? {
+        RecoveredReconciliation::Ready(outcome) => return Ok(outcome),
+        RecoveredReconciliation::Pending {
+            journal,
+            entry,
+            descriptor,
+        } => (journal, entry, descriptor),
+    };
+    let mut request = journal
+        .keyed_observation_request()
+        .cloned()
+        .ok_or_else(|| invalid("Keyed slot evidence has no original document observation scope"))?;
+    request.context = context.clone().after_external_effect();
+    let storage = crate::document_storage::IcebergDocumentStorage::new(
+        provider.descriptor().clone(),
+        provider.incarnation(),
+        Arc::clone(provider.runtime()),
+    );
+    let decoded = storage.decode_keyed_slot_change_evidence(request.clone(), evidence.clone())?;
+    let UnknownCommitIdentity::SlotWriter { slot } = &decoded.identity else {
+        return Err(invalid(
+            "Original pure slot change has no exact SlotWriter witness",
+        ));
+    };
+    let observed = KeyedSlotWriterObservation {
+        table_uuid: uuid::Uuid::from_slice(request.object_id.as_bytes())
+            .map_err(|_| invalid("Original slot target has an invalid table UUID"))?,
+        snapshot_id: decoded.preselected_snapshot,
+        parent: decoded.asserted_parent,
+        slot: (slot.owner.clone(), slot.name.clone()),
+    };
+    let attribution = PositiveAttributionObservation::KeyedSlotWriter(observed.clone());
+    if !descriptor.attribution.matches_observation(&attribution) {
+        return Err(invalid(
+            "SlotWriter evidence differs from the original frozen snapshot and slot",
+        ));
+    }
+    let conclusion = match storage
+        .resolve_keyed_commit_async(request.clone(), decoded)
+        .await
+    {
+        Ok(conclusion) => conclusion,
+        Err(error) => {
+            return Ok(unresolved_reconciliation(
+                evidence,
+                format!("Exact keyed slot observation remains unresolved: {error}"),
+            ));
+        }
+    };
+    let appended = match conclusion {
+        CommitConclusion::Committed(_) => {
+            let applied = journal.append_positive_proof_with_finalization(
+                descriptor.key,
+                attribution,
+                provider
+                    .runtime()
+                    .novarocks_catalog()
+                    .positive_attribution_finalization(),
+            );
+            if applied.is_ok() {
+                provider
+                    .runtime()
+                    .control_state()
+                    .invalidate_table_cache(&request.target.namespace, &request.target.table);
+            }
+            applied
+        }
+        CommitConclusion::NotCommitted(CommitProof::NegativeProof) => {
+            journal.append_negative_slot_proof(entry, observed)
+        }
+        CommitConclusion::NotCommitted(_)
+        | CommitConclusion::InvalidatedUndetermined
+        | CommitConclusion::StillUnknown => {
+            return Ok(journal.catalog_entry_outcome(entry));
+        }
+    };
+    if let Err(error) = appended {
+        let original = journal.catalog_entry_outcome(entry);
+        if !matches!(original, ExternalMutationOutcome::CommitUnknown { .. }) {
+            return Ok(original);
+        }
+        return Ok(unresolved_reconciliation(
+            evidence,
+            format!("Keyed slot resolution was refused by its original journal: {error}"),
+        ));
+    }
+    let needed = match journal.catalog_entry_outcome(entry) {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+            ..
+        } => receiving.record_needed_committed(effect, &receipt, &finalization),
+        _ => Ok(()),
+    };
+    // Cleanup consumes the original selection and artifact ledger only after
+    // the Provider recorded the exact D14 proof and its independent verdict.
+    if let Err(error) = journal.settle_keyed_slot_cleanup_in(entry, context).await {
+        journal.record_entry_cleanup(entry, ExternalMutationFinalization::Failed(failure(&error)));
+    }
+    needed?;
+    Ok(journal.catalog_entry_outcome(entry))
 }

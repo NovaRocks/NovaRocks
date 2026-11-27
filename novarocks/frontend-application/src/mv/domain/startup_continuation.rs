@@ -37,8 +37,8 @@
 use std::future::Future;
 
 use novarocks_mv_application::management::{
-    ManagementClock, ManagementContinuationService, ManagementEntrance, StartupContinuation,
-    StartupIsolationEvidence, SystemManagementClock,
+    ManagementClock, ManagementContinuationService, ManagementEntrance, NameStartupGrace,
+    NameStartupGraceEnd, StartupContinuation, StartupIsolationEvidence, SystemManagementClock,
 };
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
@@ -195,34 +195,69 @@ fn startup_connector_failure(
     .with_original_failure(cause)
 }
 
+pub(crate) fn log_name_startup_transition(entrance: &ManagementEntrance) {
+    let Some(observation) = entrance.take_name_startup_transition() else {
+        return;
+    };
+    let (state, end_reason) = match observation.state {
+        NameStartupGrace::Discovering => ("discovering", ""),
+        NameStartupGrace::Active { .. } => ("active", ""),
+        NameStartupGrace::Ended(reason) => (
+            "ended",
+            match reason {
+                NameStartupGraceEnd::NoRestartEvidence => "no_restart_evidence",
+                NameStartupGraceEnd::Lifetime => "lifetime",
+                NameStartupGraceEnd::Declaration => "declaration",
+            },
+        ),
+    };
+    let prior_incarnations = observation
+        .prior_incarnations
+        .iter()
+        .map(|incarnation| incarnation.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::info!(
+        state,
+        incarnation = observation.incarnation.as_str(),
+        prior_incarnations,
+        discovery_complete = observation.discovery_complete,
+        end_reason,
+        "{}",
+        novarocks_failpoint::observation_marker::MV_NAME_STARTUP_GRACE
+    );
+}
+
 pub(crate) async fn run_startup_continuation_pass_async_in(
     entrance: &ManagementEntrance,
     continuation: &ManagementContinuationService,
     readiness: &super::readiness::MvReadinessExecution<'_>,
     connector_control: &dyn ConnectorControlResolver,
-    source: &StartupIsolationSource,
+    source: Option<&StartupIsolationSource>,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     factory: &super::staged_create::CurrentProjectionMetadataCpu,
     receiving: &mut StartupContinuationReceiving,
 ) -> StartupContinuationReport {
     std::future::poll_fn(|cx| receiving.poll_progress(cx)).await;
-    let declaration = match receiving.raw.as_ref() {
-        Some(Ok(Ok(Some(declaration)))) => declaration.clone(),
-        Some(Ok(Ok(None))) => return StartupContinuationReport::default(),
-        Some(Ok(Err(error))) => {
-            tracing::warn!(%error, "MV startup isolation evidence could not be read");
-            return StartupContinuationReport::default();
-        }
-        Some(Err(error)) => {
-            tracing::warn!(%error, "MV startup isolation evidence original file job failed");
-            return StartupContinuationReport::default();
-        }
-        None => unreachable!("original file result precedes pass policy"),
-    };
     let clock = SystemManagementClock;
-    let Some(evidence) = accept_declaration(continuation, source, declaration, &clock) else {
-        return StartupContinuationReport::default();
+    let evidence = match (source, receiving.raw.as_ref()) {
+        (Some(source), Some(Ok(Ok(Some(declaration))))) => {
+            accept_declaration(continuation, source, declaration.clone(), &clock)
+        }
+        (_, Some(Ok(Err(error)))) => {
+            tracing::warn!(%error, "MV startup isolation evidence could not be read");
+            None
+        }
+        (_, Some(Err(error))) => {
+            tracing::warn!(%error, "MV startup isolation evidence original file job failed");
+            None
+        }
+        _ => None,
     };
+    if let Some(evidence) = &evidence {
+        entrance.accept_name_startup_declaration(evidence);
+    }
+    log_name_startup_transition(entrance);
     let projections = match readiness
         .candidate_reader()
         .list_candidate_definitions_async()
@@ -237,7 +272,19 @@ pub(crate) async fn run_startup_continuation_pass_async_in(
     let mut report = StartupContinuationReport::default();
     for projection in projections {
         let revision = projection.facts.source_revision();
-        match continuation.resume_target_on_startup_isolation(&revision.target, &evidence, &clock) {
+        let decision = if let Some(previous_incarnation) =
+            entrance.non_aggregate_reobservation(&revision.target)
+        {
+            StartupContinuation::Ready {
+                previous_incarnation,
+                permits: Vec::new(),
+            }
+        } else if let Some(evidence) = &evidence {
+            continuation.resume_target_on_startup_isolation(&revision.target, evidence, &clock)
+        } else {
+            StartupContinuation::Nothing
+        };
+        match decision {
             StartupContinuation::Nothing => {}
             StartupContinuation::NotCovered => report.not_covered += 1,
             StartupContinuation::OperatorOnly => report.operator_only += 1,

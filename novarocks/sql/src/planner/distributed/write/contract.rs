@@ -51,6 +51,7 @@ pub enum ConnectorWriteInputBinding {
 /// request-local binding token.
 #[derive(Clone, Debug)]
 pub(crate) struct SqlWritePlanInput {
+    pub(crate) input_completion: novarocks_physical_plan::FragmentInputCompletion,
     pub(crate) contract: SqlWriteSinkContract,
     pub(crate) position_materialization: Option<Arc<ConnectorMutationContributionGroup>>,
     pub(crate) write_layout: ConnectorWriteLayoutPreference,
@@ -249,6 +250,7 @@ pub(crate) mod test_support {
         )
         .expect("valid SQL target");
         SqlWritePlanInput {
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
             contract: SqlWriteSinkContract::try_new(SqlWriteSinkMode::Data, target, vec![column])
                 .expect("valid SQL write contract"),
             position_materialization: None,

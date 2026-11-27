@@ -1265,6 +1265,13 @@ pub enum FragmentSink {
     Noop,
 }
 
+/// Whether local operators may stop reading inputs after their result is known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FragmentInputCompletion {
+    MayShortCircuit,
+    MustDrain,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fragment {
     id: FragmentId,
@@ -1275,6 +1282,7 @@ pub struct Fragment {
     summaries: Box<[crate::SummaryOutput]>,
     dop_domain: PipelineDopDomain,
     stage_placement: crate::StagePlacementPolicy,
+    input_completion: FragmentInputCompletion,
     runtime_filters: Box<[RuntimeFilterId]>,
     pub(crate) call_requests: crate::FragmentCallRequests,
     pub(crate) calls: crate::FrozenFragmentCalls,
@@ -1291,6 +1299,7 @@ impl Fragment {
             summaries: self.summaries,
             dop_domain: self.dop_domain,
             stage_placement: self.stage_placement,
+            input_completion: self.input_completion,
             runtime_filters: self.runtime_filters,
             call_requests: self.call_requests,
             calls: self.calls,
@@ -1327,6 +1336,10 @@ impl Fragment {
 
     pub const fn sink(&self) -> &FragmentSink {
         &self.sink
+    }
+
+    pub const fn input_completion(&self) -> FragmentInputCompletion {
+        self.input_completion
     }
 
     pub fn summaries(&self) -> &[crate::SummaryOutput] {
@@ -1980,6 +1993,7 @@ pub(crate) struct FragmentParts {
     pub summaries: Box<[crate::SummaryOutput]>,
     pub dop_domain: PipelineDopDomain,
     pub stage_placement: crate::StagePlacementPolicy,
+    pub input_completion: FragmentInputCompletion,
     pub runtime_filters: Box<[RuntimeFilterId]>,
     pub call_requests: crate::FragmentCallRequests,
     pub calls: crate::FrozenFragmentCalls,
@@ -1996,6 +2010,7 @@ impl From<FragmentParts> for Fragment {
             summaries: parts.summaries,
             dop_domain: parts.dop_domain,
             stage_placement: parts.stage_placement,
+            input_completion: parts.input_completion,
             runtime_filters: parts.runtime_filters,
             call_requests: parts.call_requests,
             calls: parts.calls,

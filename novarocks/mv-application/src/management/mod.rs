@@ -25,6 +25,7 @@ mod admission;
 mod audit;
 mod continuation;
 mod effects;
+mod name_lifecycle;
 mod observation;
 mod ownership;
 mod readmission;
@@ -49,6 +50,7 @@ pub use effects::{
     EffectResponsibility, EffectScope, EffectTerminalFact, PublicationRecoveryEvidence,
     UnsettledEffect,
 };
+pub use name_lifecycle::{NameStartupGrace, NameStartupGraceEnd, NameStartupGraceObservation};
 pub use observation::{
     FreshCreateIntentObservation, FreshManagementObservation, ManagementContinuation,
     ManagementObservationError, ManagementObservationFailure, ManagementObservationPhase,

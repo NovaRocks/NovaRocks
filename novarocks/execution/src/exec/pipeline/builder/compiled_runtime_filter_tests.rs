@@ -147,6 +147,7 @@ fn rebuild(
         operators,
         &allowed,
         CompiledProgramFacts {
+            input_completion: novarocks_local_program::InputCompletion::MayShortCircuit,
             writes: program.write_recipes().clone(),
             exchange_inputs: program.exchange_inputs().clone(),
             scan_inputs: program.scan_inputs().clone(),

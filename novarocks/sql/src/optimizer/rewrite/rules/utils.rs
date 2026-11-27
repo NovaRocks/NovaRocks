@@ -690,6 +690,11 @@ mod typed_legacy {
                 ids
             }
             LogicalPlanKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
+            LogicalPlanKind::ContentApply(apply) => apply
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect(),
             LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
                 panic!("imv marker should not appear in non-IMV pruning")
             }

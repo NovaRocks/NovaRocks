@@ -389,7 +389,7 @@ pub(super) fn execute(
     let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
-    let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
+    let journal = PublicationJournal::for_keyed_operation(&operation, observation_request.clone());
     let preflight_journal = journal.clone();
     let preflight_provider = provider.clone();
     let preflight_documents = documents.clone();
@@ -646,7 +646,6 @@ pub(super) fn execute(
 /// Original operation and publication journal retained by the caller's Source.
 /// This opaque custody grants no authority to prepare or replay an operation.
 struct KeyedMutationOriginalOwner {
-    _operation: IcebergCommitOperation,
     _journal: PublicationJournal<ConnectorCatalogMutationReceipt>,
 }
 
@@ -746,7 +745,7 @@ pub(super) async fn execute_async(
     let shape = intent.shape();
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
-    let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
+    let journal = PublicationJournal::for_keyed_operation(&operation, observation_request.clone());
     let preflight_journal = journal.clone();
     let preflight_provider = provider.clone();
     let preflight_documents = documents.clone();
@@ -869,7 +868,6 @@ pub(super) async fn execute_async(
                 incarnation: provider.incarnation(),
             },
             Arc::new(KeyedMutationOriginalOwner {
-                _operation: operation.clone(),
                 _journal: journal.clone(),
             }),
         ),

@@ -280,6 +280,10 @@ fn visit(
             );
             2
         }
+        LogicalPlanKind::ContentApply(apply) => {
+            line!("{pad}CONTENT APPLY (route ordinals={:?})", apply.route_keys);
+            2
+        }
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
             return Err(crate::compiler::SqlCompileError::InvalidRequest(
                 "imv marker leaked into non-IMV plan".into(),
@@ -436,7 +440,7 @@ fn has_scan_label(source: &ScanSource) -> bool {
         | SqlScanKind::FrozenInputSet {
             version: crate::planner::table::SqlTableVersionSelector::Snapshot(_),
         }
-        | SqlScanKind::MvTargetState { .. } | SqlScanKind::MvTargetLocator { .. }))
+        | SqlScanKind::MvTargetState { .. } | SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvContentTarget { .. }))
 }
 
 struct ScanLabel<'a>(&'a ScanSource);
@@ -457,6 +461,13 @@ impl fmt::Display for ScanLabel<'_> {
                 }
                 crate::planner::table::SqlTableVersionSelector::Current => Err(fmt::Error),
             },
+            SqlScanKind::MvContentTarget {
+                target_snapshot_id, ..
+            } => write!(
+                out,
+                "IcebergMvContentTarget target={}.{}.{} snapshot_id={target_snapshot_id}",
+                source.table.catalog, source.table.namespace, source.table.table,
+            ),
             SqlScanKind::MvTargetLocator { facts } => {
                 write!(
                     out,

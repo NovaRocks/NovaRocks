@@ -86,6 +86,13 @@ message Fragment {
   novarocks.call_request.FragmentCallRequests call_requests = 9;
   StagePlacementPolicy stage_placement = 10;
   repeated SummaryOutput summaries = 11;
+  FragmentInputCompletion input_completion = 12;
+}
+
+enum FragmentInputCompletion {
+  FRAGMENT_INPUT_COMPLETION_UNSPECIFIED = 0;
+  FRAGMENT_INPUT_COMPLETION_MAY_SHORT_CIRCUIT = 1;
+  FRAGMENT_INPUT_COMPLETION_MUST_DRAIN = 2;
 }
 
 // Exact placement policy; edge distribution never supplies an implicit width.

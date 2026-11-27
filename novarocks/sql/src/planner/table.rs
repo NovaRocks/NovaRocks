@@ -129,6 +129,10 @@ pub enum SqlScanKind {
         from_snapshot_id: i64,
         to_snapshot_id: i64,
     },
+    MvContentTarget {
+        target_table_uuid: String,
+        target_snapshot_id: i64,
+    },
     MvTargetState {
         facts: SqlMvTargetStateScan,
     },
@@ -480,16 +484,6 @@ pub(crate) fn sql_mv_target_state_scan(source: &ScanSource) -> Option<&SqlMvTarg
     }
 }
 
-pub(crate) fn sql_mv_target_locator_scan(source: &ScanSource) -> Option<&SqlMvTargetLocatorScan> {
-    match source {
-        ScanSource::Sql(SqlScanSource {
-            kind: SqlScanKind::MvTargetLocator { facts },
-            ..
-        }) => Some(facts),
-        _ => None,
-    }
-}
-
 /// SQL scan carrier.  Every compiler artifact carries a tokenized SQL source;
 /// concrete provider materialization belongs exclusively to the paired
 /// application `QueryTableBindingStore`.
@@ -633,6 +627,11 @@ impl TableCompletionRetainedBytes {
 
     fn add_scan_kind(&mut self, kind: &SqlScanKind) {
         match kind {
+            SqlScanKind::MvContentTarget {
+                target_table_uuid, ..
+            } => {
+                self.add_string(target_table_uuid);
+            }
             SqlScanKind::MvTargetState { facts } => {
                 self.add_string(&facts.target_table_uuid);
                 self.add_columns(&facts.columns);
