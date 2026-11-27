@@ -139,14 +139,29 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             if pushed.is_empty() {
                 return Ok(RewriteResult::Unchanged);
             }
-            scan.predicates
-                .retain(|predicate| !seen.contains(predicate));
+            // Preserve the existing total prefix. A pushed term only needs
+            // to precede residuals whose row errors or effects its filtering
+            // may suppress, even when the connector leaves that term to SQL.
+            let boundary = scan
+                .predicates
+                .iter()
+                .position(|&predicate| {
+                    !arena
+                        .effects(predicate)
+                        .expression
+                        .permits_earlier_evaluation()
+                })
+                .unwrap_or(scan.predicates.len());
+            let mut suffix = scan.predicates.split_off(boundary);
+            suffix.retain(|predicate| !seen.contains(predicate));
+            let prefix: HashSet<_> = scan.predicates.iter().copied().collect();
+            scan.predicates.extend(
+                pushed
+                    .into_iter()
+                    .filter(|predicate| !prefix.contains(predicate)),
+            );
+            scan.predicates.append(&mut suffix);
         }
-
-        // Keep these before surviving scan residuals even when the connector
-        // does not consume them. Existing residuals stay in their original order.
-        pushed.append(&mut scan.predicates);
-        scan.predicates = pushed;
 
         let new_scan = OptExpr {
             op: Operator::LogicalScan(scan),
@@ -620,21 +635,25 @@ mod tests {
     fn unconsumed_scan_necessary_term_precedes_existing_ordered_residuals() {
         let mut arena = ScalarArena::new();
         let mut scan = scan_opt(&mut arena, &["a", "b"]);
-        let [wait, necessary] =
-            [bound_call("sleep", col("b")), eq(col("a"), int_lit(3))].map(|predicate| {
-                crate::planner::optimizer_bridge::scalar::intern_typed(
-                    &mut arena,
-                    &predicate,
-                    crate::optimizer::test_optimizer_control(),
-                )
-                .unwrap()
-            });
+        let [total, wait, necessary] = [
+            is_not_null(col("b")),
+            bound_call("sleep", col("b")),
+            eq(col("a"), int_lit(3)),
+        ]
+        .map(|predicate| {
+            crate::planner::optimizer_bridge::scalar::intern_typed(
+                &mut arena,
+                &predicate,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
+        });
         let Operator::LogicalScan(scan_op) = &mut scan.op else {
             unreachable!()
         };
         // The id already occurs below the wait. The necessary term still needs
         // its earlier slot when the provider retains it as a SQL residual.
-        scan_op.predicates = vec![wait, necessary];
+        scan_op.predicates = vec![total, wait, necessary];
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: necessary,
@@ -649,7 +668,41 @@ mod tests {
         let Operator::LogicalScan(scan) = &out.op else {
             panic!("no residual Filter");
         };
-        assert_eq!(scan.predicates, [necessary, wait]);
+        assert_eq!(scan.predicates, [total, necessary, wait]);
+    }
+
+    #[test]
+    fn keeps_existing_total_scan_predicates_before_new_terms() {
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "b"]);
+        let [original, added] =
+            [eq(col("a"), int_lit(3)), is_not_null(col("b"))].map(|predicate| {
+                crate::planner::optimizer_bridge::scalar::intern_typed(
+                    &mut arena,
+                    &predicate,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap()
+            });
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        scan_op.predicates = vec![original];
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: added }),
+            vec![scan],
+        );
+
+        let RewriteResult::Changed(out) = PushDownPredicateScan
+            .apply(filter, &mut make_ctx(arena))
+            .unwrap()
+        else {
+            panic!("the additional term belongs on the Scan");
+        };
+        let Operator::LogicalScan(scan) = &out.op else {
+            panic!("no residual Filter");
+        };
+        assert_eq!(scan.predicates, [original, added]);
     }
 
     #[test]
