@@ -88,7 +88,7 @@ impl Scenario for MvUnknownRegistration {
                 .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
             let (rest, proxy) = fixture.as_ref().context("managed MV fixture is missing")?;
             (
-                rest.create_catalog_sql(),
+                rest.create_catalog_sql().to_owned(),
                 rest.rest_uri().to_owned(),
                 proxy.uri().to_owned(),
                 proxy.control()?,
@@ -250,7 +250,7 @@ fn record_lost_effect(
     mut facts: Value,
 ) -> Result<()> {
     let summary = evidence.summary();
-    facts["lost_response"] = evidence.trace();
+    facts["lost_response"] = evidence.trace().clone();
     fs::write(
         context.scenario_root().join("lost-mv-effect.json"),
         serde_json::to_vec_pretty(&facts)?,
