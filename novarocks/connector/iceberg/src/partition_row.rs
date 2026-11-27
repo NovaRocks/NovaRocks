@@ -19,12 +19,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::iceberg::spec::{PartitionSpec, Schema, Transform};
+use crate::iceberg::spec::{PartitionSpec, PrimitiveType, Schema, Transform, Type};
 
 #[derive(Clone, Debug)]
 pub(crate) struct UnifiedPartitionField {
@@ -32,7 +30,7 @@ pub(crate) struct UnifiedPartitionField {
     pub source_id: i32,
     pub name: String,
     pub effective_transform: Transform,
-    pub data_type: DataType,
+    pub primitive: PrimitiveType,
 }
 
 #[derive(Clone, Debug)]
@@ -86,21 +84,11 @@ impl UnifiedPartitionRow {
                             part.field_id
                         )))
                     })?;
-                let data_type = match &result {
-                    crate::iceberg::spec::Type::Primitive(
-                        crate::iceberg::spec::PrimitiveType::Timestamptz,
-                    ) => DataType::Timestamp(
-                        arrow::datatypes::TimeUnit::Microsecond,
-                        Some("UTC".into()),
-                    ),
-                    crate::iceberg::spec::Type::Primitive(
-                        crate::iceberg::spec::PrimitiveType::TimestamptzNs,
-                    ) => DataType::Timestamp(
-                        arrow::datatypes::TimeUnit::Nanosecond,
-                        Some("UTC".into()),
-                    ),
-                    _ => crate::metadata_batch_reader::iceberg_type_to_arrow_type(&result)
-                        .map_err(|message| PartitionRowError::Semantic(corrupt(message)))?,
+                let Type::Primitive(primitive) = result else {
+                    return Err(PartitionRowError::Semantic(corrupt(format!(
+                        "iceberg partition field {} has a non-primitive result",
+                        part.field_id
+                    ))));
                 };
                 match by_id.entry(part.field_id) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -109,7 +97,7 @@ impl UnifiedPartitionRow {
                             source_id: part.source_id,
                             name: part.name.clone(),
                             effective_transform: part.transform,
-                            data_type,
+                            primitive,
                         });
                     }
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -133,7 +121,7 @@ impl UnifiedPartitionRow {
                         }
                         if previous_void && !current_void {
                             field.effective_transform = part.transform;
-                            field.data_type = data_type;
+                            field.primitive = primitive;
                         }
                     }
                 }
@@ -196,22 +184,19 @@ impl UnifiedPartitionRow {
         self.fields.iter().map(|field| field.field_id).collect()
     }
 
-    pub fn arrow_type(&self) -> Option<DataType> {
-        (!self.fields.is_empty()).then(|| {
-            DataType::Struct(Fields::from(
-                self.fields
-                    .iter()
-                    .map(|field| Arc::new(Field::new(&field.name, field.data_type.clone(), true)))
-                    .collect::<Vec<_>>(),
-            ))
-        })
+    #[cfg(test)]
+    pub fn arrow_type(&self) -> Option<arrow::datatypes::DataType> {
+        crate::typed_read::system_page_source::partition_row_type_from_facts(self)
+            .expect("test partition row declaration")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+    use crate::iceberg::spec::NestedField;
 
     fn schema() -> Schema {
         Schema::builder()
@@ -309,12 +294,12 @@ mod tests {
             let row = UnifiedPartitionRow::of(&schema(), &specs).unwrap();
             assert_eq!(row.fields[0].name, "removed");
             assert_eq!(row.fields[0].effective_transform, Transform::Bucket(8));
-            assert_eq!(row.fields[0].data_type, DataType::Int32);
+            assert_eq!(row.fields[0].primitive, PrimitiveType::Int);
         }
         let resurrected = spec(2, &[(1000, 1, "restored", Transform::Bucket(8))]);
         let row = UnifiedPartitionRow::of(&schema(), &[bucket, void, resurrected]).unwrap();
         assert_eq!(row.fields[0].name, "restored");
-        assert_eq!(row.fields[0].data_type, DataType::Int32);
+        assert_eq!(row.fields[0].primitive, PrimitiveType::Int);
     }
 
     #[test]

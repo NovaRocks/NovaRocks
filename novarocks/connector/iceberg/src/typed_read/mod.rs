@@ -104,7 +104,6 @@ pub use split_source::{
     READ_SPLIT_TARGET_SIZE_PROPERTY, plan_change_window_splits,
 };
 pub(crate) use system_page_source::metadata_temporal_declaration;
-pub(crate) use system_page_source::publish_read_schema_with_metadata;
 pub use system_page_source::{
     IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type, derived_row_type_json,
     files_relation_schema_json, files_relation_schema_json_with_metadata, partition_row_type,
@@ -114,9 +113,8 @@ pub use system_page_source::{
 };
 pub use system_table::{
     IcebergSystemTableReference, IcebergSystemTableReferenceParams, IcebergSystemTableType,
-    MAX_FILES_TABLE_MANIFESTS, SystemManifestSplit, SystemManifestSplitParams,
-    SystemManifestSplitSource, SystemManifestSplitSourceParams, SystemRelationSplit,
-    TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
+    MAX_FILES_TABLE_MANIFESTS, SystemManifestSplit, SystemManifestSplitSource, SystemRelationSplit,
+    SystemTableScan, TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
 };
 pub use table_handle::{
     HiveTransactionHandle, IcebergPinnedDataFileSet, IcebergTableHandle, IcebergTableHandleParams,

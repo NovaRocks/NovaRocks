@@ -1395,19 +1395,24 @@ fn metadata_query_binding_from_materialization(
     metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     binding_id: SqlTableBindingId,
 ) -> CatalogResolutionResult<QueryTableBinding> {
-    // Static relations use the frozen SQL declaration that the typed reader
-    // answers. Schema-derived relations use this exact catalog observation.
+    // Files, Entries and Manifests carry the Provider's declaration in
+    // the exact observation. The remaining static relations use SQL's declaration.
     let columns = frozen_metadata_columns(metadata_table_type)?.unwrap_or(materialization.columns);
+    let mut resolved = novarocks_sql::planning::catalog::resolved_metadata_table(
+        catalog,
+        namespace,
+        table,
+        metadata_table_type,
+        columns,
+        materialization.row_lineage_metadata_columns,
+        binding_id,
+    );
+    if let Some(view) = materialization.source_metadata.derived_view() {
+        resolved =
+            super::query_catalog::relation::project_derived_view(resolved, binding_id, view)?;
+    }
     Ok(QueryTableBinding {
-        resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
-            catalog,
-            namespace,
-            table,
-            metadata_table_type,
-            columns,
-            materialization.row_lineage_metadata_columns,
-            binding_id,
-        ),
+        resolved,
         statistics_pin: materialization.statistics_pin.clone(),
         admission: QueryTableBindingAdmission::Exact(materialization.planning_pin.clone()),
         source_metadata: None,
@@ -1425,16 +1430,8 @@ fn metadata_query_binding_from_materialization(
     })
 }
 
-/// The frozen column contract for one metadata relation, when it is fully
-/// determined by the relation kind alone.
-///
-/// `$files` and `$entries` are not: their `partition`,
-/// `lower_bounds` and `upper_bounds` columns are derived from the table's own
-/// partition spec and schema, and the contract entry point omits them rather
-/// than guess. Those facts live in the connector and no typed column binding
-/// carries a type today, so those two keep resolving through the connector's
-/// alias materialization until the derived types can cross the control plane.
-/// Returning `None` for them is that staged state, stated rather than hidden.
+/// The remaining metadata relations with SQL-owned static declarations.
+/// `None` selects the declaration from the exact Provider observation.
 fn frozen_metadata_columns(
     kind: novarocks_sql::planning::catalog::MetadataTableKind,
 ) -> CatalogResolutionResult<Option<Vec<novarocks_types::schema::ColumnDef>>> {
@@ -1446,22 +1443,23 @@ fn frozen_metadata_columns(
                 "invariant: $partitions is a SQL view over $files",
             ));
         }
-        MetadataTableKind::Files | MetadataTableKind::Entries => None,
-        MetadataTableKind::Snapshots
-        | MetadataTableKind::History
-        | MetadataTableKind::Refs
-        | MetadataTableKind::Manifests => Some(
-            novarocks_sql::planning::catalog::metadata_table_schema(kind)
-                .into_iter()
-                .map(|column| novarocks_types::schema::ColumnDef {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                    write_default: None,
-                    logical_type: column.logical_type,
-                })
-                .collect(),
-        ),
+        MetadataTableKind::Files | MetadataTableKind::Entries | MetadataTableKind::Manifests => {
+            None
+        }
+        MetadataTableKind::Snapshots | MetadataTableKind::History | MetadataTableKind::Refs => {
+            Some(
+                novarocks_sql::planning::catalog::metadata_table_schema(kind)
+                    .into_iter()
+                    .map(|column| novarocks_types::schema::ColumnDef {
+                        name: column.name,
+                        data_type: column.data_type,
+                        nullable: column.nullable,
+                        write_default: None,
+                        logical_type: column.logical_type,
+                    })
+                    .collect(),
+            )
+        }
     })
 }
 
@@ -1562,8 +1560,9 @@ mod tests {
                         logical_type: column.logical_type,
                     })
                     .collect::<Vec<_>>();
+                let mut view_columns = Vec::new();
                 if self.partitioned {
-                    columns.push(novarocks_types::schema::ColumnDef {
+                    let partition = novarocks_types::schema::ColumnDef {
                         name: "partition".into(),
                         data_type: arrow::datatypes::DataType::Struct(
                             vec![arrow::datatypes::Field::new(
@@ -1576,8 +1575,29 @@ mod tests {
                         nullable: true,
                         write_default: None,
                         logical_type: None,
+                    };
+                    view_columns.push(novarocks_spi::connector::ConnectorViewColumn {
+                        name: "partition".into(),
+                        value_type: partition.declared_value_type().unwrap(),
                     });
+                    columns.push(partition);
                 }
+                view_columns.extend(
+                    [
+                        ("record_count", true),
+                        ("file_count", false),
+                        ("total_size", true),
+                    ]
+                    .map(|(name, nullable)| {
+                        novarocks_spi::connector::ConnectorViewColumn {
+                            name: name.into(),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                arrow::datatypes::DataType::Int64,
+                                nullable,
+                            ),
+                        }
+                    }),
+                );
                 let resolved = novarocks_sql::planning::catalog::resolved_metadata_table(
                     catalog,
                     db,
@@ -1587,6 +1607,30 @@ mod tests {
                     Vec::new(),
                     token,
                 );
+                let partition = if self.partitioned { "partition, " } else { "" };
+                let grouping = if self.partitioned {
+                    "GROUP BY partition"
+                } else {
+                    "HAVING count(*) > 0"
+                };
+                let resolved = super::super::query_catalog::relation::project_derived_view(
+                    resolved,
+                    token,
+                    &novarocks_spi::connector::ConnectorDerivedView {
+                        name: format!("{table}$partitions").into(),
+                        definition: novarocks_spi::connector::ConnectorViewDefinition {
+                            dialect: novarocks_spi::connector::ConnectorViewDialect::Trino,
+                            raw_sql: format!(
+                                r#"SELECT {partition}sum(record_count) AS record_count, count(*) AS file_count,
+                                   sum(file_size_in_bytes) AS total_size FROM "{catalog}"."{db}"."{table}$files"
+                                   WHERE content = 0 {grouping}"#,
+                            ).into(),
+                            default_catalog: Some(catalog.into()),
+                            default_namespace: db.into(),
+                            columns: view_columns.into(),
+                        },
+                    },
+                )?;
                 // Local supplies only the fixture's capability-free binding
                 // container. Keep the exact Metadata source and token, as the
                 // production metadata loader does; no runtime is opened here.
@@ -1620,6 +1664,8 @@ mod tests {
                 "SELECT p.* FROM DB.\"ORDERS$partitions\" p",
                 "SELECT * FROM ICE.DB.\"ORDERS$partitions\"",
                 "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM \"orders$partitions\" p",
+                "SELECT count(*) FROM \"orders$partitions\"",
+                "SELECT p.file_count FROM \"orders$partitions\" p JOIN ice.db.\"orders$files\" f ON p.total_size = f.file_size_in_bytes",
             ] {
                 let service =
                     crate::catalog_application::query_catalog::new_query_catalog_service();
@@ -1683,7 +1729,10 @@ mod tests {
                             binding: need.binding(), label: "ice.db.orders$files".into(), reason: "no statistics in metadata binding test".into(),
                         }).unwrap()).collect::<Vec<_>>().into_boxed_slice()),
                         SqlNeedBatch::ProviderReads(needs) => {
-                            assert_eq!(needs.len(), 1, "{sql}");
+                            assert!(!needs.is_empty(), "{sql}");
+                            if !sql.contains("JOIN") {
+                                assert_eq!(needs.len(), 1, "{sql}");
+                            }
                             assert_eq!(calls.load(Ordering::SeqCst), 1, "{sql}");
                             assert_eq!(bindings.captured_bindings().len(), 1, "{sql}");
                             let token = {
@@ -1691,8 +1740,10 @@ mod tests {
                                 assert_eq!(tokens.len(), 1);
                                 tokens[0]
                             };
-                            assert_eq!(needs[0].binding(), token);
-                            assert!(matches!(needs[0].relation(), novarocks_sql::compiler::ProviderReadRelationNeed::Metadata { kind: MetadataTableKind::Files, .. }));
+                            for need in needs.iter() {
+                                assert_eq!(need.binding(), token);
+                                assert!(matches!(need.relation(), novarocks_sql::compiler::ProviderReadRelationNeed::Metadata { kind: MetadataTableKind::Files, .. }));
+                            }
                             let first = catalog.get_iceberg_metadata_table(None, "db", "orders", MetadataTableKind::Files).unwrap();
                             let second = catalog.get_iceberg_metadata_table(Some("ice"), "db", "orders", MetadataTableKind::Files).unwrap();
                             assert_eq!(novarocks_sql::planning::catalog::table_binding_id(&first), token);
@@ -1721,6 +1772,16 @@ mod tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
         }
+    }
+
+    #[test]
+    fn quoted_metadata_manifests_columns_come_from_the_provider_observation() {
+        use novarocks_sql::planning::catalog::MetadataTableKind;
+        assert!(
+            frozen_metadata_columns(MetadataTableKind::Manifests)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

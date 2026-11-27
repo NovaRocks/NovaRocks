@@ -50,5 +50,14 @@ SELECT count(*) > 0 AS has_added
   WHERE status = 1;
 
 -- query 8
+SELECT sum(e.data_file.record_count) AS records,
+       count(*) FILTER (WHERE typeof(e.readable_metrics) = 'json') AS metrics_rows
+  FROM iceberg_cat_${suite_uuid0}.iv38e_db_${uuid0}."t_${uuid0}$entries" AS e
+ WHERE e.status = 1;
+
+-- query 9
+SELECT * FROM iceberg_cat_${suite_uuid0}.iv38e_db_${uuid0}."t_${uuid0}$entries" LIMIT 0;
+
+-- query 10
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iv38e_db_${uuid0};

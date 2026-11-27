@@ -22,3 +22,7 @@ n_with_id
 -- types	bigint
 n_root_aliased
 1
+
+-- query 11
+-- types	timestamp(6) with time zone	bigint	bigint	varchar	varchar	map(varchar, varchar)
+committed_at	snapshot_id	parent_id	operation	manifest_list	summary

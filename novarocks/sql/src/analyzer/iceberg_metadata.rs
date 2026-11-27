@@ -385,12 +385,12 @@ fn manifests_columns() -> Vec<MetadataColumn> {
         MetadataColumn::new("length", bigint(), false),
         MetadataColumn::new("partition_spec_id", integer(), false),
         MetadataColumn::new("added_snapshot_id", bigint(), true),
-        MetadataColumn::new("added_data_files_count", integer(), false),
-        MetadataColumn::new("added_rows_count", bigint(), false),
-        MetadataColumn::new("existing_data_files_count", integer(), false),
-        MetadataColumn::new("existing_rows_count", bigint(), false),
-        MetadataColumn::new("deleted_data_files_count", integer(), false),
-        MetadataColumn::new("deleted_rows_count", bigint(), false),
+        MetadataColumn::new("added_data_files_count", integer(), true),
+        MetadataColumn::new("added_rows_count", bigint(), true),
+        MetadataColumn::new("existing_data_files_count", integer(), true),
+        MetadataColumn::new("existing_rows_count", bigint(), true),
+        MetadataColumn::new("deleted_data_files_count", integer(), true),
+        MetadataColumn::new("deleted_rows_count", bigint(), true),
         MetadataColumn::new(
             "partition_summaries",
             array_of(row_of(vec![
@@ -874,6 +874,7 @@ mod tests {
             integer()
         );
         assert_eq!(column(&columns, "added_rows_count").data_type, bigint());
+        assert!(columns[5..11].iter().all(|count| count.nullable));
     }
 
     #[test]

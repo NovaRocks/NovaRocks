@@ -196,12 +196,12 @@ pub use maintenance_duration::{
 };
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
-    CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorReadNamedReference, ConnectorReadReferenceFacts,
-    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry,
-    ConnectorRetiredReadField, ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
-    ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorDerivedView,
+    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorReadNamedReference,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSnapshotLogEntry, ConnectorRetiredReadField, ConnectorTableColumnPlanningFact,
+    ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
     ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
     ConnectorTableDefinitionStructField, ConnectorTableDefinitionType,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableJobAdmissionRequest,
