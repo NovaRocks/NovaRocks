@@ -60,7 +60,6 @@ pub(super) struct SourceFixture {
     requests: Mutex<Vec<ConnectorReadSourcePreparationRequest>>,
     historical_requests: Mutex<Vec<ConnectorReadSourcePreparationRequest>>,
     schema_projections: AtomicUsize,
-    revision_selectors: Mutex<Vec<ConnectorReadSelector>>,
     captured_context: Mutex<Option<ConnectorRequestContext>>,
     snapshot: i64,
     background_composition: bool,
@@ -144,7 +143,6 @@ impl SourceFixture {
             requests: Mutex::new(Vec::new()),
             historical_requests: Mutex::new(Vec::new()),
             schema_projections: AtomicUsize::new(0),
-            revision_selectors: Mutex::new(Vec::new()),
             captured_context: Mutex::new(None),
             snapshot: 18,
             background_composition,
@@ -155,7 +153,6 @@ impl SourceFixture {
         source_mut.current = observed_current_keyed(&facts, source_mut.catalog.clone());
         source_mut.projection.facts = facts;
         *source_mut.schema_projections.get_mut() = 0;
-        source_mut.revision_selectors.get_mut().unwrap().clear();
         source
     }
 
@@ -771,9 +768,6 @@ impl ConnectorMetadata for SourceFixture {
             b"original-target-11" => false,
             _ => panic!("unknown original table revision request"),
         };
-        if source {
-            self.revision_selectors.lock().unwrap().push(selector);
-        }
         let snapshot = match selector {
             ConnectorReadSelector::Current => match table.payload().as_ref() {
                 b"prepared-source-from-17" => 17,
@@ -895,12 +889,19 @@ impl ProviderReadMetadata for SourceFixture {
                 request.observed_table().payload().as_ref(),
                 b"original-source-18"
             );
+            let from = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                self.descriptor.provider_id.clone(),
+                &self.object(),
+                Some(17),
+            )?;
+            let to = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                self.descriptor.provider_id.clone(),
+                &self.object(),
+                Some(18),
+            )?;
             if request.selection() == ConnectorReadSourceSelection::Snapshot(17) {
                 assert!(request.from_revision().is_none());
-                assert_eq!(
-                    request.to_revision().canonical_read_point(),
-                    Some(ConnectorCanonicalReadPoint::Snapshot(Some(17)))
-                );
+                assert_eq!(request.to_revision(), &from);
                 self.historical_requests
                     .lock()
                     .unwrap()
@@ -917,14 +918,8 @@ impl ProviderReadMetadata for SourceFixture {
                 request.selection(),
                 ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(17, 18))
             );
-            assert_eq!(
-                request.from_revision().unwrap().canonical_read_point(),
-                Some(ConnectorCanonicalReadPoint::Snapshot(Some(17)))
-            );
-            assert_eq!(
-                request.to_revision().canonical_read_point(),
-                Some(ConnectorCanonicalReadPoint::Snapshot(Some(18)))
-            );
+            assert_eq!(request.from_revision(), Some(&from));
+            assert_eq!(request.to_revision(), &to);
             self.preparations.fetch_add(1, Ordering::SeqCst);
             self.requests.lock().unwrap().push(request.clone());
             let context = crate::connector::test_request_context();
@@ -1666,17 +1661,6 @@ async fn explain_counted_with_initial_schema(
         assert_eq!(
             requests[0].to_revision().canonical_read_point(),
             Some(ConnectorCanonicalReadPoint::Snapshot(Some(18)))
-        );
-    }
-    {
-        let selectors = source.revision_selectors.lock().unwrap();
-        assert!(
-            selectors.contains(&ConnectorReadSelector::SnapshotId(17)),
-            "B must validate the actual original From exact revision"
-        );
-        assert!(
-            selectors.contains(&ConnectorReadSelector::SnapshotId(18)),
-            "B must validate the actual frozen To exact revision"
         );
     }
     drop(result);
