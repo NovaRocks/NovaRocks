@@ -215,7 +215,6 @@ fn request_fragment(
             .collect(),
         logical_argument_count: refs.len(),
         expected_result_type: None,
-        constant_policy: policy(),
     };
     let unit = builder.unit(owner).unwrap();
     unit.request(call, original).unwrap();
@@ -297,11 +296,8 @@ fn closed(
     validate_fragment_constants_observed(fragment, pools, true, crate::PlanLimits::FROZEN, control)
 }
 fn plan(fragment: &crate::Fragment, pools: ConstantPools) -> crate::PhysicalPlan {
-    let mut builder = crate::PlanBuilder::new(
-        crate::PlanVersionId::try_new([81; 16]).unwrap(),
-        crate::tests::constant_fixture::policy(),
-    )
-    .with_constant_pools(pools);
+    let mut builder = crate::PlanBuilder::new(crate::PlanVersionId::try_new([81; 16]).unwrap())
+        .with_constant_pools(pools);
     builder.add_fragment(fragment.clone()).unwrap();
     builder.finish_observed(&Control::default()).unwrap()
 }

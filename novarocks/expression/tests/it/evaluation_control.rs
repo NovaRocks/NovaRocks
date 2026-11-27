@@ -22,7 +22,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantValue};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression::{
     CompiledExprSet, CompiledExpressionInstance, EvaluationEnvironment, EvaluationInput,
     ExprEvaluationFailure, ScopeLayouts,
@@ -48,25 +48,29 @@ use std::{
     time::Duration,
 };
 
-const SQL_LITERAL_POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 64,
-    max_array_nodes: 1024,
-    max_logical_elements: 4096,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+const SQL_LITERAL_FIXTURE: novarocks_constant_contract::ConstantPolicy =
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 64,
+        max_array_nodes: 1024,
+        max_logical_elements: 4096,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+const SQL_LITERAL_POLICY: ConstantValidation = ConstantValidation::bounded(SQL_LITERAL_FIXTURE);
 
-const VALUES_POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 16,
-    max_array_nodes: 128,
-    max_logical_elements: 1024,
-    ..SQL_LITERAL_POLICY
-};
+const VALUES_POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        ..SQL_LITERAL_FIXTURE
+    },
+);
 
 fn comparison_root<F>(
     source_name: &str,
@@ -127,7 +131,7 @@ fn compile_ownerless_fixture(
     ports: Vec<ExprPort>,
     environment: EvaluationEnvironment<'_>,
     layouts: ScopeLayouts<'_>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
 ) -> Arc<CompiledExprSet> {
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     let unit = draft

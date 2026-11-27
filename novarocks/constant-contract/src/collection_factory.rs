@@ -16,11 +16,11 @@
 // under the License.
 
 //! Controlled owned collection construction from actual caller source facts.
-//! No Unpivot key policy, nominal retag or host allocation grant is authored here.
+//! No Unpivot key validation, nominal retag or host allocation grant is authored here.
 
 use super::{
-    ConstantError, ConstantPolicy, ConstantPool, ConstantValue, ValidationCounts, checked_add,
-    checked_mul, limit, validation_envelope_core,
+    ConstantError, ConstantPool, ConstantValidation, ConstantValue, ValidationCounts, checked_add,
+    checked_mul, limit, optional_limit, validation_envelope_core,
 };
 use arrow_buffer::Buffer;
 use arrow_data::ArrayData;
@@ -45,13 +45,12 @@ fn finish<T>(
 }
 
 fn reserve<T>(n: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, ConstantError> {
-    Layout::array::<T>(n)
-        .map_err(|_| ConstantError::Control(CompileControlError::ResourceExhausted))?;
+    Layout::array::<T>(n).map_err(|source| ConstantError::array_backing::<T>(n, source))?;
     work.flush()?;
     let mut output = Vec::new();
     output
         .try_reserve_exact(n)
-        .map_err(|_| ConstantError::Control(CompileControlError::ResourceExhausted))?;
+        .map_err(ConstantError::allocation)?;
     work.flush()?;
     Ok(output)
 }
@@ -68,14 +67,14 @@ fn preflight(
     field: &Field,
     ty: &FunctionValueType,
     recipe: CollectionRecipe,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantError> {
     preflight_observed(
         field,
         ty,
         recipe,
-        policy,
+        validation,
         &mut super::PoolObserver::plain(),
         work,
     )
@@ -85,7 +84,7 @@ fn preflight_observed<E: super::PoolFailure>(
     field: &Field,
     ty: &FunctionValueType,
     recipe: CollectionRecipe,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     observer: &mut super::PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, E> {
@@ -96,21 +95,25 @@ fn preflight_observed<E: super::PoolFailure>(
         buffers,
         backing,
     } = recipe;
-    let metadata = super::validate_type_owned(field, ty, policy, observer, work)?;
-    limit(1, policy.max_rows, "collection factory row limit exceeded")?;
-    limit(
+    let metadata = super::validate_type_owned(field, ty, validation, observer, work)?;
+    optional_limit(
+        1,
+        validation.volume.map(|policy| policy.max_rows),
+        "collection factory row limit exceeded",
+    )?;
+    optional_limit(
         nodes,
-        policy.max_array_nodes,
+        validation.volume.map(|policy| policy.max_array_nodes),
         "collection factory array node limit exceeded",
     )?;
     limit(
         u64::from(depth),
-        u64::from(policy.max_type_depth),
+        u64::from(validation.shape.depth),
         "collection factory depth limit exceeded",
     )?;
-    limit(
+    optional_limit(
         elements,
-        policy.max_logical_elements,
+        validation.volume.map(|policy| policy.max_logical_elements),
         "collection factory logical element limit exceeded",
     )?;
     // Buffer::from_vec retains the actual Vec allocation. Include fixed Arrow
@@ -122,9 +125,11 @@ fn preflight_observed<E: super::PoolFailure>(
             checked_mul(buffers, std::mem::size_of::<Buffer>() as u64)?,
         )?,
     )?;
-    limit(
+    optional_limit(
         retained,
-        policy.max_retained_buffer_bytes,
+        validation
+            .volume
+            .map(|policy| policy.max_retained_buffer_bytes),
         "collection factory backing limit exceeded",
     )?;
     let bounds = validation_envelope_core(
@@ -139,19 +144,23 @@ fn preflight_observed<E: super::PoolFailure>(
             depth: u64::from(depth),
         },
         metadata,
-        policy,
+        validation,
     )?;
     // Each safe builder can validate descendants; pool admission validates
     // the complete backing again. Reuse the sole numerical envelope for a
     // conservative count of these real finite opaque passes.
-    limit(
+    optional_limit(
         checked_mul(bounds.work, checked_add(nodes, 1)?)?,
-        policy.max_library_validation_work,
+        validation
+            .volume
+            .map(|policy| policy.max_library_validation_work),
         "collection factory library work limit exceeded",
     )?;
-    limit(
+    optional_limit(
         checked_mul(bounds.bytes, checked_add(nodes, 1)?)?,
-        policy.max_library_validation_bytes,
+        validation
+            .volume
+            .map(|policy| policy.max_library_validation_bytes),
         "collection factory library byte limit exceeded",
     )?;
     observer.step(work)?;
@@ -196,10 +205,11 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         values: &[i32],
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let result = (|| {
             let valid = matches!(ty.data_type(), DataType::List(child) if child.data_type() == &DataType::Int32);
@@ -211,8 +221,8 @@ impl ConstantValue {
             }
             let count = u64::try_from(values.len())
                 .map_err(|_| ConstantError::Limit("collection source length overflow"))?;
-            let end = i32::try_from(values.len())
-                .map_err(|_| ConstantError::Limit("Int32 list offset exceeds carrier"))?;
+            let end = i32::try_from(count)
+                .map_err(|_| ConstantError::offset_extent(count, i32::MAX as u64))?;
             let backing = checked_add(8, checked_mul(count, 4)?)?;
             preflight(
                 &field,
@@ -224,7 +234,7 @@ impl ConstantValue {
                     buffers: 2,
                     backing,
                 },
-                policy,
+                validation,
                 &mut work,
             )?;
             let mut copied = reserve(values.len(), &mut work)?;
@@ -252,7 +262,7 @@ impl ConstantValue {
                 &mut work,
             )?;
             work.flush()?;
-            let pool = ConstantPool::try_new(field, ty, data, policy, phase, control)?;
+            let pool = ConstantPool::try_new(field, ty, data, validation, phase, control)?;
             work.flush()?;
             pool.value(0)
         })();
@@ -264,10 +274,11 @@ impl ConstantValue {
         field: Arc<Field>,
         ty: FunctionValueType,
         entries: &[(String, String)],
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let result = (|| {
             let entries_type = match field.data_type() {
@@ -304,11 +315,11 @@ impl ConstantValue {
                 work.step()?;
             }
             let end = i32::try_from(entries.len())
-                .map_err(|_| ConstantError::Limit("map entry offset exceeds carrier"))?;
+                .map_err(|_| ConstantError::offset_extent(entries.len() as u64, i32::MAX as u64))?;
             i32::try_from(key_bytes)
-                .map_err(|_| ConstantError::Limit("map key offsets exceed carrier"))?;
+                .map_err(|_| ConstantError::offset_extent(key_bytes as u64, i32::MAX as u64))?;
             i32::try_from(value_bytes)
-                .map_err(|_| ConstantError::Limit("map value offsets exceed carrier"))?;
+                .map_err(|_| ConstantError::offset_extent(value_bytes as u64, i32::MAX as u64))?;
             let offsets_len = entries
                 .len()
                 .checked_add(1)
@@ -332,7 +343,7 @@ impl ConstantValue {
                     buffers: 5,
                     backing,
                 },
-                policy,
+                validation,
                 &mut work,
             )?;
             let mut keys = reserve(key_bytes, &mut work)?;
@@ -393,7 +404,7 @@ impl ConstantValue {
                 &mut work,
             )?;
             work.flush()?;
-            let pool = ConstantPool::try_new(field, ty, data, policy, phase, control)?;
+            let pool = ConstantPool::try_new(field, ty, data, validation, phase, control)?;
             work.flush()?;
             pool.value(0)
         })();
@@ -411,7 +422,8 @@ fn empty_recipe<E: super::PoolFailure>(
     ty: &DataType,
     root: bool,
     depth: u32,
-    policy: ConstantPolicy,
+    dictionary_depth: u32,
+    validation: ConstantValidation,
     recipe: &mut CollectionRecipe,
     observer: &mut super::PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
@@ -419,7 +431,7 @@ fn empty_recipe<E: super::PoolFailure>(
     observer.step(work)?;
     limit(
         u64::from(depth),
-        u64::from(policy.max_type_depth),
+        u64::from(validation.shape.depth),
         "empty collection depth limit exceeded",
     )?;
     limit(
@@ -427,10 +439,16 @@ fn empty_recipe<E: super::PoolFailure>(
         novarocks_type_contract::MAX_VALUE_TYPE_DEPTH as u64,
         "empty collection intrinsic depth exceeded",
     )?;
-    recipe.nodes = checked_add(recipe.nodes, 1)?;
+    let dictionary_depth = dictionary_depth + u32::from(matches!(ty, DataType::Dictionary(_, _)));
     limit(
+        u64::from(dictionary_depth),
+        u64::from(validation.shape.dictionary_depth),
+        "constant dictionary depth limit exceeded",
+    )?;
+    recipe.nodes = checked_add(recipe.nodes, 1)?;
+    optional_limit(
         recipe.nodes,
-        policy.max_array_nodes,
+        validation.volume.map(|policy| policy.max_array_nodes),
         "empty collection array node limit exceeded",
     )?;
     recipe.depth = recipe.depth.max(depth);
@@ -442,7 +460,8 @@ fn empty_recipe<E: super::PoolFailure>(
             empty_child_type(ty, index),
             false,
             depth + 1,
-            policy,
+            dictionary_depth,
+            validation,
             recipe,
             observer,
             work,
@@ -593,15 +612,19 @@ fn empty_array<E: super::PoolFailure>(
 fn empty_collection_data<E: super::PoolFailure>(
     field: &Field,
     ty: &FunctionValueType,
-    policy: ConstantPolicy,
+    validation: ConstantValidation,
     observer: &mut super::PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ArrayData, E> {
     // These pre-array refusals precede even creator request observation.
-    limit(1, policy.max_rows, "empty collection row limit exceeded")?;
-    limit(
+    optional_limit(
         1,
-        policy.max_array_nodes,
+        validation.volume.map(|policy| policy.max_rows),
+        "empty collection row limit exceeded",
+    )?;
+    optional_limit(
+        1,
+        validation.volume.map(|policy| policy.max_array_nodes),
         "empty collection array node limit exceeded",
     )?;
     observer.step(work)?;
@@ -625,14 +648,15 @@ fn empty_collection_data<E: super::PoolFailure>(
         field.data_type(),
         true,
         1,
-        policy,
+        0,
+        validation,
         &mut recipe,
         observer,
         work,
     )?;
     // Reuse the existing construction/validation numerical owner. Its finite
     // header/backing envelope also covers the one shared Arrow Buffer handle.
-    let opaque = preflight_observed(field, ty, recipe, policy, observer, work)?;
+    let opaque = preflight_observed(field, ty, recipe, validation, observer, work)?;
     observer.work(usize::try_from(opaque).map_err(|_| CompileControlError::ResourceExhausted)?)?;
     if let Some(creator) = &mut observer.creator {
         work.flush()?;
@@ -658,19 +682,20 @@ impl ConstantValue {
     pub fn from_empty_collection(
         field: Arc<Field>,
         ty: FunctionValueType,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         phase: CompilePhase,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
+        let validation = validation.into();
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let mut observer: super::PoolObserver<'_, ConstantError> = super::PoolObserver::plain();
         let result = (|| {
-            let data = empty_collection_data(&field, &ty, policy, &mut observer, &mut work)?;
+            let data = empty_collection_data(&field, &ty, validation, &mut observer, &mut work)?;
             let pool = ConstantPool::try_new_body(
                 field,
                 ty,
                 data,
-                policy,
+                validation,
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),
                 None,
                 &mut observer,
@@ -685,7 +710,7 @@ impl ConstantValue {
     pub fn from_empty_collection_with_creator_in<H>(
         field: Arc<Field>,
         ty: FunctionValueType,
-        policy: ConstantPolicy,
+        validation: impl Into<ConstantValidation>,
         source: super::ConstantSourceOwner,
         creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         admit: &mut impl FnMut(
@@ -693,6 +718,7 @@ impl ConstantValue {
         ) -> Result<(), super::ConstantCreationFailure<H>>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, super::ConstantCreationFailure<H>> {
+        let validation = validation.into();
         use super::ConstantCreationFailure as Failure;
         if !Arc::ptr_eq(&field, source.field_ref()) {
             return Err(ConstantError::Invalid(
@@ -700,7 +726,11 @@ impl ConstantValue {
             )
             .into());
         }
-        limit(1, policy.max_rows, "empty collection row limit exceeded")?;
+        optional_limit(
+            1,
+            validation.volume.map(|policy| policy.max_rows),
+            "empty collection row limit exceeded",
+        )?;
         let storage = creation
             .storage_lifetime()
             .retaining_observed(&source.storage_lifetime(), |layout| {
@@ -709,12 +739,12 @@ impl ConstantValue {
         let mut creator = super::PoolCreator(creation);
         let mut observer = super::PoolObserver::parent(admit);
         observer.creator = Some(&mut creator);
-        let data = empty_collection_data(&field, &ty, policy, &mut observer, work)?;
+        let data = empty_collection_data(&field, &ty, validation, &mut observer, work)?;
         let pool = ConstantPool::try_new_body(
             field,
             ty,
             data,
-            policy,
+            validation,
             storage,
             Some(source),
             &mut observer,

@@ -74,8 +74,8 @@ fn finish(
         .unwrap();
     let (fragment, constants) = fragment.into_parts();
     let fragment_id = fragment.id();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap(), checked::policy())
-        .with_constant_pools(constants);
+    let mut plan =
+        PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap()).with_constant_pools(constants);
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -212,11 +212,13 @@ fn large_borrowed_alias_and_literal_are_refused_by_the_streamed_line_budget() {
     let control = crate::compiler::SqlCompileControl::unbounded();
     let diagnostic = RenderDiagnostic::new(&control);
     // Admit the genuine source before checking the independent output bound.
-    let policy = novarocks_constant_contract::ConstantPolicy {
-        max_logical_elements: 16 << 20,
-        max_retained_buffer_bytes: 32 << 20,
-        ..checked::policy()
-    };
+    let policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_logical_elements: 16 << 20,
+            max_retained_buffer_bytes: 32 << 20,
+            ..checked::policy_fixture()
+        },
+    );
     let ty = ValueType::new(DataType::Utf8, false);
     let literal = novarocks_constant_contract::ConstantValue::from_utf8(
         std::sync::Arc::new(ty.try_to_field("large-source").unwrap()),

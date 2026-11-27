@@ -263,8 +263,7 @@ async fn original_insert_and_ctas_completion_install_system_snapshots_before_wri
             &candidate,
             &BTreeMap::new(),
             &BTreeMap::from([(ordinal, recipe)]),
-            policy,
-            &novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE.plan_limits,
             &control,
         )
         .unwrap();

@@ -538,7 +538,6 @@ fn finish(
                         .collect(),
                     logical_argument_count: source.arguments.len(),
                     expected_result_type: None,
-                    constant_policy: constant_policy(),
                 },
             )
         })

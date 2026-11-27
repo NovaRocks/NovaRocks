@@ -150,7 +150,7 @@ impl FrontendCompletionCustody {
         preparation: novarocks_sql::compiler::SqlDmlCatalogPreparation,
         functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: novarocks_functions::ConstantPolicy,
+        policy: novarocks_functions::ConstantValidation,
     ) -> Result<novarocks_sql::compiler::SqlAnalyzedQuery, novarocks_sql::compiler::SqlCompileError>
     {
         use novarocks_sql::compiler::{

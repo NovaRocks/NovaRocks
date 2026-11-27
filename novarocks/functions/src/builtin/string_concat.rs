@@ -22,7 +22,7 @@
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     ScalarCallInput, SelectedValues,
-    kernel_control::{internal, invalid},
+    kernel_control::{check_i32_output_extent, internal, invalid, reserve_local_output},
     kernel_input::EvaluationCheckpoints,
 };
 use arrow_array::{Array, ArrayRef, BinaryArray, StringArray};
@@ -36,7 +36,7 @@ use std::{alloc::Layout, sync::Arc};
 use super::string_concat_core::{ConcatLength, concat_length_observed, emit_concat_observed};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
-    i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+    check_i32_output_extent(bytes)?;
     let offsets = rows
         .checked_add(1)
         .ok_or(KernelFailure::ResourceExhausted)?;
@@ -221,15 +221,9 @@ pub(super) fn evaluate_string_concat<'a>(
         }
         output_capacity(selection.len(), output_bytes)?;
         work.flush()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(output_bytes)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut bytes = reserve_local_output(output_bytes, "concat output bytes")?;
         work.flush()?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(selection.len() + 1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut offsets = reserve_local_output(selection.len() + 1, "concat output offsets")?;
         work.flush()?;
         let mut validity = BooleanBufferBuilder::new(selection.len());
         work.flush()?;

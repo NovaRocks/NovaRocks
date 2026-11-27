@@ -20,7 +20,7 @@ use arrow_array::Float64Array;
 use arrow_schema::DataType;
 use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
+    CallEffectInput, ConstantValidation, ConstantValue, EngineFunctionCatalogBuilder,
     FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
     InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureCallPreparation,
     PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
@@ -96,18 +96,20 @@ fn options(dop: usize) -> LocalCompileOptions {
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         // Explicit fixture admission; these values are not production defaults.
-        constants: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        constants: novarocks_functions::ConstantValidation::bounded(
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        ),
     }
 }
 
@@ -245,7 +247,6 @@ fn package_with_case(
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: options(1).constants,
                 },
             )
             .unwrap();
@@ -431,7 +432,7 @@ fn package_with_case(
                 required: RequiredContracts::default(),
                 constants,
                 fragment,
-                statement_constant_policy: options(1).constants,
+
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 cuts: FragmentCuts::default(),

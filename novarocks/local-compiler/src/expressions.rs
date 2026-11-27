@@ -22,9 +22,9 @@
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use novarocks_functions::{
-    CallEffectInput, ConstantError, ConstantPolicy, FunctionBindingError, FunctionBindingSelection,
-    FunctionSpecializationFailure, PureCallPreparation, PureCallSpecialization,
-    PureEngineFunctionCatalog,
+    CallEffectInput, ConstantError, ConstantValidation, FunctionBindingError,
+    FunctionBindingSelection, FunctionSpecializationFailure, PureCallPreparation,
+    PureCallSpecialization, PureEngineFunctionCatalog,
 };
 use novarocks_local_program::{ProgramCallSite, ProgramRootRef, ProgramUnitId, StaticLayout};
 use novarocks_physical_plan::{ConstantReferenceError, FragmentPackage, NodeId, PhysicalCallSite};
@@ -322,7 +322,7 @@ impl<H> From<novarocks_functions::CheckedCallPreparationFailure<H>>
     }
 }
 
-pub(crate) type CallCreation<'a, F> = Option<(&'a F, &'a ConstantPolicy)>;
+pub(crate) type CallCreation<'a, F> = Option<(&'a F, &'a ConstantValidation)>;
 pub(crate) fn validate_call_created<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -356,7 +356,7 @@ pub(crate) fn prepare_call_created<H, F: novarocks_type_contract::ValueSchemaCre
     creation: CallCreation<'_, F>,
 ) -> Result<PureCallSpecialization, ExpressionCreationFailure<H>> {
     match creation {
-        Some((factory, policy)) => {
+        Some((factory, _)) => {
             // The definition was fully validated by this immutable compiler's
             // first pass. Expected types in this preparation get a separate
             // temporary owner; they never enlarge a published type invoice.
@@ -365,7 +365,7 @@ pub(crate) fn prepare_call_created<H, F: novarocks_type_contract::ValueSchemaCre
                 .map_err(ExpressionCreationFailure::Creator)?;
             catalog
                 .prepare_frozen_with_creator_in(
-                    input, selected, frozen, options, policy, &mut scope, control,
+                    input, selected, frozen, options, &mut scope, control,
                 )
                 .map_err(Into::into)
         }
@@ -624,7 +624,7 @@ pub(crate) fn compile_unit<H, F: novarocks_type_contract::ValueSchemaCreationFac
     scopes: &[ScopeLayout],
     combined: Option<&ScopeLayout>,
     catalog: &PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     factory: Option<&F>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
@@ -740,7 +740,7 @@ pub(crate) fn compile_node_unit<H, F: novarocks_type_contract::ValueSchemaCreati
     combined: Option<(&[ValueId], &StaticLayout)>,
     expressions: &mut LoweredExpressions,
     functions: &PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
     factory: Option<&F>,

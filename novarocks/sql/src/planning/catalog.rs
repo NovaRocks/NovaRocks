@@ -876,7 +876,7 @@ pub fn analyze_view_query(
     provider: &dyn PlannerTableProvider,
     database: &str,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<Vec<ViewOutputColumn>, crate::compiler::SqlCompileError> {
     let (resolved, _ctes, factory) = crate::analyzer::analyze_with_function_catalog(

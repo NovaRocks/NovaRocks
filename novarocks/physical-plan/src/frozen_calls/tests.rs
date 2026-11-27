@@ -169,18 +169,6 @@ fn zero_argument_request() -> PhysicalCallRequest {
         arguments: Box::default(),
         logical_argument_count: 0,
         expected_result_type: None,
-        constant_policy: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 32,
-            max_logical_elements: 128,
-            max_retained_buffer_bytes: 64 * 1024,
-            max_type_depth: 16,
-            max_type_nodes: 128,
-            max_dictionary_depth: 8,
-            max_metadata_bytes: 4096,
-            max_library_validation_work: 1_000_000,
-            max_library_validation_bytes: 1024 * 1024,
-        },
     }
 }
 

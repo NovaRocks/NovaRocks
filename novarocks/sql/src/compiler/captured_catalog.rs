@@ -189,7 +189,7 @@ impl SqlCapturedCatalogPreparation {
         parameters: &super::SqlPreparedParameters,
         session: &super::SqlSessionContext,
         functions: &dyn super::SqlFunctionCatalog,
-        policy: super::ConstantPolicy,
+        policy: super::ConstantValidation,
         write_assignments: Option<&super::SqlWriteAssignments>,
         materialized_constants: Option<super::SqlExpressionConstants>,
     ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
@@ -211,7 +211,7 @@ impl SqlCapturedCatalogPreparation {
         parameters: &super::SqlPreparedParameters,
         session: &super::SqlSessionContext,
         functions: &dyn super::SqlFunctionCatalog,
-        policy: super::ConstantPolicy,
+        policy: super::ConstantValidation,
     ) -> Result<super::SqlPreparedDescription, SqlCompileError> {
         self.describe_inner(parameters, session, functions, policy, None, None, true)
     }
@@ -221,7 +221,7 @@ impl SqlCapturedCatalogPreparation {
         parameters: &super::SqlPreparedParameters,
         session: &super::SqlSessionContext,
         functions: &dyn super::SqlFunctionCatalog,
-        policy: super::ConstantPolicy,
+        policy: super::ConstantValidation,
         write_assignments: Option<&super::SqlWriteAssignments>,
         materialized_constants: Option<super::SqlExpressionConstants>,
         ctas_source: bool,
@@ -270,7 +270,7 @@ impl SqlCapturedCatalogPreparation {
         self,
         functions: &dyn super::SqlFunctionCatalog,
         sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        policy: super::ConstantPolicy,
+        policy: super::ConstantValidation,
         statement_session: Option<&crate::sql_mode::StatementSessionEnvironment>,
     ) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
         let database = self.catalog.definition_database()?;

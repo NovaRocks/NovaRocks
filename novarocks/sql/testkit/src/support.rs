@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use novarocks_functions::ConstantPolicy;
+use novarocks_functions::ConstantValidation;
 
 /// Parse one owned query from a statement fixture before compiling it.
 pub fn parse_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
@@ -32,8 +32,8 @@ pub fn parse_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
 }
 
 /// Constant admission shared by the SQL source fixtures.
-pub fn sql_fixture_constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
+pub fn sql_fixture_constant_policy() -> ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 64,
         max_array_nodes: 1024,
         max_logical_elements: 4096,
@@ -44,5 +44,5 @@ pub fn sql_fixture_constant_policy() -> ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
-    }
+    })
 }

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::ConstantPolicy;
 use arrow_array::{Array, Int32Array, ListArray, MapArray, StringArray};
 use std::{collections::HashMap, sync::Mutex};
 

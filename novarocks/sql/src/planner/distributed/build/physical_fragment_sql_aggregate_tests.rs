@@ -50,7 +50,7 @@ fn source_scopes<'a>(
     fragment: &'a Fragment,
     occurrences: &AuthoredPhysicalOccurrences,
 ) -> (
-    ConstantPolicy,
+    ConstantValidation,
     BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
 ) {
     let control = crate::compiler::SqlCompileControl::unbounded();
@@ -95,7 +95,7 @@ fn input<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
     occurrences: &'a AuthoredPhysicalOccurrences<'a>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     scopes: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
     expressions: &'a BTreeMap<novarocks_physical_plan::NodeId, NodeExpressionEffects>,
 ) -> PhysicalFragmentEffectsInput<'a> {
@@ -458,7 +458,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
 }
 
 #[test]
-fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge_reconstruction() {
+fn genuine_sql_composer_refuses_direct_merge_reconstruction() {
     let owner = crate::compiler::compile_authored_aggregate_for_test("SELECT COUNT(*) FROM orders");
     let catalog = owner.function_catalog().as_ref();
     let mut final_seen = false;
@@ -467,25 +467,6 @@ fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, scopes) = source_scopes(&owner, fragment, &occurrences);
         let expressions = pure_node_effects_for_test(fragment);
-        let mut changed = policy;
-        changed.max_retained_buffer_bytes -= 1;
-        prefixes(
-            |control| {
-                author_sql_fragment_effects_observed(
-                    owner.relational_sources(),
-                    input(
-                        &owner,
-                        fragment,
-                        &occurrences,
-                        changed,
-                        &scopes,
-                        &expressions,
-                    ),
-                    control,
-                )
-            },
-            false,
-        );
         if fragment.nodes().values().any(|node| matches!(&node.kind, NodeKind::Aggregate { calls, .. } if calls.iter().any(|call| matches!(call.binding.phase, AggregatePhase::Final { .. })))) {
             let result = author_physical_fragment_effects_observed(input(&owner, fragment, &occurrences, policy, &scopes, &expressions), catalog, &Control::default());
             assert!(matches!(result, Err(PhysicalFragmentEffectsError::AggregateRequest(PhysicalAggregateRequestError::MissingLogicalSource(_)))));

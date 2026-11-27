@@ -92,7 +92,14 @@ fn mul(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_mul(b)
         .ok_or_else(|| invalid("value origin resource product overflow"))
 }
-fn cap(value: usize, max: usize, work: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+fn cap(
+    value: usize,
+    max: impl Into<Option<usize>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    let Some(max) = max.into() else {
+        return Ok(());
+    };
     let admitted = value <= max;
     work.step()?;
     if admitted {
@@ -161,18 +168,19 @@ impl Admission<'_, '_> {
         source: usize,
         clone_bytes: usize,
         bound: usize,
-        limits: ValueOriginProjectionLimits,
+        limits: Option<ValueOriginProjectionLimits>,
     ) -> Result<(), Error> {
         if self.parent.is_none() {
             return Ok(());
         }
         let facts = self.numeric(snapshot(references, source, clone_bytes, bound))?;
-        if facts.allocation_requests_upper_bound > limits.max_allocation_requests
-            || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || facts.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || facts.cumulative_work_upper_bound > limits.max_work
-        {
+        if limits.is_some_and(|limits| {
+            facts.allocation_requests_upper_bound > limits.max_allocation_requests
+                || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || facts.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || facts.cumulative_work_upper_bound > limits.max_work
+        }) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         if let Some(parent) = &mut self.parent {
@@ -213,14 +221,14 @@ fn facts(
     source: usize,
     clone_bytes: usize,
     work_bound: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: Option<ValueOriginProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
     let result = admission.numeric(snapshot(references, source, clone_bytes, work_bound))?;
     if admission.parent.is_some() {
         admission.gate(references, source, clone_bytes, work_bound, limits)?;
-    } else {
+    } else if let Some(limits) = limits {
         cap(
             result.allocation_requests_upper_bound,
             limits.max_allocation_requests,
@@ -364,14 +372,14 @@ pub(crate) fn encode_observed(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
     encode_core(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission { parent: None },
         work,
     )
@@ -381,7 +389,7 @@ pub(crate) fn encode_admitted(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     admit: &mut OriginAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
@@ -390,7 +398,7 @@ pub(crate) fn encode_admitted(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission {
             parent: Some(admit),
         },
@@ -401,7 +409,7 @@ fn encode_core(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: Option<ValueOriginProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
@@ -416,7 +424,7 @@ fn encode_core(
         }
     }
     if admission.parent.is_none() {
-        cap(bound, limits.max_work, work)?;
+        cap(bound, limits.map(|limits| limits.max_work), work)?;
     }
     admission.floor(source_bytes, size_of::<physical::ValueOrigin>(), work)?;
     let retained = payloads.retained_floor_observed(work)?;
@@ -522,7 +530,7 @@ pub(crate) fn preflight_encode_observed(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
     encode_observed(source, payloads, source_bytes, limits, work).map(|(_, facts)| facts)
@@ -534,7 +542,7 @@ pub(crate) fn preflight_encode_admitted(
     source: &physical::ValueOrigin,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     admit: &mut OriginAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
@@ -568,7 +576,7 @@ fn decode_decision<'a>(
     source: &wire::ValueOrigin,
     payloads: &'a DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: Option<ValueOriginProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(DecodedOriginDecision<'a>, ValueOriginProjectionFacts), Error> {
@@ -595,7 +603,7 @@ fn decode_decision<'a>(
         None => work_bound(payloads.source_count(), provider)?,
     };
     if admission.parent.is_none() {
-        cap(bound, limits.max_work, work)?;
+        cap(bound, limits.map(|limits| limits.max_work), work)?;
     }
     admission.floor(source_bytes, size_of::<wire::ValueOrigin>(), work)?;
     let retained = payloads.retained_floor_observed(work)?;
@@ -717,14 +725,14 @@ pub(crate) fn preflight_decode_observed(
     source: &wire::ValueOrigin,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
     decode_decision(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission { parent: None },
         work,
     )
@@ -735,7 +743,7 @@ pub(crate) fn preflight_decode_admitted(
     source: &wire::ValueOrigin,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     admit: &mut OriginAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
@@ -744,7 +752,7 @@ pub(crate) fn preflight_decode_admitted(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission {
             parent: Some(admit),
         },
@@ -757,14 +765,14 @@ pub(crate) fn decode_observed(
     source: &wire::ValueOrigin,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
     decode_core(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission { parent: None },
         work,
     )
@@ -773,7 +781,7 @@ pub(crate) fn decode_admitted(
     source: &wire::ValueOrigin,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: impl Into<Option<ValueOriginProjectionLimits>>,
     admit: &mut OriginAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
@@ -782,7 +790,7 @@ pub(crate) fn decode_admitted(
         source,
         payloads,
         source_bytes,
-        limits,
+        limits.into(),
         &mut Admission {
             parent: Some(admit),
         },
@@ -793,7 +801,7 @@ fn decode_core(
     source: &wire::ValueOrigin,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
-    limits: ValueOriginProjectionLimits,
+    limits: Option<ValueOriginProjectionLimits>,
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {

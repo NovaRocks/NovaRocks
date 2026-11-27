@@ -849,7 +849,7 @@ fn assert_runtime_filter_plan_accepted(
 ) {
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     validate_fragment(&fragment, &cuts).unwrap();
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     crate::tests::constant_fixture::publish_plan(builder, fixture_constants).unwrap();
@@ -1318,7 +1318,7 @@ pub(super) fn cross_fragment_scan_lineage_plan(
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
@@ -1503,7 +1503,7 @@ fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
     assert!(independent.to_string().contains(
         "runtime filter scan consumer is not connected to its exact probe key by a safe lineage"
     ));
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     let error =
@@ -1523,7 +1523,7 @@ fn null_safe_join_membership_filter_preserves_null_matches_at_both_boundaries() 
         let (fragment, filter, _) = null_safe_join_filter(null_semantics, &mut fixture_constants);
         let cuts = local_runtime_filter_cuts(&fragment, &filter);
         let standalone_result = validate_fragment(&fragment, &cuts);
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
         builder.add_runtime_filter(filter).unwrap();
         let plan_result = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants);
@@ -1598,7 +1598,7 @@ fn assert_local_runtime_filter_rejected_at_both_boundaries(
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
     let independent = validate_fragment(&fragment, &cuts).unwrap_err();
 
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
     builder.add_runtime_filter(filter).unwrap();
     let whole_plan =
@@ -2409,7 +2409,7 @@ fn build_join_build_frontier_plan(
     filter: RuntimeFilter,
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, ValidationErrors> {
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     for fragment in &fixture.fragments {
         builder.add_fragment(fragment.clone()).unwrap();
     }
@@ -2607,7 +2607,7 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
             fragment.values()[&columns[2]].ty,
             ty(DataType::Int64, left_outer)
         );
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
         let plan =
             crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
@@ -4135,7 +4135,7 @@ fn runtime_filter_grouped_parent_accepts_exact_sequence_at_both_boundaries() {
         let (fragment, filter) = grouped_runtime_filter_parent_fixture(nullable);
         let cuts = local_runtime_filter_cuts(&fragment, &filter);
         validate_fragment(&fragment, &cuts).unwrap();
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
         builder.add_runtime_filter(filter).unwrap();
         builder.finish_observed(&GroupedConstantControl).unwrap();
@@ -4162,7 +4162,7 @@ fn runtime_filter_grouped_parent_preserves_the_exact_frozen_witness_at_both_boun
     for invalid in [wrong, reversed] {
         let cuts = local_runtime_filter_cuts(&fragment, &invalid);
         let cut_error = validate_fragment(&fragment, &cuts).unwrap_err();
-        let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment.clone()).unwrap();
         builder.add_runtime_filter(invalid).unwrap();
         let plan_error = builder

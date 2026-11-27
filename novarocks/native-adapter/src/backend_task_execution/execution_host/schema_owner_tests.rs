@@ -22,7 +22,10 @@ use crate::native_type_construction::{
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_plan_codec::{
     host_projection_v2::ProjectionFailure,
-    physical_package_v2::prepare_package_wire_in,
+    physical_package_v2::{
+        prepare_package_wire_in,
+        test_support::{node_projection_limits, types_projection_limits},
+    },
     physical_public_source_schema_v2::decode_public_source_schemas_with_factory_in,
     physical_schema_v2::{SchemaCodecError, decode_schemas_with_factory_in},
     physical_type_v2::decode_package_type_table_with_factory_in,
@@ -158,7 +161,7 @@ fn selected_schema_after_exit(
     let types = decode_package_type_table_with_factory_in(
         &package,
         source,
-        decode_limits().types,
+        types_projection_limits(),
         &mut creator,
         &factory,
         &mut work,
@@ -173,7 +176,7 @@ fn selected_schema_after_exit(
         &package.schemas,
         &types,
         source,
-        decode_limits().node,
+        node_projection_limits(),
         &factory,
         &mut |_| Ok(()),
         &mut work,
@@ -186,7 +189,7 @@ fn selected_schema_after_exit(
         &package.public_source_schemas,
         &schemas,
         source,
-        decode_limits().node,
+        node_projection_limits(),
         &factory,
         &mut work,
     )
@@ -332,7 +335,7 @@ fn candidate_schema_original_namespace_gate_precedes_first_real_scope_refusal() 
     let types = decode_package_type_table_with_factory_in(
         &package,
         source,
-        decode_limits().types,
+        types_projection_limits(),
         &mut creator,
         &factory,
         &mut work,
@@ -347,7 +350,7 @@ fn candidate_schema_original_namespace_gate_precedes_first_real_scope_refusal() 
     let allocated = tracker.allocated();
     let deallocated = tracker.deallocated();
     tracker.install_limit_once(before).unwrap();
-    let mut limits = decode_limits().node;
+    let mut limits = node_projection_limits();
     limits.max_list_items = 0;
     let result = decode_schemas_with_factory_in(
         &package.schemas,
@@ -375,7 +378,7 @@ fn candidate_schema_original_namespace_gate_precedes_first_real_scope_refusal() 
         &package.schemas,
         &types,
         source,
-        decode_limits().node,
+        node_projection_limits(),
         &factory,
         &mut |_| Ok(()),
         &mut work,

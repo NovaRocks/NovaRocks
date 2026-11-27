@@ -67,7 +67,11 @@ pub(super) fn validate_guarantees_observed(
     fragment: &Fragment,
     original: PropertyProofProjectionFacts,
     limits: PlanLimits,
-    ceilings: PropertyProofProjectionLimits,
+    ceilings: Option<PropertyProofProjectionLimits>,
+    caller: Option<(
+        &mut novarocks_type_contract::ControlResourceCounter,
+        &mut super::properties::PropertyResourceAdmission<'_>,
+    )>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
     let mut guarantees = 0usize;
@@ -131,8 +135,9 @@ pub(super) fn validate_guarantees_observed(
             .nodes()
             .values()
             .filter_map(|n| n.expressions.as_ref())
-            .map(|u| u.definitions().len())
-            .sum::<usize>()
+            .try_fold(0, |total, unit| {
+                add(total, unit.definitions().len(), limits)
+            })?
     };
     let index_bytes = Layout::array::<Definition<'_>>(count)
         .map_err(|_| resource(limits))?
@@ -159,19 +164,27 @@ pub(super) fn validate_guarantees_observed(
         projection_work: add(original.projection_work, new_work, limits)?,
     };
     work.step()?;
-    for (amount, maximum) in [
-        (facts.request_bytes, ceilings.max_request_bytes),
-        (facts.coexisting_bytes, ceilings.max_coexisting_bytes),
-        (facts.projection_work, ceilings.max_projection_work),
-    ] {
-        let allowed = amount <= maximum;
-        work.step()?;
-        if !allowed {
-            return Err(resource(limits));
+    if let Some(ceilings) = ceilings {
+        for (amount, maximum) in [
+            (facts.request_bytes, ceilings.max_request_bytes),
+            (facts.coexisting_bytes, ceilings.max_coexisting_bytes),
+            (facts.projection_work, ceilings.max_projection_work),
+        ] {
+            let allowed = amount <= maximum;
+            work.step()?;
+            if !allowed {
+                return Err(resource(limits));
+            }
         }
     }
     if guarantees == 0 {
         return Ok(facts);
+    }
+    if let Some((resources, admit)) = caller {
+        resources.buffer::<Definition<'_>>(count, 1)?;
+        resources.buffer::<usize>(count, 1)?;
+        resources.work(new_work)?;
+        admit(&resources.facts())?;
     }
     work.flush()?;
     let mut definitions = Vec::new();

@@ -68,8 +68,11 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    ConstantValidation::bounded(policy_fixture())
+}
+fn policy_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
         max_rows: 8,
         max_array_nodes: 32,
         max_logical_elements: 4096,
@@ -82,18 +85,20 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 64 << 20,
     }
 }
-fn refusal_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 0,
-        max_array_nodes: 0,
-        max_logical_elements: 0,
-        max_retained_buffer_bytes: 0,
-        max_type_nodes: 0,
-        max_metadata_bytes: 0,
-        max_library_validation_work: 0,
-        max_library_validation_bytes: 0,
-        ..policy()
-    }
+fn refusal_policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            max_array_nodes: 0,
+            max_logical_elements: 0,
+            max_retained_buffer_bytes: 0,
+            max_type_nodes: 0,
+            max_metadata_bytes: 0,
+            max_library_validation_work: 0,
+            max_library_validation_bytes: 0,
+            ..policy_fixture()
+        },
+    )
 }
 fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
     ExprNode {
@@ -106,7 +111,7 @@ fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
 fn invoke(
     source: &ExprNode,
     pools: &ConstantPools,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     control: &Control,
 ) -> Result<FunctionArgument, PhysicalArgumentError> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;

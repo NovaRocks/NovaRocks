@@ -1347,10 +1347,7 @@ fn checked_writer_plan_packages_inner(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = p::PlanBuilder::new(
-        p::PlanVersionId::try_new([1; 16]).unwrap(),
-        crate::test_constants::policy(),
-    );
+    let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap());
     for (&id, pool) in literal_sources.entries() {
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }

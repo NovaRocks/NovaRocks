@@ -229,9 +229,6 @@ fn assert_writer_selections(
     functions: &EngineFunctionCatalog,
 ) {
     let control = SqlCompileControl::unbounded();
-    source
-        .require_statement_constant_policy(super::test_support::constant_policy())
-        .unwrap();
     let authored = source
         .plan()
         .fragments()
@@ -356,7 +353,7 @@ fn wide_collect_true_source() -> (
         ConnectorInstanceDescriptor, ConnectorWriteBinding, ConnectorWriteFieldBinding,
         ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
     };
-    use novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+    use novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE;
     use novarocks_sql::planning::dml::begin_final_connector_write_plan;
 
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -406,7 +403,7 @@ fn wide_collect_true_source() -> (
         &functions,
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
-        FROZEN_CONSTANT_POLICY,
+        CONSTANT_POLICY_FIXTURE.into(),
         control.clone(),
     ))
     .unwrap_or_else(|e| panic!("collect1024 phase=analyze: {e:#?}"))
@@ -536,8 +533,8 @@ fn wide_collect_true_source() -> (
 fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
     use novarocks_physical_plan::{UnpivotConstant, extract_fragment_packages};
     use novarocks_plan_codec::physical_package_v2::{
-        FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits, PackageEncodeLimits,
-        decode_fragment_package, encode_fragment_package,
+        PACKAGE_ADMISSION_FIXTURE, PackageDecodeLimits, decode_fragment_package,
+        encode_fragment_package,
     };
     use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
     use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
@@ -600,9 +597,6 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         }
     }
     assert_eq!((writers, finishes), (1, 1));
-    owner
-        .require_statement_constant_policy(FROZEN_CONSTANT_POLICY)
-        .unwrap_or_else(|e| panic!("collect1024 phase=statement-policy: {e:#?}"));
     let authored = owner
         .plan()
         .fragments()
@@ -631,7 +625,7 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
         .plan()
         .fragments()
         .keys()
-        .map(|&id| (id, FROZEN_PACKAGE_ADMISSION))
+        .map(|&id| (id, PACKAGE_ADMISSION_FIXTURE))
         .collect();
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
     let packages = extract_fragment_packages(
@@ -648,7 +642,7 @@ fn wide_collect_true_actual_theta_plan_freezes_with_production_limits() {
     let mut decoded_writers = 0;
     let mut decoded_finishes = 0;
     for (id, package) in &packages {
-        let bytes = encode_fragment_package(package, &PackageEncodeLimits::FROZEN, &control)
+        let bytes = encode_fragment_package(package, &control)
             .unwrap_or_else(|e| panic!("collect1024 fragment={id:?} phase=encode: {e:#?}"))
             .encode_to_vec();
         let decoded =

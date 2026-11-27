@@ -463,7 +463,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     filter.producers[0].progress.non_build_edges = Box::from([probe_branch]);
 
     let finish = |filter: RuntimeFilter| {
-        let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+        let mut plan = PlanBuilder::new(version());
         for fragment in [
             source_fragment.clone(),
             build_fragment.clone(),
@@ -628,7 +628,7 @@ fn nested_unicast_plan(
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     plan.add_fragment(build_fragment).unwrap();
     plan.add_fragment(inner_fragment).unwrap();
     plan.add_fragment(outer_fragment).unwrap();
@@ -887,7 +887,7 @@ pub(super) fn acyclic_cross_fragment_fixture(
         Box::from([blocking_consumer(410, target_fragment, join, probe.1)]),
     );
 
-    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut plan = PlanBuilder::new(version());
     for fragment in [source, relay, target] {
         plan.add_fragment(fragment).unwrap();
     }
@@ -951,7 +951,7 @@ fn replace_source_fragment(
     PhysicalPlan::from(crate::PhysicalPlanParts {
         constants: plan.constants().clone(),
         parameters: plan.parameters().clone(),
-        statement_constant_policy: plan.statement_constant_policy(),
+
         version: plan.version(),
         fragments,
         edges: plan.edges().clone(),

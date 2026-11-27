@@ -284,10 +284,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
             },
         ]),
     };
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(scan_fragment).unwrap();
     plan.add_fragment(aggregate_fragment).unwrap();
     plan.add_edge(edge(
@@ -527,10 +524,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
     filter.consumers = consumers.into_boxed_slice();
     let mut result = result_port(PROBE, TOPN, &[union_key]);
     result.fields[0].ty = nullable_int64(true);
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.add_runtime_filter(filter).unwrap();
     plan.set_result_port(result).unwrap();

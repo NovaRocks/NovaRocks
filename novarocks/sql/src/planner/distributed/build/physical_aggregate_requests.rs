@@ -20,7 +20,7 @@
 use std::{alloc::Layout, sync::Arc};
 
 use novarocks_functions::{
-    AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions, ConstantPolicy,
+    AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions, ConstantValidation,
     FunctionArgument, FunctionBindingRequest, FunctionBindingSelection, MAX_CALL_EFFECT_ARGUMENTS,
     PureCallPreparation, ScopedRelationalEffects,
 };
@@ -131,7 +131,7 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
             }
         }
     }
-    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+    pub fn captured_constant_policy(&self) -> Option<ConstantValidation> {
         match &self.arguments {
             AggregateUpdateArguments::OwnedPhysical(_) => None,
             AggregateUpdateArguments::Canonical { captured, .. } => {
@@ -163,7 +163,7 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
     site: PhysicalCallSite,
     fragment: &Fragment,
     pools: &ConstantPools,
-    literal_policy: ConstantPolicy,
+    literal_policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalAggregateUpdateRequest<'a>, PhysicalAggregateRequestError> {
     work.flush()?;

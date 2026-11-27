@@ -509,7 +509,7 @@ fn freeze_rewrite_cohort_recipe(
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &novarocks_sql::compiler::SqlCompileControl,
     capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<RewriteCohortPlanParts, novarocks_sql::compiler::SqlCompileError> {
@@ -585,7 +585,6 @@ fn freeze_rewrite_cohort_recipe(
         candidate,
         access,
         static_plan_carrier,
-        constant_policy,
         &write_target_facts,
         control,
         capacity,

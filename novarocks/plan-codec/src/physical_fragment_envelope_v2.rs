@@ -244,7 +244,7 @@ impl EnvelopeAdmission<'_, '_> {
         &mut self,
         model: &Model,
         source: usize,
-        limits: FragmentEnvelopeProjectionLimits,
+        limits: Option<FragmentEnvelopeProjectionLimits>,
     ) -> Result<(), Error> {
         if self.observed() {
             let facts = self.numeric(model.numerical_facts(source, 0, limits))?;
@@ -256,7 +256,7 @@ impl EnvelopeAdmission<'_, '_> {
         &mut self,
         model: &Model,
         source: usize,
-        limits: FragmentEnvelopeProjectionLimits,
+        limits: Option<FragmentEnvelopeProjectionLimits>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
         self.gate(model, source, limits)?;
@@ -466,7 +466,7 @@ fn decode_route_requests(
 fn preflight_encode(
     input: &p::Fragment,
     source: usize,
-    l: FragmentEnvelopeProjectionLimits,
+    l: Option<FragmentEnvelopeProjectionLimits>,
     admission: &mut EnvelopeAdmission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
@@ -502,7 +502,18 @@ fn preflight_encode(
         },
     )?;
     known = add(known, bytes::<p::SummaryOutput>(input.summaries().len())?)?;
-    count_prefix(0, outer, source, known, l, w)?;
+    count_prefix(
+        0,
+        outer,
+        if l.is_none() {
+            source.max(known)
+        } else {
+            source
+        },
+        known,
+        l,
+        w,
+    )?;
     if !admission.observed() {
         admission.request::<wire::SummaryOutput>(&mut model, input.summaries().len(), 1)?;
         admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
@@ -546,14 +557,27 @@ fn preflight_encode(
                 encode_route_requests(route, &mut model, admission)?;
                 admission.gate(&model, source, l)?;
             }
-            count_prefix(0, model.items, source, known, l, w)?;
+            count_prefix(
+                0,
+                model.items,
+                if l.is_none() {
+                    source.max(known)
+                } else {
+                    source
+                },
+                known,
+                l,
+                w,
+            )?;
             if !admission.observed() {
                 model.refs = admission.sum(
                     model.refs,
                     admission.sum(route.input_mapping.len(), physical_route_keys(route)?)?,
                 )?;
             }
-            cap(model.refs, l.max_value_references, w)?;
+            if let Some(limits) = l {
+                cap(model.refs, limits.max_value_references, w)?;
+            }
             known = add(
                 known,
                 add(
@@ -568,17 +592,33 @@ fn preflight_encode(
                 encode_route_requests(route, &mut model, admission)?;
             }
             admission.facts(&model, source, l, w)?;
-            floor(source, known, w)?;
+            floor(
+                if l.is_none() {
+                    source.max(known)
+                } else {
+                    source
+                },
+                known,
+                w,
+            )?;
             w.step()?;
         }
     }
-    floor(source, known, w)?;
+    floor(
+        if l.is_none() {
+            source.max(known)
+        } else {
+            source
+        },
+        known,
+        w,
+    )?;
     admission.facts(&model, source, l, w)
 }
 fn preflight_decode(
     input: &wire::Fragment,
     source: usize,
-    l: FragmentEnvelopeProjectionLimits,
+    l: Option<FragmentEnvelopeProjectionLimits>,
     admission: &mut EnvelopeAdmission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
@@ -629,7 +669,18 @@ fn preflight_decode(
         known,
         bytes::<wire::SummaryOutput>(input.summaries.capacity())?,
     )?;
-    count_prefix(0, outer, source, known, l, w)?;
+    count_prefix(
+        0,
+        outer,
+        if l.is_none() {
+            source.max(known)
+        } else {
+            source
+        },
+        known,
+        l,
+        w,
+    )?;
     let mut model = initial.unwrap_or(Model {
         items: outer,
         ..Model::default()
@@ -667,7 +718,15 @@ fn preflight_decode(
             admission.sum(columns.value_ids.len(), 1 + author_refs)?,
         )?;
         admission.facts(&model, source, l, w)?;
-        floor(source, known, w)?;
+        floor(
+            if l.is_none() {
+                source.max(known)
+            } else {
+                source
+            },
+            known,
+            w,
+        )?;
         crate::physical_summary_v2::decode_output(summary, w)?;
     }
     match kind {
@@ -704,14 +763,27 @@ fn preflight_decode(
                     decode_route_requests(route, &mut model, admission)?;
                     admission.gate(&model, source, l)?;
                 }
-                count_prefix(0, model.items, source, known, l, w)?;
+                count_prefix(
+                    0,
+                    model.items,
+                    if l.is_none() {
+                        source.max(known)
+                    } else {
+                        source
+                    },
+                    known,
+                    l,
+                    w,
+                )?;
                 if !admission.observed() {
                     model.refs = admission.sum(
                         model.refs,
                         admission.sum(route.input_mapping.len(), wire_route_keys(route)?)?,
                     )?;
                 }
-                cap(model.refs, l.max_value_references, w)?;
+                if let Some(limits) = l {
+                    cap(model.refs, limits.max_value_references, w)?;
+                }
                 known = add(
                     known,
                     add(
@@ -729,7 +801,15 @@ fn preflight_decode(
                     decode_route_requests(route, &mut model, admission)?;
                 }
                 admission.facts(&model, source, l, w)?;
-                floor(source, known, w)?;
+                floor(
+                    if l.is_none() {
+                        source.max(known)
+                    } else {
+                        source
+                    },
+                    known,
+                    w,
+                )?;
                 token32(&route.route_id, w)?;
                 ordinal(route.write_target_ordinal, w)?;
                 required(route.edge_id, "router route edge ID is absent", w)?;
@@ -738,7 +818,15 @@ fn preflight_decode(
                 }
                 for mapping in &route.input_mapping {
                     known = add(known, mapping.field_token.capacity())?;
-                    floor(source, known, w)?;
+                    floor(
+                        if l.is_none() {
+                            source.max(known)
+                        } else {
+                            source
+                        },
+                        known,
+                        w,
+                    )?;
                     token32(&mapping.field_token, w)?;
                     required(mapping.value_id, "router mapping ValueId is absent", w)?;
                     w.step()?;
@@ -748,7 +836,15 @@ fn preflight_decode(
         }
         _ => {}
     }
-    floor(source, known, w)?;
+    floor(
+        if l.is_none() {
+            source.max(known)
+        } else {
+            source
+        },
+        known,
+        w,
+    )?;
     admission.facts(&model, source, l, w)
 }
 fn emit_encode(
@@ -977,9 +1073,10 @@ impl PreparedFragmentEnvelopeEncode<'_> {
 pub(crate) fn prepare_fragment_envelope_encode<'a>(
     input: &'a p::Fragment,
     source_retained_bytes: usize,
-    limits: FragmentEnvelopeProjectionLimits,
+    limits: impl Into<Option<FragmentEnvelopeProjectionLimits>>,
     control: &'a dyn PureCompileControl,
 ) -> Result<PreparedFragmentEnvelopeEncode<'a>, Error> {
+    let limits = limits.into();
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = preflight_encode(
         input,
@@ -1034,9 +1131,10 @@ impl PreparedFragmentEnvelopeDecode<'_> {
 pub(crate) fn prepare_fragment_envelope_decode<'a>(
     input: &'a wire::Fragment,
     source_retained_bytes: usize,
-    limits: FragmentEnvelopeProjectionLimits,
+    limits: impl Into<Option<FragmentEnvelopeProjectionLimits>>,
     control: &'a dyn PureCompileControl,
 ) -> Result<PreparedFragmentEnvelopeDecode<'a>, Error> {
+    let limits = limits.into();
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = preflight_decode(
         input,
@@ -1057,10 +1155,11 @@ pub(crate) fn prepare_fragment_envelope_decode<'a>(
 pub(crate) fn prepare_fragment_envelope_encode_in<'a, 'control: 'a>(
     input: &'a p::Fragment,
     source_retained_bytes: usize,
-    limits: FragmentEnvelopeProjectionLimits,
+    limits: impl Into<Option<FragmentEnvelopeProjectionLimits>>,
     admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedFragmentEnvelopeEncode<'a>, Error> {
+    let limits = limits.into();
     let facts = preflight_encode(
         input,
         source_retained_bytes,
@@ -1081,10 +1180,11 @@ pub(crate) fn prepare_fragment_envelope_encode_in<'a, 'control: 'a>(
 pub(crate) fn prepare_fragment_envelope_decode_in<'a, 'control: 'a>(
     input: &'a wire::Fragment,
     source_retained_bytes: usize,
-    limits: FragmentEnvelopeProjectionLimits,
+    limits: impl Into<Option<FragmentEnvelopeProjectionLimits>>,
     admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedFragmentEnvelopeDecode<'a>, Error> {
+    let limits = limits.into();
     let facts = preflight_decode(
         input,
         source_retained_bytes,

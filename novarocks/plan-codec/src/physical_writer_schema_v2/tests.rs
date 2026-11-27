@@ -873,7 +873,7 @@ fn writer_count_all_known_non_name_limits_precede_pending_255_callback() {
                 work.step().unwrap();
             }
             assert!(matches!(
-                count.facts(128, 1, under(admitted, axis), &mut work),
+                count.facts(128, 1, Some(under(admitted, axis)), &mut work),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(c.trace(), vec![(CompilePhase::Encode, 0)], "axis {axis}");
@@ -1076,11 +1076,11 @@ fn parent_base() -> Model {
 fn projection(base: Model, node: NodeProjectionLimits) -> WriterSchemaProjection {
     WriterSchemaProjection {
         source: SOURCE,
-        limits: limits(),
+        limits: Some(limits()),
         parent: WriterSchemaNodeAdmission {
             base,
             values: 2,
-            limits: node,
+            limits: Some(node),
         },
     }
 }
@@ -1141,7 +1141,7 @@ fn writer_observed_two_schemas_accumulate_same_node_without_type_value_or_source
             let admission = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             };
             let after_first = admission.merge(first).unwrap();
             c.arm(None);
@@ -1394,7 +1394,7 @@ fn writer_observed_parent_remaining_limits_original_borrowed_metadata_visits() {
             let whole = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(first)
             .unwrap()
@@ -1514,7 +1514,7 @@ fn writer_schema_parent_prefix_replacement_exact_replay_and_actual_callbacks() {
             let merged = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(f)
             .unwrap();
@@ -1700,7 +1700,7 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
             let final_node = WriterSchemaNodeAdmission {
                 base: parent_base(),
                 values: 2,
-                limits: parent_limits(),
+                limits: Some(parent_limits()),
             }
             .merge(f)
             .unwrap()
@@ -1741,7 +1741,7 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
             let mut count = Count::new(1);
             count.admit = Some(&mut callback);
             count.model.delegated_work = delegated;
-            let result = count.comparison_prefix(&ty, &ty, SOURCE, 1, limits());
+            let result = count.comparison_prefix(&ty, &ty, SOURCE, 1, Some(limits()));
             assert!(matches!(
                 finish(work, result),
                 Err(Error::Control(CompileControlError::ResourceExhausted))

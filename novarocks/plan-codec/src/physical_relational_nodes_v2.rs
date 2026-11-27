@@ -473,7 +473,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: RelationalNodeProjectionLimits,
+    l: Option<RelationalNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RelationalNodeProjectionFacts, Error> {
@@ -635,15 +635,20 @@ fn prepare_encode(
     {
         if parent.is_some() {
             let pf = properties::properties_encode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_encode_observed(property, source, l.properties, w)?;
+            properties::preflight_encode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_encode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -755,9 +760,9 @@ fn prepare_decode(
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &MaterializedFunctionBindings<'_, '_>,
     aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
-    binding_limits: BindingProjectionLimits,
+    binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     source: usize,
-    l: RelationalNodeProjectionLimits,
+    l: Option<RelationalNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
     mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RelationalNodeProjectionFacts, Error> {
@@ -917,15 +922,20 @@ fn prepare_decode(
     {
         if parent.is_some() {
             let pf = properties::properties_decode_numerical_facts_in(property, source)?;
-            properties::check_properties_numerical_facts(pf, l.properties)?;
+            properties::check_properties_numerical_facts(pf, l.map(|limits| limits.properties))?;
             model.property(pf)?;
             gate(&model, known, &mut parent)?;
-            properties::preflight_decode_observed(property, source, l.properties, w)?;
+            properties::preflight_decode_observed(
+                property,
+                source,
+                l.map(|limits| limits.properties),
+                w,
+            )?;
         } else {
             model.property(properties::preflight_decode_observed(
                 property,
                 source,
-                l.properties,
+                l.map(|limits| limits.properties),
                 w,
             )?)?;
         }
@@ -1066,7 +1076,7 @@ struct WindowCopyProjection {
     model: Model,
     source: usize,
     dependency: usize,
-    limits: NodeProjectionLimits,
+    limits: Option<RelationalNodeProjectionLimits>,
 }
 fn window_copy_facts<'parent>(
     window: &wire::WindowNode,
@@ -1074,7 +1084,7 @@ fn window_copy_facts<'parent>(
     functions: &MaterializedFunctionBindings<'_, '_>,
     aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
     projection: WindowCopyProjection,
-    binding_limits: BindingProjectionLimits,
+    binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     parent: Option<&'parent mut NodeAdmit<'parent>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
@@ -1246,7 +1256,7 @@ fn emit_encode(
     input: &p::PhysicalNode,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    l: RelationalNodeProjectionLimits,
+    l: Option<RelationalNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) = encode_header(input, source, l, w)?;
@@ -1402,7 +1412,7 @@ fn emit_decode(
     functions: &MaterializedFunctionBindings<'_, '_>,
     aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
     source: usize,
-    l: RelationalNodeProjectionLimits,
+    l: Option<RelationalNodeProjectionLimits>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<p::PhysicalNode, Error> {
     let (inputs, required_inputs, output_properties, output) = decode_header(input, source, l, w)?;
@@ -1550,7 +1560,7 @@ pub struct PreparedRelationalNodeEncode<'node, 'namespace, 'loan, 'source, 'cont
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: RelationalNodeProjectionLimits,
+    limits: Option<RelationalNodeProjectionLimits>,
     facts: RelationalNodeProjectionFacts,
 }
 impl PreparedRelationalNodeEncode<'_, '_, '_, '_, '_> {
@@ -1599,6 +1609,7 @@ pub fn prepare_relational_node_encode<'node, 'namespace, 'loan, 'source, 'contro
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<PreparedRelationalNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -1625,10 +1636,11 @@ pub fn prepare_relational_node_encode_in<'node, 'namespace, 'loan, 'source, 'con
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source_retained_bytes: usize,
-    limits: RelationalNodeProjectionLimits,
+    limits: impl Into<Option<RelationalNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRelationalNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(values.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -1659,7 +1671,7 @@ pub struct PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'contro
     functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
     source: usize,
-    limits: RelationalNodeProjectionLimits,
+    limits: Option<RelationalNodeProjectionLimits>,
     facts: RelationalNodeProjectionFacts,
 }
 impl PreparedRelationalNodeDecode<'_, '_, '_, '_, '_> {
@@ -1709,10 +1721,11 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
-    binding_limits: BindingProjectionLimits,
+    binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = prepare_decode(
@@ -1743,12 +1756,13 @@ pub fn prepare_relational_node_decode_in<'node, 'namespace, 'loan, 'wire, 'contr
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
     aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
-    binding_limits: BindingProjectionLimits,
+    binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     source_retained_bytes: usize,
-    limits: RelationalNodeProjectionLimits,
+    limits: impl Into<Option<RelationalNodeProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
         return Err(invalid(
             "node caller does not borrow the original controller",
@@ -1783,6 +1797,7 @@ pub fn encode_relational_node(
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<(wire::PhysicalNode, RelationalNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(
@@ -1804,10 +1819,11 @@ pub fn decode_relational_node(
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &MaterializedFunctionBindings<'_, '_>,
     aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
-    binding_limits: BindingProjectionLimits,
+    binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     source_retained_bytes: usize,
     limits: RelationalNodeProjectionLimits,
 ) -> Result<(p::PhysicalNode, RelationalNodeProjectionFacts), Error> {
+    let limits = Some(limits);
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {

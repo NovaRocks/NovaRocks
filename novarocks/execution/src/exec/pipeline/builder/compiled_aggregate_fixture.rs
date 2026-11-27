@@ -562,7 +562,6 @@ pub(crate) fn finish(
                     arguments,
                     logical_argument_count: binding.logical_argument_count as usize,
                     expected_result_type: None,
-                    constant_policy: constant_policy(),
                 },
             ));
             Ok(())

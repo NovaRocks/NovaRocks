@@ -56,7 +56,6 @@ pub(crate) async fn internal_profile_recovery_description(
 pub(crate) async fn internal_profile_recovery_encoded_description(
     scope: &novarocks_workload_control::WorkScope,
     carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
-    policy: novarocks_physical_plan::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<
     (
@@ -69,7 +68,7 @@ pub(crate) async fn internal_profile_recovery_encoded_description(
     let completed = original_profile_completed_plan(scope).await;
     let (description, plan) = original_profile_description(completed.candidate().clone());
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
-        completed, carrier, policy, None, control,
+        completed, carrier, None, control,
     )?;
     Ok((description, plan, encoded))
 }
@@ -350,10 +349,7 @@ fn internal_description_with_recovery_and_candidate(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([151; 16]).unwrap(),
-        crate::application::test_constant_policy(),
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([151; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

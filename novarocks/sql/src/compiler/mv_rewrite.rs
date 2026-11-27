@@ -2470,7 +2470,7 @@ pub(crate) struct SqlMvRewriteDiagnostic {
 }
 
 pub(crate) struct SqlMvRewritePreparation {
-    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
+    pub(crate) constant_policy: novarocks_functions::ConstantValidation,
     pub(crate) candidates: Vec<MvRewriteCandidate>,
     pub(crate) diagnostics: Vec<SqlMvRewriteDiagnostic>,
 }
@@ -3471,12 +3471,12 @@ enum SqlMvRewriteAnalysisEntry {
 }
 
 pub(crate) struct SqlMvRewriteAnalysis {
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     entries: Vec<SqlMvRewriteAnalysisEntry>,
 }
 
 impl SqlMvRewriteAnalysis {
-    pub(crate) fn empty(constant_policy: novarocks_functions::ConstantPolicy) -> Self {
+    pub(crate) fn empty(constant_policy: novarocks_functions::ConstantValidation) -> Self {
         Self {
             constant_policy,
             entries: Vec::new(),
@@ -3514,7 +3514,7 @@ pub(crate) fn analyze_candidates(
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
     optimizer_settings: &crate::optimizer::options::SessionOptimizerSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
     consumer_has_non_default_computation_semantics: bool,
 ) -> Result<SqlMvRewriteAnalysis, crate::compiler::SqlCompileError> {
@@ -3674,7 +3674,7 @@ fn build_candidate(
     definition: &MvRewriteDefinition,
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<Option<AnalyzedMvRewriteCandidate>, crate::compiler::SqlCompileError> {
     use crate::compiler::SqlCompileError;
@@ -4831,8 +4831,7 @@ mod tests {
     fn phase_one_materializes_mv_base_and_target_before_statistics_attachment() {
         let catalog = CandidateCatalog::new();
         let (logical, factory) = main_candidate_query(&catalog);
-        let mut constant_policy = crate::constant::test_constant_policy();
-        constant_policy.max_rows = 37;
+        let constant_policy = crate::constant::test_constant_validation(37);
         let analysis = analyze_candidates(
             &candidate_index(),
             &catalog,

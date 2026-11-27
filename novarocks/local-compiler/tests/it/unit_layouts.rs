@@ -147,7 +147,6 @@ fn filter_program(width: usize) -> Arc<LocalProgram> {
         fields,
         SemanticParameters::try_new([]).unwrap(),
         constants,
-        options().constants,
     );
     compile(&rng_subset(), package, &HarnessControl).unwrap()
 }
@@ -497,7 +496,6 @@ fn rng_program(
         result_fields.into_boxed_slice(),
         parameters,
         constants,
-        options().constants,
     );
     compile(functions, package, &HarnessControl).unwrap()
 }

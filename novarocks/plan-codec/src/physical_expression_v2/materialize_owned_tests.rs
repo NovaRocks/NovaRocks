@@ -23,9 +23,11 @@ fn invoke(
     defs: &[wire::ExpressionDefinition],
     c: &Control,
     source: usize,
-    caps: Limits,
+    caps: impl Into<Option<Limits>>,
     stop: Option<(usize, CompileControlError)>,
 ) -> Result<(Facts, Facts, Box<[novarocks_expression_contract::ExprNode]>), Error> {
+    let caps = caps.into();
+    let read_caps = caps.map(|_| limits());
     f.with_tokens(defs, c, |original, functions, aggregates| {
         c.arm(stop);
         let mut w = match CompileCheckpoints::try_new(c, CompilePhase::Decode) {
@@ -45,7 +47,7 @@ fn invoke(
                 original.parameters(),
                 original.pools(),
                 EXPR_SOURCE,
-                limits(),
+                read_caps,
                 &mut |facts| {
                     read_snapshot = *facts;
                     Ok(())
@@ -105,6 +107,15 @@ fn caller_owned_receiving_and_materializing_preserve_original_complete_kinds_and
     assert_eq!(parameter_types[0].data_type(), &DataType::Utf8);
     assert_eq!(parameter_types[1], *f.types.value_type(4).unwrap());
 }
+#[test]
+fn input_derived_expression_receiver_preserves_owned_results_and_admitted_geometry() {
+    let c = Control::default();
+    let f = Fixture::new(&c);
+    let defs = f.all();
+    let explicit = invoke(&f, &defs, &c, SOURCE, limits(), None).unwrap();
+    assert_eq!(invoke(&f, &defs, &c, SOURCE, None, None).unwrap(), explicit);
+}
+
 #[test]
 fn caller_owned_materialization_seven_axes_exact_replay_and_one_under() {
     let c = Control::default();
@@ -373,7 +384,7 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
             let mut admission = super::super::super::owner_admission::Admission {
                 parent: Some(&mut admit),
                 source: EXPR_SOURCE,
-                limits: caps,
+                limits: Some(caps),
             };
             let result = super::super::super::namespace::compare_types(
                 header,

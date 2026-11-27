@@ -154,6 +154,8 @@ fn input_contribution(
 }
 impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> {
     #[cfg(test)]
+    #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn new_in(
         requests: [SourceInputReserve<'source>; N],
         budget: &mut TypeViewBudget<'source, 'control, '_>,
@@ -238,10 +240,7 @@ impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> 
             budget.facts.cumulative_work_upper_bound,
             add(delta.2, additional_completed_work_upper_bound)?,
         )?;
-        budget.facts.coexisting_source_and_request_bytes_upper_bound = add(
-            budget.source,
-            budget.facts.allocation_request_bytes_upper_bound,
-        )?;
+        budget.update_coexisting_request_bytes()?;
         budget.gate()?;
         for request in &mut requests {
             request.admitted_floor = Some(budget.facts());
@@ -290,12 +289,12 @@ pub(crate) struct TypeViewFacts {
 pub(crate) struct TypeViewBudget<'source, 'control, 'parent> {
     package: &'source p::FragmentPackage,
     control: &'control dyn PureCompileControl,
-    limits: TypeViewLimits,
-    source: usize,
+    admission: Option<(usize, TypeViewLimits)>,
     facts: TypeViewFacts,
     admit: &'parent mut dyn FnMut(&TypeViewFacts) -> Result<(), CompileControlError>,
 }
 impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
+    #[cfg(test)]
     pub(crate) fn new_in(
         package: &'source p::FragmentPackage,
         source_retained_bytes: usize,
@@ -306,13 +305,32 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
         if source_retained_bytes < size_of::<p::FragmentPackage>() {
             return Err(CompileControlError::ResourceExhausted.into());
         }
+        Self::from_original_in(package, Some((source_retained_bytes, limits)), admit, work)
+    }
+
+    /// Collect concrete source loans and their local allocation facts without
+    /// pricing the original package. Its existing owner retains that backing.
+    pub(crate) fn new_input_derived_in(
+        package: &'source p::FragmentPackage,
+        admit: &'parent mut dyn FnMut(&TypeViewFacts) -> Result<(), CompileControlError>,
+        work: &CompileCheckpoints<'control>,
+    ) -> Result<Self, TypeViewError> {
+        Self::from_original_in(package, None, admit, work)
+    }
+
+    fn from_original_in(
+        package: &'source p::FragmentPackage,
+        admission: Option<(usize, TypeViewLimits)>,
+        admit: &'parent mut dyn FnMut(&TypeViewFacts) -> Result<(), CompileControlError>,
+        work: &CompileCheckpoints<'control>,
+    ) -> Result<Self, TypeViewError> {
         let mut model = Self {
             package,
             control: work.control(),
-            limits,
-            source: source_retained_bytes,
+            admission,
             facts: TypeViewFacts {
-                coexisting_source_and_request_bytes_upper_bound: source_retained_bytes,
+                coexisting_source_and_request_bytes_upper_bound: admission
+                    .map_or(0, |(source, _)| source),
                 ..TypeViewFacts::default()
             },
             admit,
@@ -344,16 +362,16 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
     }
     fn gate(&mut self) -> Result<(), TypeViewError> {
         let f = self.facts;
-        let l = self.limits;
-        if f.occurrence_count > l.max_occurrences
-            || f.value_root_count > l.max_value_roots
-            || f.field_root_count > l.max_field_roots
-            || f.writer_recipe_count > l.max_writer_recipes
-            || f.allocation_requests_upper_bound > l.max_allocation_requests
-            || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
-            || f.coexisting_source_and_request_bytes_upper_bound
-                > l.max_coexisting_source_and_request_bytes
-            || f.cumulative_work_upper_bound > l.max_work
+        if let Some((_, limits)) = self.admission
+            && (f.occurrence_count > limits.max_occurrences
+                || f.value_root_count > limits.max_value_roots
+                || f.field_root_count > limits.max_field_roots
+                || f.writer_recipe_count > limits.max_writer_recipes
+                || f.allocation_requests_upper_bound > limits.max_allocation_requests
+                || f.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || f.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || f.cumulative_work_upper_bound > limits.max_work)
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -383,8 +401,12 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
         self.facts.allocation_request_bytes_upper_bound =
             add(self.facts.allocation_request_bytes_upper_bound, bytes)?;
         self.facts.cumulative_work_upper_bound = add(self.facts.cumulative_work_upper_bound, work)?;
+        self.update_coexisting_request_bytes()
+    }
+    fn update_coexisting_request_bytes(&mut self) -> Result<(), TypeViewError> {
+        let source = self.admission.map_or(0, |(source, _)| source);
         self.facts.coexisting_source_and_request_bytes_upper_bound =
-            add(self.source, self.facts.allocation_request_bytes_upper_bound)?;
+            add(source, self.facts.allocation_request_bytes_upper_bound)?;
         Ok(())
     }
     pub(crate) fn before_steps(&mut self, count: usize) -> Result<(), TypeViewError> {
@@ -1057,13 +1079,78 @@ mod tests {
         crate::physical_type_v2::sender_tests::checked_writer_package(recipe)
     }
     #[test]
+    fn input_derived_collectors_preserve_the_original_package_and_local_requests() {
+        use super::super::{
+            binding_sources::collect_binding_sources_in,
+            definition_sources::collect_definition_sources_in,
+            provider_sources::collect_provider_sources_in,
+        };
+
+        let package = package();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut previous = TypeViewFacts::default();
+        let mut admit = |next: &TypeViewFacts| {
+            assert!(
+                next.allocation_request_bytes_upper_bound
+                    >= previous.allocation_request_bytes_upper_bound
+            );
+            assert_eq!(
+                next.coexisting_source_and_request_bytes_upper_bound,
+                next.allocation_request_bytes_upper_bound
+            );
+            previous = *next;
+            Ok(())
+        };
+        let mut budget = TypeViewBudget::new_input_derived_in(&package, &mut admit, &work).unwrap();
+        let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+        let writer_types = views.writer_sources_in(&mut budget, &mut work).unwrap();
+        let bindings =
+            collect_binding_sources_in(&package, &views, None, &mut budget, &mut work).unwrap();
+        let providers = collect_provider_sources_in(
+            &package,
+            &views,
+            &writer_types,
+            None,
+            &mut budget,
+            &mut work,
+        )
+        .unwrap();
+        let definitions = collect_definition_sources_in(
+            &package,
+            &views,
+            &bindings,
+            None,
+            &mut budget,
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(
+            definitions.values().len(),
+            package.fragment().values().len()
+        );
+        assert_eq!(
+            providers
+                .prepare_inputs_in(&mut budget, &mut work)
+                .unwrap()
+                .writers()
+                .len(),
+            package.writes().len(),
+        );
+        assert!(
+            budget.facts().allocation_request_bytes_upper_bound
+                >= std::mem::size_of_val(views.occurrences())
+        );
+        work.finish().unwrap();
+    }
+
+    #[test]
     fn occurrence_lookup_retains_independent_ids_and_refuses_equal_foreign_types_and_field_roots() {
         let package = package();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
         let mut admit = |_: &TypeViewFacts| Ok(());
-        let mut budget =
-            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+        let mut budget = TypeViewBudget::new_input_derived_in(&package, &mut admit, &work).unwrap();
         let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
         for row in views.occurrences() {
             if let (TypeRootReference::Value(id), PackageTypeSource::Value(original)) =
@@ -1162,7 +1249,7 @@ mod tests {
             if reject {
                 // A real lookup contributes a full known linear comparison
                 // upper bound before its first completed observation.
-                budget.limits.max_work =
+                budget.admission.as_mut().unwrap().1.max_work =
                     budget.facts().cumulative_work_upper_bound + views.occurrences().len() * 2 - 1;
                 let first = &views.occurrences()[0];
                 let PackageTypeSource::Value(original) = first.source else {
@@ -1425,10 +1512,26 @@ mod tests {
                 let bytes = Layout::array::<u32>(3).unwrap().size()
                     + Layout::array::<u8>(5).unwrap().size();
                 match axis {
-                    0 => budget.limits.max_allocation_requests = 1,
-                    1 => budget.limits.max_allocation_request_bytes = bytes - 1,
-                    2 => budget.limits.max_coexisting_source_and_request_bytes = SOURCE + bytes - 1,
-                    3 => budget.limits.max_work = 2 * 128 + 4 * bytes + 11 - 1,
+                    0 => budget.admission.as_mut().unwrap().1.max_allocation_requests = 1,
+                    1 => {
+                        budget
+                            .admission
+                            .as_mut()
+                            .unwrap()
+                            .1
+                            .max_allocation_request_bytes = bytes - 1
+                    }
+                    2 => {
+                        budget
+                            .admission
+                            .as_mut()
+                            .unwrap()
+                            .1
+                            .max_coexisting_source_and_request_bytes = SOURCE + bytes - 1
+                    }
+                    3 => {
+                        budget.admission.as_mut().unwrap().1.max_work = 2 * 128 + 4 * bytes + 11 - 1
+                    }
                     _ => unreachable!(),
                 }
                 let mut requests = [

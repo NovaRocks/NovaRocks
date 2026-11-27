@@ -44,7 +44,7 @@ type Error = WriterGroupedUnpivotCodecError;
 pub(crate) struct GroupedNodeAdmission {
     pub(crate) base: Model,
     pub(crate) values: usize,
-    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) limits: Option<WriterGroupedUnpivotProjectionLimits>,
 }
 impl GroupedNodeAdmission {
     pub(crate) fn merge(self, child: NodeProjectionFacts) -> Result<Model, Error> {
@@ -66,7 +66,7 @@ impl GroupedNodeAdmission {
 #[derive(Clone, Copy)]
 pub(crate) struct GroupedProjection {
     pub(crate) source: usize,
-    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) limits: Option<WriterGroupedUnpivotProjectionLimits>,
     pub(crate) parent: Option<GroupedNodeAdmission>,
 }
 impl GroupedProjection {
@@ -116,7 +116,7 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: WriterGroupedUnpivotProjectionLimits,
+    limits: Option<WriterGroupedUnpivotProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
     preflight_grouped_encode_observed(
@@ -285,7 +285,7 @@ fn prepare_decode(
     input: &wire::WriterGroupedUnpivot,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: WriterGroupedUnpivotProjectionLimits,
+    limits: Option<WriterGroupedUnpivotProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
     preflight_grouped_decode_observed(
@@ -564,6 +564,7 @@ pub fn prepare_writer_grouped_unpivot_encode<'input, 'namespace, 'loan, 'source,
     limits: WriterGroupedUnpivotProjectionLimits,
 ) -> Result<PreparedWriterGroupedUnpivotEncode<'input, 'namespace, 'loan, 'source, 'control>, Error>
 {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = prepare_encode(
         input,
@@ -612,6 +613,7 @@ pub fn prepare_writer_grouped_unpivot_decode<'input, 'namespace, 'loan, 'wire, '
     source_retained_bytes: usize,
     limits: WriterGroupedUnpivotProjectionLimits,
 ) -> Result<PreparedWriterGroupedUnpivotDecode<'input, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
     let result = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work);
     let facts = finish(work, result)?;
@@ -634,6 +636,7 @@ pub fn encode_writer_grouped_unpivot(
     ),
     Error,
 > {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
         let facts = prepare_encode(
@@ -660,6 +663,7 @@ pub fn decode_writer_grouped_unpivot(
     ),
     Error,
 > {
+    let limits = Some(limits);
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
     let result = (|| {
         let facts = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
@@ -673,11 +677,12 @@ pub fn prepare_writer_grouped_unpivot_encode_in<'input, 'namespace, 'loan, 'sour
     values: &'namespace EncodedValues<'loan, 'source, 'control>,
     expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
     source: usize,
-    limits: WriterGroupedUnpivotProjectionLimits,
+    limits: impl Into<Option<WriterGroupedUnpivotProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedWriterGroupedUnpivotEncode<'input, 'namespace, 'loan, 'source, 'control>, Error>
 {
+    let limits = limits.into();
     let facts = preflight_grouped_encode_core(
         input,
         values,
@@ -722,10 +727,11 @@ pub fn prepare_writer_grouped_unpivot_decode_in<'input, 'namespace, 'loan, 'wire
     input: &'input wire::WriterGroupedUnpivot,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
     source: usize,
-    limits: WriterGroupedUnpivotProjectionLimits,
+    limits: impl Into<Option<WriterGroupedUnpivotProjectionLimits>>,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedWriterGroupedUnpivotDecode<'input, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let limits = limits.into();
     let facts = preflight_grouped_decode_core(
         input,
         expressions,

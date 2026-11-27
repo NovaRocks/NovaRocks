@@ -1239,7 +1239,7 @@ impl FragmentBuilder {
 pub struct PlanBuilder {
     constants: crate::ConstantPools,
     parameters: SemanticParameters,
-    statement_constant_policy: crate::ConstantPolicy,
+
     version: PlanVersionId,
     next_edge: u32,
     fragments: BTreeMap<FragmentId, Fragment>,
@@ -1255,12 +1255,12 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
-    pub fn new(version: PlanVersionId, statement_constant_policy: crate::ConstantPolicy) -> Self {
+    pub fn new(version: PlanVersionId) -> Self {
         Self {
             constants: crate::ConstantPools::empty(),
             // An empty table supplies no semantic value or implicit flag.
             parameters: SemanticParameters::default(),
-            statement_constant_policy,
+
             version,
             next_edge: 0,
             fragments: BTreeMap::new(),
@@ -1386,7 +1386,7 @@ impl PlanBuilder {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
             constants: self.constants,
             parameters: self.parameters,
-            statement_constant_policy: self.statement_constant_policy,
+
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,
@@ -1460,7 +1460,7 @@ impl PlanBuilder {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
             constants: self.constants,
             parameters: self.parameters,
-            statement_constant_policy: self.statement_constant_policy,
+
             version: self.version,
             fragments: self.fragments,
             edges: self.edges,

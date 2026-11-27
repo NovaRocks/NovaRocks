@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{CompiledExprSet, EvaluationEnvironment, ScopeLayouts};
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation};
 use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprId, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
@@ -32,18 +32,20 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-pub const POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 16,
-    max_array_nodes: 128,
-    max_logical_elements: 1024,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+pub const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    },
+);
 
 pub struct Control;
 impl PureCompileControl for Control {
@@ -103,14 +105,7 @@ pub(super) fn finish_frame(
     let scope = fixture_scope(&port, schema.clone());
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
-    declare_call_controls(
-        &mut draft,
-        functions,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
+    declare_call_controls(&mut draft, functions, &constants, &parameters, &mut work);
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         functions,
@@ -118,7 +113,6 @@ pub(super) fn finish_frame(
         &authors,
         &constants,
         &parameters,
-        POLICY,
         &mut work,
     );
     work.finish().unwrap();

@@ -32,9 +32,9 @@ use novarocks_expression_contract::{
     PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
-    FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
+    CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
+    PureCallPreparation, PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
@@ -45,10 +45,7 @@ use novarocks_native_adapter::backend_task_execution::{
 };
 use novarocks_physical_plan::*;
 use novarocks_plan_codec::{
-    physical_package_v2::{
-        encode_fragment_package,
-        test_support::{decode_limits, encode_limits},
-    },
+    physical_package_v2::{encode_fragment_package, test_support::decode_limits},
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
 use novarocks_type_contract::*;
@@ -60,20 +57,6 @@ struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
-    }
-}
-fn constants() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
     }
 }
 fn functions_for_names(names: &[&str]) -> PureEngineFunctionCatalog {
@@ -253,7 +236,6 @@ fn source_for_arguments(
                 .collect(),
             logical_argument_count: types.len(),
             expected_result_type: None,
-            constant_policy: constants(),
         },
     )
     .unwrap();
@@ -361,7 +343,7 @@ fn source_for_arguments(
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            statement_constant_policy: constants(),
+
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -383,7 +365,7 @@ fn source_for_arguments(
         &Control,
     )
     .unwrap();
-    encode_fragment_package(&package, &encode_limits(), &Control)
+    encode_fragment_package(&package, &Control)
         .unwrap()
         .encode_to_vec()
 }
@@ -404,7 +386,6 @@ pub(super) fn program_for_arguments(
         decode_limits(),
         Arc::new(functions),
         Arc::new(providers),
-        constants(),
     );
     let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let loan = owner.loan();

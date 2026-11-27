@@ -20,7 +20,7 @@
 use super::*;
 use crate::binding::SqlFunctionBinding;
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
+    ConstantValidation, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
 };
 
 /// A consumer asks about an actual immutable source; IDs alone do not authorize it.
@@ -181,7 +181,7 @@ impl<'a> SqlCallDependencyLoan<'a> {
             }
         }
     }
-    pub fn original_constant_policy(&self) -> ConstantPolicy {
+    pub fn original_constant_policy(&self) -> ConstantValidation {
         match &self.source {
             AuthenticatedSource::Expression { entry: source, .. } => {
                 source.captured().constant_policy()

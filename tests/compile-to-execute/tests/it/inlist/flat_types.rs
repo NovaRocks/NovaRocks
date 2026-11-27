@@ -244,7 +244,6 @@ fn compiled_in_preserves_unsigned_and_nominal_uuid_port_types() {
             &BTreeMap::new(),
             &constants,
             &parameters,
-            policy,
             &mut work,
         );
         work.finish().unwrap();

@@ -127,38 +127,7 @@ mod tests {
                 expected.max_wire_depth
             ]
         );
-        let admission = carrier.admission();
-        let limits = carrier.limits();
         let receiver = novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN;
-        assert_eq!(admission.plan_limits, receiver.admission.plan_limits);
-        assert_eq!(
-            admission.source_retained_bytes,
-            receiver.admission.source_retained_bytes
-        );
-        assert_eq!(
-            admission.property_projection_limits.max_request_bytes,
-            receiver
-                .admission
-                .property_projection_limits
-                .max_request_bytes
-        );
-        assert_eq!(
-            admission.property_projection_limits.max_coexisting_bytes,
-            receiver
-                .admission
-                .property_projection_limits
-                .max_coexisting_bytes
-        );
-        assert_eq!(
-            admission.property_projection_limits.max_projection_work,
-            receiver
-                .admission
-                .property_projection_limits
-                .max_projection_work
-        );
-        assert_eq!(
-            limits.source_retained_bytes,
-            admission.source_retained_bytes
-        );
+        assert_eq!(carrier.plan_limits(), receiver.plan_limits);
     }
 }

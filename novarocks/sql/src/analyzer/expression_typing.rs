@@ -19,7 +19,7 @@ use novarocks_expression::typing::{
     NodeShape, NodeTyping, ScalarBindingCatalog, TypedLiteral, TypingContext, TypingError,
 };
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
+    ConstantValidation, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
     FunctionResultType, HigherOrderBindingCandidate, ResolvedFunctionBinding,
 };
 use novarocks_parser::{Span, ast};
@@ -557,7 +557,7 @@ fn bind_temporal_syntax(
 
 pub(super) fn authored_temporal_cast(
     finalizer: &BindingFinalizer<'_>,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     source: TypedExpr,
     target: FunctionValueType,
     safe: bool,
@@ -613,7 +613,7 @@ pub(super) fn type_value_node_with_catalog(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
 ) -> Result<(FunctionValueType, Vec<TypedExpr>), AnalyzeError> {
@@ -653,7 +653,7 @@ pub(super) fn type_scalar_call_with_catalog(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
 ) -> Result<BoundScalarCall, AnalyzeError> {
@@ -672,7 +672,7 @@ fn type_scalar_call_with_finalizer(
     shape: NodeShape<'_>,
     args: Vec<TypedExpr>,
     originals: &[&ast::Expr],
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     span: Span,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     with_typing(
@@ -750,7 +750,7 @@ fn scalar_selection_error(
 fn with_typing<T>(
     catalog: &dyn SqlFunctionCatalog,
     decimal_overflow_policy: DecimalOverflowPolicy,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
     span: Span,
     action: impl FnOnce(&TypingContext<'_>, &mut CompileCheckpoints<'_>) -> Result<T, SqlTypingError>,

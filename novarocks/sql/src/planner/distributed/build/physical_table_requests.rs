@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
+    ConstantValidation, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
     FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_physical_plan::{
@@ -134,7 +134,7 @@ impl AuthoredPhysicalTableRequest<'_> {
             }
         }
     }
-    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+    pub fn captured_constant_policy(&self) -> Option<ConstantValidation> {
         match &self.arguments {
             TableRequestArguments::OwnedPhysical(_) => None,
             TableRequestArguments::BorrowedCanonical { captured, .. } => {
@@ -160,7 +160,7 @@ pub(crate) fn author_physical_table_request_observed<'a>(
     source: &'a PhysicalNode,
     fragment: &Fragment,
     pools: &ConstantPools,
-    literal_policy: ConstantPolicy,
+    literal_policy: ConstantValidation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalTableRequest<'a>, PhysicalTableRequestError> {
     work.flush()?;

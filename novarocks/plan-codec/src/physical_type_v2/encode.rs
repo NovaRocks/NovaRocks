@@ -69,7 +69,7 @@ impl SourceLaw<'_> {
 
 struct Admission<'a, H> {
     model: Model,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     admit: &'a mut dyn FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
 }
 impl<H> Admission<'_, H> {
@@ -1301,7 +1301,7 @@ pub(super) fn encode_writer_sources(
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     source_retained_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, Error> {
@@ -1322,7 +1322,7 @@ pub(super) fn encode_writer_sources_with_host<H>(
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     source_retained_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, HostError<H>> {
@@ -1343,11 +1343,12 @@ fn encode_writer_sources_with_host_core<H>(
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     source_retained_bytes: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
     work: &mut CompileCheckpoints<'_>,
     source_output: &mut Option<Vec<wire::SourceArrowFieldFacts>>,
 ) -> Result<wire::TypeTable, HostError<H>> {
+    let limits = limits.into();
     let writer_fields = writers
         .iter()
         .try_fold(0usize, |count, source| {
@@ -1374,10 +1375,19 @@ fn encode_writer_sources_with_host_core<H>(
         values,
         fields,
         writers,
-        TypeProjectionLimits {
-            max_definitions: limits.max_definitions,
-            max_expanded_nodes: limits.max_expanded_nodes,
-            max_string_bytes: limits.max_string_bytes,
+        match limits {
+            Some(limits) => TypeProjectionLimits {
+                max_definitions: limits.max_definitions,
+                max_expanded_nodes: limits.max_expanded_nodes,
+                max_string_bytes: limits.max_string_bytes,
+            },
+            None => TypeProjectionLimits::for_validated_source_root_count(
+                values
+                    .len()
+                    .checked_add(fields.len())
+                    .and_then(|roots| roots.checked_add(writer_fields))
+                    .ok_or(CompileControlError::ResourceExhausted)?,
+            )?,
         },
         Some(resources),
         work,
@@ -1389,7 +1399,7 @@ pub(super) fn encode_source_writer_sources(
     fields: &[(u32, &Arc<Field>)],
     writers: &[WriterTypeSource<'_>],
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: impl Into<Option<PackageTypeProjectionLimits>>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), Error>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::SourceFieldTable, Error> {

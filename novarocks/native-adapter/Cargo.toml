@@ -25,6 +25,7 @@ novarocks-execution-contract.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-physical-plan.workspace = true
+novarocks-expression-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
@@ -64,7 +65,6 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 novarocks-expression.workspace = true
-novarocks-expression-contract.workspace = true
 novarocks-parser.workspace = true
 novarocks-test-support.workspace = true
 novarocks-worker-protocol.workspace = true

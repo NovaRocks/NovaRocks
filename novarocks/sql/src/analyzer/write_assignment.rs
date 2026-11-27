@@ -51,7 +51,7 @@ pub(crate) fn bind_write_assignment_value(
     span: Span,
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::sql_mode::SqlSemanticSettings,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &SqlCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let finalizer = super::BindingFinalizer::new(
@@ -69,7 +69,7 @@ fn bind_assignment(
     site: &SqlWriteAssignmentSite,
     span: Span,
     finalizer: &super::BindingFinalizer<'_>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &SqlCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let related = |source: &TypedExpr| {
@@ -201,7 +201,7 @@ fn bind_nested_temporal_assignment(
     source: TypedExpr,
     target: novarocks_type_contract::FunctionValueType,
     finalizer: &super::BindingFinalizer<'_>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;

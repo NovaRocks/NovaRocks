@@ -5451,12 +5451,9 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("deep fragment");
-        let mut plan = novarocks_physical_plan::PlanBuilder::new(
-            seed.plan().version(),
-            crate::test_constants::policy(),
-        )
-        .with_constant_pools(constants)
-        .with_required_contracts(seed.plan().required());
+        let mut plan = novarocks_physical_plan::PlanBuilder::new(seed.plan().version())
+            .with_constant_pools(constants)
+            .with_required_contracts(seed.plan().required());
         plan.add_fragment(deep_fragment)
             .expect("deep fragment in plan");
         plan.set_result_port(novarocks_physical_plan::ResultPort {

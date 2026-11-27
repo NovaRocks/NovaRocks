@@ -128,7 +128,7 @@ pub struct IcebergMvCorePorts {
     system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -158,7 +158,7 @@ impl IcebergMvCorePorts {
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
         system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
@@ -203,7 +203,7 @@ impl IcebergMvCorePorts {
         &self.typed_connector_control
     }
 
-    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 

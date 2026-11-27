@@ -316,9 +316,8 @@ fn fixture_local_options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        // The package carries the statement's source policy. These are the
-        // host's fixture admission limits.
-        constants: policy(),
+        // The host supplies these fixture admission limits.
+        constants: policy().into(),
     }
 }
 

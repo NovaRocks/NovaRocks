@@ -523,7 +523,7 @@ fn same_numerical_envelope_maps_only_parent_arithmetic_to_primary_resource() {
     let mut policy = policy();
     policy.max_library_validation_work = 0;
     assert!(matches!(
-        validation_envelope_core_policy(counts, 0, policy, true),
+        validation_envelope_profile_core(counts, 0, ConstantValidation::from(policy).volume, true),
         Err(ConstantError::Limit(
             "opaque Arrow validation work limit exceeded"
         ))
@@ -550,7 +550,7 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
             &input.data,
             2,
             0,
-            policy(),
+            policy().into(),
             &mut ScanFacts::default(),
             &mut PoolObserver::plain(),
             &mut work,
@@ -568,7 +568,7 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
             &input.data,
             2,
             0,
-            policy(),
+            policy().into(),
             &mut ScanFacts::default(),
             &mut PoolObserver::parent(&mut admit),
             &mut work,
@@ -603,7 +603,7 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
                         &input.data,
                         2,
                         0,
-                        policy(),
+                        policy().into(),
                         &mut ScanFacts::default(),
                         &mut PoolObserver::parent(&mut admit),
                         &mut work,

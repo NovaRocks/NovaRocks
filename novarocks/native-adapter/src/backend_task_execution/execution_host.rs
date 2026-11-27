@@ -887,6 +887,13 @@ impl NativeTaskExecutionHost {
         )
         .map_err(|error| native_type_construction_failure_to_host(&error))?;
         let type_scopes = super::compiled_package::CompiledTypeScopes::new(&type_creation);
+        #[cfg(novarocks_dev_controls)]
+        let type_scopes = type_scopes.with_value_observation(
+            crate::task_execution_observation::PreparedTaskValueObservation::resolve(
+                self.queries.observation_controls().as_deref(),
+                identity,
+            ),
+        );
         let mut request = |layout| type_creation.request_layout(layout);
         let mut opaque = |bytes| type_creation.request_opaque_upper_bound(bytes);
         let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
@@ -8961,7 +8968,7 @@ pub(crate) mod tests {
         use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
         use novarocks_connector_contract::PureProviderProgramCatalog;
         use novarocks_functions::{
-            ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
+            ConstantValidation, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
             FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
             PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
         };
@@ -8972,7 +8979,7 @@ pub(crate) mod tests {
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
         use novarocks_plan_codec::physical_package_v2::test_support::{
-            decode_limits, encode_limits,
+            decode_limits, types_projection_limits,
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_sql::compiler::{
@@ -8991,8 +8998,8 @@ pub(crate) mod tests {
         }
 
         // Explicit fixture admission; these values are not production defaults.
-        pub(crate) fn constants() -> ConstantPolicy {
-            ConstantPolicy {
+        pub(crate) fn constants() -> ConstantValidation {
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
                 max_rows: 16,
                 max_array_nodes: 128,
                 max_logical_elements: 1024,
@@ -9003,7 +9010,7 @@ pub(crate) mod tests {
                 max_metadata_bytes: 1 << 20,
                 max_library_validation_work: 1 << 20,
                 max_library_validation_bytes: 1 << 20,
-            }
+            })
         }
 
         /// A real sealed RAND-only subset; `SELECT 1` binds no function, but
@@ -9066,7 +9073,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 functions,
                 Arc::new(providers),
-                constants(),
             )
         }
 
@@ -9112,7 +9118,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(functions),
                 Arc::new(providers),
-                constants(),
             )
         }
 
@@ -9208,7 +9213,7 @@ pub(crate) mod tests {
         ) {
             use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
             use novarocks_execution::runtime::mem_tracker::MemTracker;
-            use novarocks_plan_codec::physical_constant_v2::prepare_constant_namespace_with_factory_in;
+            use novarocks_plan_codec::physical_constant_v2::prepare_constant_namespace_input_derived_with_factory_in;
             use novarocks_plan_codec::physical_package_v2::prepare_package_wire_in;
             use novarocks_plan_codec::physical_type_v2::decode_package_type_table_with_factory_in;
             use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation};
@@ -9254,7 +9259,7 @@ pub(crate) mod tests {
                 .request_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
                 .unwrap();
             let wire = prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
-            let mut source = usage
+            let source = usage
                 .input_bytes
                 .checked_add(usage.root_inline_bytes)
                 .unwrap()
@@ -9268,37 +9273,29 @@ pub(crate) mod tests {
             let types = decode_package_type_table_with_factory_in(
                 &wire,
                 source,
-                decode_limits().types,
+                types_projection_limits(),
                 &mut creator,
                 &type_factory,
                 &mut work,
             )
             .unwrap();
-            source = source
-                .checked_add(types.creation_request_bytes_upper_bound().unwrap())
-                .unwrap()
-                .checked_add(std::mem::size_of_val(&types))
-                .unwrap();
             let factory = NativeTypeFactory::new(&actual);
-            let mut limits = decode_limits().constants;
-            if let Some(cap) = cap {
-                limits.max_new_allocation_request_bytes = cap;
-            }
-            let result = prepare_constant_namespace_with_factory_in(
+            let mut admit = |facts: &novarocks_plan_codec::physical_constant_v2::ConstantNamespaceResourceFacts| {
+                if cap.is_some_and(|limit| facts.new_allocation_request_bytes_upper_bound > limit) {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                Ok(())
+            };
+            let result = prepare_constant_namespace_input_derived_with_factory_in(
                 &wire.constants,
                 &types,
-                source,
                 types.source_metadata_namespace(),
-                decode_limits().constant_policy,
-                decode_limits().constant_records,
-                limits,
-                &decode_limits().verifier,
                 &factory,
-                &mut |_| Ok(()),
+                &mut admit,
                 &mut work,
             )
             .and_then(|prepared| {
-                prepared.materialize_with_factory_in(&factory, &mut |_| Ok(()), &mut work)
+                prepared.materialize_with_factory_in(&factory, &mut admit, &mut work)
             });
             let quoted = factory.construction_request_bytes_upper_bound();
             {
@@ -9316,7 +9313,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn candidate_pool_namespace_keeps_one_cumulative_cap_and_source_invoice() {
+        fn candidate_pool_namespace_reports_original_request_facts_and_keeps_caller_refusal() {
             use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
             use novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError;
             let (result, tracker, quoted) = candidate_pool_namespace_audit(None);
@@ -9519,7 +9516,7 @@ pub(crate) mod tests {
         #[test]
         fn candidate_logical_scopes_classified_actual_requests_equal_the_sole_completed_model_once()
         {
-            let audit = candidate_type_fee_audit(decode_limits().types);
+            let audit = candidate_type_fee_audit(types_projection_limits());
             let completed = audit.verdict.unwrap();
             assert!(
                 audit.original_creator_bytes > 0,
@@ -9544,9 +9541,9 @@ pub(crate) mod tests {
         fn candidate_logical_scopes_keep_the_original_near_boundary_cumulative_allocation_cap() {
             use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
             use novarocks_plan_codec::physical_type_v2::TypeCodecError;
-            let baseline = candidate_type_fee_audit(decode_limits().types);
+            let baseline = candidate_type_fee_audit(types_projection_limits());
             let completed = baseline.verdict.unwrap();
-            let mut limits = decode_limits().types;
+            let mut limits = types_projection_limits();
             limits.max_allocation_request_bytes = completed.checked_sub(1).unwrap();
             let refused = candidate_type_fee_audit(limits);
             assert!(matches!(
@@ -9581,7 +9578,7 @@ pub(crate) mod tests {
         }
 
         fn encode_sql_fixture_package(package: &FragmentPackage) -> Vec<u8> {
-            encode_fragment_package(package, &encode_limits(), &SqlCompileControl::unbounded())
+            encode_fragment_package(package, &SqlCompileControl::unbounded())
                 .expect("v2 bytes")
                 .encode_to_vec()
         }
@@ -9627,9 +9624,6 @@ pub(crate) mod tests {
                     novarocks_result_contract::FrozenRootOutput::CountOnly,
                 ))
                 .expect("the fixture declares its actual CountOnly RootV1 output");
-            owner
-                .require_statement_constant_policy(constants())
-                .expect("the original statement constant policy");
             let plan = owner.plan();
             let mut pruning = BTreeMap::new();
             let mut admissions = BTreeMap::new();
@@ -10324,7 +10318,7 @@ pub(crate) mod tests {
                 decode_package_type_table_with_factory_in(
                     &wire,
                     source,
-                    decode_limits().types,
+                    types_projection_limits(),
                     &mut creation,
                     &factory,
                     &mut work,
@@ -10420,62 +10414,6 @@ pub(crate) mod tests {
             );
             drop(minimal);
             assert_eq!(minimal_tracker.current(), 0);
-        }
-
-        #[test]
-        fn compiled_interpreter_scoped_decode_keeps_original_whole_type_caps() {
-            use crate::backend_task_execution::CompiledTypeScopes;
-            use crate::native_type_construction::NativeTypeConstruction;
-            use novarocks_execution::runtime::mem_tracker::MemTracker;
-            use novarocks_type_contract::ValueSchemaCreation;
-            let (bytes, _) = select_one_producer();
-            let tracker = MemTracker::new_root("compiled scoped global caps");
-            let actual =
-                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
-            let mut limits = decode_limits();
-            limits.types.max_definitions = 0;
-            let providers = PureProviderProgramCatalog::<std::convert::Infallible>::try_new(
-                &[],
-                vec![],
-                &Unbounded,
-            )
-            .unwrap();
-            let compiler = CompiledPackageInterpreter::new(
-                FragmentDecodeResourceModel::try_new(&Unbounded).unwrap(),
-                limits,
-                Arc::new(sealed_rand_subset()),
-                Arc::new(providers),
-                constants(),
-            );
-            let scopes = CompiledTypeScopes::new(&actual);
-            let mut exact = |layout| actual.request_layout(layout);
-            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
-            let mut creation =
-                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
-            let result = compiler.compile(
-                &bytes,
-                CompiledTaskOptions {
-                    pipeline_dop: NonZeroUsize::MIN,
-                },
-                &mut creation,
-                &scopes,
-                &Unbounded,
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(CompiledPackageError::Control(
-                        CompileControlError::ResourceExhausted
-                    ))
-                ),
-                "entity scopes cannot replace the original complete-table cap"
-            );
-            drop(creation);
-            {
-                let _scopes = scopes;
-            }
-            drop(actual);
-            assert_eq!(tracker.current(), 0);
         }
 
         #[test]
@@ -10725,7 +10663,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
                 Arc::new(crate::compiled_scan_binding::tests::fixture_providers()),
-                constants(),
             )))
         }
 
@@ -11270,7 +11207,6 @@ pub(crate) mod tests {
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
                 Arc::new(crate::compiled_writer_binding::tests::writer_providers()),
-                constants(),
             )))
         }
 

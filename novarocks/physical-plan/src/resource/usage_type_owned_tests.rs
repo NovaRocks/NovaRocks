@@ -253,7 +253,6 @@ fn checked_scalar_unit() -> (
         ]),
         logical_argument_count: 2,
         expected_result_type: None,
-        constant_policy: policy,
     };
     let call = builder
         .add(

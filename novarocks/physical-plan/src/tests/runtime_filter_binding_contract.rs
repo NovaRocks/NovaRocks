@@ -40,7 +40,7 @@ pub(super) fn numbered_plan() -> PhysicalPlan {
     let broadcast =
         super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture(&mut fixture_constants)
             .plan;
-    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
+    let mut builder = PlanBuilder::new(version());
     for plan in [&partitioned, &broadcast] {
         for fragment in plan.fragments().values() {
             builder.add_fragment(fragment.clone()).unwrap();
@@ -282,7 +282,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             PhysicalPlan::from(crate::PhysicalPlanParts {
                 constants: crate::ConstantPools::empty(),
                 parameters: novarocks_type_contract::SemanticParameters::default(),
-                statement_constant_policy: checked.statement_constant_policy(),
+
                 version: checked.version(),
                 fragments,
                 edges: checked.edges().clone(),

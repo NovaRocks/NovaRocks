@@ -45,6 +45,13 @@ pub(crate) enum PreparedReader<'raw, 'table, 'control> {
     Recursive(PreparedRecursiveReader<'raw, 'table, 'table, 'control>),
 }
 impl PreparedReader<'_, '_, '_> {
+    pub(super) fn body_bytes(&self) -> usize {
+        match self {
+            Self::Flat(value) => value.body_bytes(),
+            Self::Recursive(value) => value.body_bytes(),
+        }
+    }
+
     pub(crate) fn geometry_requests(&self) -> (usize, usize) {
         match self {
             Self::Flat(value) => (
@@ -155,29 +162,6 @@ impl PreparedReader<'_, '_, '_> {
     }
 }
 
-pub(crate) fn prepare_reader_from_sources_observed<'raw, 'source, 'control, E: ReaderFailure>(
-    record: &'raw wire::IpcConstantPool,
-    value_type: &'source FunctionValueType,
-    field: &'source Arc<Field>,
-    live_source: usize,
-    policy: ConstantPolicy,
-    limits: ConstantDecodeProjectionLimits,
-    verifier: &VerifierOptions,
-    admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), E>,
-    construction: Option<&mut dyn FnMut(Layout) -> Result<(), E>>,
-    work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedReader<'raw, 'source, 'control>, E> {
-    prepare_reader_from_sources_profile_observed(
-        record,
-        value_type,
-        field,
-        live_source,
-        Some((policy, limits, verifier)),
-        admit,
-        construction,
-        work,
-    )
-}
 pub(crate) fn prepare_reader_from_sources_profile_observed<
     'raw,
     'source,

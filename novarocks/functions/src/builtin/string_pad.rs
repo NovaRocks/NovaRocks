@@ -22,7 +22,7 @@
 use super::string_measure::{fixed_char_padding, fixed_char_width};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
-    kernel_control::{internal, invalid},
+    kernel_control::{check_i32_output_extent, internal, invalid, reserve_local_output},
     kernel_input::EvaluationCheckpoints,
     string_repeat_pad_core::{self, CyclicCharacters, PadProjection, SourceCharacters},
 };
@@ -39,7 +39,7 @@ pub(super) enum StringPadOp {
 }
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
-    i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+    check_i32_output_extent(bytes)?;
     let offsets = Layout::array::<i32>(
         rows.checked_add(1)
             .ok_or(KernelFailure::ResourceExhausted)?,
@@ -483,15 +483,9 @@ pub(super) fn evaluate_string_pad<'a>(
         }
         output_capacity(selection.len(), total)?;
         work.flush()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut bytes = reserve_local_output(total, "lpad/rpad output bytes")?;
         work.flush()?;
-        let mut offsets = Vec::new();
-        offsets
-            .try_reserve_exact(selection.len() + 1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        let mut offsets = reserve_local_output(selection.len() + 1, "lpad/rpad output offsets")?;
         work.flush()?;
         let mut validity = BooleanBufferBuilder::new(selection.len());
         work.flush()?;

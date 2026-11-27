@@ -411,7 +411,7 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
             )
         } else {
             crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
-                schema, expected, source, &mut host, work,
+                schema, expected, &mut host, work,
             )
             .map(|_| ())
         };

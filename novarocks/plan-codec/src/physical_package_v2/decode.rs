@@ -37,69 +37,58 @@ use crate::{
         prepare_aggregate_bindings_materialization_in,
     },
     physical_binding_v2::{
-        BindingCodecError, BindingProjectionLimits, materialize_function_bindings_in,
-        prepare_function_binding_headers_in, prepare_function_bindings_materialization_in,
+        BindingCodecError, materialize_function_bindings_in, prepare_function_binding_headers_in,
+        prepare_function_bindings_materialization_in,
     },
     physical_call_requests_v2::{
-        CallRequestCodecError, CallRequestProjectionLimits, CallRequestTypeOwner,
-        decode_call_requests_in, decode_call_requests_with_creator_in,
-        prepare_call_requests_decode_in, prepare_call_requests_decode_with_creator_in,
+        CallRequestCodecError, CallRequestTypeOwner, decode_call_requests_in,
+        decode_call_requests_with_creator_in, prepare_call_requests_decode_in,
+        prepare_call_requests_decode_with_creator_in,
     },
-    physical_connector_payload_v2::{
-        ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, decode_connector_payloads_in,
-    },
+    physical_connector_payload_v2::{ConnectorPayloadCodecError, decode_connector_payloads_in},
     physical_constant_v2::{
-        ConstantDecodeProjectionLimits, ConstantNamespaceProjectionLimits,
-        PhysicalConstantCodecError, prepare_constant_namespace_in,
-        prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
+        PhysicalConstantCodecError, prepare_constant_namespace_input_derived_in,
+        prepare_constant_namespace_input_derived_with_creator_in,
+        prepare_constant_namespace_input_derived_with_factory_in,
     },
-    physical_control_v2::{
-        ControlCodecError, ControlProjectionLimits, decode_expression_control_observed,
-    },
+    physical_control_v2::{ControlCodecError, decode_expression_control_observed},
     physical_cuts_v2::{CutsProjectionLimits, decode_fragment_cuts_observed},
     physical_expression_v2::{
-        ExpressionCodecError, ExpressionProjectionLimits, decode_expression_definitions_in,
-        materialize_expressions_in, prepare_expression_materialization_in,
+        ExpressionCodecError, decode_expression_definitions_in, materialize_expressions_in,
+        prepare_expression_materialization_in,
     },
     physical_fragment_envelope_v2::prepare_fragment_envelope_decode_in,
-    physical_node_v2::{NodeCodecError, NodeProjectionLimits},
+    physical_node_v2::NodeCodecError,
     physical_package_metadata_v2::{PackageMetadataCodecError, decode_package_metadata_observed},
-    physical_provider_binding_v2::{
-        ProviderBindingCodecError, ProviderBindingProjectionLimits,
-        decode_joint_provider_bindings_in,
-    },
-    physical_provider_read_v2::{
-        ProviderReadCodecError, ProviderReadProjectionLimits, decode_provider_reads_in,
-    },
+    physical_provider_binding_v2::{ProviderBindingCodecError, decode_joint_provider_bindings_in},
+    physical_provider_read_v2::{ProviderReadCodecError, decode_provider_reads_in},
     physical_read_scan_v2::{
-        ReadScanCodecError, ReadScanDecodeContext, ReadScanProjectionLimits,
-        decode_read_scans_observed, decode_read_scans_with_creator,
+        ReadScanCodecError, ReadScanDecodeContext, decode_read_scans_observed,
+        decode_read_scans_with_creator,
     },
-    physical_relation_v2::{RelationCodecError, RelationProjectionLimits, decode_relations_in},
+    physical_relation_v2::{RelationCodecError, decode_relations_in},
     physical_result_v2::prepare_result_decode_in,
     physical_schema_v2::{
         SchemaCodecError, decode_schemas_with_factory_in, prepare_schemas_decode_observed_in,
         prepare_schemas_decode_with_creator_in,
     },
     physical_semantics_v2::{
-        ParameterProjectionLimits, SemanticsCodecError, decode_frozen_pruning_observed,
+        SemanticsCodecError, decode_frozen_pruning_observed,
         prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
-        PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
-        decode_package_type_table_observed, decode_package_type_table_with_creator_in,
-        decode_package_type_table_with_factory_in,
+        PackageTypeProjectionFacts, TypeCodecError, decode_package_type_table_observed,
+        decode_package_type_table_with_creator_in, decode_package_type_table_with_factory_in,
     },
-    physical_value_v2::{ValueCodecError, ValueProjectionLimits, decode_values_observed_in},
+    physical_value_v2::{ValueCodecError, decode_values_observed_in},
     physical_writer_recipe_v2::{
-        WriterRecipeCodecError, WriterRecipeDecodeContext, WriterRecipeProjectionLimits,
-        decode_writer_recipes_observed, decode_writer_recipes_with_factory_in,
+        WriterRecipeCodecError, WriterRecipeDecodeContext, decode_writer_recipes_observed,
+        decode_writer_recipes_with_factory_in,
     },
-    physical_writer_schema_v2::WriterSchemaProjectionLimits,
     resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel},
 };
-use novarocks_arrow_ipc_frame::VerifierOptions;
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
+
+use novarocks_constant_contract::ConstantPools;
 use novarocks_physical_plan::{
     self as p, CallRequestError, FragmentPackageError, FragmentStructureError,
 };
@@ -115,39 +104,11 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
-/// Host-authored receiving envelopes; none of these is on the wire and no
-/// default exists. `admission.plan_limits` is the one structural PlanLimits
-/// for the owned expression arena, the Fragment and the Package.
+/// The receiver's generated wire layout and the original structural plan limits.
 #[derive(Clone, Debug)]
 pub struct PackageDecodeLimits {
-    /// Generated-layout byte admission before Prost allocates.
     pub wire: DecodeProjectionLimits,
-    pub types: PackageTypeProjectionLimits,
-    /// Metadata, schemas, envelope, calls, pruning, result and node headers.
-    pub node: NodeProjectionLimits,
-    pub constant_policy: ConstantPolicy,
-    pub constant_records: ConstantDecodeProjectionLimits,
-    pub constants: ConstantNamespaceProjectionLimits,
-    pub verifier: VerifierOptions,
-    /// Function and aggregate headers, their owned materializations and the
-    /// per-node signature copies.
-    pub bindings: BindingProjectionLimits,
-    pub provider_bindings: ProviderBindingProjectionLimits,
-    pub payloads: ConnectorPayloadProjectionLimits,
-    pub reads: ProviderReadProjectionLimits,
-    /// The relation namespace and each Scan node's relation copy.
-    pub relations: RelationProjectionLimits,
-    pub values: ValueProjectionLimits,
-    /// The receiving expression namespace and its owned arena materialization.
-    pub expressions: ExpressionProjectionLimits,
-    pub requests: CallRequestProjectionLimits,
-    pub parameters: ParameterProjectionLimits,
-    pub cuts: CutsProjectionLimits,
-    pub scans: ReadScanProjectionLimits,
-    pub writers: WriterRecipeProjectionLimits,
-    pub writer_schema: WriterSchemaProjectionLimits,
-    pub control: ControlProjectionLimits,
-    pub admission: p::FragmentPackageAdmission,
+    pub plan_limits: p::PlanLimits,
 }
 
 #[derive(Debug)]
@@ -588,7 +549,7 @@ pub(crate) fn decode_fragment_package_core<H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     decode_fragment_package_factory_core::<H, crate::value_type_table::resources::NoFactory>(
-        raw, model, limits, creation, None, work, &mut None,
+        raw, model, limits, creation, None, work, &mut None, None,
     )
 }
 
@@ -614,6 +575,7 @@ pub fn decode_fragment_package_with_factory<
         Some(factory),
         &mut work,
         &mut None,
+        None,
     );
     if matches!(
         &result,
@@ -628,6 +590,11 @@ pub fn decode_fragment_package_with_factory<
 
 /// The existing receiver with the caller's actual creator and narrow original
 /// Arrow/source tail funding. Other namespaces retain their existing responsibility.
+/// Observation of a checked record's actual IPC body. The original bound
+/// constant pools still own their array backings and resource receipts.
+pub type ConstantRecordObserver<'a> =
+    dyn FnMut(novarocks_constant_contract::ConstantPoolId, usize) + 'a;
+
 pub fn decode_fragment_package_with_factory_and_funding<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -639,6 +606,7 @@ pub fn decode_fragment_package_with_factory_and_funding<
     factory: &F,
     control: &dyn PureCompileControl,
     funding: &mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>,
+    constant_records: Option<&mut ConstantRecordObserver<'_>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_fragment_package_factory_core(
@@ -649,6 +617,7 @@ pub fn decode_fragment_package_with_factory_and_funding<
         Some(factory),
         &mut work,
         &mut Some(funding),
+        constant_records,
     );
     if matches!(
         &result,
@@ -673,7 +642,16 @@ pub fn decode_fragment_package_with_type_host<
     let result = decode_fragment_package_factory_core::<
         G::HostError,
         crate::value_type_table::resources::NoFactory,
-    >(raw, model, limits, None, None, &mut work, &mut Some(host));
+    >(
+        raw,
+        model,
+        limits,
+        None,
+        None,
+        &mut work,
+        &mut Some(host),
+        None,
+    );
     if matches!(
         &result,
         Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
@@ -682,6 +660,31 @@ pub fn decode_fragment_package_with_type_host<
     }
     work.finish()?;
     result
+}
+
+fn fund_component<T, H>(
+    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    run: impl FnOnce(
+        &mut dyn FnMut(usize) -> Result<(), CompileControlError>,
+    ) -> Result<T, PackageDecodeError>,
+) -> Result<T, ProjectionFailure<PackageDecodeError, H>> {
+    let mut prior = 0;
+    let mut original_host = None;
+    let result = run(&mut |bytes| {
+        if let Some(creator) = creation.as_deref_mut()
+            && bytes > prior
+            && let Err(error) = creator.observe_opaque_upper_bound(bytes - prior)
+        {
+            original_host = Some(error);
+            return Err(CompileControlError::ResourceExhausted);
+        }
+        prior = prior.max(bytes);
+        Ok(())
+    });
+    if let Some(error) = original_host {
+        return Err(ProjectionFailure::Host(error));
+    }
+    result.map_err(ProjectionFailure::Codec)
 }
 
 fn decode_fragment_package_factory_core<
@@ -695,9 +698,10 @@ fn decode_fragment_package_factory_core<
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
     funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
+    constant_records: Option<&mut ConstantRecordObserver<'_>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
-    let plan_limits = limits.admission.plan_limits;
-    let mut unit_totals = super::unit_totals::UnitProjectionTotals::default();
+    let plan_limits = limits.plan_limits;
+    let mut unit_roots = 0;
 
     // L0: generated-layout byte admission, then the original Prost verdict.
     let prepared = prepare_package_wire_in(raw, model, limits.wire, &mut |_| Ok(()), work)?;
@@ -733,9 +737,6 @@ fn decode_fragment_package_factory_core<
 
     // Mandatory singular components have no default.
     let fragment_wire = required(wire_package.fragment.as_ref(), "package fragment is absent")?;
-    let statement_constant_policy = crate::physical_call_requests_v2::decode_source_policy(
-        wire_package.source_constant_policy.as_ref(),
-    )?;
     let calls_wire = required(
         wire_package.calls.as_ref(),
         "package frozen calls are absent",
@@ -754,13 +755,8 @@ fn decode_fragment_package_factory_core<
     )?;
 
     // L1: owners that borrow only the DTO.
-    let (metadata, _) = decode_package_metadata_observed(
-        &wire_package,
-        invoice,
-        limits.node,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let (metadata, _) =
+        decode_package_metadata_observed(&wire_package, invoice, None, &mut |_| Ok(()), work)?;
     // Types and constant pools have no retained-floor author, yet later laws
     // charge their roots; their own admitted request upper bound and inline
     // header join the invoice once.
@@ -771,7 +767,7 @@ fn decode_fragment_package_factory_core<
                 crate::physical_type_v2::decode_package_type_table_with_factory_and_funding_in(
                     &wire_package,
                     invoice,
-                    limits.types,
+                    None,
                     creator,
                     factory,
                     work,
@@ -781,7 +777,7 @@ fn decode_fragment_package_factory_core<
             (Some(factory), None) => decode_package_type_table_with_factory_in(
                 &wire_package,
                 invoice,
-                limits.types,
+                None,
                 creator,
                 factory,
                 work,
@@ -789,7 +785,7 @@ fn decode_fragment_package_factory_core<
             (None, _) => decode_package_type_table_with_creator_in(
                 &wire_package,
                 invoice,
-                limits.types,
+                None,
                 creator,
                 work,
             )?,
@@ -805,7 +801,7 @@ fn decode_fragment_package_factory_core<
         crate::physical_type_v2::decode_package_type_table_with_funding_in(
             &wire_package,
             invoice,
-            limits.types,
+            None,
             &mut |facts: &PackageTypeProjectionFacts| {
                 type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
                 Ok(())
@@ -817,7 +813,7 @@ fn decode_fragment_package_factory_core<
         decode_package_type_table_observed(
             &wire_package,
             invoice,
-            limits.types,
+            None,
             &mut |facts: &PackageTypeProjectionFacts| {
                 type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
                 Ok(())
@@ -827,38 +823,37 @@ fn decode_fragment_package_factory_core<
     };
     invoice = add(add(invoice, type_requests)?, size_of_val(&types))?;
     // Joint mode is required: writer views exist only on joint bindings.
-    let provider_bindings = decode_joint_provider_bindings_in(
-        &wire_package.provider_bindings,
-        invoice,
-        limits.provider_bindings,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let provider_bindings = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_joint_provider_bindings_in(
+            &wire_package.provider_bindings,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(provider_bindings.retained_invoice_floor_in(work)?);
-    let payloads = decode_connector_payloads_in(
-        &wire_package.provider_payloads,
-        invoice,
-        limits.payloads,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let payloads = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_connector_payloads_in(
+            &wire_package.provider_payloads,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(payloads.retained_invoice_floor_in(work)?);
     let (parameters, _) = prepare_semantic_parameters_decode_observed_in(
         parameters_wire,
         invoice,
-        limits.parameters,
+        None,
         &mut |_| Ok(()),
         work,
     )?
     .emit_observed_in(&mut |_| Ok(()), work)?;
-    let (envelope, _) = prepare_fragment_envelope_decode_in(
-        fragment_wire,
-        invoice,
-        limits.node,
-        &mut |_| Ok(()),
-        work,
-    )?
-    .emit_in(&mut |_| Ok(()), work)?;
+    let (envelope, _) =
+        prepare_fragment_envelope_decode_in(fragment_wire, invoice, None, &mut |_| Ok(()), work)?
+            .emit_in(&mut |_| Ok(()), work)?;
 
     // L2: owners over types and provider namespaces.
     let writer_context = WriterRecipeDecodeContext {
@@ -871,7 +866,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.writes,
             writer_context,
             invoice,
-            limits.writers,
+            None,
             factory,
             &mut |_| Ok(()),
             work,
@@ -882,7 +877,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.writes,
             writer_context,
             invoice,
-            limits.writers,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -905,7 +900,7 @@ fn decode_fragment_package_factory_core<
         &provider_bindings,
         &payloads,
         invoice,
-        limits.writers,
+        None,
         work,
     )
     .map_err(|error| ProjectionFailure::Codec(Error::from(error)))?;
@@ -915,7 +910,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.schemas,
             &types,
             invoice,
-            limits.node,
+            None,
             factory,
             &mut |_| Ok(()),
             work,
@@ -925,7 +920,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.schemas,
             &types,
             invoice,
-            limits.node,
+            None,
             creator,
             work,
         )?
@@ -935,7 +930,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.schemas,
             &types,
             invoice,
-            limits.node,
+            None,
             &mut |_| Ok(()),
             work,
         )?
@@ -957,7 +952,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.public_source_schemas,
             &schemas,
             invoice,
-            limits.node,
+            None,
             factory,
             work,
         )?
@@ -966,7 +961,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.public_source_schemas,
             &schemas,
             invoice,
-            limits.node,
+            None,
             creator,
             work,
         )?
@@ -975,7 +970,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.public_source_schemas,
             &schemas,
             invoice,
-            limits.node,
+            None,
             work,
         )?
     };
@@ -991,7 +986,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.connector_expressions,
             scan_context,
             invoice,
-            limits.scans,
+            None,
             &mut |_| Ok(()),
             creator,
             work,
@@ -1002,7 +997,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.connector_expressions,
             scan_context,
             invoice,
-            limits.scans,
+            None,
             &mut |_| Ok(()),
             work,
         )?
@@ -1013,40 +1008,42 @@ fn decode_fragment_package_factory_core<
         "read scan node ID is duplicated",
         work,
     )?;
-    let reads = decode_provider_reads_in(
-        &wire_package.read_references,
-        &provider_bindings,
-        &payloads,
-        invoice,
-        limits.reads,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let reads = fund_component(creation.as_deref_mut(), |admit| {
+        Ok(decode_provider_reads_in(
+            &wire_package.read_references,
+            &provider_bindings,
+            &payloads,
+            invoice,
+            None,
+            &mut |facts| admit(facts.allocation_request_bytes_upper_bound),
+            work,
+        )?)
+    })?;
     invoice = invoice.max(reads.retained_invoice_floor_in(work)?);
     let relations = decode_relations_in(
         &wire_package.relations,
         &reads,
         &types,
         invoice,
-        limits.relations,
+        None,
         &mut |_| Ok(()),
         work,
     )?;
     invoice = invoice.max(relations.retained_invoice_floor_in(work)?);
     let (pools, pool_requests) = if let Some(factory) = factory {
-        let prepared = prepare_constant_namespace_with_factory_in(
+        let prepared = prepare_constant_namespace_input_derived_with_factory_in(
             &wire_package.constants,
             &types,
-            invoice,
             types.source_metadata_namespace(),
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             factory,
             &mut |_| Ok(()),
             work,
         )?;
+        if let Some(observe) = constant_records {
+            for (pool, body_bytes) in prepared.checked_record_body_bytes() {
+                observe(pool, body_bytes);
+            }
+        }
         let (pools, facts) =
             prepared.materialize_with_factory_in(factory, &mut |_| Ok(()), work)?;
         (
@@ -1057,15 +1054,10 @@ fn decode_fragment_package_factory_core<
         // No source Fields/constants means no metadata namespace. Every
         // captured source occurrence still requires its original receipt.
         let source_metadata = types.source_metadata_namespace();
-        let prepared = prepare_constant_namespace_with_creator_in(
+        let prepared = prepare_constant_namespace_input_derived_with_creator_in(
             &wire_package.constants,
             &types,
-            invoice,
             source_metadata,
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             creator,
             &mut |_| Ok(()),
             work,
@@ -1076,14 +1068,9 @@ fn decode_fragment_package_factory_core<
             requests,
         )
     } else {
-        let prepared = prepare_constant_namespace_in(
+        let prepared = prepare_constant_namespace_input_derived_in(
             &wire_package.constants,
             &types,
-            invoice,
-            limits.constant_policy,
-            limits.constant_records,
-            limits.constants,
-            &limits.verifier,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1092,14 +1079,13 @@ fn decode_fragment_package_factory_core<
     };
     validate_json_constants_in(&pools, work)?;
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
-    let (requests, request_storage, request_facts) = if let Some(creator) = creation.as_deref_mut()
-    {
+    let (requests, request_storage, _) = if let Some(creator) = creation.as_deref_mut() {
         let prepared = prepare_call_requests_decode_with_creator_in(
             fragment_wire.call_requests.as_ref(),
             CallRequestTypeOwner::Package(&types),
             &pools,
             invoice,
-            limits.requests,
+            None,
             creator,
             work,
         )?;
@@ -1113,7 +1099,7 @@ fn decode_fragment_package_factory_core<
             &types,
             &pools,
             invoice,
-            limits.requests,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1124,12 +1110,15 @@ fn decode_fragment_package_factory_core<
             facts,
         )
     };
-    unit_totals.requests_commit(&request_facts, limits.requests)?;
+
     let (cuts, _) = decode_fragment_cuts_observed(
         cuts_wire,
         &types,
         invoice,
-        limits.cuts,
+        CutsProjectionLimits {
+            node: None,
+            binding: None,
+        },
         &mut |_| Ok(()),
         work,
     )?;
@@ -1138,7 +1127,7 @@ fn decode_fragment_package_factory_core<
         &payloads,
         &types,
         invoice,
-        limits.values,
+        None,
         &mut |_| Ok(()),
         work,
     )?;
@@ -1152,7 +1141,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.function_bindings,
             &types,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1165,7 +1154,7 @@ fn decode_fragment_package_factory_core<
             &wire_package.aggregate_bindings,
             &function_headers,
             aggregate_source,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1173,7 +1162,7 @@ fn decode_fragment_package_factory_core<
         let function_token = prepare_function_bindings_materialization_in(
             &function_headers,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1198,7 +1187,7 @@ fn decode_fragment_package_factory_core<
             &aggregate_headers,
             &functions,
             invoice,
-            limits.bindings,
+            None,
             &mut |_| Ok(()),
             work,
         )?;
@@ -1227,23 +1216,26 @@ fn decode_fragment_package_factory_core<
             wire_package.result.as_ref(),
             &values,
             result_source,
-            limits.node,
+            None,
             &mut |_| Ok(()),
             work,
         )?
         .emit_in(&mut |_| Ok(()), work)?;
         let dispatch = NodeDispatchLimits {
-            node: limits.node,
-            binding: limits.bindings,
-            relation: limits.relations,
-            writer_schema: limits.writer_schema,
+            node: None,
+            binding: None,
+            relation: None,
+            writer_schema: None,
         };
         admit_count(fragment_wire.nodes.len(), plan_limits.fragment_nodes)?;
         let mut nodes = BTreeMap::new();
+        let mut fragment_definitions = 0usize;
         for input in &fragment_wire.nodes {
             let raw_unit = input.expressions.as_ref();
             if let Some(unit) = raw_unit {
-                unit_totals.roots(unit.roots.len())?;
+                super::unit_headers::admit_fragment_roots(&mut unit_roots, unit.roots.len())?;
+                fragment_definitions = add(fragment_definitions, unit.definitions.len())?;
+                admit_count(fragment_definitions, plan_limits.fragment_expressions)?;
             }
             let expressions = decode_expression_definitions_in(
                 crate::physical_expression_v2::ExpressionDefinitionInput::new(
@@ -1256,11 +1248,11 @@ fn decode_fragment_package_factory_core<
                 &parameters,
                 &pools,
                 invoice,
-                limits.expressions,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, false),
+                None,
+                &mut |_| Ok(()),
                 work,
             )?;
-            unit_totals.expressions_commit(expressions.facts(), limits.expressions, false)?;
+
             invoice = invoice.max(expressions.retained_floor_observed(work)?);
             let materialization = prepare_expression_materialization_in(
                 &expressions,
@@ -1268,8 +1260,8 @@ fn decode_fragment_package_factory_core<
                 &aggregates,
                 &plan_limits,
                 invoice,
-                limits.expressions,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
+                None,
+                &mut |_| Ok(()),
                 work,
             )?;
             if let Some(creator) = creation.as_deref_mut() {
@@ -1284,12 +1276,8 @@ fn decode_fragment_package_factory_core<
                     )
                     .map_err(ProjectionFailure::<PackageDecodeError, H>::Host)?;
             }
-            let materialized = materialize_expressions_in(
-                materialization,
-                &mut |facts| unit_totals.expressions_prefix(facts, limits.expressions, true),
-                work,
-            )?;
-            unit_totals.expressions_commit(materialized.facts(), limits.expressions, true)?;
+            let materialized = materialize_expressions_in(materialization, &mut |_| Ok(()), work)?;
+
             invoice = invoice.max(materialized.retained_invoice_floor()?);
             let context = NodeDecodeContext {
                 expressions: &expressions,
@@ -1304,7 +1292,7 @@ fn decode_fragment_package_factory_core<
                 let header_facts = super::unit_headers::decode(
                     raw_unit,
                     invoice,
-                    limits.node,
+                    None,
                     &mut |_| Ok(()),
                     creation.as_deref_mut(),
                     work,
@@ -1326,8 +1314,8 @@ fn decode_fragment_package_factory_core<
                         &definitions,
                         control_wire,
                         invoice,
-                        limits.control,
-                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        None,
+                        &mut |_| Ok(()),
                         creator,
                         factory,
                         work,
@@ -1343,19 +1331,19 @@ fn decode_fragment_package_factory_core<
                         &definitions,
                         control_wire,
                         invoice,
-                        limits.control,
-                        &mut |facts| unit_totals.control_prefix(facts, limits.control),
+                        None,
+                        &mut |_| Ok(()),
                         work,
                     )?
                 };
-                unit_totals.control_commit(&flow_facts, limits.control)?;
+
                 invoice = add(invoice, flow_facts.allocation_request_bytes_upper_bound)?;
                 let (claims, claim_facts) =
                     crate::physical_semantics_v2::decode_expression_claims_in(
                         required(raw_unit.claims.as_ref(), "unit scalar claims are absent")?,
                         invoice,
-                        limits.node,
-                        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
+                        None,
+                        &mut |_| Ok(()),
                         creation.as_deref_mut(),
                         work,
                     )
@@ -1365,7 +1353,7 @@ fn decode_fragment_package_factory_core<
                         }
                         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
                     })?;
-                unit_totals.semantics_commit(&claim_facts, limits.node)?;
+
                 invoice = add(invoice, claim_facts.allocation_request_bytes_upper_bound)?;
                 let (requests, storage, request_facts) =
                     crate::physical_call_requests_v2::decode_unit_requests_in(
@@ -1373,8 +1361,8 @@ fn decode_fragment_package_factory_core<
                         &types,
                         &pools,
                         invoice,
-                        limits.requests,
-                        &mut |facts| unit_totals.requests_prefix(facts, limits.requests),
+                        None,
+                        &mut |_| Ok(()),
                         creation.as_deref_mut(),
                         work,
                     )
@@ -1384,7 +1372,7 @@ fn decode_fragment_package_factory_core<
                         }
                         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
                     })?;
-                unit_totals.requests_commit(&request_facts, limits.requests)?;
+
                 invoice = add(invoice, request_facts.request_bytes_upper_bound)?;
                 let mut ports = Vec::new();
                 ports
@@ -1471,8 +1459,6 @@ fn decode_fragment_package_factory_core<
                         expression_semantic_depth: plan_limits.expression_semantic_depth,
                     },
                     invoice,
-                    limits.node,
-                    &mut unit_totals,
                     creation.as_deref_mut(),
                     factory,
                     work,
@@ -1556,21 +1542,21 @@ fn decode_fragment_package_factory_core<
         plan_limits,
         work,
     )?;
-    let fragment = if let Some(creator) = creation {
+    let fragment = if let Some(creator) = creation.as_deref_mut() {
         fragment.with_call_requests_created_in(requests, request_storage, creator, work)?
     } else {
         fragment.with_call_requests_in(requests, work)?
     };
 
     // L8: components whose membership is the final Fragment.
-    let (calls, call_facts) = crate::physical_semantics_v2::decode_frozen_call_entries_observed(
+    let (calls, _) = crate::physical_semantics_v2::decode_frozen_call_entries_observed(
         calls_wire,
         invoice,
-        limits.node,
-        &mut |facts| unit_totals.semantics_prefix(facts, limits.node),
+        None,
+        &mut |_| Ok(()),
         work,
     )?;
-    unit_totals.semantics_commit(&call_facts, limits.node)?;
+
     let fragment = fragment
         .with_calls_in(calls, &mut |_| Ok(()), work)
         .map_err(SemanticsCodecError::from)?;
@@ -1578,16 +1564,17 @@ fn decode_fragment_package_factory_core<
         fragment.id(),
         pruning_wire,
         invoice,
-        limits.node,
+        None,
         &mut |_| Ok(()),
         work,
     )?;
 
     // L9: the original checked Package constructor on this same scope.
-    let package = p::FragmentPackage::try_new_in(
+    let mut original_host = None;
+    let mut admitted = 0;
+    let package = p::FragmentPackage::try_new_input_derived_in(
         p::FragmentPackageInput {
             constants: pools,
-            statement_constant_policy,
             version: metadata.version,
             required: metadata.required,
             fragment,
@@ -1600,10 +1587,26 @@ fn decode_fragment_package_factory_core<
             annotations: metadata.annotations,
             layouts,
         },
-        limits.admission,
-        &mut |_| Ok(()),
+        plan_limits,
+        invoice,
+        &mut |facts| {
+            let requested = facts.allocation_request_bytes_upper_bound;
+            if let Some(creator) = creation.as_deref_mut()
+                && requested > admitted
+                && let Err(error) = creator.observe_opaque_upper_bound(requested - admitted)
+            {
+                original_host = Some(error);
+                return Err(CompileControlError::ResourceExhausted);
+            }
+            admitted = admitted.max(requested);
+            Ok(())
+        },
         work,
-    )?;
+    );
+    if let Some(error) = original_host {
+        return Err(ProjectionFailure::Host(error));
+    }
+    let package = package?;
     Ok(match types.source_metadata_namespace() {
         Some(namespace) => package.with_original_metadata_namespace(namespace.clone()),
         None => package,

@@ -995,8 +995,7 @@ pub(crate) async fn run_actual_statistics_case(case: StatisticsRecipeCase) {
     )
     .unwrap();
     let carrier = crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-        novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+        novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
     );
     let compile = novarocks_sql::compiler::SqlCompileControl::unbounded();
     let (description, plan, recipe_root) =

@@ -29,9 +29,9 @@ use novarocks_execution::{
 };
 use novarocks_expression_contract::{BoundFunction, LegacyBindingMetadata, PhysicalCallRequest};
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder,
-    FunctionBindingRequest, FunctionKind, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
+    CallArgumentUses, CallEffectInput, EngineFunctionCatalogBuilder, FunctionBindingRequest,
+    FunctionKind, FunctionResultType, InstalledPureKernel, PureCallPreparation,
+    PureEngineFunctionCatalog, ScopedRelationalEffects, WindowCallOptions,
 };
 use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
@@ -46,10 +46,7 @@ use novarocks_native_adapter::backend_task_execution::{
 };
 use novarocks_physical_plan::*;
 use novarocks_plan_codec::{
-    physical_package_v2::{
-        encode_fragment_package,
-        test_support::{decode_limits, encode_limits},
-    },
+    physical_package_v2::{encode_fragment_package, test_support::decode_limits},
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
 use novarocks_type_contract::*;
@@ -82,20 +79,6 @@ fn binding(bytes: u64) -> QueryMemoryBinding {
         account,
     )
     .unwrap()
-}
-fn constants() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
 }
 
 fn functions() -> PureEngineFunctionCatalog {
@@ -138,7 +121,6 @@ fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
         decode_limits(),
         Arc::new(functions()),
         Arc::new(providers),
-        constants(),
     )
 }
 fn bigint() -> FunctionValueType {
@@ -277,7 +259,6 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: constants(),
                 },
             )],
             &Control,
@@ -347,7 +328,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            statement_constant_policy: constants(),
+
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -369,7 +350,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         &Control,
     )
     .unwrap();
-    encode_fragment_package(&package, &encode_limits(), &Control)
+    encode_fragment_package(&package, &Control)
         .unwrap()
         .encode_to_vec()
 }

@@ -29,7 +29,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use novarocks_constant_contract::{ConstantPolicy, ConstantPools, ConstantValue};
+use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression_contract::{
     BinaryOperator, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope,
     UnitLimits, ValueId,
@@ -45,18 +45,20 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-const POLICY: ConstantPolicy = ConstantPolicy {
-    max_rows: 64,
-    max_array_nodes: 1024,
-    max_logical_elements: 4096,
-    max_retained_buffer_bytes: 1 << 20,
-    max_type_depth: 64,
-    max_type_nodes: 4096,
-    max_dictionary_depth: 64,
-    max_metadata_bytes: 1 << 20,
-    max_library_validation_work: 1 << 20,
-    max_library_validation_bytes: 1 << 20,
-};
+const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidation::bounded(
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 64,
+        max_array_nodes: 1024,
+        max_logical_elements: 4096,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    },
+);
 const OUTPUT_NULL: DecimalOverflowPolicy = DecimalOverflowPolicy::OutputNull;
 const ALLOW_THROW: SemanticParameterRef = SemanticParameterRef {
     id: SemanticParameterId::new(0),
@@ -320,14 +322,7 @@ pub fn fixture(shape: FilterShape) -> Fixture {
     .unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(
-        &mut draft,
-        &catalog,
-        &constants,
-        &parameters,
-        POLICY,
-        &mut work,
-    );
+    declare_call_controls(&mut draft, &catalog, &constants, &parameters, &mut work);
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         &catalog,
@@ -335,7 +330,6 @@ pub fn fixture(shape: FilterShape) -> Fixture {
         &authors,
         &constants,
         &parameters,
-        POLICY,
         &mut work,
     );
     work.finish().unwrap();

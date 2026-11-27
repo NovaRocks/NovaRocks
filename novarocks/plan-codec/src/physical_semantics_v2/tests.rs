@@ -85,7 +85,6 @@ fn input() -> FragmentPackageInput {
         .unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     FragmentPackageInput {
-        statement_constant_policy: crate::test_constants::policy(),
         version: PlanVersionId::try_new([1; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,

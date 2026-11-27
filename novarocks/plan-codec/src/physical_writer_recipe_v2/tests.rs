@@ -273,7 +273,7 @@ fn encode_run(
     recipes: &[c::ConnectorWriteRecipeDraft],
     ids: &[Vec<u32>],
     stop: Option<(usize, CompileControlError)>,
-    l: WriterRecipeProjectionLimits,
+    l: impl Into<Option<WriterRecipeProjectionLimits>>,
 ) -> Run<wire::FrozenWriterRecipe> {
     encode_with_views(recipes, ids, ids, stop, l)
 }
@@ -282,7 +282,7 @@ fn encode_with_views(
     ids: &[Vec<u32>],
     views: &[Vec<u32>],
     stop: Option<(usize, CompileControlError)>,
-    l: WriterRecipeProjectionLimits,
+    l: impl Into<Option<WriterRecipeProjectionLimits>>,
 ) -> Run<wire::FrozenWriterRecipe> {
     let control = Control::default();
     let out = with_encoded(recipes, ids, &control, |context| {
@@ -383,7 +383,7 @@ fn raw_with_nodes(
 fn decode_run(
     raw: &Raw,
     stop: Option<(usize, CompileControlError)>,
-    l: WriterRecipeProjectionLimits,
+    l: impl Into<Option<WriterRecipeProjectionLimits>>,
     read_only: bool,
 ) -> Run<(NodeId, c::ConnectorWriteRecipeDraft)> {
     let control = Control::default();
@@ -1080,7 +1080,6 @@ fn source_invoice_and_original_control_loans_remain_explicit() {
 // and cumulative fields from two writers, with independent token identities.
 #[test]
 fn production_writer_policy_round_trips_wide_and_cumulative_field_tokens() {
-    use crate::physical_package_v2::{PackageDecodeLimits, PackageEncodeLimits};
     for widths in [&[1024usize][..], &[512usize, 512][..]] {
         let mut ordinal = 0u32;
         let mut ids = Vec::new();
@@ -1107,16 +1106,14 @@ fn production_writer_policy_round_trips_wide_and_cumulative_field_tokens() {
                 draft(c::ConnectorWriteInputShape::Data { fields })
             })
             .collect::<Vec<_>>();
-        let encode = PackageEncodeLimits::FROZEN.writers;
-        let decode = PackageDecodeLimits::FROZEN.writers;
-        let (encoded, _) = encode_run(&recipes, &ids, None, encode);
+        let (encoded, _) = encode_run(&recipes, &ids, None, None);
         let (encoded, facts) = encoded.unwrap();
         assert_eq!(facts.recipe_count, widths.len());
         assert_eq!(facts.input_field_count, 1024);
         assert_eq!(facts.token_bytes, 32768);
         let raw = raw(&recipes, &ids);
         assert_eq!(encoded, raw.package.writes);
-        let (decoded, _) = decode_run(&raw, None, decode, false);
+        let (decoded, _) = decode_run(&raw, None, None, false);
         let (decoded, decoded_facts) = decoded.unwrap();
         assert_eq!(decoded.len(), widths.len());
         assert_eq!(decoded_facts.recipe_count, widths.len());
@@ -1137,11 +1134,11 @@ fn production_writer_policy_round_trips_wide_and_cumulative_field_tokens() {
         }
         let finite_encode = WriterRecipeProjectionLimits {
             max_token_bytes: 32000,
-            ..encode
+            ..limits()
         };
         let finite_decode = WriterRecipeProjectionLimits {
             max_token_bytes: 32000,
-            ..decode
+            ..limits()
         };
         assert!(matches!(
             encode_run(&recipes, &ids, None, finite_encode).0,

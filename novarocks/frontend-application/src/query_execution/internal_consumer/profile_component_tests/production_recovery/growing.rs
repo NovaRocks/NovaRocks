@@ -33,7 +33,7 @@ pub(super) fn description(
     };
     let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
     let version = p::PlanVersionId::try_new([0xa4; 16]).unwrap();
-    let mut plan = p::PlanBuilder::new(version, crate::application::test_constant_policy());
+    let mut plan = p::PlanBuilder::new(version);
     let edge = plan.reserve_edge_id().unwrap();
     let leaf_id = p::FragmentId::new(1);
     let root_id = p::FragmentId::new(2);

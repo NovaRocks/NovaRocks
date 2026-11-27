@@ -2076,7 +2076,7 @@ mod conditional_compiled_selection {
     use novarocks_connector_contract::PureProviderProgramCatalog;
     use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_functions::{
-        ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+        ConstantValidation, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
         PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
     };
     use novarocks_local_compiler::{
@@ -2246,8 +2246,7 @@ mod conditional_compiled_selection {
                     required: RequiredContracts::default(),
                     constants,
                     fragment,
-                    statement_constant_policy:
-                        crate::exec::operators::family_fixture::constant_policy(),
+
                     pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                         .unwrap(),
                     cuts: FragmentCuts::default(),
@@ -2278,7 +2277,7 @@ mod conditional_compiled_selection {
         );
         compile_checked(
             package,
-            ConstantPolicy {
+            novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
                 max_rows: 16,
                 max_array_nodes: 128,
                 max_logical_elements: 1024,
@@ -2289,13 +2288,13 @@ mod conditional_compiled_selection {
                 max_metadata_bytes: 1 << 20,
                 max_library_validation_work: 1 << 20,
                 max_library_validation_bytes: 1 << 20,
-            },
+            }),
         )
     }
 
     pub(super) fn compile_checked(
         package: Arc<FragmentPackage>,
-        constants: ConstantPolicy,
+        constants: ConstantValidation,
     ) -> Arc<LocalProgram> {
         let providers =
             PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)

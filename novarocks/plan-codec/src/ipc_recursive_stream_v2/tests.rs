@@ -697,3 +697,73 @@ fn recursive_request_count_includes_body_repair_and_empty_offset_payload_request
             + 3
     );
 }
+
+#[test]
+fn input_derived_recursive_reader_rejects_wrong_field_nodes_before_scratch_request() {
+    use crate::ipc_flat_stream_v2::progress::{Admission, IpcReaderProgressFacts};
+
+    let field = Field::new(
+        "root",
+        DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, true))].into()),
+        true,
+    );
+    let node = |rows, nulls| ipc::FieldNode::new(rows, nulls);
+    for (nodes, expected) in [
+        (vec![node(1, 0)], "recursive IPC FieldNode is missing"),
+        (
+            vec![node(1, 0), node(0, 0)],
+            "recursive IPC Struct child length differs from parent",
+        ),
+        (
+            vec![node(1, 0), node(1, 2)],
+            "recursive IPC node NULL count exceeds its rows",
+        ),
+        (
+            vec![node(1, 0), node(1, 0), node(1, 0)],
+            "recursive IPC batch has extra FieldNodes",
+        ),
+    ] {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let nodes = builder.create_vector(&nodes);
+        let buffers = builder.create_vector::<ipc::Buffer>(&[]);
+        let batch = ipc::RecordBatch::create(
+            &mut builder,
+            &ipc::RecordBatchArgs {
+                length: 1,
+                nodes: Some(nodes),
+                buffers: Some(buffers),
+                ..Default::default()
+            },
+        );
+        let message = ipc::Message::create(
+            &mut builder,
+            &ipc::MessageArgs {
+                version: ipc::MetadataVersion::V5,
+                header_type: ipc::MessageHeader::RecordBatch,
+                header: Some(batch.as_union_value()),
+                ..Default::default()
+            },
+        );
+        ipc::finish_message_buffer(&mut builder, message);
+        let bytes = builder.finished_data();
+        let stripped = ipc::root_as_message(bytes).unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let mut observe = |_: &IpcReaderProgressFacts| Ok::<(), TypeCodecError>(());
+        let mut request = |_| -> Result<(), TypeCodecError> {
+            panic!("FieldNode shape must be rejected before geometry allocation");
+        };
+        let mut admission =
+            Admission::new(bytes.len(), &mut observe).with_construction(Some(&mut request));
+        let result =
+            crate::ipc_recursive_batch_v2::preflight_verified_recursive_record_batch_profile(
+                stripped,
+                &[],
+                &field,
+                None,
+                Some(&mut admission),
+                &mut work,
+            );
+        assert!(matches!(result, Err(TypeCodecError::InvalidShape(actual)) if actual == expected));
+    }
+}

@@ -886,7 +886,7 @@ pub struct FrontendApplicationHost {
     mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
     mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
     required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
     session_properties:
@@ -1087,7 +1087,7 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     /// The one static carrier every completed plan of this process is frozen
     /// into. It travels with the function catalog to every owner that
     /// encodes a plan, and is never chosen per statement.
@@ -1157,7 +1157,7 @@ impl FrontendExecutionConfig {
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
         required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
         session_properties: Arc<
@@ -1223,7 +1223,7 @@ impl FrontendExecutionConfig {
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-        constant_policy: novarocks_functions::ConstantPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
     ) -> Self {
         Self::new(
             runtime_filter_worker_count,
@@ -1232,8 +1232,7 @@ impl FrontendExecutionConfig {
             FrontendLogicalExecutionRuntimeConfig::for_test(),
             constant_policy,
             crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
             Arc::new(
                 crate::query_execution::required_constant_eval::test_required_constant_interpreter(
@@ -1286,7 +1285,7 @@ impl FrontendExecutionConfig {
         Arc::clone(&self.function_catalog)
     }
 
-    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 
@@ -2276,7 +2275,7 @@ impl FrontendApplicationHost {
 
     /// The immutable deployment profile used by every FE constant author.
     /// This is an admission ceiling, not a memory allocation capability.
-    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
 
@@ -2884,8 +2883,8 @@ impl FrontendApplicationHost {
 
 /// Finite constant admission used only by explicit Frontend unit fixtures.
 #[cfg(test)]
-pub(crate) fn test_constant_policy() -> novarocks_functions::ConstantPolicy {
-    novarocks_functions::ConstantPolicy {
+pub(crate) fn test_constant_policy() -> novarocks_functions::ConstantValidation {
+    novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
         max_rows: 1 << 20,
         max_array_nodes: 1 << 20,
         max_logical_elements: 1 << 24,
@@ -2896,7 +2895,7 @@ pub(crate) fn test_constant_policy() -> novarocks_functions::ConstantPolicy {
         max_metadata_bytes: 1 << 20,
         max_library_validation_work: 1 << 30,
         max_library_validation_bytes: 1 << 32,
-    }
+    })
 }
 
 #[cfg(test)]

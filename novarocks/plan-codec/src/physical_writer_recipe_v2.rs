@@ -295,7 +295,7 @@ impl Model {
     fn combined(
         &self,
         current: &WriterOwnedResourceFacts,
-        limits: WriterRecipeProjectionLimits,
+        limits: Option<WriterRecipeProjectionLimits>,
     ) -> Result<WriterRecipeProjectionFacts, CompileControlError> {
         let mut f = self.facts;
         f.allocation_requests_upper_bound = add(
@@ -317,22 +317,23 @@ impl Model {
         // and this leaf's live temporary FieldRef view. Add requests only.
         f.coexisting_source_and_request_bytes_upper_bound =
             add(self.source, f.allocation_request_bytes_upper_bound)?;
-        if f.recipe_count > limits.max_recipes
-            || f.input_field_count > limits.max_input_fields
-            || f.token_bytes > limits.max_token_bytes
-            || f.allocation_requests_upper_bound > limits.max_allocation_requests
-            || f.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || f.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || f.cumulative_work_upper_bound > limits.max_work
-        {
+        if limits.is_some_and(|limits| {
+            f.recipe_count > limits.max_recipes
+                || f.input_field_count > limits.max_input_fields
+                || f.token_bytes > limits.max_token_bytes
+                || f.allocation_requests_upper_bound > limits.max_allocation_requests
+                || f.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || f.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || f.cumulative_work_upper_bound > limits.max_work
+        }) {
             return Err(CompileControlError::ResourceExhausted);
         }
         Ok(f)
     }
     fn gate(
         &self,
-        limits: WriterRecipeProjectionLimits,
+        limits: Option<WriterRecipeProjectionLimits>,
         admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
     ) -> Result<(), E> {
         admit(&self.combined(&Default::default(), limits)?)?;
@@ -614,9 +615,10 @@ pub(crate) fn encode_write_layouts_in(
     bindings: &EncodedProviderBindings<'_, '_>,
     payloads: &EncodedConnectorPayloads<'_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: impl Into<Option<WriterRecipeProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Vec<wire::FrozenWriteLayoutRecipe>, usize), E> {
+    let limits = limits.into();
     let mut model = Model::new::<wire::FrozenWriteLayoutRecipe>(sources.len(), source)?;
     for recipe in sources.values() {
         let count = recipe.inputs().len();
@@ -653,7 +655,7 @@ pub(crate) fn decode_write_layouts_in(
     bindings: &DecodedProviderBindings<'_, '_>,
     payloads: &DecodedConnectorPayloads<'_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: impl Into<Option<WriterRecipeProjectionLimits>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
     (
@@ -662,6 +664,7 @@ pub(crate) fn decode_write_layouts_in(
     ),
     E,
 > {
+    let limits = limits.into();
     let recipe = match sources {
         [] => return Ok((std::collections::BTreeMap::new(), source)),
         [recipe] => recipe,
@@ -732,10 +735,11 @@ pub fn encode_writer_recipes_observed(
     sources: &[WriterRecipeSource<'_>],
     context: WriterRecipeEncodeContext<'_, '_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: impl Into<Option<WriterRecipeProjectionLimits>>,
     admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Vec<wire::FrozenWriterRecipe>, WriterRecipeProjectionFacts), E> {
+    let limits = limits.into();
     let mut model = Model::new::<wire::FrozenWriterRecipe>(sources.len(), source)?;
     model.gate(limits, admit)?;
     observed(
@@ -924,7 +928,7 @@ pub fn decode_writer_recipes_observed(
     definitions: &[wire::FrozenWriterRecipe],
     context: WriterRecipeDecodeContext<'_, '_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: impl Into<Option<WriterRecipeProjectionLimits>>,
     admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
@@ -934,6 +938,7 @@ pub fn decode_writer_recipes_observed(
     ),
     E,
 > {
+    let limits = limits.into();
     let decoded = decode_writer_recipes_core::<
         std::convert::Infallible,
         crate::value_type_table::resources::NoFactory,
@@ -948,11 +953,12 @@ pub(crate) fn decode_writer_recipes_with_factory_in<H, F: ValueSchemaCreationFac
     definitions: &[wire::FrozenWriterRecipe],
     context: WriterRecipeDecodeContext<'_, '_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: impl Into<Option<WriterRecipeProjectionLimits>>,
     factory: &F,
     admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<CreatedWriterRecipes, Failure<H>> {
+    let limits = limits.into();
     decode_writer_recipes_core(
         definitions,
         context,
@@ -982,7 +988,7 @@ fn decode_writer_recipes_core<H, F: ValueSchemaCreationFactory<H>>(
     definitions: &[wire::FrozenWriterRecipe],
     context: WriterRecipeDecodeContext<'_, '_, '_>,
     source: usize,
-    limits: WriterRecipeProjectionLimits,
+    limits: Option<WriterRecipeProjectionLimits>,
     factory: Option<&F>,
     admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
@@ -1330,7 +1336,7 @@ mod resource_tests {
         model
             .request(array::<ConnectorWriteFieldRef<'_>>(3).unwrap(), 1)
             .unwrap();
-        let base = model.combined(&Default::default(), limits()).unwrap();
+        let base = model.combined(&Default::default(), Some(limits())).unwrap();
         let first = WriterOwnedResourceFacts {
             source_retained_bytes: 5000,
             source_floor: 1024,
@@ -1339,7 +1345,7 @@ mod resource_tests {
             coexistence_bytes: 5128,
             work_units: 64,
         };
-        let first_facts = model.combined(&first, limits()).unwrap();
+        let first_facts = model.combined(&first, Some(limits())).unwrap();
         assert_eq!(
             first_facts.allocation_requests_upper_bound,
             base.allocation_requests_upper_bound + 4
@@ -1348,10 +1354,10 @@ mod resource_tests {
             first_facts.coexisting_source_and_request_bytes_upper_bound,
             4096 + base.allocation_request_bytes_upper_bound + 128
         );
-        assert_eq!(model.combined(&first, limits()).unwrap(), first_facts);
+        assert_eq!(model.combined(&first, Some(limits())).unwrap(), first_facts);
         model.complete(first).unwrap();
         assert_eq!(
-            model.combined(&Default::default(), limits()).unwrap(),
+            model.combined(&Default::default(), Some(limits())).unwrap(),
             first_facts
         );
         let second = WriterOwnedResourceFacts {
@@ -1361,7 +1367,7 @@ mod resource_tests {
             work_units: 9,
             ..Default::default()
         };
-        let final_facts = model.combined(&second, limits()).unwrap();
+        let final_facts = model.combined(&second, Some(limits())).unwrap();
         assert_eq!(
             final_facts.allocation_request_bytes_upper_bound,
             base.allocation_request_bytes_upper_bound + 160
@@ -1383,7 +1389,7 @@ mod resource_tests {
         model
             .request(array::<ConnectorWriteFieldRef<'_>>(3).unwrap(), 1)
             .unwrap();
-        let f = model.combined(&Default::default(), limits()).unwrap();
+        let f = model.combined(&Default::default(), Some(limits())).unwrap();
         assert_eq!(f.recipe_count, 2);
         assert_eq!(f.input_field_count, 3);
         assert_eq!(f.token_bytes, 96);
@@ -1406,7 +1412,7 @@ mod resource_tests {
         };
         let mut calls = 0;
         model
-            .gate(exact, &mut |actual| {
+            .gate(Some(exact), &mut |actual| {
                 calls += 1;
                 assert_eq!(*actual, f);
                 Ok(())
@@ -1424,7 +1430,7 @@ mod resource_tests {
                 _ => under.max_work -= 1,
             }
             assert!(matches!(
-                model.gate(under, &mut |_| {
+                model.gate(Some(under), &mut |_| {
                     calls += 1;
                     Ok(())
                 }),
@@ -1481,7 +1487,7 @@ mod resource_tests {
             let mut cap = limits();
             cap.max_token_bytes = 320 * 32 - 1;
             assert!(matches!(
-                model.gate(cap, &mut |_| Ok(())),
+                model.gate(Some(cap), &mut |_| Ok(())),
                 Err(E::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(*control.trace.lock().unwrap(), vec![0]);

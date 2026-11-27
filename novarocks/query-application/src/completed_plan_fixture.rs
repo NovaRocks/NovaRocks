@@ -119,10 +119,7 @@ pub(crate) fn completed_noop_plan(version: [u8; 16]) -> CompletedPlanWithAccess<
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("no-op fragment");
-    let mut builder = PlanBuilder::new(
-        PlanVersionId::try_new(version).expect("plan version"),
-        test_constant_policy(),
-    );
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
     builder.add_fragment(fragment).expect("one fragment");
     let candidate = CompletedPhysicalPlanCandidate::for_program(
         builder.finish().expect("plan"),
@@ -220,10 +217,7 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("scan fragment");
-    let mut builder = PlanBuilder::new(
-        PlanVersionId::try_new(version).expect("plan version"),
-        test_constant_policy(),
-    );
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
     builder.add_fragment(fragment).expect("one fragment");
     CompletedPhysicalPlanCandidate::for_program(
         builder.finish().expect("scan plan"),
@@ -250,19 +244,21 @@ fn query_scope() -> (RootWork, WorkScope) {
     (root, scope)
 }
 
-pub(crate) fn test_constant_policy() -> novarocks_sql::compiler::ConstantPolicy {
-    novarocks_sql::compiler::ConstantPolicy {
-        max_rows: 1 << 20,
-        max_array_nodes: 1 << 20,
-        max_logical_elements: 1 << 24,
-        max_retained_buffer_bytes: 1 << 30,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 30,
-        max_library_validation_bytes: 1 << 32,
-    }
+pub(crate) fn test_constant_policy() -> novarocks_sql::compiler::ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1 << 20,
+            max_array_nodes: 1 << 20,
+            max_logical_elements: 1 << 24,
+            max_retained_buffer_bytes: 1 << 30,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 30,
+            max_library_validation_bytes: 1 << 32,
+        },
+    )
 }
 
 /// Parse one owned query before handing test syntax to the compiler.

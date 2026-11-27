@@ -4629,8 +4629,7 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(version, crate::test_constants::policy())
-            .with_constant_pools(constants);
+        let mut plan = PlanBuilder::new(version).with_constant_pools(constants);
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,

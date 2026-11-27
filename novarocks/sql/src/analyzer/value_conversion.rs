@@ -97,7 +97,7 @@ pub(super) fn cast_with_trino_mode(
     mode: novarocks_type_contract::TrinoCastMode,
     span: Span,
     finalizer: &BindingFinalizer<'_>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;
     use novarocks_functions::{CastPrepareError, PreparedCastRecipe};
@@ -163,7 +163,7 @@ pub(super) fn cast_to_value_type(
     target: FunctionValueType,
     span: Span,
     finalizer: &BindingFinalizer<'_>,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;
     super::helpers::validate_value_type(&source.value_type, control)?;
@@ -241,7 +241,7 @@ pub(super) fn coerce_array_common_argument(
     finalizer: &BindingFinalizer<'_>,
     source: TypedExpr,
     target: &FunctionValueType,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;
@@ -298,7 +298,7 @@ pub(super) fn convert_value_domain(
     finalizer: &BindingFinalizer<'_>,
     source: TypedExpr,
     target: FunctionValueType,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     span: Span,
 ) -> Result<TypedExpr, AnalyzeError> {
     let control = finalizer.control;
@@ -376,7 +376,7 @@ pub(super) fn convert_value_domain(
 /// syntax shape until their admitted construction boundary.
 pub(super) fn constant_is_null(
     source: &TypedExpr,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<bool, AnalyzeError> {
     match &source.kind {
@@ -397,7 +397,7 @@ pub(super) fn constant_is_null(
 fn typed_null_conversion(
     source: TypedExpr,
     mut target: FunctionValueType,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     target = target
@@ -440,7 +440,7 @@ pub(super) fn convert_value_domain_with_catalog(
     source: TypedExpr,
     target: FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let finalizer = BindingFinalizer::ordinary(catalog, decimal_overflow_policy, control);

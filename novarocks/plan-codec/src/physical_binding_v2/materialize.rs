@@ -206,7 +206,7 @@ pub(crate) struct Model<'parent> {
 /// Only the sole Node model authors the composed axes and work formula.
 struct NodeAdmission<'parent> {
     base: resources::Model,
-    limits: resources::NodeProjectionLimits,
+    limits: Option<resources::NodeProjectionLimits>,
     values: usize,
     peak: usize,
     admit: Option<&'parent mut resources::NodeAdmit<'parent>>,
@@ -216,7 +216,7 @@ impl NodeAdmission<'_> {
         &self,
         base: resources::Model,
         values: usize,
-        limits: resources::NodeProjectionLimits,
+        limits: Option<resources::NodeProjectionLimits>,
     ) -> bool {
         let counts = |model: resources::Model| {
             [
@@ -228,24 +228,8 @@ impl NodeAdmission<'_> {
                 model.delegated_work,
             ]
         };
-        let envelope = |l: resources::NodeProjectionLimits| {
-            [
-                l.max_input_nodes,
-                l.max_value_references,
-                l.max_list_items,
-                l.max_allocation_requests,
-                l.max_allocation_request_bytes,
-                l.max_coexisting_source_and_request_bytes,
-                l.max_work,
-                l.properties.max_value_references,
-                l.properties.max_allocation_requests,
-                l.properties.max_allocation_request_bytes,
-                l.properties.max_coexisting_source_and_request_bytes,
-                l.properties.max_work,
-            ]
-        };
         self.values == values
-            && envelope(self.limits) == envelope(limits)
+            && self.limits == limits
             && counts(base)
                 .into_iter()
                 .zip(counts(self.base))
@@ -323,9 +307,10 @@ impl<'parent> Model<'parent> {
         &mut self,
         base: resources::Model,
         values: usize,
-        node_limits: resources::NodeProjectionLimits,
-        binding_limits: BindingProjectionLimits,
+        node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
+        binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
     ) -> Result<(), Error> {
+        let node_limits = node_limits.into();
         if self
             .node_admission
             .as_ref()
@@ -356,8 +341,8 @@ impl<'parent> Model<'parent> {
         &mut self,
         base: resources::Model,
         values: usize,
-        node_limits: resources::NodeProjectionLimits,
-        binding_limits: BindingProjectionLimits,
+        node_limits: impl Into<Option<resources::NodeProjectionLimits>>,
+        binding_limits: impl Into<Option<BindingProjectionLimits>> + Copy,
         admit: &'parent mut resources::NodeAdmit<'parent>,
     ) -> Result<(), Error> {
         if self
@@ -412,7 +397,14 @@ impl<'parent> Model<'parent> {
     fn node_projection_model(
         &mut self,
         work_ceiling: usize,
-    ) -> Result<(resources::Model, usize, resources::NodeProjectionLimits), Error> {
+    ) -> Result<
+        (
+            resources::Model,
+            usize,
+            Option<resources::NodeProjectionLimits>,
+        ),
+        Error,
+    > {
         let parent = self
             .node_admission
             .as_mut()
@@ -457,30 +449,38 @@ impl<'parent> Model<'parent> {
     }
     pub(crate) fn check_admitted(
         &mut self,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut super::owner_admission::Admit<'_>,
     ) -> Result<(), Error> {
         self.check(limits)?;
         admit(&self.facts)?;
         Ok(())
     }
-    pub(crate) fn check(&mut self, limits: BindingProjectionLimits) -> Result<(), Error> {
-        cap(self.facts.definition_count, limits.max_definitions)?;
-        cap(self.facts.type_reference_count, limits.max_type_references)?;
-        cap(
-            self.facts.request_bytes_upper_bound,
-            limits.max_request_bytes,
-        )?;
-        cap(
-            self.facts.allocation_requests_upper_bound,
-            limits.max_allocation_requests,
-        )?;
+    pub(crate) fn check(
+        &mut self,
+        limits: impl Into<Option<BindingProjectionLimits>>,
+    ) -> Result<(), Error> {
+        let limits = limits.into();
+        if let Some(limits) = limits {
+            cap(self.facts.definition_count, limits.max_definitions)?;
+            cap(self.facts.type_reference_count, limits.max_type_references)?;
+            cap(
+                self.facts.request_bytes_upper_bound,
+                limits.max_request_bytes,
+            )?;
+            cap(
+                self.facts.allocation_requests_upper_bound,
+                limits.max_allocation_requests,
+            )?;
+        }
         self.facts.coexisting_source_and_request_bytes_upper_bound =
             add(self.source, self.facts.request_bytes_upper_bound)?;
-        cap(
-            self.facts.coexisting_source_and_request_bytes_upper_bound,
-            limits.max_coexisting_source_and_request_bytes,
-        )?;
+        if let Some(limits) = limits {
+            cap(
+                self.facts.coexisting_source_and_request_bytes_upper_bound,
+                limits.max_coexisting_source_and_request_bytes,
+            )?;
+        }
         // The sole clone grammar's maximum admits its preflight before that
         // bounded traversal. Keep the conservative ceiling in final facts so
         // exact-envelope replay cannot rely on an unreported early ceiling.
@@ -498,7 +498,9 @@ impl<'parent> Model<'parent> {
                 )?,
             )?,
         )?;
-        cap(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        if let Some(limits) = limits {
+            cap(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        }
         if let Some(parent) = &mut self.node_admission {
             parent.check(self.items, self.facts, self.source)?;
         }
@@ -538,7 +540,7 @@ fn count_clone(
     types: &DecodedTypeTable,
     id: u32,
     model: &mut Model,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     observed: bool,
     admit: &mut super::owner_admission::Admit<'_>,
     w: &mut CompileCheckpoints<'_>,
@@ -568,9 +570,10 @@ impl Model<'_> {
     pub(crate) fn count_owned_type_clone(
         &mut self,
         source: &FunctionValueType,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let limits = limits.into();
         self.check(limits)?;
         w.flush()?;
         let clone = preflight_value_type_clone(source, w)?;
@@ -596,13 +599,13 @@ impl Model<'_> {
     pub(crate) fn count_owned_type_clone_admitted(
         &mut self,
         source: &FunctionValueType,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut impl FnMut(&resources::NodeProjectionFacts) -> Result<(), CompileControlError>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         self.count_owned_type_clone_core(
             source,
-            limits,
+            limits.into(),
             &mut |model| {
                 admit(&model.node_numerical_facts(model.node_work_peak())?)?;
                 Ok(())
@@ -614,13 +617,13 @@ impl Model<'_> {
     pub(crate) fn count_owned_type_clone_in(
         &mut self,
         source: &FunctionValueType,
-        limits: BindingProjectionLimits,
+        limits: impl Into<Option<BindingProjectionLimits>>,
         admit: &mut super::owner_admission::Admit<'_>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         self.count_owned_type_clone_core(
             source,
-            limits,
+            limits.into(),
             &mut |model| {
                 admit(&model.facts)?;
                 Ok(())
@@ -631,7 +634,7 @@ impl Model<'_> {
     fn count_owned_type_clone_core(
         &mut self,
         source: &FunctionValueType,
-        limits: BindingProjectionLimits,
+        limits: Option<BindingProjectionLimits>,
         admit: &mut impl FnMut(&mut Self) -> Result<(), Error>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
@@ -680,7 +683,7 @@ impl Model<'_> {
 fn preflight(
     headers: &PreparedFunctionBindingHeaders<'_>,
     mut model: Model,
-    limits: BindingProjectionLimits,
+    limits: Option<BindingProjectionLimits>,
     observed: bool,
     admit: &mut super::owner_admission::Admit<'_>,
     w: &mut CompileCheckpoints<'_>,
@@ -859,7 +862,7 @@ pub fn prepare_function_bindings_materialization<'loan, 'source>(
     let result = (|| {
         let mut model = Model::new(headers, source_retained_bytes)?;
         model.request::<(u32, MaterializedFunctionBinding)>(headers.as_wire().len(), 2)?;
-        preflight(headers, model, limits, false, &mut |_| Ok(()), &mut w)
+        preflight(headers, model, Some(limits), false, &mut |_| Ok(()), &mut w)
     })()
     .map(
         |(facts, retained_bytes)| PreparedFunctionBindingsMaterialization {
@@ -1035,13 +1038,16 @@ fn materialize_definition_in<H>(
 }
 
 /// Original preparation with growing binding facts and no scope entry/footer.
+/// Passing None derives the checked prefix amounts from the original headers
+/// and exact type namespace, with admission supplied by the caller.
 pub fn prepare_function_bindings_materialization_in<'loan, 'source>(
     headers: &'loan PreparedFunctionBindingHeaders<'source>,
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedFunctionBindingsMaterialization<'loan, 'source>, Error> {
+    let limits = limits.into();
     // Pure initial geometry wins before the first identity observation.
     let mut model = Model::new(headers, source_retained_bytes)?;
     model.request::<(u32, MaterializedFunctionBinding)>(headers.as_wire().len(), 2)?;

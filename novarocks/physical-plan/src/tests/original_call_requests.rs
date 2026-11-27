@@ -20,26 +20,10 @@
 //! binding; nothing is recovered from selected results, names or occurrences.
 
 use crate::{
-    ConstantPolicy, Fragment, FrozenCallError, FunctionArgumentType, PhysicalCallBinding,
-    PhysicalCallRequest, StaticFunctionArgument,
+    Fragment, FrozenCallError, FunctionArgumentType, PhysicalCallBinding, PhysicalCallRequest,
+    StaticFunctionArgument,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
-
-/// Source admission facts for fixture requests, not a production default.
-fn fixture_constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 32,
-        max_logical_elements: 128,
-        max_retained_buffer_bytes: 64 * 1024,
-        max_type_depth: 16,
-        max_type_nodes: 128,
-        max_dictionary_depth: 8,
-        max_metadata_bytes: 4096,
-        max_library_validation_work: 1_000_000,
-        max_library_validation_bytes: 1_000_000,
-    }
-}
 
 /// Attach one original request per relational call site of `fragment`, keeping
 /// any expression requests it already carries.
@@ -100,7 +84,6 @@ pub(crate) fn with_original_relational_requests(
                     arguments,
                     logical_argument_count,
                     expected_result_type: None,
-                    constant_policy: fixture_constant_policy(),
                 },
             ));
             Ok(())

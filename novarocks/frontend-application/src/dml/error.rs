@@ -542,7 +542,7 @@ mod compile_control_tests {
             }
         }
 
-        let mut policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+        let mut policy = novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE;
         policy.max_rows = 0;
         let domain = novarocks_functions::ConstantValue::from_i64(
             Arc::new(Field::new("value", DataType::Int64, false)),

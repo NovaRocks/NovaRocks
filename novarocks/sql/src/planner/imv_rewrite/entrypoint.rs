@@ -43,7 +43,7 @@ pub(crate) struct ImvRewriteInput<'a> {
     pub target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
     pub disabled_rules: Vec<String>,
     pub decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub constant_policy: novarocks_functions::ConstantValidation,
     pub control: &'a dyn PureCompileControl,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
     #[cfg(not(test))]

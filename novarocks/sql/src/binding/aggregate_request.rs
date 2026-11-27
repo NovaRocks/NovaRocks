@@ -20,7 +20,7 @@
 use std::alloc::Layout;
 
 use novarocks_functions::{
-    ConstantPolicy, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
+    ConstantValidation, FunctionArgument, FunctionBindingError, FunctionBindingRequest,
     FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_type_contract::{
@@ -83,7 +83,7 @@ pub(crate) struct CapturedAggregateLogicalRequest {
     arguments: Box<[FunctionArgument]>,
     logical_count: usize,
     filter_input: Option<crate::column_id::ColumnId>,
-    constant_policy: ConstantPolicy,
+    constant_policy: ConstantValidation,
 }
 impl CapturedAggregateLogicalRequest {
     pub(crate) fn filter_input(&self) -> Option<crate::column_id::ColumnId> {
@@ -96,7 +96,7 @@ impl CapturedAggregateLogicalRequest {
     pub(crate) fn binding(&self) -> &SqlFunctionBinding {
         &self.binding
     }
-    pub(crate) fn constant_policy(&self) -> ConstantPolicy {
+    pub(crate) fn constant_policy(&self) -> ConstantValidation {
         self.constant_policy
     }
     pub(crate) fn request(&self) -> FunctionBindingRequest<'_> {
@@ -121,7 +121,7 @@ impl CapturedAggregateLogicalRequest {
 /// coexistence; the bounded reserve is not a host grant or formal MEM model.
 pub(crate) fn capture_aggregate_logical_request(
     source: &AggregateArgumentSource<TypedExpr, SortItem>,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<CapturedAggregateLogicalRequest, AggregateRequestCaptureError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;

@@ -294,10 +294,7 @@ fn ordered_scan_plan(
             })
             .collect(),
     };
-    let mut plan = PlanBuilder::new(
-        PlanVersionId::try_new([7; 16]).unwrap(),
-        options(None).constants,
-    );
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result).unwrap();
     plan.add_runtime_filter(ordered_filter(

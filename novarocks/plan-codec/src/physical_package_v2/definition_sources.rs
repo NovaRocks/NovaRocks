@@ -507,7 +507,7 @@ fn visit<'source>(
 struct CountPass<'buffers, 'source, 'control> {
     sources: &'buffers DefinitionSources<'source>,
     counts: Counts,
-    limits: DefinitionSourceLimits,
+    limits: Option<DefinitionSourceLimits>,
     prefix: SourceInputPrefix<'source, 'control, 11>,
     copy_work: usize,
 }
@@ -518,7 +518,9 @@ impl<'source> CountPass<'_, 'source, '_> {
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        self.counts.check(self.limits)?;
+        if let Some(limits) = self.limits {
+            self.counts.check(limits)?;
+        }
         let copy = self.counts.copy_work()?;
         let delta = copy
             .checked_sub(self.copy_work)
@@ -980,7 +982,7 @@ pub(crate) fn collect_definition_sources_in<'source>(
     package: &'source p::FragmentPackage,
     types: &PackageTypeViews<'source>,
     bindings: &BindingSources<'source>,
-    limits: DefinitionSourceLimits,
+    limits: impl Into<Option<DefinitionSourceLimits>>,
     budget: &mut TypeViewBudget<'source, 'source, '_>,
     work: &mut CompileCheckpoints<'source>,
 ) -> Result<DefinitionSources<'source>, Error> {
@@ -1023,7 +1025,10 @@ pub(crate) fn collect_definition_sources_in<'source>(
         result: package.result().map_or(0, |r| r.fields.len()),
         ..Counts::default()
     };
-    initial.check(limits)?;
+    let limits = limits.into();
+    if let Some(limits) = limits {
+        initial.check(limits)?;
+    }
     let copy_work = initial.copy_work()?;
     let prefix = SourceInputPrefix::new_with_work_in(
         sources.reserves(&initial)?,

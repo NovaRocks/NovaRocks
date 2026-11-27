@@ -172,7 +172,6 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
                 }]),
                 logical_argument_count: 1,
                 expected_result_type: None,
-                constant_policy: policy,
             },
         )
         .unwrap();
@@ -251,7 +250,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
             ports: &[],
             all_ports: None,
         },
-        policy,
+        novarocks_functions::ConstantValidation::bounded(policy),
         &catalogue,
         &mut work,
     )

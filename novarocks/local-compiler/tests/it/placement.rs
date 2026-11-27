@@ -16,7 +16,7 @@
 // under the License.
 
 use super::fragment_fixture::{
-    ADMISSION, DOP, compile, empty_values, numeric_catalogue, options, output_value, seal_units,
+    ADMISSION, DOP, compile, empty_values, numeric_catalogue, output_value, seal_units,
 };
 use arrow_schema::DataType;
 use novarocks_expression::testkit::HarnessControl;
@@ -284,10 +284,7 @@ fn compile_consumer(
 
 fn builder() -> (PlanBuilder, FragmentBuilder) {
     (
-        PlanBuilder::new(
-            PlanVersionId::try_new([100; 16]).unwrap(),
-            options().constants,
-        ),
+        PlanBuilder::new(PlanVersionId::try_new([100; 16]).unwrap()),
         FragmentBuilder::new(CONSUMER),
     )
 }

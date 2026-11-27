@@ -20,7 +20,7 @@ use crate::{FragmentCompileError, FragmentCreationError, expressions::LoweredExp
 use novarocks_expression_contract::{
     BoundExprSetBuilder, ExprKind, ExprPort, RootScope, UnitLimits, ValueId,
 };
-use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
+use novarocks_functions::{ConstantValidation, PureEngineFunctionCatalog};
 use novarocks_local_program::{ProgramRootRef, ProgramUnitId, StaticLayout};
 use novarocks_type_contract::{
     CompileCheckpoints, EvaluationDemand, FunctionValueType, ValueSchemaCreation,
@@ -36,7 +36,7 @@ pub(crate) fn compile_reads<H, F: ValueSchemaCreationFactory<H>>(
     package: &novarocks_physical_plan::FragmentPackage,
     expressions: &mut LoweredExpressions,
     functions: &PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     layout: &StaticLayout,
     columns: &[(ValueId, FunctionValueType)],
     reads: &[(usize, EvaluationDemand)],
@@ -193,7 +193,7 @@ pub(crate) fn compile_branch_reads<H, F: ValueSchemaCreationFactory<H>>(
     package: &novarocks_physical_plan::FragmentPackage,
     expressions: &mut LoweredExpressions,
     functions: &PureEngineFunctionCatalog,
-    policy: ConstantPolicy,
+    policy: ConstantValidation,
     layout: &StaticLayout,
     source: novarocks_physical_plan::NodeId,
     branch: &crate::channels::UnionChannelBranch,

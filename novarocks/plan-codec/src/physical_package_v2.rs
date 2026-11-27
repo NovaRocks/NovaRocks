@@ -35,7 +35,6 @@ mod encode;
 mod encode_error;
 mod unit_creation;
 mod unit_headers;
-mod unit_totals;
 pub use encode_error::PhysicalEncodeError;
 
 mod frozen_limits;
@@ -50,7 +49,7 @@ pub use system_relation::SystemRelationError;
 
 pub use binding_sources::BindingSourceLimits;
 pub use decode::{
-    PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
+    ConstantRecordObserver, PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
     decode_fragment_package_with_creator, decode_fragment_package_with_factory,
     decode_fragment_package_with_factory_and_funding, decode_fragment_package_with_type_host,
 };
@@ -58,11 +57,11 @@ pub use definition_sources::{
     DefinitionSourceLimits, FragmentDefinitionSource, visit_fragment_definitions_observed,
 };
 pub use encode::{
-    PackageEncodeError, PackageEncodeLimits, encode_fragment_package,
-    encode_fragment_package_with_creator,
+    PackageEncodeError, encode_fragment_package, encode_fragment_package_with_creator,
 };
-pub use frozen_limits::{FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION};
 pub use provider_sources::{ProviderSourceError, ProviderSourceLimits};
+#[cfg(any(test, novarocks_dev_controls))]
+pub use test_support::{CONSTANT_POLICY_FIXTURE, PACKAGE_ADMISSION_FIXTURE};
 pub use type_views::{TypeViewError, TypeViewLimits};
 
 #[derive(Debug)]

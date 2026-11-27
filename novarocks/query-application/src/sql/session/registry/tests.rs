@@ -627,18 +627,20 @@ fn constant_pool(
     );
     // The test owns three tiny rows. These are test construction bounds, not
     // production session limits or an alternative constant factory.
-    let policy = novarocks_constant_contract::ConstantPolicy {
-        max_rows: 3,
-        max_array_nodes: 4,
-        max_logical_elements: 3,
-        max_retained_buffer_bytes: 65536,
-        max_type_depth: 4,
-        max_type_nodes: 4,
-        max_dictionary_depth: 2,
-        max_metadata_bytes: 65536,
-        max_library_validation_work: 65536,
-        max_library_validation_bytes: 65536,
-    };
+    let policy = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 3,
+            max_array_nodes: 4,
+            max_logical_elements: 3,
+            max_retained_buffer_bytes: 65536,
+            max_type_depth: 4,
+            max_type_nodes: 4,
+            max_dictionary_depth: 2,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 65536,
+            max_library_validation_bytes: 65536,
+        },
+    );
     novarocks_constant_contract::ConstantPool::try_new(
         field,
         ty,

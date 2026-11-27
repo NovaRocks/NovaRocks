@@ -83,7 +83,6 @@ fn missing_or_foreign_guarded_child_summary_is_refused() {
             constants: &constants,
             parameters: &parameters,
         },
-        constant_policy: policy,
         functions: &functions,
         decimal_overflow: &decimal,
     };

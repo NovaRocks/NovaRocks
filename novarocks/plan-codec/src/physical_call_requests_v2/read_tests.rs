@@ -68,6 +68,8 @@ fn limits() -> Limits {
         max_work: 512 * 1024 * 1024,
     }
 }
+use novarocks_constant_contract::ConstantPolicy;
+
 fn pool_policy() -> ConstantPolicy {
     ConstantPolicy {
         max_rows: 16,
@@ -144,20 +146,6 @@ fn pools() -> ConstantPools {
     pools.insert(ConstantPoolId::new(u32::MAX), pool).unwrap();
     pools
 }
-fn zero_policy() -> wire::SourceConstantPolicy {
-    wire::SourceConstantPolicy {
-        max_rows: Some(0),
-        max_array_nodes: Some(0),
-        max_logical_elements: Some(0),
-        max_retained_buffer_bytes: Some(0),
-        max_type_depth: Some(0),
-        max_type_nodes: Some(0),
-        max_dictionary_depth: Some(0),
-        max_metadata_bytes: Some(0),
-        max_library_validation_work: Some(0),
-        max_library_validation_bytes: Some(0),
-    }
-}
 // This component fixture declares real relation addresses. It is not a
 // published Fragment or a scalar unit; those closures have separate owners.
 fn window_site(id: u32) -> PhysicalCallSite {
@@ -192,7 +180,6 @@ fn request(id: u32) -> wire::OriginalCallRequest {
         arguments: vec![],
         logical_argument_count: Some(0),
         expected_result_value_type_id: None,
-        constant_policy: Some(zero_policy()),
     }
 }
 fn source() -> wire::FragmentCallRequests {
@@ -255,7 +242,7 @@ fn assert_causes(run: impl Fn(&Control) -> Result<(), E>) {
 }
 
 #[test]
-fn original_request_decode_requires_present_table_count_and_all_ten_policy_fields_including_zero() {
+fn original_request_decode_requires_present_table_and_logical_count_including_zero() {
     let t = types();
     let p = ConstantPools::empty();
     assert!(matches!(
@@ -275,55 +262,12 @@ fn original_request_decode_requires_present_table_count_and_all_ten_policy_field
     assert_eq!(decoded[0].0, window_site(0));
     assert_eq!(decoded[0].1.logical_argument_count, 0);
     assert!(decoded[0].1.expected_result_type.is_none());
-    assert_eq!(decoded[0].1.constant_policy.max_rows, 0);
-    for missing in 0..12 {
-        let mut bad = valid.clone();
-        let e = &mut bad.entries[0];
-        match missing {
-            0 => e.logical_argument_count = None,
-            1 => e.constant_policy = None,
-            n => {
-                let p = e.constant_policy.as_mut().unwrap();
-                match n {
-                    2 => p.max_rows = None,
-                    3 => p.max_array_nodes = None,
-                    4 => p.max_logical_elements = None,
-                    5 => p.max_retained_buffer_bytes = None,
-                    6 => p.max_type_depth = None,
-                    7 => p.max_type_nodes = None,
-                    8 => p.max_dictionary_depth = None,
-                    9 => p.max_metadata_bytes = None,
-                    10 => p.max_library_validation_work = None,
-                    11 => p.max_library_validation_bytes = None,
-                    _ => unreachable!(),
-                }
-            }
-        }
-        assert!(
-            matches!(
-                execute(Some(&bad), &t, &p, SOURCE, limits(), &Control::default()),
-                Err(E::InvalidShape(_))
-            ),
-            "missing {missing}"
-        );
-    }
-    let mut maximum = valid.clone();
-    let p = maximum.entries[0].constant_policy.as_mut().unwrap();
-    p.max_rows = Some(u64::MAX);
-    p.max_type_depth = Some(u32::MAX);
-    let p = execute(
-        Some(&maximum),
-        &t,
-        &ConstantPools::empty(),
-        SOURCE,
-        limits(),
-        &Control::default(),
-    )
-    .unwrap()[0]
-        .1
-        .constant_policy;
-    assert_eq!(p.max_rows, u64::MAX);
-    assert_eq!(p.max_type_depth, u32::MAX);
+    let mut bad = valid;
+    bad.entries[0].logical_argument_count = None;
+    assert!(matches!(
+        execute(Some(&bad), &t, &p, SOURCE, limits(), &Control::default()),
+        Err(E::InvalidShape(_))
+    ));
 }
 #[test]
 fn original_request_decode_keeps_sparse_definition_namespace_relational_order_and_rejects_duplicates()
@@ -414,7 +358,6 @@ fn original_request_decode_keeps_sparse_definition_namespace_relational_order_an
         arguments: vec![],
         logical_argument_count: Some(0),
         expected_result_value_type_id: None,
-        constant_policy: Some(zero_policy()),
     }];
     let c = Control::default();
     let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -509,10 +452,6 @@ fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_
         parameter_types[0].data_type(),
         t.value_type(u32::MAX).unwrap().data_type()
     ));
-    assert_eq!(
-        request.constant_policy.max_rows, 0,
-        "source policy was incorrectly used to re-admit the pool"
-    );
 }
 #[test]
 fn original_request_decode_rejects_missing_oob_and_full_type_drift_without_new_cv_admission() {
@@ -794,37 +733,50 @@ fn original_request_decode_new_argument_resource_at_real_pending_256_never_obser
         )
         .unwrap();
     }
-    let mut raw = wire::FragmentCallRequests {
-        entries: (0..42).map(request).collect(),
-    };
-    raw.entries[41].arguments.push(value_argument(7, None));
-    raw.entries[41].logical_argument_count = Some(1);
-    // This authentic source reaches the first real 256-unit callback precisely
-    // when admission of the last entry's new argument succeeds.
-    let c = Control::default();
-    execute(Some(&raw), &t, &p, SOURCE, limits(), &c).unwrap();
-    let trace = c.trace.lock().unwrap().clone();
-    assert_eq!(trace.iter().position(|(_, units)| *units == 256), Some(1));
-    // Admit both original outer arrays exactly, but no new argument Vec/Box.
-    // Repeating the same backing under four keys is legal and counted once as
-    // a backing floor, while each occupied key remains actual source storage.
-    let mut l = limits();
-    l.max_request_bytes = Layout::array::<PhysicalCallSite>(42).unwrap().size()
-        + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(42)
-            .unwrap()
-            .size();
+    // Find a request whose final real argument joins the numerical prefix
+    // just before a completed quantum. Keep the emitted schema itself in the
+    // witness, since shrinking its header changes the pending work count.
+    let (raw, tight, prefix) = (32..128)
+        .find_map(|count| {
+            let mut raw = wire::FragmentCallRequests {
+                entries: (0..count).map(request).collect(),
+            };
+            let last = raw.entries.last_mut().unwrap();
+            last.arguments.push(value_argument(7, None));
+            last.logical_argument_count = Some(1);
+            let control = Control::default();
+            execute(Some(&raw), &t, &p, SOURCE, limits(), &control).unwrap();
+            let trace = control.trace.into_inner().unwrap();
+            let mut tight = limits();
+            tight.max_request_bytes = Layout::array::<PhysicalCallSite>(count as usize)
+                .unwrap()
+                .size()
+                + Layout::array::<(PhysicalCallSite, PhysicalCallRequest)>(count as usize)
+                    .unwrap()
+                    .size();
+            let control = Control::default();
+            assert!(matches!(
+                execute(Some(&raw), &t, &p, SOURCE, tight, &control),
+                Err(E::Control(CompileControlError::ResourceExhausted))
+            ));
+            let prefix = control.trace.into_inner().unwrap();
+            (trace.starts_with(&prefix)
+                && trace.get(prefix.len()) == Some(&(CompilePhase::Decode, 256)))
+            .then_some((raw, tight, prefix))
+        })
+        .expect("real argument admission immediately before a decode quantum");
     for cause in CAUSES {
         let c = Control {
-            stop: Some((1, cause)),
+            stop: Some((prefix.len(), cause)),
             ..Control::default()
         };
         assert!(matches!(
-            execute(Some(&raw), &t, &p, SOURCE, l, &c),
+            execute(Some(&raw), &t, &p, SOURCE, tight, &c),
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
         assert_eq!(
             *c.trace.lock().unwrap(),
-            [(CompilePhase::Decode, 0)],
+            prefix,
             "known numeric resource refusal must precede a later callback"
         );
     }

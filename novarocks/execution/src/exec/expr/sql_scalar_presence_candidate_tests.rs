@@ -20,7 +20,7 @@ use novarocks_functions::{
     ConstantValue, FunctionArgument, FunctionBindingError, FunctionKind,
     FunctionSpecializationFailure, FunctionValueType, ResolvedFunctionBinding,
 };
-use novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+use novarocks_plan_codec::physical_package_v2::CONSTANT_POLICY_FIXTURE;
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlFunctionCatalog, builtin_sql_function_catalog,
 };
@@ -57,7 +57,7 @@ fn variant_get_arguments(control: &dyn PureCompileControl) -> [FunctionArgument;
         Arc::new(path_type.try_to_field("path").unwrap()),
         path_type.clone(),
         "$.k",
-        FROZEN_CONSTANT_POLICY,
+        CONSTANT_POLICY_FIXTURE,
         CompilePhase::Validate,
         control,
     )

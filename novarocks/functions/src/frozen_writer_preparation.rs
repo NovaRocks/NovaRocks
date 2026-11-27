@@ -77,22 +77,14 @@ pub fn prepare_frozen_writer_aggregate_with_empty_order_keys(
     )
     .map_err(pure_writer_failure)
 }
-/// Prepare the same frozen writer source using its actual construction scope
-/// and already-admitted constant policy. Neither loan creates a new policy.
+/// Prepare the same frozen writer source using its actual construction scope.
 pub fn prepare_frozen_writer_aggregate_with_creator_in<H>(
     catalog: &EngineFunctionCatalog,
     source: FrozenWriterAggregatePreparation<'_>,
-    constant_policy: &crate::ConstantPolicy,
     creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
     control: &dyn PureCompileControl,
 ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
-    prepare_frozen_writer_aggregate_core(
-        catalog,
-        source,
-        None,
-        control,
-        Some((creation, constant_policy)),
-    )
+    prepare_frozen_writer_aggregate_core(catalog, source, None, control, Some(creation))
 }
 
 /// Borrow the original caller-created empty order owner on the checked route.
@@ -100,7 +92,6 @@ pub fn prepare_frozen_writer_aggregate_with_empty_order_keys_and_creator_in<H>(
     catalog: &EngineFunctionCatalog,
     source: FrozenWriterAggregatePreparation<'_>,
     order_keys: Arc<[crate::AggregateOrderKey]>,
-    constant_policy: &crate::ConstantPolicy,
     creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
     control: &dyn PureCompileControl,
 ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
@@ -109,13 +100,7 @@ pub fn prepare_frozen_writer_aggregate_with_empty_order_keys_and_creator_in<H>(
             FunctionSpecializationFailure::InvalidInput("writer source has order keys").into(),
         );
     }
-    prepare_frozen_writer_aggregate_core(
-        catalog,
-        source,
-        Some(order_keys),
-        control,
-        Some((creation, constant_policy)),
-    )
+    prepare_frozen_writer_aggregate_core(catalog, source, Some(order_keys), control, Some(creation))
 }
 
 fn pure_writer_failure(
@@ -138,10 +123,7 @@ fn prepare_frozen_writer_aggregate_core<H>(
     source: FrozenWriterAggregatePreparation<'_>,
     order_keys: Option<Arc<[crate::AggregateOrderKey]>>,
     control: &dyn PureCompileControl,
-    creation: Option<(
-        &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
-        &crate::ConstantPolicy,
-    )>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
 ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result: Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> = (|| {
@@ -240,12 +222,11 @@ fn prepare_frozen_writer_aggregate_core<H>(
             options,
         };
         let token = match creation {
-            Some((creation, constant_policy)) => catalog.prepare_selected_checked_with_creator_in(
+            Some(creation) => catalog.prepare_selected_checked_with_creator_in(
                 effect_input,
                 selected,
                 Some(source.frozen_effects),
                 preparation,
-                constant_policy,
                 creation,
                 control,
             )?,

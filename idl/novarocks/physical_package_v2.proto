@@ -68,7 +68,8 @@ message FragmentPackage {
   novarocks.physical_type_v2.SourceFieldTable source_fields = 24;
   repeated SystemRelationUnits system_relation_units = 25;
   repeated FrozenWriteLayoutRecipe layouts = 26;
-  novarocks.call_request.SourceConstantPolicy source_constant_policy = 27;
+  reserved 27;
+  reserved "source_constant_policy";
 }
 message RequiredContracts { uint32 plan_contract_revision = 1; }
 message Fragment {

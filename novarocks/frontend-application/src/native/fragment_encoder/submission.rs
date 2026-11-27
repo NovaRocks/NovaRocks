@@ -82,29 +82,14 @@ pub(crate) fn freeze_completed_packages(
         validate_fragment_output_kind(fragment_id, is_root, has_stream_edge, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(fragment_id, is_root, has_stream_edge)?;
         let artifact = match author {
-            crate::query_execution::physical_encoding::EncodingAuthor::Statement(capacity) => {
-                let window = capacity.try_window_alias().map_err(|error| {
-                    PhysicalEncodeError::Control(
-                        novarocks_type_contract::CompileControlError::Source(
-                            novarocks_failure_contract::SharedFailureCause::new(error),
-                        ),
-                    )
-                })?;
-                crate::query_execution::required_constant_eval::with_root_value_creation(
-                    capacity.scope(),
-                    &window,
+            crate::query_execution::physical_encoding::EncodingAuthor::Statement(root) => {
+                FragmentArtifact::freeze_statement_package(
+                    root,
+                    package,
+                    physical.edges(),
+                    carrier,
                     control,
-                    |creation| {
-                        FragmentArtifact::freeze_package_with_creator(
-                            package,
-                            physical.edges(),
-                            carrier,
-                            control,
-                            creation,
-                        )
-                    },
-                )
-                .map_err(PhysicalEncodeError::Control)??
+                )?
             }
             #[cfg(test)]
             crate::query_execution::physical_encoding::EncodingAuthor::SemanticFixture => {
@@ -128,6 +113,9 @@ pub(crate) fn freeze_completed_packages(
         )
         .into());
     }
+    crate::metrics::task_creation::statement_static_fragments_frozen(
+        frozen.values().map(|artifact| artifact.content().len()),
+    );
     Ok(frozen)
 }
 

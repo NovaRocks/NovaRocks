@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use novarocks_functions::{ConstantPolicy, ConstantValue};
+use novarocks_functions::{ConstantValidation, ConstantValue};
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::FunctionValueType;
 
@@ -108,7 +108,7 @@ pub struct RequiredConstantRequest<'a> {
     pub functions: Arc<dyn SqlFunctionCatalog>,
     pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub sql_semantics: &'a crate::sql_mode::SqlSemanticSettings,
-    pub constant_policy: ConstantPolicy,
+    pub constant_policy: ConstantValidation,
     pub control: &'a SqlCompileControl,
 }
 
@@ -130,7 +130,7 @@ pub struct SqlStandaloneScalarRequest<'a> {
     pub functions: Arc<dyn SqlFunctionCatalog>,
     pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub sql_semantics: &'a crate::sql_mode::SqlSemanticSettings,
-    pub constant_policy: ConstantPolicy,
+    pub constant_policy: ConstantValidation,
     pub control: &'a SqlCompileControl,
 }
 
@@ -169,7 +169,7 @@ impl SqlAuthoredScalarUnit {
     pub fn function_catalog(&self) -> &Arc<dyn SqlFunctionCatalog> {
         self.emission.function_catalog()
     }
-    pub fn constant_policy(&self) -> ConstantPolicy {
+    pub fn constant_policy(&self) -> ConstantValidation {
         self.emission.constant_policy()
     }
     pub fn value_type(&self) -> &FunctionValueType {
@@ -208,7 +208,7 @@ pub struct PreparedRequiredConstant {
     pub(crate) source: SqlAuthoredScalarUnit,
     pub(crate) value_type: FunctionValueType,
     pub(crate) span: Span,
-    pub(crate) policy: ConstantPolicy,
+    pub(crate) policy: ConstantValidation,
     pub(crate) control: SqlCompileControl,
     pub(crate) original_value: Option<ConstantValue>,
     pub(crate) eligibility: RequiredConstantEligibility,
@@ -231,7 +231,7 @@ impl PreparedRequiredConstant {
     pub const fn span(&self) -> Span {
         self.span
     }
-    pub const fn constant_policy(&self) -> ConstantPolicy {
+    pub const fn constant_policy(&self) -> ConstantValidation {
         self.policy
     }
     pub const fn eligibility(&self) -> RequiredConstantEligibility {

@@ -39,7 +39,7 @@ use novarocks_native_adapter::backend_task_execution::{
     materialize_package_types_for_test,
 };
 use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
-use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+use novarocks_plan_codec::physical_package_v2::test_support::types_projection_limits;
 use novarocks_plan_codec::physical_type_v2::{PackageTypeMaterializationScope, TypeCodecError};
 use novarocks_proto_models::{physical_package_v2 as package, physical_type_v2 as wire, plan};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -178,7 +178,7 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
     let table = materialize_package_types_for_test(
         &source,
         SOURCE_INVOICE,
-        decode_limits().types,
+        types_projection_limits(),
         &Control,
         &binding,
         &owner.loan(),
@@ -291,7 +291,7 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
         materialize_package_types_for_test(
             &source,
             SOURCE_INVOICE,
-            decode_limits().types,
+            types_projection_limits(),
             &Control,
             &binding,
             &owner.loan(),
@@ -315,7 +315,7 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     let error = materialize_package_types_for_test(
         &source,
         SOURCE_INVOICE,
-        decode_limits().types,
+        types_projection_limits(),
         &Control,
         &binding,
         &loan,
@@ -365,7 +365,7 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
     let result = materialize_package_types_for_test(
         &source,
         SOURCE_INVOICE,
-        decode_limits().types,
+        types_projection_limits(),
         &Control,
         &binding,
         &owner.loan(),

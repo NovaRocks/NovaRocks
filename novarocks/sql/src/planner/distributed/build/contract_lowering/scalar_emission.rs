@@ -168,7 +168,7 @@ impl ScalarStorage<'_> {
 
 pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) root_allow_throw_exception: bool,
-    pub(super) constant_policy: novarocks_constant_contract::ConstantPolicy,
+    pub(super) constant_policy: novarocks_constant_contract::ConstantValidation,
     pub(super) root_allow_throw_exception_used: &'emission mut bool,
     pub(super) parameters: &'emission mut BTreeMap<SemanticParameterId, SemanticParameterValue>,
     pub(super) functions: &'emission Arc<dyn crate::compiler::SqlFunctionCatalog>,

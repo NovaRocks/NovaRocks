@@ -487,7 +487,7 @@ fn checked_package(
                 required: RequiredContracts::default(),
                 constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment,
-                statement_constant_policy: crate::test_constants::policy(),
+
                 pruning,
                 cuts,
                 result: None,

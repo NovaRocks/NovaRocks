@@ -829,7 +829,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-    use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
+
     use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
     use prost::Message;
 
@@ -972,18 +972,19 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         requires_power_of_two: false,
     };
     // Explicit fixture admission; these values are not production defaults.
-    let constants = novarocks_functions::ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    };
+    let constants =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
     let ports = builder.node_ports(SCAN).unwrap();
     let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Validate).unwrap();
     let unit = builder
@@ -995,7 +996,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         .unwrap();
     work.finish().unwrap();
     builder.install_unit(SCAN, Arc::new(unit)).unwrap();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap(), constants);
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.insert_constant_pool(
         pool,
         ConstantPool::try_new(
@@ -1143,7 +1144,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     )
     .unwrap();
     let package = packages.remove(&PRODUCER).unwrap();
-    let bytes = encode_fragment_package(&package, &encode_limits(), &Unbounded)
+    let bytes = encode_fragment_package(&package, &Unbounded)
         .expect("v2 bytes")
         .encode_to_vec();
     (bytes, RECEIVER.get())

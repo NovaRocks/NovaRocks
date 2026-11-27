@@ -286,7 +286,6 @@ fn source_fixture() -> SourceFixture {
                 ]),
                 logical_argument_count: 2,
                 expected_result_type: None,
-                constant_policy: constant_policy(),
             },
         ),
         (
@@ -298,7 +297,6 @@ fn source_fixture() -> SourceFixture {
                 }]),
                 logical_argument_count: 1,
                 expected_result_type: None,
-                constant_policy: constant_policy(),
             },
         ),
     ];

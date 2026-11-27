@@ -37,7 +37,7 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::{alloc::Layout, fmt, mem::size_of};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeProjectionLimits {
     pub max_input_nodes: usize,
     pub max_value_references: usize,
@@ -202,7 +202,14 @@ pub(crate) fn bytes<T>(n: usize) -> Result<usize, Error> {
         .map(|layout| layout.size())
         .map_err(|_| CompileControlError::ResourceExhausted.into())
 }
-pub(crate) fn cap(n: usize, maximum: usize, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+pub(crate) fn cap(
+    n: usize,
+    maximum: impl Into<Option<usize>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    let Some(maximum) = maximum.into() else {
+        return Ok(());
+    };
     // A known numerical refusal is already the originating control cause;
     // no later checkpoint or ordinary footer may replace it.
     check_cap(n, maximum)?;
@@ -414,7 +421,7 @@ impl Model {
         &self,
         source: usize,
         values: usize,
-        l: NodeProjectionLimits,
+        l: impl Into<Option<NodeProjectionLimits>>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<NodeProjectionFacts, Error> {
         self.facts_in(source, values, l, &mut |_| Ok(()), w)
@@ -423,11 +430,11 @@ impl Model {
         &self,
         source: usize,
         values: usize,
-        l: NodeProjectionLimits,
+        l: impl Into<Option<NodeProjectionLimits>>,
         admit: &mut NodeAdmit<'_>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<NodeProjectionFacts, Error> {
-        let (facts, axes) = self.checked_facts(source, values, l)?;
+        let (facts, axes) = self.checked_facts_core(source, values, l.into())?;
         admit(&facts)?;
         for _ in 0..axes {
             w.step()?;
@@ -440,7 +447,7 @@ impl Model {
         &self,
         source: usize,
         values: usize,
-        l: NodeProjectionLimits,
+        l: impl Into<Option<NodeProjectionLimits>>,
         admit: &mut NodeAdmit<'_>,
     ) -> Result<NodeProjectionFacts, Error> {
         let facts = self.numerical_facts(source, values, l)?;
@@ -453,18 +460,10 @@ impl Model {
         &self,
         source: usize,
         values: usize,
-        l: NodeProjectionLimits,
+        l: impl Into<Option<NodeProjectionLimits>>,
     ) -> Result<NodeProjectionFacts, Error> {
-        self.checked_facts(source, values, l)
+        self.checked_facts_core(source, values, l.into())
             .map(|(facts, _)| facts)
-    }
-    fn checked_facts(
-        &self,
-        source: usize,
-        values: usize,
-        l: NodeProjectionLimits,
-    ) -> Result<(NodeProjectionFacts, usize), Error> {
-        self.checked_facts_core(source, values, Some(l))
     }
     pub(crate) fn numerical_input_derived_facts(
         &self,
@@ -539,16 +538,18 @@ pub(crate) fn count_prefix(
     items: usize,
     source: usize,
     known: usize,
-    l: NodeProjectionLimits,
+    l: impl Into<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     // This lower bound precedes all variable-length numerical counting.
     let work = add(256, mul(add(items, inputs)?, 32)?)?;
-    check_cap(inputs, l.max_input_nodes)?;
-    check_cap(items, l.max_list_items)?;
-    check_cap(work, l.max_work)?;
-    for _ in 0..3 {
-        w.step()?;
+    if let Some(limits) = l.into() {
+        check_cap(inputs, limits.max_input_nodes)?;
+        check_cap(items, limits.max_list_items)?;
+        check_cap(work, limits.max_work)?;
+        for _ in 0..3 {
+            w.step()?;
+        }
     }
     floor(source, known, w)
 }
@@ -635,9 +636,10 @@ pub(crate) type DecodedHeader = (
 pub(crate) fn encode_header(
     input: &p::PhysicalNode,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedHeader, Error> {
+    let properties = limits.into().map(|limits| limits.properties);
     let mut inputs = reserve(input.inputs.len(), w)?;
     for id in &input.inputs {
         inputs.push(id.get());
@@ -645,11 +647,11 @@ pub(crate) fn encode_header(
     }
     let mut required = reserve(input.required_inputs.len(), w)?;
     for property in &input.required_inputs {
-        required.push(properties::encode_observed(property, source, limits.properties, w)?.0);
+        required.push(properties::encode_observed(property, source, properties, w)?.0);
         w.step()?;
     }
     let output_properties =
-        properties::encode_observed(&input.output_properties, source, limits.properties, w)?.0;
+        properties::encode_observed(&input.output_properties, source, properties, w)?.0;
     let output = wire::OutputPort {
         node_id: Some(input.output.node.get()),
         value_ids: encode_ids(&input.output.columns, w)?,
@@ -659,9 +661,10 @@ pub(crate) fn encode_header(
 pub(crate) fn decode_header(
     input: &wire::PhysicalNode,
     source: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedHeader, Error> {
+    let properties = limits.into().map(|limits| limits.properties);
     let port = input
         .output
         .as_ref()
@@ -674,7 +677,7 @@ pub(crate) fn decode_header(
     let inputs = boxed(inputs, w)?;
     let mut required = reserve(input.required_inputs.len(), w)?;
     for property in &input.required_inputs {
-        required.push(properties::decode_observed(property, source, limits.properties, w)?.0);
+        required.push(properties::decode_observed(property, source, properties, w)?.0);
         w.step()?;
     }
     let required = boxed(required, w)?;
@@ -684,7 +687,7 @@ pub(crate) fn decode_header(
             .as_ref()
             .ok_or_else(|| invalid("prepared Repeat output properties are absent"))?,
         source,
-        limits.properties,
+        properties,
         w,
     )?
     .0;

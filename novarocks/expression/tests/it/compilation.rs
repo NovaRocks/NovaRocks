@@ -71,8 +71,11 @@ impl PureCompileControl for Control {
         Ok(())
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+fn policy() -> ConstantValidation {
+    ConstantValidation::bounded(policy_fixture())
+}
+fn policy_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
         max_rows: 1024,
         max_array_nodes: 4096,
         max_logical_elements: 1_000_000,
@@ -490,7 +493,6 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
             arguments: Box::new([]),
             logical_argument_count: 0,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -587,7 +589,6 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
         &sealed,
         &CallAuthorInputs {
             environment,
-            constant_policy: policy(),
             functions: &catalog,
             decimal_overflow: &overflow,
         },
@@ -964,7 +965,6 @@ fn rand_unit() -> (BoundExprSet, PureEngineFunctionCatalog, SemanticParameters) 
             arguments: Box::default(),
             logical_argument_count: 0,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();
@@ -1240,11 +1240,13 @@ fn checked_sources_are_not_readmitted_under_a_different_caller_policy() {
     let u = finish(b, vec![]);
     let c = Control::good();
     let mut w = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-    let low = ConstantPolicy {
-        max_rows: 0,
-        max_retained_buffer_bytes: 0,
-        ..policy()
-    };
+    let low = novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 0,
+            max_retained_buffer_bytes: 0,
+            ..policy_fixture()
+        },
+    );
     let p = compile_expr_set_pure(
         &u,
         EvaluationEnvironment {
@@ -1787,7 +1789,7 @@ fn full_types_and_shared_float_bits_keep_original_backing_and_reject_retagging()
 }
 
 #[test]
-fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged() {
+fn compiled_unit_keeps_shared_and_independent_large_constant_backings() {
     use arrow::array::BinaryArray;
     let payload = vec![7u8; 9 * 1024 * 1024];
     let make = || {
@@ -1805,7 +1807,7 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
     let b = make();
     let mut pools = ConstantPools::empty();
     pools.insert(ConstantPoolId::new(1), a.clone()).unwrap();
-    pools.insert(ConstantPoolId::new(2), b).unwrap();
+    pools.insert(ConstantPoolId::new(2), b.clone()).unwrap();
     let unit = |pool_ids: &[u32]| {
         let mut builder = builder();
         for &pool in pool_ids {
@@ -1842,7 +1844,7 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
         };
         assert_eq!(value.pool().backing_identity(), a.backing_identity());
     }
-    let e = compile(
+    let independent = compile(
         &unit(&[1, 2]),
         &pools,
         &SemanticParameters::default(),
@@ -1852,14 +1854,23 @@ fn shared_constant_backing_is_bounded_once_and_independent_backings_are_charged(
         },
         &Control::good(),
     )
-    .unwrap_err();
-    assert!(matches!(
-        e,
-        ExprCompileError::Expressions(ExpressionsCompileError::Expression(
-            StaticExpressionError::TooManyBytes
-        ))
-    ));
-    assert_eq!(e.failure_fact().class(), FailureClass::Resource);
+    .unwrap();
+    drop(pools);
+    assert_ne!(a.backing_identity(), b.backing_identity());
+    assert_eq!(independent.definitions().nodes().len(), 2);
+    for (node, source) in independent.definitions().nodes().iter().zip([a, b]) {
+        let StaticExprKind::Constant(value) = node.kind() else {
+            panic!("constant")
+        };
+        assert_eq!(value.pool().backing_identity(), source.backing_identity());
+        let array = value
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(array.value(value.ordinal() as usize), payload.as_slice());
+    }
 }
 
 #[test]
@@ -2214,7 +2225,6 @@ fn original_no_arguments_invocation_keeps_full_static_request_without_input_uses
             ]),
             logical_argument_count: 3,
             expected_result_type: None,
-            constant_policy: policy(),
         },
     )
     .unwrap();

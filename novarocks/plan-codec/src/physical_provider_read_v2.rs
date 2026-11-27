@@ -353,18 +353,20 @@ fn prefix(
     n: usize,
     input: usize,
     requests: &Requests,
-    envelope: (usize, (usize, usize), ProviderReadProjectionLimits),
+    envelope: (usize, (usize, usize), Option<ProviderReadProjectionLimits>),
     admit: &mut Option<&mut Admit<'_>>,
 ) -> Result<ProviderReadProjectionFacts, Error> {
     let result = numerical_facts(n, input, requests, envelope.0, envelope.1)?;
     if let Some(callback) = admit.as_mut() {
         let limits = envelope.2;
-        if result.definition_count > limits.max_definitions
-            || result.allocation_requests_upper_bound > limits.max_allocation_requests
-            || result.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || result.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || result.cumulative_work_upper_bound > limits.max_work
+        if let Some(limits) = limits
+            && (result.definition_count > limits.max_definitions
+                || result.allocation_requests_upper_bound > limits.max_allocation_requests
+                || result.allocation_request_bytes_upper_bound
+                    > limits.max_allocation_request_bytes
+                || result.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || result.cumulative_work_upper_bound > limits.max_work)
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -376,44 +378,45 @@ fn facts(
     n: usize,
     input: usize,
     requests: Requests,
-    envelope: (usize, (usize, usize), ProviderReadProjectionLimits),
+    envelope: (usize, (usize, usize), Option<ProviderReadProjectionLimits>),
     admit: &mut Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ProviderReadProjectionFacts, Error> {
     let result = prefix(n, input, &requests, envelope, admit)?;
-    let limits = envelope.2;
-    cap(
-        result.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
-        work,
-    )?;
-    cap(
-        result.allocation_request_bytes_upper_bound,
-        limits.max_allocation_request_bytes,
-        work,
-    )?;
-    cap(
-        result.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
-        work,
-    )?;
-    cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    if let Some(limits) = envelope.2 {
+        cap(
+            result.allocation_requests_upper_bound,
+            limits.max_allocation_requests,
+            work,
+        )?;
+        cap(
+            result.allocation_request_bytes_upper_bound,
+            limits.max_allocation_request_bytes,
+            work,
+        )?;
+        cap(
+            result.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+            work,
+        )?;
+        cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    }
     Ok(result)
 }
 fn prior_work(
     n: usize,
     bindings: usize,
     payloads: usize,
-    limits: ProviderReadProjectionLimits,
+    limits: Option<ProviderReadProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     // Admit floor/source-ID/lookup scans before any potentially long walk. The
     // complete request/copy bound is gated separately before first reserve.
-    cap(
-        bound(n, bindings, payloads, 0, &Requests::default())?,
-        limits.max_work,
-        work,
-    )
+    let work_bound = bound(n, bindings, payloads, 0, &Requests::default())?;
+    match limits {
+        Some(limits) => cap(work_bound, limits.max_work, work),
+        None => Ok(()),
+    }
 }
 
 pub struct EncodedProviderReads<'source, 'control> {
@@ -620,8 +623,9 @@ pub fn encode_provider_reads<'source, 'control>(
     bindings: &'source EncodedProviderBindings<'source, 'control>,
     payloads: &'source EncodedConnectorPayloads<'source, 'control>,
     source_retained_bytes: usize,
-    limits: ProviderReadProjectionLimits,
+    limits: impl Into<Option<ProviderReadProjectionLimits>>,
 ) -> Result<EncodedProviderReads<'source, 'control>, Error> {
+    let limits = limits.into();
     let control = bindings.original_control();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = encode_core(
@@ -638,7 +642,7 @@ fn encode_core<'source, 'control>(
     inputs: &'source [(u32, &'source ProviderReadReference)],
     bindings: &'source EncodedProviderBindings<'source, 'control>,
     payloads: &'source EncodedConnectorPayloads<'source, 'control>,
-    envelope: (usize, ProviderReadProjectionLimits),
+    envelope: (usize, Option<ProviderReadProjectionLimits>),
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedProviderReads<'source, 'control>, Error> {
@@ -674,7 +678,9 @@ fn encode_core<'source, 'control>(
         payloads.original_control(),
         work,
     )?;
-    cap(inputs.len(), limits.max_definitions, work)?;
+    if let Some(limits) = limits {
+        cap(inputs.len(), limits.max_definitions, work)?;
+    }
     prior_work(
         inputs.len(),
         bindings.source_count(),
@@ -685,9 +691,25 @@ fn encode_core<'source, 'control>(
     let known = bindings
         .retained_floor_observed(work)?
         .max(payloads.retained_floor_observed(work)?);
-    floor(source, known, work)?;
+    floor(
+        if limits.is_none() {
+            source.max(known)
+        } else {
+            source
+        },
+        known,
+        work,
+    )?;
     let roots = bytes::<(u32, &ProviderReadReference)>(inputs.len())?;
-    floor(source, roots, work)?;
+    floor(
+        if limits.is_none() {
+            source.max(roots)
+        } else {
+            source
+        },
+        roots,
+        work,
+    )?;
 
     if !observed {
         req.record(bytes::<usize>(inputs.len())?)?;
@@ -713,7 +735,15 @@ fn encode_core<'source, 'control>(
         payloads.source_id_observed(read.relation.table(), work)?;
         payloads.source_id_observed(read.relation.view(), work)?;
     }
-    floor(source, add(roots, individual)?, work)?;
+    floor(
+        if limits.is_none() {
+            source.max(add(roots, individual)?)
+        } else {
+            source
+        },
+        add(roots, individual)?,
+        work,
+    )?;
     let facts = facts(inputs.len(), input, req, envelope, &mut admit, work)?;
     let indices = BindingIndex::prepare(inputs.len(), |at| inputs[at].0, work)?;
     let mut output = reserve(inputs.len(), work)?;
@@ -782,8 +812,9 @@ pub fn decode_provider_reads<'wire, 'control>(
     bindings: &'wire DecodedProviderBindings<'wire, 'control>,
     payloads: &'wire DecodedConnectorPayloads<'wire, 'control>,
     source_retained_bytes: usize,
-    limits: ProviderReadProjectionLimits,
+    limits: impl Into<Option<ProviderReadProjectionLimits>>,
 ) -> Result<DecodedProviderReads<'wire, 'control>, Error> {
+    let limits = limits.into();
     let mut work = CompileCheckpoints::try_new(bindings.original_control(), CompilePhase::Decode)?;
     let result = decode_core(
         definitions,
@@ -799,7 +830,7 @@ fn decode_core<'wire, 'control>(
     definitions: &'wire [wire::ProviderReadReferenceDefinition],
     bindings: &'wire DecodedProviderBindings<'wire, 'control>,
     payloads: &'wire DecodedConnectorPayloads<'wire, 'control>,
-    envelope: (usize, ProviderReadProjectionLimits),
+    envelope: (usize, Option<ProviderReadProjectionLimits>),
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedProviderReads<'wire, 'control>, Error> {
@@ -841,7 +872,9 @@ fn decode_core<'wire, 'control>(
         payloads.original_control(),
         work,
     )?;
-    cap(definitions.len(), limits.max_definitions, work)?;
+    if let Some(limits) = limits {
+        cap(definitions.len(), limits.max_definitions, work)?;
+    }
     prior_work(
         definitions.len(),
         bindings.source_count(),
@@ -954,10 +987,11 @@ pub fn encode_provider_reads_in<'source, 'control>(
     bindings: &'source EncodedProviderBindings<'source, 'control>,
     payloads: &'source EncodedConnectorPayloads<'source, 'control>,
     source: usize,
-    limits: ProviderReadProjectionLimits,
+    limits: impl Into<Option<ProviderReadProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderReadProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<EncodedProviderReads<'source, 'control>, Error> {
+    let limits = limits.into();
     check_control(bindings.original_control(), work)?;
     encode_core(
         inputs,
@@ -973,10 +1007,11 @@ pub fn decode_provider_reads_in<'wire, 'control>(
     bindings: &'wire DecodedProviderBindings<'wire, 'control>,
     payloads: &'wire DecodedConnectorPayloads<'wire, 'control>,
     source: usize,
-    limits: ProviderReadProjectionLimits,
+    limits: impl Into<Option<ProviderReadProjectionLimits>>,
     admit: &mut impl FnMut(&ProviderReadProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<DecodedProviderReads<'wire, 'control>, Error> {
+    let limits = limits.into();
     check_control(bindings.original_control(), work)?;
     decode_core(
         definitions,

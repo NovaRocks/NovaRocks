@@ -138,7 +138,6 @@ fn literal_results(values: Vec<ConstantValue>) {
         fields.into_boxed_slice(),
         SemanticParameters::try_new([]).unwrap(),
         constants,
-        options().constants,
     );
     let program = compile(&rng_subset(), package, &HarnessControl).unwrap();
     assert!(
@@ -487,15 +486,7 @@ fn conversion_project_output_layout_keeps_largeint_after_each_signed_width() {
             value,
             ty: result_type,
         }]);
-        let package = package(
-            193,
-            builder,
-            output,
-            fields,
-            parameters,
-            constants,
-            options().constants,
-        );
+        let package = package(193, builder, output, fields, parameters, constants);
         let program = compile(&functions, package, &HarnessControl).unwrap();
         let binding = program.graph().nodes()[2]
             .output_layout()

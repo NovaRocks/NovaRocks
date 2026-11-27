@@ -20,7 +20,7 @@ use arrow::array::{
     ArrayRef, DictionaryArray, Float32Array, Int64Array, LargeBinaryArray, StringArray,
 };
 use arrow::datatypes::{Field, Int8Type};
-use novarocks_functions::{ConstantPolicy, ConstantPool};
+use novarocks_functions::{ConstantPool, ConstantValidation};
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::{Arc, Mutex};
 
@@ -57,19 +57,21 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 16_777_216,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 67_108_864,
-        max_library_validation_bytes: 67_108_864,
-    }
+fn policy() -> ConstantValidation {
+    novarocks_constant_contract::ConstantValidation::bounded(
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 1024,
+            max_array_nodes: 4096,
+            max_logical_elements: 1_000_000,
+            max_retained_buffer_bytes: 16_777_216,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 1_048_576,
+            max_library_validation_work: 67_108_864,
+            max_library_validation_bytes: 67_108_864,
+        },
+    )
 }
 fn cv(array: ArrayRef, ty: FunctionValueType, field: Arc<Field>, ordinal: u32) -> ConstantValue {
     ConstantPool::try_new(

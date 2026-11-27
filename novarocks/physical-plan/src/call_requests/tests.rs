@@ -99,7 +99,6 @@ fn request(arguments: Vec<FunctionArgument<ConstantReference>>) -> PhysicalCallR
         logical_argument_count: arguments.len(),
         arguments: arguments.into_boxed_slice(),
         expected_result_type: None,
-        constant_policy: policy(),
     }
 }
 fn value(ty: ValueType) -> FunctionArgument<ConstantReference> {

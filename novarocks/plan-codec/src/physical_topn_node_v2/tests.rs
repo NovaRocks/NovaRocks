@@ -114,14 +114,14 @@ fn limits() -> TopNNodeProjectionLimits {
                 max_work: 2_000_000_000,
             },
         },
-        binding: BindingProjectionLimits {
+        binding: Some(BindingProjectionLimits {
             max_definitions: 1024,
             max_type_references: 8192,
             max_request_bytes: 16 << 20,
             max_allocation_requests: 8192,
             max_coexisting_source_and_request_bytes: 32 << 20,
             max_work: 2_000_000_000,
-        },
+        }),
     }
 }
 fn tl() -> TypeProjectionLimits {
@@ -627,7 +627,8 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         let functions =
-            encode_function_bindings(&types, &finputs, previous, limits().binding, c).unwrap();
+            encode_function_bindings(&types, &finputs, previous, limits().binding.unwrap(), c)
+                .unwrap();
         let mut ainputs = calls
             .iter()
             .enumerate()
@@ -671,7 +672,7 @@ impl Fixture {
             functions.as_wire(),
             &read_types,
             previous,
-            limits().binding,
+            limits().binding.unwrap(),
             c,
         )
         .unwrap();
@@ -683,7 +684,8 @@ impl Fixture {
         )
         .unwrap();
         let mf = materialize_function_bindings(
-            prepare_function_bindings_materialization(&fh, 2 * previous, limits().binding).unwrap(),
+            prepare_function_bindings_materialization(&fh, 2 * previous, limits().binding.unwrap())
+                .unwrap(),
         )
         .unwrap();
         let ma = materialize_aggregate_bindings(
@@ -1096,12 +1098,12 @@ fn topn_independent_layout_and_exact_seven_axes_cover_rows_and_inline_states() {
             }
             if grouped_mode {
                 let mut l = limits();
-                l.binding.max_type_references = 5;
+                l.binding.as_mut().unwrap().max_type_references = 5;
                 assert!(matches!(
                     decode_topn_node(&wire, d, a, SOURCE, l),
                     Err(Error::Control(CompileControlError::ResourceExhausted))
                 ));
-                l.binding.max_type_references = 6;
+                l.binding.as_mut().unwrap().max_type_references = 6;
                 assert!(decode_topn_node(&wire, d, a, SOURCE, l).is_ok());
             }
             let mut over = wire.clone();

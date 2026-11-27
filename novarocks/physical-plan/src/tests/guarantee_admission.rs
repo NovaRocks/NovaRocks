@@ -160,18 +160,6 @@ fn install_unit(builder: &mut FragmentBuilder, node: NodeId) {
                     logical_argument_count: arguments.len(),
                     arguments,
                     expected_result_type: None,
-                    constant_policy: crate::ConstantPolicy {
-                        max_rows: 16,
-                        max_array_nodes: 32,
-                        max_logical_elements: 128,
-                        max_retained_buffer_bytes: 64 * 1024,
-                        max_type_depth: 16,
-                        max_type_nodes: 128,
-                        max_dictionary_depth: 8,
-                        max_metadata_bytes: 4096,
-                        max_library_validation_work: 1_000_000,
-                        max_library_validation_bytes: 1_000_000,
-                    },
                 },
             )
             .unwrap();
@@ -558,7 +546,7 @@ fn fixture_with_guarantee_count(
     let read = package_contract::frozen_scan(&fragment);
     let mut input = FragmentPackageInput {
         constants: fixture_constants.for_fragment(&fragment),
-        statement_constant_policy: crate::tests::constant_fixture::policy(),
+
         version: version(),
         required: RequiredContracts::default(),
         pruning: FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap(),

@@ -138,7 +138,7 @@ pub(crate) fn preflight_type_binding(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundTypeComparisonFacts, TypeCodecError> {
     preflight_type_binding_admitted(
@@ -157,18 +157,23 @@ pub(crate) fn preflight_type_binding_admitted<E: From<TypeCodecError>>(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundTypeComparisonFacts, E> {
+    let max_work = max_work.into();
     preflight_type_binding_admitted_core(
         left,
         right,
         source_retained_bytes,
-        Some(max_work),
+        max_work,
         admit,
         work,
-        Arithmetic::Plain,
+        if max_work.is_some() {
+            Arithmetic::Plain
+        } else {
+            Arithmetic::Parent
+        },
     )
 }
 
@@ -176,7 +181,7 @@ pub(crate) fn preflight_type_binding_admitted_in<E: From<TypeCodecError>>(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundTypeComparisonFacts, E> {
@@ -184,7 +189,7 @@ pub(crate) fn preflight_type_binding_admitted_in<E: From<TypeCodecError>>(
         left,
         right,
         source_retained_bytes,
-        Some(max_work),
+        max_work.into(),
         admit,
         work,
         Arithmetic::Parent,
@@ -254,7 +259,7 @@ pub(crate) fn verify_type_binding(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedTypeBinding, TypeCodecError> {
     verify_type_binding_admitted(
@@ -273,18 +278,23 @@ pub(crate) fn verify_type_binding_admitted<E: From<TypeCodecError>>(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedTypeBinding, E> {
+    let max_work = max_work.into();
     verify_type_binding_admitted_core(
         left,
         right,
         source_retained_bytes,
-        Some(max_work),
+        max_work,
         admit,
         work,
-        Arithmetic::Plain,
+        if max_work.is_some() {
+            Arithmetic::Plain
+        } else {
+            Arithmetic::Parent
+        },
     )
 }
 
@@ -292,7 +302,7 @@ pub(crate) fn verify_type_binding_admitted_in<E: From<TypeCodecError>>(
     left: &FunctionValueType,
     right: &FunctionValueType,
     source_retained_bytes: usize,
-    max_work: usize,
+    max_work: impl Into<Option<usize>>,
     admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedTypeBinding, E> {
@@ -300,7 +310,7 @@ pub(crate) fn verify_type_binding_admitted_in<E: From<TypeCodecError>>(
         left,
         right,
         source_retained_bytes,
-        Some(max_work),
+        max_work.into(),
         admit,
         work,
         Arithmetic::Parent,

@@ -122,8 +122,7 @@ fn system_fragment(
             version: p::PlanVersionId::try_new([0x72; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            statement_constant_policy:
-                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
+
             pruning,
             constants: p::ConstantPools::empty(),
             cuts: p::FragmentCuts::default(),
@@ -134,7 +133,7 @@ fn system_fragment(
             annotations: Box::default(),
             layouts: Default::default(),
         },
-        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+        novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         &control,
     )
     .unwrap();
@@ -142,8 +141,7 @@ fn system_fragment(
         &package,
         &BTreeMap::new(),
         &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
         ),
         &control,
     )

@@ -24,10 +24,11 @@ pub fn prepare_schemas_decode_with_creator_in<'loan, 'control, H>(
     definitions: &'loan [wire::SchemaDefinition],
     types: &'loan DecodedTypeTable,
     original_source_bytes: usize,
-    limits: NodeProjectionLimits,
+    limits: impl Into<Option<NodeProjectionLimits>>,
     creation: &mut ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, ProjectionFailure<Error, H>> {
+    let limits = limits.into();
     prepare_schemas_decode_core(
         definitions,
         types,

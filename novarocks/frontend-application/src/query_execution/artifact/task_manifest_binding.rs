@@ -2216,10 +2216,8 @@ mod tests {
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
             paired,
             &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                novarocks_plan_codec::physical_package_v2::PACKAGE_ADMISSION_FIXTURE,
             ),
-            crate::application::test_constant_policy(),
             None,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )

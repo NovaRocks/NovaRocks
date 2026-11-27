@@ -20,16 +20,16 @@
 //! The counters say how many times a static plan was frozen, a creation was
 //! priced, and a creation's metadata was frozen. The gauges say how many of
 //! those frozen payloads are alive right now and how many bytes they hold.
-//! A gauge is driven by the payload's own lifetime: freezing mints a
-//! [`RetainedPayload`] that the payload keeps, and the gauge falls only when
-//! the payload's last holder drops it. So a gauge reports real release, not
-//! the moment one owner stopped referring to a payload that another -- a queued
-//! batch, an in-flight send -- still holds.
+//! Static fragment bytes keep a [`RetainedPayload`] in their shared backing,
+//! so queued, replayed and in-flight byte aliases keep the gauges alive through
+//! actual release. Creation metadata keeps its own retained observation.
+//! The histogram records the total encoded fragment bytes once per completed
+//! statement freeze.
 
 use std::fmt;
 
 use once_cell::sync::Lazy;
-use prometheus::{IntCounter, IntGauge, Opts, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
 
 static STATIC_FRAGMENTS_FROZEN: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
@@ -53,6 +53,17 @@ static STATIC_FRAGMENT_BYTES_RETAINED: Lazy<IntGauge> = Lazy::new(|| {
         "Bytes of frozen static fragment plans alive in this frontend.",
     ))
     .expect("register novarocks_task_static_fragment_bytes_retained")
+});
+
+static STATEMENT_STATIC_FRAGMENT_BYTES: Lazy<Histogram> = Lazy::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "novarocks_task_statement_static_fragment_bytes",
+            "Total encoded static fragment bytes in one completed statement freeze.",
+        )
+        .buckets(prometheus::exponential_buckets(4096.0, 2.0, 20).expect("valid byte buckets")),
+    )
+    .expect("register novarocks_task_statement_static_fragment_bytes")
 });
 
 static CREATES_PRICED: Lazy<IntCounter> = Lazy::new(|| {
@@ -92,6 +103,7 @@ pub(crate) fn register_collectors(registry: &Registry) -> Result<(), String> {
         Box::new(STATIC_FRAGMENTS_FROZEN.clone()) as Box<dyn prometheus::core::Collector>,
         Box::new(STATIC_FRAGMENTS_RETAINED.clone()),
         Box::new(STATIC_FRAGMENT_BYTES_RETAINED.clone()),
+        Box::new(STATEMENT_STATIC_FRAGMENT_BYTES.clone()),
         Box::new(CREATES_PRICED.clone()),
         Box::new(CREATES_FROZEN.clone()),
         Box::new(CREATE_PAYLOADS_RETAINED.clone()),
@@ -149,6 +161,18 @@ pub(crate) fn static_fragment_frozen(len: usize) -> RetainedPayload {
     )
 }
 
+pub(crate) fn statement_static_fragments_frozen(lengths: impl Iterator<Item = usize>) {
+    STATEMENT_STATIC_FRAGMENT_BYTES.observe(lengths.map(|len| len as f64).sum());
+}
+
+#[cfg(test)]
+pub(crate) fn retained_static_fragments() -> (i64, i64) {
+    (
+        STATIC_FRAGMENTS_RETAINED.get(),
+        STATIC_FRAGMENT_BYTES_RETAINED.get(),
+    )
+}
+
 /// One creation was measured for admission.
 pub(crate) fn create_priced() {
     CREATES_PRICED.inc();
@@ -181,6 +205,7 @@ mod tests {
             "novarocks_task_static_fragments_frozen_total",
             "novarocks_task_static_fragments_retained",
             "novarocks_task_static_fragment_bytes_retained",
+            "novarocks_task_statement_static_fragment_bytes",
             "novarocks_task_creates_priced_total",
             "novarocks_task_creates_frozen_total",
             "novarocks_task_create_payloads_retained",

@@ -37,7 +37,7 @@ use novarocks_type_contract::{
     PartitionCountParameterId, PartitionHashAlgorithm, PartitionSpaceId,
 };
 
-use super::fragment_fixture::{ADMISSION, DOP, compile, empty_values, numeric_catalogue, options};
+use super::fragment_fixture::{ADMISSION, DOP, compile, empty_values, numeric_catalogue};
 
 const PRODUCER: FragmentId = FragmentId::new(1);
 const RECEIVER: NodeId = NodeId::new(7);
@@ -51,7 +51,7 @@ fn package_input(
         version: PlanVersionId::try_new([1; 16]).unwrap(),
         required: Default::default(),
         constants: novarocks_constant_contract::ConstantPools::empty(),
-        statement_constant_policy: options().constants,
+
         pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &HarnessControl).unwrap(),
         fragment,
         cuts,

@@ -2103,7 +2103,7 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
 struct PackageDecodeResources<'host, 'creation, 'callback, H> {
     creation: Option<&'host mut novarocks_type_contract::ValueSchemaCreation<'creation, H>>,
     pure_admit: Option<&'callback mut PureTypeAdmit<'callback>>,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     source: usize,
     completed: PackageTypeProjectionFacts,
     completed_scoped: usize,
@@ -2469,7 +2469,7 @@ fn decode_source_fields_core<H, F: novarocks_type_contract::ValueSchemaCreationF
 pub(super) fn decode_package(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
@@ -2487,7 +2487,7 @@ pub(super) fn decode_package_with_storage(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
     storage: ValueTypeStorageLifetime,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
@@ -2520,7 +2520,7 @@ pub(super) fn decode_package_with_storage(
 pub(super) fn decode_package_with_creator<H>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
@@ -2535,7 +2535,7 @@ pub(super) fn decode_package_with_factory<
 >(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: &F,
     work: &mut CompileCheckpoints<'_>,
@@ -2554,7 +2554,7 @@ pub(super) fn decode_package_with_factory<
 fn decode_package_created_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
@@ -2591,7 +2591,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
     storage: ValueTypeStorageLifetime,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     resources: &mut PackageDecodeResources<'_, '_, '_, H>,
     work: &mut CompileCheckpoints<'_>,
     factory: Option<&F>,
@@ -2607,7 +2607,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     }
     // All header-known output/scratch requests precede source steps and late
     // control checks. Child graph caps must not replace this numerical cause.
-    resources.gate(&model.facts(limits)?, model.entity_bytes())?;
+    resources.gate(&model.facts_in(limits)?, model.entity_bytes())?;
     // Pure numerical header projection: only kinds, lengths and layouts are
     // read, with CPU already covered by the original B/N numerical ceiling.
     // No attribute validation, byte traversal, graph edge, output allocation
@@ -2622,7 +2622,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     }
     // Known output requests must refuse before the graph's first source step,
     // including when a late caller refusal is pending at 254/255 units.
-    resources.gate(&model.facts(limits)?, model.entity_bytes())?;
+    resources.gate(&model.facts_in(limits)?, model.entity_bytes())?;
     let graph_limits = TypeProjectionLimits {
         max_definitions: usize::MAX,
         max_expanded_nodes: usize::MAX,
@@ -2634,7 +2634,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
         source,
         &mut |facts| {
             model.graph(*facts)?;
-            resources.gate(&model.facts(limits)?, model.entity_bytes())
+            resources.gate(&model.facts_in(limits)?, model.entity_bytes())
         },
         work,
     )?;
@@ -2647,7 +2647,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
         Some(Receiver {
             graph: Some(&graph),
             model,
-            limits: Some(limits),
+            limits,
             admit: &mut |facts, scoped| resources.gate(facts, scoped),
             scoped_request_bytes: 0,
         }),
@@ -2663,7 +2663,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     let source_fields = decode_source_fields_core(
         source_table,
         source,
-        Some(limits),
+        limits,
         storage.clone(),
         Some(package),
         None,
@@ -2680,7 +2680,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
 pub(super) fn decode_package_with_funding<H>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
     host: &mut dyn super::PackageTypeFundingScope<H>,
@@ -2715,7 +2715,7 @@ pub(super) fn decode_package_with_factory_and_funding<
 >(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source: usize,
-    limits: PackageTypeProjectionLimits,
+    limits: Option<PackageTypeProjectionLimits>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: &F,
     work: &mut CompileCheckpoints<'_>,

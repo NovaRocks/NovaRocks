@@ -829,10 +829,12 @@ fn string_pad_character_and_byte_sizes_can_exceed_one_mib() {
         output_capacity(usize::MAX, 0),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert_eq!(
-        output_capacity(1, i32::MAX as usize + 1),
-        Err(KernelFailure::ResourceExhausted)
-    );
+    use novarocks_failure_contract::{FailureProjection, RepresentationBoundary};
+    let unsupported = output_capacity(1, i32::MAX as usize + 1).unwrap_err();
+    let facts = unsupported.failure_fact().representation().unwrap();
+    assert_eq!(facts.boundary, RepresentationBoundary::SingleOutput);
+    assert_eq!(facts.required, Some(i32::MAX as u64 + 1));
+    assert_eq!(facts.extent_limit, Some(i32::MAX as u64));
 }
 
 #[test]

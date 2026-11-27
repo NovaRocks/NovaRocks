@@ -255,18 +255,20 @@ impl PureCompileControl for RecordingControl {
 }
 
 #[test]
-fn optional_fold_declines_values_that_exceed_the_constant_pool_limit() {
+fn optional_fold_admits_a_value_above_the_retired_pool_ceiling() {
     let ty = FunctionValueType::new(DataType::Utf8, false);
-    let policy = ConstantPolicy {
-        max_retained_buffer_bytes: 256,
-        ..test_constant_policy()
-    };
-    let control = test_optimizer_control();
-    let small = Arc::new(StringArray::from(vec!["March"])) as ArrayRef;
-    let long_text = "t".repeat(2560);
-    let long = Arc::new(StringArray::from(vec![long_text.as_str()])) as ArrayRef;
-    assert!(admit_result(small, &ty, policy, control).unwrap().is_some());
-    assert!(admit_result(long, &ty, policy, control).unwrap().is_none());
+    let text = "t".repeat(9 * 1024 * 1024);
+    let output = Arc::new(StringArray::from(vec![text.as_str()])) as ArrayRef;
+    let constant = admit_result(
+        output,
+        &ty,
+        ConstantValidation::INPUT_DERIVED,
+        test_optimizer_control(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(constant.value_type(), &ty);
+    assert_eq!(constant.try_utf8().unwrap(), Some(text.as_str()));
 }
 
 #[test]

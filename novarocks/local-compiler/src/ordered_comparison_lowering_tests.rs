@@ -446,7 +446,6 @@ fn rand_operand_fixture(
         Some(&selected),
         Some(request),
         &[call],
-        options().constants,
     )
     .unwrap();
     Fixture {
@@ -468,7 +467,6 @@ fn rand_operand_fixture(
         rand_selected: Some(selected),
         rand_request: Some(request),
         rand_definitions: vec![call],
-        constant_policy: options().constants,
         parameters: SemanticParameters::default(),
     }
 }

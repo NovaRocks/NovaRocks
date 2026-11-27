@@ -41,7 +41,6 @@ use novarocks_sql::planning::dml::DmlStatisticsEvidence;
 use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
-use novarocks_functions::ConstantPolicy;
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
@@ -103,7 +102,7 @@ fn sql_source_with_columns_and_semantics(
         builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         // Explicit fixture admission; neither capacity grant nor defaults.
-        ConstantPolicy {
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
             max_rows: 64,
             max_array_nodes: 1024,
             max_logical_elements: 4096,
@@ -114,7 +113,7 @@ fn sql_source_with_columns_and_semantics(
             max_metadata_bytes: 1 << 20,
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
-        },
+        }),
         control.clone(),
         PipelineDopDomain {
             min: 1,

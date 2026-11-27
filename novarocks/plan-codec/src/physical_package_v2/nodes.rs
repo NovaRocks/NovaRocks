@@ -85,11 +85,25 @@ use novarocks_type_contract::CompileCheckpoints;
 
 /// Original component limits; no default or independent resource ledger.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct NodeDispatchLimits {
-    pub node: NodeProjectionLimits,
-    pub binding: BindingProjectionLimits,
-    pub relation: RelationProjectionLimits,
-    pub writer_schema: WriterSchemaProjectionLimits,
+pub(super) struct NodeDispatchLimits<N = NodeProjectionLimits, R = RelationProjectionLimits> {
+    pub node: N,
+    pub binding: Option<BindingProjectionLimits>,
+    pub relation: R,
+    pub writer_schema: Option<WriterSchemaProjectionLimits>,
+}
+impl<N: Into<Option<NodeProjectionLimits>>, R: Into<Option<RelationProjectionLimits>>>
+    NodeDispatchLimits<N, R>
+{
+    fn capture_node_profile(
+        self,
+    ) -> NodeDispatchLimits<Option<NodeProjectionLimits>, Option<RelationProjectionLimits>> {
+        NodeDispatchLimits {
+            node: self.node.into(),
+            binding: self.binding,
+            relation: self.relation.into(),
+            writer_schema: self.writer_schema,
+        }
+    }
 }
 
 /// Exact sender namespace loans prepared by the containing Package author.
@@ -218,10 +232,14 @@ pub(super) fn prepare_node_encode_in<'node, 'namespace, 'loan, 'source, 'control
     context: &NodeEncodeContext<'namespace, 'loan, 'source, 'control>,
     writer_type_ids: Option<TableWriteTypeIds<'node>>,
     source_retained_bytes: usize,
-    limits: NodeDispatchLimits,
+    limits: NodeDispatchLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, NodeCodecError> {
+    let limits = limits.capture_node_profile();
     if !std::ptr::addr_eq(work.control(), context.values.original_control()) {
         return Err(NodeCodecError::InvalidShape(
             "node dispatcher uses a different original control",
@@ -382,10 +400,14 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
     context: &NodeDecodeContext<'namespace, 'loan, 'wire, 'control>,
     source_retained_bytes: usize,
-    limits: NodeDispatchLimits,
+    limits: NodeDispatchLimits<
+        impl Into<Option<NodeProjectionLimits>>,
+        impl Into<Option<RelationProjectionLimits>>,
+    >,
     admit: &mut NodeAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, NodeCodecError> {
+    let limits = limits.capture_node_profile();
     if !std::ptr::addr_eq(work.control(), context.expressions.original_control()) {
         return Err(NodeCodecError::InvalidShape(
             "node dispatcher uses a different original control",

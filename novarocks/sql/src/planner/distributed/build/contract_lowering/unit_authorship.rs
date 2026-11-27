@@ -113,7 +113,7 @@ pub(super) fn standalone_input_ports_observed(
 }
 
 /// Consume one actual draft through the expression-layer call author.
-/// SQL still pairs each call with its source journal and statement policy.
+/// SQL pairs each call with its original source journal.
 /// Ports are authored at their original point after definition controls; this
 /// closure supplies declarations only, never capacity or source credentials.
 pub(super) fn finish_scalar_unit_observed(
@@ -125,7 +125,6 @@ pub(super) fn finish_scalar_unit_observed(
     journal: &SqlLogicalSourceJournal,
     functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: &novarocks_functions::PureEngineFunctionCatalog,
-    policy: novarocks_constant_contract::ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredScalarUnit, ContractLoweringError> {
     {
@@ -163,7 +162,6 @@ pub(super) fn finish_scalar_unit_observed(
             constants,
             parameters,
         },
-        constant_policy: policy,
         functions: sealed_functions,
         decimal_overflow: &empty_decimal,
     };
@@ -183,7 +181,7 @@ pub(super) fn finish_scalar_unit_observed(
         functions,
     };
     let mut decimal = BTreeMap::new();
-    for (&id, invocation) in sealed.uses() {
+    for invocation in sealed.uses().values() {
         let definition = sealed.definition(invocation.definition).ok_or(
             PackageSemanticsError::InvalidSource("sealed unit invocation has no actual definition"),
         )?;
@@ -192,20 +190,6 @@ pub(super) fn finish_scalar_unit_observed(
             continue;
         }
         let entry = source.checked_expression_source_observed(definition, work)?;
-        if entry.captured().constant_policy() != policy {
-            return Err(match &site {
-                ScalarSourceSite::Node { node, .. } => {
-                    PackageSemanticsError::ExpressionPolicyMismatch {
-                        node: *node,
-                        invocation: id,
-                    }
-                }
-                ScalarSourceSite::Standalone(_) => {
-                    PackageSemanticsError::StandaloneExpressionPolicyMismatch { invocation: id }
-                }
-            }
-            .into());
-        }
         work.flush()?;
         decimal.insert(
             invocation.definition,
@@ -218,7 +202,6 @@ pub(super) fn finish_scalar_unit_observed(
             constants,
             parameters,
         },
-        constant_policy: policy,
         functions: sealed_functions,
         decimal_overflow: &decimal,
     };
@@ -251,12 +234,6 @@ pub(in crate::planner::distributed::build) fn package_author_error(
         }
         CallAuthorError::Capability(CapabilityRefusal::Primitive { source, cast }) => {
             PackageSemanticsError::PrimitiveSource { source, cast }
-        }
-        CallAuthorError::Invariant(InvariantRefusal::ConstantPolicy) => {
-            PackageSemanticsError::Effects(
-                "InvalidSource(\"SQL expression occurrence changes its original captured policy\")"
-                    .into(),
-            )
         }
         CallAuthorError::Invariant(InvariantRefusal::MissingOverflow(definition)) => {
             PackageSemanticsError::Effects(format!(
@@ -430,7 +407,6 @@ impl ContractLoweringVisitor<'_> {
                 &self.call_sources,
                 &self.functions,
                 self.sealed_functions.as_ref(),
-                self.constant_policy,
                 &mut self.work,
             )?;
             let unit = authored.unit;
@@ -523,14 +499,11 @@ impl ContractLoweringVisitor<'_> {
                 let node = fragment.nodes().get(&site.node()).ok_or(
                     PackageSemanticsError::InvalidSource("relation site has no actual node"),
                 )?;
-                let (binding, policy) = match site {
+                let binding = match site {
                     PhysicalCallSite::Table { .. } => {
                         let entry =
                             facts.checked_table_source_observed(fragment, node, &mut self.work)?;
-                        (
-                            entry.captured().binding(),
-                            entry.captured().constant_policy(),
-                        )
+                        entry.captured().binding()
                     }
                     PhysicalCallSite::Window { .. } => {
                         let source =
@@ -542,10 +515,7 @@ impl ContractLoweringVisitor<'_> {
                             source,
                             &mut self.work,
                         )?;
-                        (
-                            entry.captured().binding(),
-                            entry.captured().constant_policy(),
-                        )
+                        entry.captured().binding()
                     }
                     PhysicalCallSite::Aggregate { .. } | PhysicalCallSite::TopNState { .. } => {
                         let source =
@@ -557,10 +527,7 @@ impl ContractLoweringVisitor<'_> {
                             source,
                             &mut self.work,
                         )?;
-                        (
-                            entry.captured().binding(),
-                            entry.captured().constant_policy(),
-                        )
+                        entry.captured().binding()
                     }
                     PhysicalCallSite::WriterPartial { .. }
                     | PhysicalCallSite::WriterFinal { .. } => {
@@ -573,15 +540,9 @@ impl ContractLoweringVisitor<'_> {
                             source,
                             &mut self.work,
                         )?;
-                        (
-                            entry.captured().binding(),
-                            entry.captured().constant_policy(),
-                        )
+                        entry.captured().binding()
                     }
                 };
-                if policy != self.constant_policy {
-                    return Err(PackageSemanticsError::PolicyMismatch(site).into());
-                }
                 self.work.flush()?;
                 policies.insert(site, binding.decimal_overflow_policy());
                 self.work.step()?;

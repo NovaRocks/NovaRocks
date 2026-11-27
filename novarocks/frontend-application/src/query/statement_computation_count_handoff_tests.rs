@@ -135,9 +135,7 @@ mod count_handoff_tests {
             )
             .unwrap();
         let mut plan = PlanBuilder::new(
-            PlanVersionId::try_new([199; 16]).unwrap(),
-            crate::application::test_constant_policy(),
-        );
+            PlanVersionId::try_new([199; 16]).unwrap());
         plan.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
             plan.finish().unwrap(),

@@ -18,7 +18,7 @@
 //! Checked constant sources for hand-authored physical test inputs.
 //! The fixture owns each source table explicitly; consumers pass `constants()`
 //! to the actual physical author rather than synthesizing dangling references.
-use novarocks_constant_contract::{ConstantPolicy, ConstantValue};
+use novarocks_constant_contract::{ConstantValidation, ConstantValue};
 use novarocks_physical_plan as p;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
@@ -32,8 +32,12 @@ impl PureCompileControl for Setup {
         Ok(())
     }
 }
-pub(crate) fn policy() -> ConstantPolicy {
-    ConstantPolicy {
+pub(crate) fn policy() -> ConstantValidation {
+    ConstantValidation::bounded(policy_fixture())
+}
+
+pub(crate) fn policy_fixture() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
         max_rows: 1024,
         max_array_nodes: 4096,
         max_logical_elements: 1_000_000,

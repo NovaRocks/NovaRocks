@@ -254,7 +254,7 @@ pub(super) fn build_typed(
                 required: RequiredContracts::default(),
                 fragment,
                 constants,
-                statement_constant_policy: policy(),
+
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),

@@ -64,20 +64,6 @@ fn limits() -> DecodeProjectionLimits {
         max_wire_depth: 100,
     }
 }
-fn zero_policy() -> wire::SourceConstantPolicy {
-    wire::SourceConstantPolicy {
-        max_rows: Some(0),
-        max_array_nodes: Some(0),
-        max_logical_elements: Some(0),
-        max_retained_buffer_bytes: Some(0),
-        max_type_depth: Some(0),
-        max_type_nodes: Some(0),
-        max_dictionary_depth: Some(0),
-        max_metadata_bytes: Some(0),
-        max_library_validation_work: Some(0),
-        max_library_validation_bytes: Some(0),
-    }
-}
 fn request() -> wire::UnitCallRequest {
     wire::UnitCallRequest {
         definition_id: Some(0),
@@ -112,7 +98,6 @@ fn request() -> wire::UnitCallRequest {
         ],
         logical_argument_count: Some(2),
         expected_result_value_type_id: Some(u32::MAX),
-        constant_policy: Some(zero_policy()),
     }
 }
 // Resource-only syntax fixture, not a semantically published unit. The real
@@ -195,10 +180,10 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
     // Hand count: four outer messages, then one unit request, three argument
-    // wrappers, two Value payloads, one reference, one Lambda and one policy.
-    assert_eq!(projection.usage.message_occurrences, 13);
-    assert_eq!(projection.usage.field_occurrences, 31);
-    assert_eq!(projection.usage.scalar_elements, 21);
+    // wrappers, two Value payloads, one reference and one Lambda.
+    assert_eq!(projection.usage.message_occurrences, 12);
+    assert_eq!(projection.usage.field_occurrences, 20);
+    assert_eq!(projection.usage.scalar_elements, 11);
     let message_initialization_floor = size::<wire::FragmentPackage>()
         + size::<wire::Fragment>()
         + size::<wire::PhysicalNode>()
@@ -207,8 +192,7 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
         + 3 * size::<wire::OriginalFunctionArgument>()
         + 2 * size::<wire::OriginalValueArgument>()
         + size::<wire::ConstantReference>()
-        + size::<wire::LambdaArgumentType>()
-        + size::<wire::SourceConstantPolicy>();
+        + size::<wire::LambdaArgumentType>();
     assert!(projection.usage.initialization_bytes_upper >= message_initialization_floor);
 
     let decoded = wire::FragmentPackage::decode(raw.as_slice()).unwrap();
@@ -222,7 +206,6 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
     };
     assert_eq!(lambda.parameter_value_type_ids, [0, u32::MAX, 7]);
     assert_eq!(lambda.result_value_type_id, Some(0));
-    assert_eq!(actual.constant_policy, Some(zero_policy()));
     let live_vec_backing = entries.capacity() * size_of::<wire::UnitCallRequest>()
         + decoded.fragment.as_ref().unwrap().nodes.capacity() * size_of::<wire::PhysicalNode>()
         + actual.arguments.capacity() * size_of::<wire::OriginalFunctionArgument>()
@@ -254,7 +237,6 @@ fn relation_request_carrier_keeps_the_real_site_and_original_argument_payload() 
         arguments: scalar.arguments,
         logical_argument_count: scalar.logical_argument_count,
         expected_result_value_type_id: scalar.expected_result_value_type_id,
-        constant_policy: scalar.constant_policy,
     };
     let package = wire::FragmentPackage {
         fragment: Some(wire::Fragment {
@@ -298,14 +280,13 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
         .preflight(&raw, limits(), &Control::default())
         .unwrap()
         .usage;
-    // Seven descents reach the Value's ConstantReference; these source-policy
-    // zeros never replace any receiving limit.
+    // Seven descents reach the Value's ConstantReference.
     let exact = DecodeProjectionLimits {
         max_input_bytes: raw.len(),
         max_requested_heap_bytes: usage.cumulative_requested_heap_bytes_upper,
-        max_message_occurrences: 13,
-        max_scalar_elements: 21,
-        max_field_occurrences: 31,
+        max_message_occurrences: 12,
+        max_scalar_elements: 11,
+        max_field_occurrences: 20,
         max_copied_bytes: usage.copied_bytes_upper,
         max_initialization_bytes: usage.initialization_bytes_upper,
         max_wire_depth: 7,
@@ -327,15 +308,15 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
             ..exact
         },
         DecodeProjectionLimits {
-            max_message_occurrences: 12,
+            max_message_occurrences: 11,
             ..exact
         },
         DecodeProjectionLimits {
-            max_scalar_elements: 20,
+            max_scalar_elements: 10,
             ..exact
         },
         DecodeProjectionLimits {
-            max_field_occurrences: 30,
+            max_field_occurrences: 19,
             ..exact
         },
         DecodeProjectionLimits {
@@ -360,49 +341,6 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
 }
 
 #[test]
-fn repeated_singular_request_policy_counts_both_occurrences_before_prost_merges() {
-    let model = model();
-    let mut original = request();
-    original.constant_policy.as_mut().unwrap().max_rows = Some(9);
-    let once = wrap_request(&original.encode_to_vec());
-    let first = model
-        .preflight(&once, limits(), &Control::default())
-        .unwrap()
-        .usage;
-    let mut raw_request = original.encode_to_vec();
-    raw_request.extend(ld(5, &zero_policy().encode_to_vec()));
-    let twice = wrap_request(&raw_request);
-    let second = model
-        .preflight(&twice, limits(), &Control::default())
-        .unwrap()
-        .usage;
-    assert_eq!(second.message_occurrences, 14);
-    assert_eq!(second.scalar_elements, 31);
-    assert_eq!(second.field_occurrences, 42);
-    assert!(
-        second.initialization_bytes_upper
-            >= first.initialization_bytes_upper + size_of::<wire::SourceConstantPolicy>()
-    );
-    let decoded = wire::FragmentPackage::decode(twice.as_slice()).unwrap();
-    assert_eq!(
-        decoded_requests(&decoded)[0].constant_policy,
-        Some(zero_policy())
-    );
-    // Charging only the final logical object would incorrectly accept this.
-    assert!(matches!(
-        model.preflight(
-            &twice,
-            DecodeProjectionLimits {
-                max_scalar_elements: 21,
-                ..limits()
-            },
-            &Control::default()
-        ),
-        Err(ResourceModelError::Limit(_))
-    ));
-}
-
-#[test]
 fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
     let model = model();
     let original = request();
@@ -418,9 +356,9 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         .preflight(&unknown, limits(), &Control::default())
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    assert_eq!(projection.usage.field_occurrences, 32);
-    assert_eq!(projection.usage.message_occurrences, 13);
-    assert_eq!(projection.usage.scalar_elements, 21);
+    assert_eq!(projection.usage.field_occurrences, 21);
+    assert_eq!(projection.usage.message_occurrences, 12);
+    assert_eq!(projection.usage.scalar_elements, 11);
     assert_eq!(
         projection.usage.cumulative_requested_heap_bytes_upper,
         baseline.cumulative_requested_heap_bytes_upper
@@ -433,7 +371,7 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         model.preflight(
             &unknown,
             DecodeProjectionLimits {
-                max_field_occurrences: 31,
+                max_field_occurrences: 20,
                 ..limits()
             },
             &Control::default()
@@ -450,9 +388,9 @@ fn request_unknown_fields_and_malformed_argument_keep_the_accounted_prefix() {
         .preflight(&malformed, limits(), &Control::default())
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::MalformedPrefix);
-    assert_eq!(projection.usage.message_occurrences, 14);
-    assert_eq!(projection.usage.field_occurrences, 32);
-    assert_eq!(projection.usage.scalar_elements, 21);
+    assert_eq!(projection.usage.message_occurrences, 13);
+    assert_eq!(projection.usage.field_occurrences, 21);
+    assert_eq!(projection.usage.scalar_elements, 11);
     assert!(
         projection.usage.cumulative_requested_heap_bytes_upper
             > baseline.cumulative_requested_heap_bytes_upper
@@ -471,7 +409,7 @@ fn request_small_success_malformed_and_limit_keep_every_original_control_prefix(
         (
             package(vec![request()]).encode_to_vec(),
             DecodeProjectionLimits {
-                max_message_occurrences: 12,
+                max_message_occurrences: 11,
                 ..limits()
             },
             true,
@@ -505,9 +443,9 @@ fn wide_request_wire_is_refused_before_prost_and_observes_real_decode_quanta() {
     let control = Control::default();
     let projection = model.preflight(&raw, limits(), &control).unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    assert_eq!(projection.usage.message_occurrences, 4 + 9 * 320);
-    assert_eq!(projection.usage.scalar_elements, 21 * 320);
-    assert_eq!(projection.usage.field_occurrences, 3 + 28 * 320);
+    assert_eq!(projection.usage.message_occurrences, 4 + 8 * 320);
+    assert_eq!(projection.usage.scalar_elements, 11 * 320);
+    assert_eq!(projection.usage.field_occurrences, 3 + 17 * 320);
     // Independent entry-count floor, even before argument/Lambda backing.
     assert!(
         projection.usage.cumulative_requested_heap_bytes_upper
@@ -517,7 +455,7 @@ fn wide_request_wire_is_refused_before_prost_and_observes_real_decode_quanta() {
         model.preflight(
             &raw,
             DecodeProjectionLimits {
-                max_message_occurrences: 4 + 9 * 320 - 1,
+                max_message_occurrences: 4 + 8 * 320 - 1,
                 ..limits()
             },
             &Control::default()

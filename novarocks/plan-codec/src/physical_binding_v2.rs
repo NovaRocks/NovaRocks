@@ -162,7 +162,7 @@ pub struct BindingProjectionLimits {
     pub max_coexisting_source_and_request_bytes: usize,
     pub max_work: usize,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BindingProjectionFacts {
     pub definition_count: usize,
     pub type_reference_count: usize,
@@ -339,7 +339,7 @@ pub fn encode_function_bindings<'loan, 'source>(
         types,
         inputs,
         source_retained_bytes,
-        limits,
+        Some(limits),
         owner_admission::Policy(false),
         &mut |_| Ok(()),
         &mut work,
@@ -359,11 +359,13 @@ pub fn encode_function_bindings<'loan, 'source>(
 
 /// Same sender and original typed source loans, borrowing the parent's scope.
 /// Facts replace this call's previous prefix; source B is a single union.
+/// Passing None derives the request and work from the original source and
+/// admits them through the supplied parent.
 pub fn encode_function_bindings_in<'loan, 'source>(
     types: &'loan EncodedTypeTable<'source>,
     inputs: &'loan [FunctionBindingInput<'source>],
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedFunctionBindings<'loan, 'source>, BindingCodecError> {
@@ -371,7 +373,7 @@ pub fn encode_function_bindings_in<'loan, 'source>(
         types,
         inputs,
         source_retained_bytes,
-        limits,
+        limits.into(),
         owner_admission::Policy(true),
         admit,
         work,
@@ -390,7 +392,7 @@ pub fn encode_function_bindings_with_host_in<'loan, 'source, H>(
     types: &'loan EncodedTypeTable<'source>,
     inputs: &'loan [FunctionBindingInput<'source>],
     source_retained_bytes: usize,
-    limits: BindingProjectionLimits,
+    limits: impl Into<Option<BindingProjectionLimits>>,
     admit: &mut impl FnMut(
         &BindingProjectionFacts,
     ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
@@ -403,7 +405,7 @@ pub fn encode_function_bindings_with_host_in<'loan, 'source, H>(
         types,
         inputs,
         source_retained_bytes,
-        limits,
+        limits.into(),
         owner_admission::Policy(true),
         admit,
         work,

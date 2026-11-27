@@ -560,7 +560,7 @@ fn complete_pure_plan(builder: FragmentBuilder, node: NodeId) -> PhysicalPlan {
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap(), fixture_policy());
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
     plan.finish().unwrap()
 }
@@ -821,18 +821,6 @@ fn window_request_keeps_logical_arguments_separate_from_function_order_channels(
         ]),
         logical_argument_count: 1,
         expected_result_type: None,
-        constant_policy: ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 32,
-            max_logical_elements: 128,
-            max_retained_buffer_bytes: 65536,
-            max_type_depth: 16,
-            max_type_nodes: 128,
-            max_dictionary_depth: 8,
-            max_metadata_bytes: 4096,
-            max_library_validation_work: 1_000_000,
-            max_library_validation_bytes: 1_000_000,
-        },
     };
     fragment
         .clone()
@@ -951,7 +939,6 @@ fn window_offset_only_pool_is_in_the_complete_plan_constant_closure() {
                     arguments: Box::default(),
                     logical_argument_count: 0,
                     expected_result_type: None,
-                    constant_policy: policy,
                 },
             )],
             &Control,
@@ -975,8 +962,8 @@ fn window_offset_only_pool_is_in_the_complete_plan_constant_closure() {
         local.entries()[&reference.pool].backing_identity(),
         offset.pool().backing_identity()
     );
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([19; 16]).unwrap(), policy)
-        .with_constant_pools(pools);
+    let mut plan =
+        PlanBuilder::new(PlanVersionId::try_new([19; 16]).unwrap()).with_constant_pools(pools);
     plan.add_fragment(fragment.clone()).unwrap();
     // Red before R1: PlanConstructionError::Constants(UnusedPools). The pool
     // has one real consumer, the frame, even though no scalar unit names it.

@@ -382,7 +382,7 @@ impl Clone for TypedExpr {
 
 pub(crate) fn function_argument(
     expr: &TypedExpr,
-    policy: novarocks_functions::ConstantPolicy,
+    policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::FunctionArgument, novarocks_functions::FunctionBindingError> {
     use novarocks_functions::FunctionArgument;
@@ -495,7 +495,7 @@ pub(crate) fn select_scalar_function(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-    constant_policy: novarocks_functions::ConstantPolicy,
+    constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<novarocks_functions::ResolvedFunctionBinding, novarocks_functions::FunctionBindingError>
 {

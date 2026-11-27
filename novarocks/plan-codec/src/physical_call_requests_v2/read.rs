@@ -30,8 +30,7 @@ use crate::{
 };
 use novarocks_expression_contract::PhysicalCallRequest;
 use novarocks_physical_plan::{
-    ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallSite,
-    StaticFunctionArgument,
+    ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallSite, StaticFunctionArgument,
 };
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -166,42 +165,6 @@ fn relation_definition(input: &wire::OriginalCallRequest) -> Result<PhysicalCall
     }
 }
 
-pub(crate) fn policy(input: Option<&wire::SourceConstantPolicy>) -> Result<ConstantPolicy, E> {
-    let p = input.ok_or_else(|| invalid("call request constant policy is absent"))?;
-    Ok(ConstantPolicy {
-        max_rows: required(p.max_rows, "constant policy max_rows is absent")?,
-        max_array_nodes: required(
-            p.max_array_nodes,
-            "constant policy max_array_nodes is absent",
-        )?,
-        max_logical_elements: required(
-            p.max_logical_elements,
-            "constant policy max_logical_elements is absent",
-        )?,
-        max_retained_buffer_bytes: required(
-            p.max_retained_buffer_bytes,
-            "constant policy max_retained_buffer_bytes is absent",
-        )?,
-        max_type_depth: required(p.max_type_depth, "constant policy max_type_depth is absent")?,
-        max_type_nodes: required(p.max_type_nodes, "constant policy max_type_nodes is absent")?,
-        max_dictionary_depth: required(
-            p.max_dictionary_depth,
-            "constant policy max_dictionary_depth is absent",
-        )?,
-        max_metadata_bytes: required(
-            p.max_metadata_bytes,
-            "constant policy max_metadata_bytes is absent",
-        )?,
-        max_library_validation_work: required(
-            p.max_library_validation_work,
-            "constant policy max_library_validation_work is absent",
-        )?,
-        max_library_validation_bytes: required(
-            p.max_library_validation_bytes,
-            "constant policy max_library_validation_bytes is absent",
-        )?,
-    })
-}
 fn reference(input: &wire::ConstantReference) -> Result<ConstantReference, E> {
     Ok(ConstantReference {
         pool: ConstantPoolId::new(required(
@@ -244,16 +207,21 @@ fn boxed<T>(output: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, 
 
 #[derive(Clone, Copy)]
 enum Profile {
+    Derived,
     Receiving(Limits),
 }
-impl From<Limits> for Profile {
-    fn from(value: Limits) -> Self {
-        Self::Receiving(value)
+impl Profile {
+    fn from_limits(value: impl Into<Option<Limits>>) -> Self {
+        match value.into() {
+            Some(value) => Self::Receiving(value),
+            None => Self::Derived,
+        }
     }
 }
 impl Profile {
     fn remaining_work(self, used: usize) -> Result<Option<usize>, E> {
         match self {
+            Self::Derived => Ok(None),
             Self::Receiving(limits) => limits
                 .max_work
                 .checked_sub(used)
@@ -327,8 +295,7 @@ impl Model {
             add(self.source, size_of::<PreparedCallRequestsDecode<'_>>())?,
             self.facts.request_bytes_upper_bound,
         )?;
-        {
-            let Profile::Receiving(limits) = limits;
+        if let Profile::Receiving(limits) = limits {
             gate(self.facts.definition_count, limits.max_definitions)?;
             gate(self.facts.type_reference_count, limits.max_type_references)?;
             gate(
@@ -535,22 +502,24 @@ fn preflight<F: ReadFailure, W: RequestWire>(
         model.output_map_work = tree.cumulative_work_upper_bound;
     }
     observed(model.admit(limits, parent), w)?;
-    // Visit the loaned pool namespace once. Maximum individual backing is an
-    // alias-safe NECESSARY floor, not a complete host invoice or dedup upper.
-    let mut maximum_pool_backing = 0;
-    for pool in pools.entries().values() {
-        let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
-            .map_err(|_| resource())?;
-        maximum_pool_backing = maximum_pool_backing.max(add(
-            novarocks_physical_plan::ConstantPool::backing_allocation_layout().size(),
-            retained,
-        )?);
-        observed(
-            source_gate(invoice, add(model.known, maximum_pool_backing)?),
-            w,
-        )?;
+    // Only the explicit bounded fixture accepts a retained-source invoice.
+    // The production request links to the original, already owned pools.
+    if matches!(limits, Profile::Receiving(_)) {
+        let mut maximum_pool_backing = 0;
+        for pool in pools.entries().values() {
+            let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+                .map_err(|_| resource())?;
+            maximum_pool_backing = maximum_pool_backing.max(add(
+                novarocks_physical_plan::ConstantPool::backing_allocation_layout().size(),
+                retained,
+            )?);
+            observed(
+                source_gate(invoice, add(model.known, maximum_pool_backing)?),
+                w,
+            )?;
+        }
+        model.known = add(model.known, maximum_pool_backing)?;
     }
-    model.known = add(model.known, maximum_pool_backing)?;
     for entry in source {
         if parent.is_some() {
             capture_arguments(entry, &mut model, limits, parent)?;
@@ -569,9 +538,6 @@ fn preflight<F: ReadFailure, W: RequestWire>(
         if !valid {
             return Err(invalid("request logical argument count exceeds actual channels").into());
         }
-        let p = policy(entry.constant_policy());
-        w.step()?;
-        p?;
         if parent.is_none() {
             capture_arguments(entry, &mut model, limits, parent)?;
         }
@@ -804,7 +770,7 @@ pub fn prepare_call_requests_decode<'loan>(
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
@@ -813,7 +779,7 @@ pub fn prepare_call_requests_decode<'loan>(
         CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut None::<&mut Parent<'_, E>>,
         &mut work,
     );
@@ -827,7 +793,7 @@ pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
@@ -836,7 +802,7 @@ pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
         CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut Some(&mut |facts: &Facts| admit(facts).map_err(E::from)),
         work,
     )
@@ -847,7 +813,7 @@ pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
     types: CallRequestTypeOwner<'loan>,
     pools: &'loan ConstantPools,
     original_source_bytes: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
@@ -856,7 +822,7 @@ pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
         types,
         pools,
         original_source_bytes,
-        limits.into(),
+        Profile::from_limits(limits),
         creation,
         work,
     )
@@ -988,15 +954,12 @@ fn decode_core<W: RequestWire>(
         );
         work.step()?;
         let logical_argument_count = usize::try_from(logical?).map_err(|_| resource())?;
-        let constant_policy = policy(entry.constant_policy());
-        work.step()?;
         output.push((
             key?,
             PhysicalCallRequest {
                 arguments: boxed(arguments, work)?,
                 logical_argument_count,
                 expected_result_type,
-                constant_policy: constant_policy?,
             },
         ));
         work.step()?;
@@ -1074,7 +1037,6 @@ pub trait RequestWire {
     fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument>;
     fn logical_argument_count(&self) -> Option<u32>;
     fn expected_result_value_type_id(&self) -> Option<u32>;
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy>;
 }
 impl RequestWire for wire::OriginalCallRequest {
     type Key = PhysicalCallSite;
@@ -1090,9 +1052,6 @@ impl RequestWire for wire::OriginalCallRequest {
     }
     fn expected_result_value_type_id(&self) -> Option<u32> {
         self.expected_result_value_type_id
-    }
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
-        self.constant_policy.as_ref()
     }
 }
 impl RequestWire for wire::UnitCallRequest {
@@ -1113,9 +1072,6 @@ impl RequestWire for wire::UnitCallRequest {
     fn expected_result_value_type_id(&self) -> Option<u32> {
         self.expected_result_value_type_id
     }
-    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
-        self.constant_policy.as_ref()
-    }
 }
 type DecodedUnitRequests = (
     std::collections::BTreeMap<novarocks_expression_contract::ExprId, PhysicalCallRequest>,
@@ -1127,7 +1083,7 @@ pub(crate) fn decode_unit_requests_in<H>(
     types: &DecodedTypeTable,
     pools: &ConstantPools,
     invoice: usize,
-    limits: Limits,
+    limits: impl Into<Option<Limits>>,
     observe: &mut CallRequestAdmit<'_>,
     mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
@@ -1160,7 +1116,7 @@ pub(crate) fn decode_unit_requests_in<H>(
         CallRequestTypeOwner::Package(types),
         pools,
         invoice,
-        limits.into(),
+        Profile::from_limits(limits),
         &mut Some(&mut admit),
         work,
     )?;

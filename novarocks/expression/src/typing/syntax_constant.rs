@@ -20,7 +20,7 @@
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, i256};
 use novarocks_constant_contract::{
-    ConstantError, ConstantPolicy, ConstantValue, preflight_scalar_construction,
+    ConstantError, ConstantValidation, ConstantValue, preflight_scalar_construction,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
@@ -42,9 +42,10 @@ pub enum LiteralValue {
 pub fn admit_syntax_constant(
     value: &LiteralValue,
     value_type: &FunctionValueType,
-    policy: ConstantPolicy,
+    policy: impl Into<ConstantValidation>,
     control: &dyn PureCompileControl,
 ) -> Result<ConstantValue, ConstantError> {
+    let policy = policy.into();
     let phase = CompilePhase::FunctionSpecialization;
     let mut work = CompileCheckpoints::try_new(control, phase)?;
     let result = (|| {
