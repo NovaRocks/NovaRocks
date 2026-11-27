@@ -292,6 +292,55 @@ fn conjunctive_key_constraint_is_exact_and_engine_filter_remains() {
 }
 
 #[test]
+fn snapshot_keys_only_prune_before_later_required_filter_effects() {
+    for (sql, key_is_leading) in [
+        (
+            "SELECT payload FROM system.metadata.fixture \
+             WHERE CAST(payload AS BIGINT) > 0 AND schema_name = 'missing'",
+            false,
+        ),
+        (
+            "SELECT payload FROM system.metadata.fixture \
+             WHERE schema_name = 'missing' AND CAST(payload AS BIGINT) > 0",
+            true,
+        ),
+        (
+            "SELECT payload FROM (SELECT schema_name, payload FROM system.metadata.fixture \
+             WHERE CAST(payload AS BIGINT) > 0) t WHERE schema_name = 'missing'",
+            false,
+        ),
+        (
+            "SELECT payload FROM (SELECT schema_name, payload FROM system.metadata.fixture \
+             WHERE schema_name = 'missing') t WHERE CAST(payload AS BIGINT) > 0",
+            true,
+        ),
+    ] {
+        let provider = snapshot_need(sql);
+        let SqlNeedBatch::ProviderInputs { system_tables, .. } = provider.needs() else {
+            panic!("expected a system table snapshot need for {sql}");
+        };
+        let constraint = system_tables[0].key_constraint();
+        assert_eq!(
+            constraint.columns().len(),
+            usize::from(key_is_leading),
+            "{sql}"
+        );
+        assert_eq!(constraint.allows(0, "Db"), !key_is_leading, "{sql}");
+        assert!(constraint.allows(0, "missing"), "{sql}");
+        let completed = finish(provider);
+        assert!(
+            completed
+                .plan()
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .any(|node| matches!(node.kind, NodeKind::Filter { .. })),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn disjunction_and_nonkey_filters_do_not_prune_provider_rows() {
     for predicate in [
         "schema_name = 'a' OR schema_name = 'b'",

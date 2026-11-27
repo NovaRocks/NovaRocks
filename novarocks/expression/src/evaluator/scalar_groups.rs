@@ -66,8 +66,10 @@ impl Groups {
             return Ok(None);
         };
         let effects = prepared.contract().effects();
-        if effects.argument_control != ArgumentControl::Eager
-            || effects.value_stability.is_volatile()
+        if !matches!(
+            effects.argument_control,
+            ArgumentControl::Eager | ArgumentControl::OrderedNull
+        ) || effects.value_stability.is_volatile()
             || effects.instance_state != FunctionInstanceState::None
             || !effects.observable_effects.is_empty()
             || active.len() < 2

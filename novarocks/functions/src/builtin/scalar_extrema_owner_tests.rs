@@ -145,7 +145,7 @@ fn extrema_owner_exact_profiles_keep_source_nullability_and_eager_demand() {
                 assert_eq!(result.nullable(), nullable);
                 assert_eq!(
                     prepared.contract().effects().argument_control,
-                    ArgumentControl::Eager
+                    ArgumentControl::OrderedNull
                 );
                 assert_eq!(
                     prepared.contract().effects().own_row_error,

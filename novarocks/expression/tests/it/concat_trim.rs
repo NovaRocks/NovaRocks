@@ -323,13 +323,18 @@ impl KernelEvaluationControl for ChildControl {
 }
 
 #[test]
-fn concat_required_trim_child_control_survives_strict_null_and_latches() {
+fn concat_only_demands_trim_after_non_null_prefix_and_latches_interruption() {
     let wide = format!("{}x", "\u{2003}".repeat(1025));
-    let arrays = [strings(&[None]), strings(&[Some(wide.as_str())])];
-    let mut child_trace = None;
-    for trim_child in [false, true] {
-        let program = compiled_slot_program("concat", &arrays, None, trim_child);
-        let batch = program.batch(arrays.to_vec());
+    let arrays = [
+        strings(&[None, Some("prefix")]),
+        strings(&[Some(wide.as_str()), Some(wide.as_str())]),
+    ];
+    let program = compiled_slot_program("concat", &arrays, None, true);
+    let batch = program.batch(arrays.to_vec());
+    let mut demanded_trace = None;
+    for row in [0, 1] {
+        let positions = [row];
+        let selection = Selection::try_sparse(2, &positions).unwrap();
         let good = ChildControl::default();
         let mut instance = program.instance();
         let actual = instance
@@ -338,29 +343,36 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
                     batch: &batch,
                     source: None,
                 },
-                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationScope::new(selection, selection),
                 ScalarInvocationActivation::Activated,
                 &good,
                 &mut PassThroughCallHost,
             )
             .unwrap();
         assert!(actual.errors().is_empty());
-        assert!(actual.values().is_null(0));
+        assert_eq!(actual.values().is_null(0), row == 0);
         let trace = good.trace.lock().unwrap().clone();
-        if trim_child {
+        if row == 1 {
+            let values = actual
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), "prefixx");
             assert!(
                 trace.contains(&256),
-                "required real trim child must scan whitespace"
+                "the demanded trim child must scan whitespace"
             );
-            child_trace = Some((program, batch, trace));
+            demanded_trace = Some(trace);
         } else {
             assert!(
                 !trace.contains(&256),
-                "strict NULL skips CONCAT row payload reads"
+                "the strict NULL prefix skips the long trim child"
             );
         }
     }
-    let (program, batch, trace) = child_trace.unwrap();
+    let trace = demanded_trace.unwrap();
+    let demanded = Selection::try_sparse(2, &[1]).unwrap();
     let at = trace.iter().position(|units| *units == 256).unwrap();
     let control = ChildControl {
         trace: Mutex::new(vec![]),
@@ -374,7 +386,7 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
                     batch: &batch,
                     source: None
                 },
-                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationScope::new(demanded, demanded),
                 ScalarInvocationActivation::Activated,
                 &control,
                 &mut PassThroughCallHost,
@@ -391,7 +403,7 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
                     batch: &batch,
                     source: None
                 },
-                ScalarInvocationScope::new(Selection::all(1), Selection::all(1)),
+                ScalarInvocationScope::new(demanded, demanded),
                 ScalarInvocationActivation::Activated,
                 &after,
                 &mut PassThroughCallHost,
@@ -404,7 +416,7 @@ fn concat_required_trim_child_control_survives_strict_null_and_latches() {
     // Empty positive-carrier demand must not scan the long child.
     let empty = ChildControl::default();
     let mut instance = program.instance();
-    let selection = Selection::try_sparse(1, &[]).unwrap();
+    let selection = Selection::try_sparse(2, &[]).unwrap();
     let actual = instance
         .evaluate(
             EvaluationInput::Batch {

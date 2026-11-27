@@ -133,7 +133,7 @@ fn split_owner_exact_signature_and_strict_eager_effects() {
         );
         assert_eq!(
             prepared.contract().effects().argument_control,
-            ArgumentControl::Eager
+            ArgumentControl::OrderedNull
         );
         assert_eq!(
             prepared.contract().effects().own_row_error,

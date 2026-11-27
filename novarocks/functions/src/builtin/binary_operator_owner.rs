@@ -193,7 +193,7 @@ fn overload(
             } else {
                 FunctionNullBehavior::Strict
             },
-            argument_control: ArgumentControl::Eager,
+            argument_control: ArgumentControl::OrderedNull,
             instance_state: FunctionInstanceState::None,
             observable_effects: ObservableEffects::NONE,
             environment_dependencies: Box::new([]),
@@ -379,7 +379,7 @@ impl BinaryOperatorOwner {
             value_stability: base.value_stability,
             own_row_error,
             failure_behavior: base.failure_behavior,
-            null_behavior: base.null_behavior,
+            null_behavior: base.null_behavior.clone(),
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,

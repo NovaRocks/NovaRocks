@@ -683,6 +683,9 @@ impl ScalarEmission<'_, '_> {
                         ),
                     });
                 }
+                if ty.nullable() && self.has_strict_constant_null(binding, args.iter())? {
+                    return self.author_literal_expression(&LiteralValue::Null, ty);
+                }
                 self.work.flush()?;
                 let captured = capture_logical_call_arguments(
                     binding,
@@ -1542,6 +1545,67 @@ impl ScalarEmission<'_, '_> {
         self.work.flush()?;
         let expression = self.lower_constant_expression(&value, ty)?;
         Ok((expression, value))
+    }
+
+    fn has_strict_constant_null<'expr>(
+        &mut self,
+        binding: &SqlFunctionBinding,
+        arguments: impl Iterator<Item = &'expr TypedExpr>,
+    ) -> Result<bool, ContractLoweringError> {
+        use novarocks_functions::FunctionSpecializationFailure;
+
+        let mut declaration: Option<novarocks_functions::PureOverloadDeclaration<'_>> = None;
+        for (position, mut argument) in arguments.enumerate() {
+            let is_null = loop {
+                self.work.step()?;
+                match &argument.kind {
+                    ExprKind::Literal(LiteralValue::Null) => break true,
+                    ExprKind::Constant(value) => {
+                        break value.is_null_observed(
+                            CompilePhase::FunctionSpecialization,
+                            self.control,
+                        )?;
+                    }
+                    ExprKind::Nested(expr) | ExprKind::Cast { expr, .. } => argument = expr,
+                    _ => break false,
+                }
+            };
+            if !is_null {
+                continue;
+            }
+            if declaration.is_none() {
+                let selected = self
+                    .functions
+                    .pure_overload_declaration_observed(
+                        &binding.function_id,
+                        binding.kind,
+                        &binding.selected.overload,
+                        self.control,
+                    )
+                    .map_err(|cause| match cause {
+                        FunctionSpecializationFailure::Control(cause) => cause.into(),
+                        FunctionSpecializationFailure::Binding(cause) => cause.into(),
+                        cause => ContractLoweringError::InvalidFunctionBinding {
+                            detail: cause.to_string(),
+                        },
+                    })?;
+                selected.admit_selected_lifecycle_observed(
+                    &binding.selected,
+                    binding.logical_argument_count,
+                    novarocks_functions::PureCallLifecycle::Scalar,
+                    self.control,
+                )?;
+                declaration = Some(selected);
+            }
+            let effects = declaration
+                .as_ref()
+                .expect("known NULL resolved its declaration")
+                .effects();
+            if crate::binding::strict_null_argument(effects, position) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn lower_literal_expression(

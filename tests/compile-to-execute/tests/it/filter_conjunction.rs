@@ -259,7 +259,7 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
     }
 }
 #[test]
-fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latches() {
+fn filter_conjunction_keeps_first_error_before_a_deciding_operand() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL AND approx_distinct(v) = 0",
     );
@@ -268,22 +268,21 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
         &[1, 0, 0],
         &[Some(f64::NAN), Some(f64::NAN), Some(20200101.)],
     );
-    assert_eq!(
-        bits(
-            &group(&f)
-                .evaluate(
-                    EvaluationInput::Batch {
-                        batch: &input,
-                        source: None
-                    },
-                    Selection::try_sparse(3, &[0, 2]).unwrap(),
-                    &Control,
-                    &mut PassThroughCallHost,
-                )
-                .unwrap()
-        ),
-        vec![Some(false), Some(true)]
-    );
+    let first = group(&f)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            Selection::try_sparse(3, &[0, 2]).unwrap(),
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap_err();
+    let ExprEvaluationFailure::RequiredRow(first) = first else {
+        panic!("actual first row error");
+    };
+    assert_eq!(first.batch_row(), 0);
     let mut instance = group(&f);
     let error = instance
         .evaluate(
@@ -328,7 +327,7 @@ fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL) AND approx_distinct(v) = 0",
     );
-    let input = batch(&f, &[0, 1, 0], &[None, Some(f64::NAN), Some(20200101.)]);
+    let input = batch(&f, &[0, 1, 0], &[None, Some(1.), Some(20200101.)]);
     assert_eq!(
         bits(
             &group(&f)

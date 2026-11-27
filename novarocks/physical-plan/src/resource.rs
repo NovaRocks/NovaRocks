@@ -986,7 +986,10 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
             add_expression_usage_core(&expression.kind, &path, &mut usage, errors, policy)?;
         }
         for claim in unit.claims().values() {
-            usage.add_items(claim.effects.environment.len());
+            usage.add_item_counts([
+                claim.effects.environment.len(),
+                claim.effects.null_behavior.strict_positions().len(),
+            ]);
         }
         for request in unit.requests().values() {
             if usage.exhausted() {

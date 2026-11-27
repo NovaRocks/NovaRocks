@@ -49,7 +49,7 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
-        argument_control: ArgumentControl::Eager,
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects {
             rng_sampling: false,
@@ -533,7 +533,7 @@ mod tests {
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
             assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert_eq!(effects.instance_state, FunctionInstanceState::None);
             assert_eq!(
                 effects.observable_effects,

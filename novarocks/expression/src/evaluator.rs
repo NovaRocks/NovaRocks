@@ -827,7 +827,6 @@ impl CompiledExpressionInstance {
             &mut self.instances,
             &mut self.json_constants,
             self.allocator.as_ref(),
-            &self.effects,
             work,
         )?;
         let root = self
@@ -899,7 +898,11 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
         work.step()?;
     }
     let mut inherited = BTreeMap::<usize, RowDataError>::new();
-    for child in children {
+    let effects = prepared.contract().effects();
+    // Ordered arguments arrive on the leaf's already narrowed selection.
+    let arguments_already_screened =
+        effects.argument_control == novarocks_type_contract::ArgumentControl::OrderedNull;
+    for (position, child) in children.iter().enumerate() {
         for error in child.errors() {
             let ordinal = error.selected_ordinal();
             blocked[ordinal] = true;
@@ -907,7 +910,7 @@ fn evaluate_scalar<'a, R, K: Ord + Clone>(
             inherited.entry(ordinal).or_insert_with(|| error.clone());
             work.step()?;
         }
-        if prepared.contract().effects().null_behavior == FunctionNullBehavior::Strict {
+        if !arguments_already_screened && effects.null_behavior.rejects_null_at(position) {
             if let Value::Mapped(value) = child.uncontinued() {
                 for (ordinal, blocked) in blocked.iter_mut().enumerate() {
                     *blocked |= value.is_null(ordinal, work)?;
@@ -1186,8 +1189,10 @@ fn admit_call_protocol(
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
         }
-        (ControlShape::OrderedNull, PreparedPureKernel::Scalar(_))
-        | (ControlShape::OrderedRegexp, PreparedPureKernel::OrderedRegexp(_))
+        (ControlShape::OrderedNull, PreparedPureKernel::Scalar(_)) => {
+            call.call_contract().effects().null_behavior != FunctionNullBehavior::ControlDefined
+        }
+        (ControlShape::OrderedRegexp, PreparedPureKernel::OrderedRegexp(_))
         | (ControlShape::NullIf, PreparedPureKernel::NullIf(_)) => {
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)

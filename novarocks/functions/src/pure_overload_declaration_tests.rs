@@ -68,7 +68,7 @@ fn expected(name: &str) -> (FunctionKind, PureKernelAbi, FunctionEffectDeclarati
             PureKernelAbi::ScalarV1,
             FunctionIntrinsicRowError::NoRowError,
             FunctionNullBehavior::Strict,
-            ArgumentControl::Eager,
+            ArgumentControl::OrderedNull,
             FunctionInstanceState::None,
         ),
         "if" => (

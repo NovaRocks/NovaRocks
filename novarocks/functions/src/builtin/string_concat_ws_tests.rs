@@ -78,6 +78,38 @@ impl PureCompileControl for CompileControl {
 fn source(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Utf8, nullable)
 }
+
+#[test]
+fn concat_ws_unknown_separator_resolves_the_mixed_nullability_tie() {
+    let owner = owner_for_test("concat_ws");
+    let arguments = std::array::from_fn::<_, 2, _>(|_| FunctionArgument::Value {
+        value_type: FunctionValueType::new(DataType::Null, true),
+        constant: None,
+    });
+    let selected = owner
+        .resolve(
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: None,
+            },
+            crate::binding_test_control(),
+        )
+        .expect("both actual overloads produce the same typed NULL");
+    assert_eq!(
+        selected.result_type,
+        FunctionResultType::Scalar(source(true))
+    );
+    assert!(
+        owner
+            .binding_declaration()
+            .effect_declaration(&selected.overload)
+            .unwrap()
+            .null_behavior
+            .rejects_null_at(0)
+    );
+}
+
 fn instance(sources: &[FunctionValueType]) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
         prepared_for_test_with_policy("concat_ws", sources, DecimalOverflowPolicy::OutputNull)
@@ -245,7 +277,7 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
         );
         assert_eq!(
             canonical.effects().null_behavior,
-            FunctionNullBehavior::CalledOnNull
+            FunctionNullBehavior::StrictPositions(Box::new([0]))
         );
         assert!(canonical.effects().observable_effects.is_empty());
         assert_eq!(
@@ -254,7 +286,7 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
         );
         assert_eq!(
             canonical.effects().argument_control,
-            novarocks_type_contract::ArgumentControl::Eager
+            novarocks_type_contract::ArgumentControl::OrderedNull
         );
         assert_eq!(
             canonical.effects().failure_behavior,
@@ -273,8 +305,12 @@ fn string_concat_ws_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_s
             format!("builtin.scalar/{name}/selected-v1")
         );
         assert_eq!(
-            owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&super::super::string_concat_ws_owner::trino_effects())
+            owner
+                .binding_declaration()
+                .effect_declaration(&selected.overload)
+                .unwrap()
+                .null_behavior,
+            FunctionNullBehavior::StrictPositions(Box::new([0]))
         );
         assert_eq!(owner.binding_declaration().overloads().len(), 2);
         for count in [0, 1] {

@@ -377,7 +377,12 @@ fn canonical_bool_key(
     let mut terms = Vec::new();
     collect_bool_terms(arena, left, op_name, &mut terms);
     collect_bool_terms(arena, right, op_name, &mut terms);
-    terms.sort();
+    if [left, right].into_iter().all(|expr| {
+        !scalar_expr::can_fail(arena, expr)
+            && !scalar_expr::contains_non_replica_deterministic_function(arena, expr)
+    }) {
+        terms.sort();
+    }
     format!("{op_name}({})", terms.join(","))
 }
 

@@ -1254,8 +1254,14 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         ScalarNode::Between {
             child, low, high, ..
         } => can_fail(arena, *child) || can_fail(arena, *low) || can_fail(arena, *high),
+        // An unbound pattern requires an actual runtime matcher. A known
+        // unescaped pattern has no row failure after its operands succeed.
         ScalarNode::Like { child, pattern, .. } => {
-            can_fail(arena, *child) || can_fail(arena, *pattern)
+            !matches!(
+                arena.node(*pattern),
+                ScalarNode::Literal(_) | ScalarNode::Constant(_)
+            ) || can_fail(arena, *child)
+                || can_fail(arena, *pattern)
         }
         ScalarNode::Case {
             operand,

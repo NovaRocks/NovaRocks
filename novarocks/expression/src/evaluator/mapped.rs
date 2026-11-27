@@ -223,6 +223,47 @@ impl MappedValues {
         self.rows[ordinal]
     }
 
+    /// Compact a proven ordered subset of successful rows without copying
+    /// the value sources or allocating a second mapping.
+    pub(super) fn retain_successful_positions(
+        &mut self,
+        positions: impl IntoIterator<Item = Result<usize, KernelFailure>>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<(), KernelFailure> {
+        let mut count = 0;
+        let mut previous = None;
+        let mut errors = self.errors.iter().peekable();
+        for position in positions {
+            let position = position?;
+            if previous.is_some_and(|previous| previous >= position) {
+                return Err(internal("mapped positions are not in their original order"));
+            }
+            while errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() < position)
+            {
+                errors.next();
+                work.step()?;
+            }
+            if errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() == position)
+            {
+                return Err(internal("failed mapped argument remained active"));
+            }
+            self.rows[count] = *self
+                .rows
+                .get(position)
+                .ok_or_else(|| internal("mapped position is outside its original extent"))?;
+            previous = Some(position);
+            count += 1;
+            work.step()?;
+        }
+        self.rows.truncate(count);
+        self.errors = Box::default();
+        Ok(())
+    }
+
     pub(super) fn value(&self, ordinal: usize) -> Option<(&ArrayRef, usize)> {
         self.address(ordinal)
             .map(|(source, row)| (&self.sources[source], row))

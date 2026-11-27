@@ -59,15 +59,12 @@ fn effects(control: ArgumentControl) -> FunctionEffectDeclaration {
             FunctionIntrinsicRowError::NoRowError
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: if matches!(
-            control,
-            ArgumentControl::If
-                | ArgumentControl::OrderedNull
-                | ArgumentControl::HigherOrder { .. }
-        ) {
-            FunctionNullBehavior::ControlDefined
-        } else {
-            FunctionNullBehavior::CalledOnNull
+        null_behavior: match control {
+            ArgumentControl::If | ArgumentControl::HigherOrder { .. } => {
+                FunctionNullBehavior::ControlDefined
+            }
+            ArgumentControl::OrderedNull => FunctionNullBehavior::Strict,
+            _ => FunctionNullBehavior::CalledOnNull,
         },
         argument_control: control,
         instance_state: FunctionInstanceState::None,
@@ -227,7 +224,7 @@ impl Owner {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
-            null_behavior: base.null_behavior,
+            null_behavior: base.null_behavior.clone(),
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
@@ -1148,12 +1145,15 @@ fn intrinsic_controller_keeps_hand_checked_branch_guards_without_scalar_instance
         assert_eq!(scope.root, RootOrdinal::new(i as u32));
         assert_eq!(call.effects().argument_control, ArgumentControl::If);
         let invocation = &p.control_flow().uses()[&root.use_id];
+        assert_eq!(invocation.context.demand, root.demand);
         let condition = &p.control_flow().uses()[&invocation.arguments[0]];
         assert_eq!(condition.context.region, invocation.context.region);
-        assert_eq!(condition.context.demand, EvaluationDemand::TruthOnly);
+        assert_eq!(condition.context.demand, EvaluationDemand::Value);
         for (ordinal, kind) in [(1, GuardKind::IfThen), (2, GuardKind::IfElse)] {
             let child = &p.control_flow().uses()[&invocation.arguments[ordinal]];
-            assert_eq!(child.context.demand, root.demand);
+            assert_eq!(child.context.demand, EvaluationDemand::Value);
+            assert_eq!(child.definition, condition.definition);
+            assert_ne!(child.context.use_id, condition.context.use_id);
             let region = &p.control_flow().regions()[&child.context.region];
             assert_eq!(region.parent, Some(invocation.context.region));
             assert_eq!(
@@ -1509,7 +1509,7 @@ fn zero_port_strict_null_skips_kernel_creation() {
                 )
             })
             .to_vec();
-        let claim = ClaimAuthor::with_exact_eager_binding(
+        let claim = ClaimAuthor::with_exact_ordinary_binding(
             &functions,
             "unit_fixture",
             owner.arguments(&oid(STRICT)),

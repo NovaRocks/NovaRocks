@@ -48,7 +48,7 @@ pub(super) fn effects(bounded: bool) -> FunctionEffectDeclaration {
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
-        argument_control: ArgumentControl::Eager,
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::ScalarInstance,
         observable_effects: ObservableEffects {
             rng_sampling: true,

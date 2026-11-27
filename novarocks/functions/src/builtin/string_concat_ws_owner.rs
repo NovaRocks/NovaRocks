@@ -37,7 +37,6 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the actually registered minimum-two variadic Utf8 declaration is installed.
 pub(super) fn operation(name: &str) -> Option<()> {
     (name == "concat_ws").then_some(())
 }
@@ -49,17 +48,20 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::CalledOnNull,
-        argument_control: ArgumentControl::Eager,
+        null_behavior: FunctionNullBehavior::StrictPositions(Box::new([0])),
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
     }
 }
 
-pub(super) fn trino_effects() -> FunctionEffectDeclaration {
+pub(super) fn trino_effects(signature: &str) -> FunctionEffectDeclaration {
     let mut result = effects();
     result.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    if signature.starts_with("(utf8,list<utf8>)") {
+        result.null_behavior = FunctionNullBehavior::Strict;
+    }
     result
 }
 
@@ -78,7 +80,6 @@ pub(super) fn definition(
 }
 
 pub(super) struct StringConcatWsOwner {
-    trino: bool,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -94,17 +95,16 @@ impl StringConcatWsOwner {
             value: name.into(),
         })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let trino = trino_effects();
-        let uses_trino = declaration
-            .overloads()
-            .first()
-            .and_then(|overload| overload.effects.as_ref())
-            == Some(&trino);
-        let expected = if uses_trino { trino } else { effects() };
+        let uses_trino = declaration.overloads().len() == 2;
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != if uses_trino { 2 } else { 1 }
             || declaration.overloads().iter().any(|overload| {
+                let expected = if uses_trino {
+                    trino_effects(&overload.argument_pattern)
+                } else {
+                    effects()
+                };
                 overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
             })
         {
@@ -125,30 +125,29 @@ impl StringConcatWsOwner {
             })
             .collect();
         Ok(Self {
-            trino: uses_trino,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = if self.trino {
-            trino_effects()
-        } else {
-            effects()
-        };
-        CallEffects {
+    fn call_effects(
+        &self,
+        selected: &FunctionBindingSelection,
+        scope: CallProofScope,
+    ) -> Result<CallEffects, FunctionBindingError> {
+        let base = self.declaration.effect_declaration(&selected.overload)?;
+        Ok(CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
-            null_behavior: base.null_behavior,
+            null_behavior: base.null_behavior.clone(),
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::new([]),
             proof_scope: scope,
-        }
+        })
     }
 }
 
@@ -396,7 +395,7 @@ impl StringConcatWsOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope))
+            Ok(self.call_effects(input.selected, input.proof_scope)?)
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -415,6 +414,9 @@ impl StringConcatWsOwner {
             .map_err(compile_failure)?;
         let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
             work.step().map_err(compile_failure)?;
+            let selected_effects = self
+                .call_effects(input.selected, input.proof_scope)
+                .map_err(|_| invalid("CONCAT_WS preparation has a foreign overload"))?;
             if input.function_id != self.declaration.function_id()
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
@@ -422,7 +424,7 @@ impl StringConcatWsOwner {
                 || novarocks_type_contract::CallEffectContext::from(contract.context())
                     != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
+                || contract.effects() != &selected_effects
                 || !input.environment.is_empty()
             {
                 return Err(invalid(

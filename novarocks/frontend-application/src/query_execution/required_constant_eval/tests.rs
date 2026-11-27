@@ -193,6 +193,22 @@ fn required_constants_run_real_compiled_calls_and_selected_control_branches() {
 }
 
 #[test]
+fn required_constant_static_strict_null_keeps_the_original_boolean_type() {
+    let fixture = Fixture::new();
+    let result = fixture
+        .evaluate(
+            "10 / 0 = CAST(NULL AS INTEGER)",
+            RequiredConstantTarget::Boolean,
+        )
+        .unwrap();
+    assert_eq!(result.value_type().data_type(), &DataType::Boolean);
+    assert_eq!(result.try_boolean().unwrap(), None);
+    drop(result);
+    assert_eq!(fixture.window.retained_payload_bytes(), 0);
+    fixture.close();
+}
+
+#[test]
 fn required_active_branch_error_preserves_original_data_and_ordinal() {
     let fixture = Fixture::new();
     for sql in [

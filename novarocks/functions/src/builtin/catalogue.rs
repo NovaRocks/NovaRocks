@@ -3211,13 +3211,28 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
     }
 }
 
-pub(super) fn strict_on_unknown(name: &str, signature: &str) -> bool {
-    matches!(
+pub(super) fn returns_null_on_unknown(
+    name: &str,
+    signature: &str,
+    actuals: ScalarTypes<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, novarocks_type_contract::CompileControlError> {
+    if matches!(
         builtin_disposition(name),
         Some(BuiltinDisposition::WindowBoundary)
-    ) || scalar_overload_effects(name, signature).is_some_and(|effects| {
-        effects.null_behavior == novarocks_type_contract::FunctionNullBehavior::Strict
-    })
+    ) {
+        return Ok(true);
+    }
+    let Some(effects) = scalar_overload_effects(name, signature) else {
+        return Ok(false);
+    };
+    for (ordinal, actual) in actuals.iter().enumerate() {
+        work.step()?;
+        if actual.data_type() == &DataType::Null && effects.null_behavior.rejects_null_at(ordinal) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn scalar_overload_effects(
@@ -3296,7 +3311,7 @@ fn scalar_overload_effects(
             Some(super::string_split_part_owner::trino_effects())
         }
         name if super::string_concat_ws_owner::operation(name).is_some() => {
-            Some(super::string_concat_ws_owner::trino_effects())
+            Some(super::string_concat_ws_owner::trino_effects(signature))
         }
         "split" => Some(super::string_split_owner::trino_effects()),
         "slice" => Some(super::array_slice_owner::effects()),
@@ -3309,7 +3324,7 @@ fn scalar_overload_effects(
         }
         "array_join" => Some(super::array_join_owner::effects()),
         "__map_element_at" | "__map_subscript" | "element_at" => {
-            Some(super::map_element_at_owner::effects())
+            Some(super::map_element_at_owner::effects(name))
         }
         "__array_element_at" => Some(super::array_element_at_owner::effects()),
         super::array_element_at_owner::SUBSCRIPT_NAME => {

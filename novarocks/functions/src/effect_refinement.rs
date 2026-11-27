@@ -212,6 +212,12 @@ impl<E: Error> fmt::Display for CallEffectRefinementError<E> {
 }
 impl<E: Error> Error for CallEffectRefinementError<E> {}
 
+impl<E: Error> From<EffectContractError> for CallEffectRefinementError<E> {
+    fn from(error: EffectContractError) -> Self {
+        Self::Contract(error)
+    }
+}
+
 /// Recompute local call effects from the exact implementation. A BE compares
 /// this result with frozen call facts, rather than trusting a FE never-fails bit.
 pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
@@ -319,8 +325,12 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         let declaration = owner
             .declaration(input.function_id, input.selected)
             .map_err(CallEffectRefinementError::Owner)?;
+        declaration.validate_observed(input.kind, || {
+            work.step().map_err(CallEffectRefinementError::Control)
+        })?;
         declaration
-            .validate(input.kind)
+            .null_behavior
+            .validate_arity(input.request.logical_argument_count)
             .map_err(CallEffectRefinementError::Contract)?;
         let selected_control = owner
             .selected_argument_control_observed(
@@ -1018,7 +1028,7 @@ mod tests {
                     FunctionIntrinsicRowError::NoRowError
                 },
                 failure_behavior: self.declaration.failure_behavior,
-                null_behavior: self.declaration.null_behavior,
+                null_behavior: self.declaration.null_behavior.clone(),
                 argument_control: self.declaration.argument_control,
                 instance_state: self.declaration.instance_state,
                 observable_effects: self.declaration.observable_effects,

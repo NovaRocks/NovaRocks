@@ -84,7 +84,7 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
             }
             _ => FunctionNullBehavior::CalledOnNull,
         },
-        argument_control: ArgumentControl::Eager,
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: if random {
             FunctionInstanceState::ScalarInstance
         } else {

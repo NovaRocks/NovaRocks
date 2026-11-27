@@ -478,13 +478,6 @@ impl<'a, H> UnitValidationCreation<'a, H> {
         work.flush()?;
         Ok(())
     }
-    pub(crate) fn boxed<T>(
-        &mut self,
-        out: Vec<T>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Box<[T]>, UnitAllocationFailure<H>> {
-        self.boxed_for(UnitConstructionStorage::Temporary, out, work)
-    }
     pub(crate) fn boxed_retained<T>(
         &mut self,
         out: Vec<T>,

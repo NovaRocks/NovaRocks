@@ -131,7 +131,7 @@ fn array_literal_real_empty_and_homogeneous_profiles_have_exact_effects() {
         );
         assert_eq!(
             p.contract().effects().argument_control,
-            ArgumentControl::Eager
+            ArgumentControl::OrderedNull
         );
     }
 }

@@ -118,7 +118,7 @@ impl FunctionEffectOwner for Refiner {
             value_stability: self.declaration.value_stability,
             own_row_error: self.declaration.own_row_error,
             failure_behavior: self.declaration.failure_behavior,
-            null_behavior: self.declaration.null_behavior,
+            null_behavior: self.declaration.null_behavior.clone(),
             argument_control: self.declaration.argument_control,
             instance_state: self.declaration.instance_state,
             observable_effects: self.declaration.observable_effects,

@@ -205,16 +205,7 @@ impl SpjgDescriptor {
         };
 
         let mut predicates: Vec<ScalarId> = Vec::new();
-        while let Operator::LogicalFilter(f) = &node.op {
-            scalar_expr::split_conjuncts(arena, f.predicate, &mut predicates);
-            node = node
-                .children
-                .first()
-                .ok_or_else(|| "filter without child in MV rewrite shape".to_string())?;
-        }
-
         let (scan, joins) = peel_join_spine_opt(node, arena, &mut predicates)?;
-        predicates.extend(scan.predicates.iter().copied());
 
         // Composition map: ColumnId -> defining expr over scan columns
         // (from the mid project). Identity for scan columns themselves.
@@ -367,8 +358,6 @@ impl SpjgDescriptor {
         if scan.mv_rewritten_from.is_some() {
             return Ok(None);
         }
-        predicates.extend(scan.predicates.iter().copied());
-
         // Composition map from the mid project (ColumnId -> expr over scan cols).
         let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
         if let Some(p) = &mid_project {
@@ -618,12 +607,16 @@ fn peel_join_spine_memo(
     predicates: &mut Vec<ScalarId>,
 ) -> Option<(ScanOp, Option<JoinShape>)> {
     let mut n = node.clone();
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        filters.push(f.predicate);
         n = first_logical_expr(memo, *n.children.first()?)?;
     }
-    match &n.op {
-        Operator::LogicalScan(scan) => Some((scan.clone(), None)),
+    let result = match &n.op {
+        Operator::LogicalScan(scan) => {
+            predicates.extend(scan.predicates.iter().copied());
+            Some((scan.clone(), None))
+        }
         Operator::LogicalJoin(join) => {
             if join.join_type != JoinKind::Inner {
                 return None;
@@ -652,7 +645,11 @@ fn peel_join_spine_memo(
             Some((driving, Some(shape)))
         }
         _ => None,
+    }?;
+    for filter in filters.into_iter().rev() {
+        scalar_expr::split_conjuncts(&memo.scalars, filter, predicates);
     }
+    Some(result)
 }
 
 fn peel_filter_scan_memo(
@@ -692,58 +689,65 @@ fn peel_join_spine_opt<'a>(
     predicates: &mut Vec<ScalarId>,
 ) -> Result<(&'a ScanOp, Option<JoinShape>), String> {
     let mut n = node;
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        filters.push(f.predicate);
         n = n
             .children
             .first()
             .ok_or_else(|| "filter without child in MV rewrite join spine".to_string())?;
     }
-    match &n.op {
-        Operator::LogicalScan(scan) => Ok((scan, None)),
-        Operator::LogicalJoin(join) => {
-            if join.join_type != JoinKind::Inner {
-                return Err(format!(
-                    "unsupported join kind for MV rewrite: {:?}",
-                    join.join_type
-                ));
+    let result =
+        match &n.op {
+            Operator::LogicalScan(scan) => {
+                predicates.extend(scan.predicates.iter().copied());
+                Ok((scan, None))
             }
-            let left = n
-                .children
-                .first()
-                .ok_or_else(|| "inner join without left child in MV rewrite shape".to_string())?;
-            let right = n
-                .children
-                .get(1)
-                .ok_or_else(|| "inner join without right child in MV rewrite shape".to_string())?;
+            Operator::LogicalJoin(join) => {
+                if join.join_type != JoinKind::Inner {
+                    return Err(format!(
+                        "unsupported join kind for MV rewrite: {:?}",
+                        join.join_type
+                    ));
+                }
+                let left = n.children.first().ok_or_else(|| {
+                    "inner join without left child in MV rewrite shape".to_string()
+                })?;
+                let right = n.children.get(1).ok_or_else(|| {
+                    "inner join without right child in MV rewrite shape".to_string()
+                })?;
 
-            // Left-deep: recurse the left spine; the right child must reduce to
-            // Filter*->Scan (one base input). A right-side join is rejected.
-            let (driving, left_joins) = peel_join_spine_opt(left, arena, predicates)?;
-            let right_input = peel_filter_scan_opt(right, arena, predicates)?;
+                // Left-deep: recurse the left spine; the right child must reduce to
+                // Filter*->Scan (one base input). A right-side join is rejected.
+                let (driving, left_joins) = peel_join_spine_opt(left, arena, predicates)?;
+                let right_input = peel_filter_scan_opt(right, arena, predicates)?;
 
-            let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
-            let right_columns = column_id_set(&right_input.scan_columns);
-            let (edges, residuals) =
-                split_join_condition(arena, join.condition, &left_columns, &right_columns);
-            if edges.is_empty() {
-                return Err("inner join without equi edge in MV rewrite shape".to_string());
+                let left_columns = join_left_column_ids(&driving.columns, left_joins.as_ref());
+                let right_columns = column_id_set(&right_input.scan_columns);
+                let (edges, residuals) =
+                    split_join_condition(arena, join.condition, &left_columns, &right_columns);
+                if edges.is_empty() {
+                    return Err("inner join without equi edge in MV rewrite shape".to_string());
+                }
+                predicates.extend(residuals);
+
+                let mut shape = left_joins.unwrap_or(JoinShape {
+                    inputs: Vec::new(),
+                    equi_edges: Vec::new(),
+                });
+                shape.inputs.push(right_input);
+                shape.equi_edges.extend(edges);
+                Ok((driving, Some(shape)))
             }
-            predicates.extend(residuals);
-
-            let mut shape = left_joins.unwrap_or(JoinShape {
-                inputs: Vec::new(),
-                equi_edges: Vec::new(),
-            });
-            shape.inputs.push(right_input);
-            shape.equi_edges.extend(edges);
-            Ok((driving, Some(shape)))
-        }
-        _ => Err(format!(
-            "not an SPJG base shape: unexpected node {:?}",
-            std::mem::discriminant(&n.op)
-        )),
+            _ => Err(format!(
+                "not an SPJG base shape: unexpected node {:?}",
+                std::mem::discriminant(&n.op)
+            )),
+        }?;
+    for filter in filters.into_iter().rev() {
+        scalar_expr::split_conjuncts(arena, filter, predicates);
     }
+    Ok(result)
 }
 
 /// Peel one join input's `Filter*->Scan`, pushing its predicates into

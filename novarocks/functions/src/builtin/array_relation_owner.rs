@@ -64,7 +64,7 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
-        argument_control: ArgumentControl::Eager,
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),

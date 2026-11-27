@@ -256,7 +256,7 @@ fn package_with_case(
             .definition_control(
                 definition,
                 DefinitionControl {
-                    shape: ControlShape::Eager,
+                    shape: ControlShape::OrderedNull,
                     temporal_sources: None,
                 },
             )

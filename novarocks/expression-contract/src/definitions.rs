@@ -187,11 +187,10 @@ pub enum ExprKind {
     /// and the depth bound exists to stop pathological nesting rather than to
     /// cap how many conditions a user may write.
     ///
-    /// The list preserves source occurrences. A pure Boolean region may be
-    /// scheduled using exact effect facts and buffer row data errors. Value
-    /// demand is decided by FALSE; TruthOnly demand is decided by FALSE or
-    /// NULL. Observable state/effects and strong conditional domains constrain
-    /// movement independently of Boolean associativity.
+    /// The list preserves source occurrences. A demanded row error ends
+    /// evaluation for that row. Value demand is decided by FALSE; TruthOnly
+    /// demand is decided by FALSE or NULL. Reordering requires proof that it
+    /// preserves row demand, failures and observable effects.
     Conjunction {
         args: Box<[ExprId]>,
     },

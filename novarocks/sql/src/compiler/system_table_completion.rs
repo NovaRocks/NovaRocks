@@ -19,7 +19,7 @@
 use super::SqlCompileError;
 use super::completion::{CompileNeedId, SystemTableSnapshotFact, SystemTableSnapshotNeed};
 use super::completion_predicate::{
-    ProviderPredicateColumn, lower_atom_with_literal, lower_literal,
+    ProviderPredicateColumn, lower_atom_with_literal, lower_literal, reads_predicate_value,
 };
 use crate::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::column_id::ColumnId;
@@ -197,7 +197,14 @@ pub(super) fn collect(
     ) -> Result<(), SqlCompileError> {
         work.step()?;
         match &mut plan.kind {
-            PhysicalPlanKind::Filter(filter) => add_conjuncts(&filter.predicate, &mut predicates),
+            PhysicalPlanKind::Filter(filter) => {
+                // The walk descends toward the source, but a child filter's
+                // complete group runs before every enclosing filter.
+                let mut child_predicates = Vec::new();
+                add_conjuncts(&filter.predicate, &mut child_predicates);
+                child_predicates.append(&mut predicates);
+                predicates = child_predicates;
+            }
             PhysicalPlanKind::Project(project) => {
                 let mapping = project
                     .items
@@ -246,6 +253,9 @@ pub(super) fn collect(
                 for predicate in predicates {
                     work.step()?;
                     let expression = unnest(&predicate.expression);
+                    if reads_predicate_value(expression) {
+                        continue;
+                    }
                     let resolve_column = |expression: &TypedExpr| {
                         let expression = varchar_widening_source(expression)?;
                         let ExprKind::ColumnRef { column_id, .. } = &expression.kind else {
@@ -289,51 +299,54 @@ pub(super) fn collect(
                         }
                         lower_varchar_literal(expression)
                     };
+                    // Snapshot keys discard rows before the original filters.
+                    // Allow exact leading atoms, then stop at the first
+                    // operation we cannot establish as safe to evaluate past.
                     if let Some((input, pattern, escape)) = like_operands(expression) {
-                        if let Some((ordinal, literal)) = exact_like_key(
+                        let Some((ordinal, literal)) = exact_like_key(
                             input,
                             pattern,
                             escape,
                             resolve_column,
                             resolve_literal,
                             work,
-                        )? {
-                            constraint.set_values(
-                                ordinal,
-                                SystemTableKeyValues::Values([literal].into()),
-                            );
-                        }
+                        )?
+                        else {
+                            break;
+                        };
+                        constraint
+                            .set_values(ordinal, SystemTableKeyValues::Values([literal].into()));
                         continue;
                     }
                     if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
                         && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
                     {
-                        continue;
+                        break;
                     }
                     let Some((ordinal, domain)) = lower_atom_with_literal(
                         &predicate.expression,
                         resolve_column,
                         resolve_literal,
                     ) else {
-                        continue;
+                        break;
                     };
                     if domain.null_allowed() {
-                        continue;
+                        break;
                     }
                     let Some(values) = domain.values().discrete_values() else {
-                        continue;
+                        break;
                     };
-                    let values = values
+                    let Some(values) = values
                         .into_iter()
                         .map(|value| match value {
                             ConnectorValue::Varchar(value) => Some(value.to_string()),
                             _ => None,
                         })
-                        .collect::<Option<std::collections::BTreeSet<_>>>();
-                    if let Some(values) = values {
-                        constraint
-                            .set_values(ordinal as usize, SystemTableKeyValues::Values(values));
-                    }
+                        .collect::<Option<std::collections::BTreeSet<_>>>()
+                    else {
+                        break;
+                    };
+                    constraint.set_values(ordinal as usize, SystemTableKeyValues::Values(values));
                 }
                 table.key_constraint = constraint;
                 if materialize {

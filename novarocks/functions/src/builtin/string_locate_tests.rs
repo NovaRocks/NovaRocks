@@ -570,7 +570,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             );
             assert_eq!(
                 canonical.effects().argument_control,
-                novarocks_type_contract::ArgumentControl::Eager
+                novarocks_type_contract::ArgumentControl::OrderedNull
             );
             assert_eq!(
                 canonical.effects().failure_behavior,

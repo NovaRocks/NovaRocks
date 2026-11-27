@@ -428,3 +428,17 @@ mod tests {
 
 #[cfg(test)]
 mod aggregate_identity_tests;
+
+/// A known SQL NULL in a strict position can decide the scalar before any
+/// runtime argument demand. Dedicated regexp control also rejects every NULL.
+pub(crate) fn strict_null_argument(
+    effects: &novarocks_type_contract::FunctionEffectDeclaration,
+    position: usize,
+) -> bool {
+    use novarocks_type_contract::ArgumentControl;
+    match effects.argument_control {
+        ArgumentControl::OrderedRegexp => true,
+        ArgumentControl::OrderedNull => effects.null_behavior.rejects_null_at(position),
+        _ => false,
+    }
+}

@@ -61,7 +61,8 @@ pub enum ArgumentControl {
     /// Demand each regexp argument only after the previous one succeeded and
     /// produced a non-NULL value. Compile the pattern at argument ordinal 1.
     OrderedRegexp,
-    /// Demand each argument only after all earlier arguments succeed non-NULL.
+    /// Demand each argument only after all earlier arguments succeed and no
+    /// earlier strict position produces NULL.
     OrderedNull,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
@@ -141,14 +142,67 @@ impl ArgumentControl {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum FunctionNullBehavior {
     /// NULL inputs produce NULL without invoking the row implementation.
     Strict,
+    /// Only the listed, strictly increasing ordinals reject NULL.
+    /// All other positions convey NULL to the implementation.
+    StrictPositions(Box<[u32]>),
     /// The implementation receives NULL inputs and owns its result rule.
     CalledOnNull,
     /// The exact control protocol owns argument demand and NULL decisions.
     ControlDefined,
+}
+impl FunctionNullBehavior {
+    pub fn rejects_null_at(&self, ordinal: usize) -> bool {
+        match self {
+            Self::Strict => true,
+            Self::StrictPositions(positions) => u32::try_from(ordinal)
+                .is_ok_and(|ordinal| positions.binary_search(&ordinal).is_ok()),
+            Self::CalledOnNull | Self::ControlDefined => false,
+        }
+    }
+
+    pub fn strict_positions(&self) -> &[u32] {
+        match self {
+            Self::StrictPositions(positions) => positions,
+            _ => &[],
+        }
+    }
+
+    pub fn validate_positions_observed<E: From<EffectContractError>>(
+        &self,
+        mut step: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Self::StrictPositions(positions) = self {
+            let Some((&first, tail)) = positions.split_first() else {
+                return Err(EffectContractError::ControlMismatch.into());
+            };
+            step()?;
+            let mut previous = first;
+            for &position in tail {
+                step()?;
+                if position <= previous {
+                    return Err(EffectContractError::ControlMismatch.into());
+                }
+                previous = position;
+            }
+        }
+        Ok(())
+    }
+
+    /// For a canonical position set, check that it names some, but not all,
+    /// selected arguments. Validate order separately when admitting a set.
+    pub fn validate_arity(&self, arity: usize) -> Result<(), EffectContractError> {
+        if let Self::StrictPositions(positions) = self
+            && (positions.len() >= arity
+                || positions.last().is_none_or(|&last| last as usize >= arity))
+        {
+            return Err(EffectContractError::ControlMismatch);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FunctionInstanceState {
@@ -198,76 +252,26 @@ pub struct FunctionEffectDeclaration {
 }
 impl FunctionEffectDeclaration {
     pub fn validate(&self, kind: FunctionKind) -> Result<(), EffectContractError> {
+        self.validate_observed(kind, || Ok(()))
+    }
+
+    pub fn validate_observed<E: From<EffectContractError>>(
+        &self,
+        kind: FunctionKind,
+        step: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
         if self.environment_dependencies.len() > crate::MAX_SEMANTIC_PARAMETERS {
-            return Err(EffectContractError::InvalidEnvironmentReference);
+            return Err(EffectContractError::InvalidEnvironmentReference.into());
         }
-        if kind != FunctionKind::Scalar && self.null_behavior == FunctionNullBehavior::Strict {
-            return Err(EffectContractError::KindMismatch);
-        }
-        if !self.own_row_error.is_valid_for_kind(kind) {
-            return Err(EffectContractError::KindMismatch);
-        }
-        let valid = match kind {
-            FunctionKind::Scalar => {
-                matches!(
-                    self.argument_control,
-                    ArgumentControl::Eager
-                        | ArgumentControl::NoArguments
-                        | ArgumentControl::TypeOnly
-                        | ArgumentControl::If
-                        | ArgumentControl::Coalesce
-                        | ArgumentControl::NullIf
-                        | ArgumentControl::Try
-                        | ArgumentControl::OrderedRegexp
-                        | ArgumentControl::OrderedNull
-                        | ArgumentControl::TemporalSource(_)
-                        | ArgumentControl::SimpleCase
-                        | ArgumentControl::SearchedCase
-                        | ArgumentControl::HigherOrder { .. }
-                ) && matches!(
-                    self.instance_state,
-                    FunctionInstanceState::None | FunctionInstanceState::ScalarInstance
-                )
-            }
-            FunctionKind::Aggregate => {
-                self.argument_control == ArgumentControl::Aggregate
-                    && self.instance_state == FunctionInstanceState::AggregateInstance
-            }
-            FunctionKind::Window => {
-                self.argument_control == ArgumentControl::Window
-                    && self.instance_state == FunctionInstanceState::WindowPartition
-            }
-            FunctionKind::Table => {
-                self.argument_control == ArgumentControl::Table
-                    && self.instance_state == FunctionInstanceState::TableInstance
-            }
-        };
-        if !valid {
-            return Err(EffectContractError::KindMismatch);
-        }
-        if matches!(
+        validate_control(
+            kind,
+            &self.null_behavior,
             self.argument_control,
-            ArgumentControl::If
-                | ArgumentControl::Coalesce
-                | ArgumentControl::NullIf
-                | ArgumentControl::Try
-                | ArgumentControl::OrderedRegexp
-                | ArgumentControl::OrderedNull
-                | ArgumentControl::TemporalSource(_)
-                | ArgumentControl::SimpleCase
-                | ArgumentControl::SearchedCase
-                | ArgumentControl::HigherOrder { .. }
-        ) && self.null_behavior != FunctionNullBehavior::ControlDefined
-        {
-            return Err(EffectContractError::ControlMismatch);
-        }
-        if self.argument_control == ArgumentControl::TypeOnly
-            && (self.own_row_error != FunctionIntrinsicRowError::NoRowError
-                || self.instance_state != FunctionInstanceState::None
-                || !self.observable_effects.is_empty())
-        {
-            return Err(EffectContractError::ControlMismatch);
-        }
+            self.own_row_error,
+            self.instance_state,
+            self.observable_effects,
+        )?;
+        self.null_behavior.validate_positions_observed(step)?;
         // The closed key vocabulary needs no heap-backed membership set.
         // Each exhaustive match arm names an actual semantic key, not an ID
         // range or a new limit on declarations.
@@ -281,11 +285,103 @@ impl FunctionEffectDeclaration {
                 SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
             };
             if std::mem::replace(seen, true) {
-                return Err(EffectContractError::DuplicateEnvironmentKey);
+                return Err(EffectContractError::DuplicateEnvironmentKey.into());
             }
         }
         Ok(())
     }
+}
+
+fn validate_control(
+    kind: FunctionKind,
+    null_behavior: &FunctionNullBehavior,
+    argument_control: ArgumentControl,
+    own_row_error: FunctionIntrinsicRowError,
+    instance_state: FunctionInstanceState,
+    observable_effects: ObservableEffects,
+) -> Result<(), EffectContractError> {
+    if kind != FunctionKind::Scalar
+        && matches!(
+            null_behavior,
+            FunctionNullBehavior::Strict | FunctionNullBehavior::StrictPositions(_)
+        )
+    {
+        return Err(EffectContractError::KindMismatch);
+    }
+    if !own_row_error.is_valid_for_kind(kind) {
+        return Err(EffectContractError::KindMismatch);
+    }
+    let valid = match kind {
+        FunctionKind::Scalar => {
+            matches!(
+                argument_control,
+                ArgumentControl::Eager
+                    | ArgumentControl::NoArguments
+                    | ArgumentControl::TypeOnly
+                    | ArgumentControl::If
+                    | ArgumentControl::Coalesce
+                    | ArgumentControl::NullIf
+                    | ArgumentControl::Try
+                    | ArgumentControl::OrderedRegexp
+                    | ArgumentControl::OrderedNull
+                    | ArgumentControl::TemporalSource(_)
+                    | ArgumentControl::SimpleCase
+                    | ArgumentControl::SearchedCase
+                    | ArgumentControl::HigherOrder { .. }
+            ) && matches!(
+                instance_state,
+                FunctionInstanceState::None | FunctionInstanceState::ScalarInstance
+            )
+        }
+        FunctionKind::Aggregate => {
+            argument_control == ArgumentControl::Aggregate
+                && instance_state == FunctionInstanceState::AggregateInstance
+        }
+        FunctionKind::Window => {
+            argument_control == ArgumentControl::Window
+                && instance_state == FunctionInstanceState::WindowPartition
+        }
+        FunctionKind::Table => {
+            argument_control == ArgumentControl::Table
+                && instance_state == FunctionInstanceState::TableInstance
+        }
+    };
+    if !valid {
+        return Err(EffectContractError::KindMismatch);
+    }
+    if matches!(
+        argument_control,
+        ArgumentControl::If
+            | ArgumentControl::Coalesce
+            | ArgumentControl::NullIf
+            | ArgumentControl::Try
+            | ArgumentControl::OrderedRegexp
+            | ArgumentControl::TemporalSource(_)
+            | ArgumentControl::SimpleCase
+            | ArgumentControl::SearchedCase
+            | ArgumentControl::HigherOrder { .. }
+    ) && *null_behavior != FunctionNullBehavior::ControlDefined
+    {
+        return Err(EffectContractError::ControlMismatch);
+    }
+    if argument_control == ArgumentControl::OrderedNull
+        && *null_behavior == FunctionNullBehavior::ControlDefined
+    {
+        return Err(EffectContractError::ControlMismatch);
+    }
+    if matches!(null_behavior, FunctionNullBehavior::StrictPositions(_))
+        && argument_control != ArgumentControl::OrderedNull
+    {
+        return Err(EffectContractError::ControlMismatch);
+    }
+    if argument_control == ArgumentControl::TypeOnly
+        && (own_row_error != FunctionIntrinsicRowError::NoRowError
+            || instance_state != FunctionInstanceState::None
+            || !observable_effects.is_empty())
+    {
+        return Err(EffectContractError::ControlMismatch);
+    }
+    Ok(())
 }
 
 /// Assumptions belong to one proven scalar region or exact relation identity.
@@ -324,6 +420,19 @@ pub fn validate_selected_argument_control(
     }
 }
 impl CallEffects {
+    /// Validate the frozen argument and failure facts without reconstructing
+    /// an owned declaration. The enclosing contract checks environment references.
+    pub fn validate_control(&self, kind: FunctionKind) -> Result<(), EffectContractError> {
+        validate_control(
+            kind,
+            &self.null_behavior,
+            self.argument_control,
+            self.own_row_error,
+            self.instance_state,
+            self.observable_effects,
+        )
+    }
+
     /// Refinement may prove fewer row errors or environment dependencies. It
     /// cannot change the control protocol or silently erase observable effects.
     pub fn validate_refinement(
@@ -437,23 +546,29 @@ impl ExpressionEffects {
             observable_effects: self.observable_effects.union(other.observable_effects),
         }
     }
-    /// Eligible only inside the already-proven pure Boolean region/region.
-    /// Row errors are buffered there, rather than erased by this fact.
+    /// Reordering may change which operands a row demands. An already
+    /// observable row failure cannot be moved past a deciding operand.
     pub const fn permits_boolean_reordering(self) -> bool {
+        self.permits_same_row_kernel_replay() && !self.may_raise_row_error
+    }
+    /// Replaying a pure kernel for the same selected row may recreate a row
+    /// error. This fact never permits repeating a successful state/effect.
+    pub const fn permits_same_row_kernel_replay(self) -> bool {
         !matches!(self.value_stability, FunctionVolatility::Volatile)
             && !self.may_raise_invocation_data
             && !self.has_instance_state
             && self.observable_effects.is_empty()
     }
-    /// Replaying a pure kernel for the same selected row may recreate a row
-    /// error. This fact never permits repeating a successful state/effect.
-    pub const fn permits_same_row_kernel_replay(self) -> bool {
-        self.permits_boolean_reordering()
+    /// An effect prerequisite for interleaving already-demanded independent
+    /// rows. The caller still preserves each row's order, failure and resource
+    /// scope, and must prove that the rows are actually independent.
+    pub const fn permits_interleaved_independent_rows(self) -> bool {
+        self.permits_same_row_kernel_replay()
     }
     /// This is only an effect prerequisite. Relational, NULL-extension and
     /// control-region proofs are still required before earlier evaluation.
     pub const fn permits_earlier_evaluation(self) -> bool {
-        self.permits_boolean_reordering() && !self.may_raise_row_error
+        self.permits_boolean_reordering()
     }
 }
 
@@ -560,6 +675,7 @@ mod tests {
             };
             assert!(!effects.permits_boolean_reordering());
             assert!(!effects.permits_same_row_kernel_replay());
+            assert!(!effects.permits_interleaved_independent_rows());
             assert!(!effects.permits_earlier_evaluation());
         }
         assert!(
@@ -570,8 +686,9 @@ mod tests {
             .permits_boolean_reordering()
         );
         let may_fail = ExpressionEffects::PURE_VALUE.with_call(&call());
-        assert!(may_fail.permits_boolean_reordering());
+        assert!(!may_fail.permits_boolean_reordering());
         assert!(may_fail.permits_same_row_kernel_replay());
+        assert!(may_fail.permits_interleaved_independent_rows());
         assert!(!may_fail.permits_earlier_evaluation());
     }
     #[test]
@@ -664,6 +781,53 @@ mod tests {
     }
 
     #[test]
+    fn mixed_null_positions_require_an_ordered_scalar_and_exact_argument_extent() {
+        let mixed = FunctionNullBehavior::StrictPositions(Box::new([0, 3]));
+        assert_eq!(mixed.strict_positions(), &[0, 3]);
+        assert_eq!(
+            (0..4)
+                .map(|ordinal| mixed.rejects_null_at(ordinal))
+                .collect::<Vec<_>>(),
+            [true, false, false, true]
+        );
+        assert!(mixed.validate_arity(4).is_ok());
+        assert!(mixed.validate_arity(3).is_err());
+        assert!(
+            FunctionNullBehavior::StrictPositions(Box::new([0, 1]))
+                .validate_arity(2)
+                .is_err()
+        );
+        let mut declared = FunctionEffectDeclaration {
+            argument_control: ArgumentControl::OrderedNull,
+            null_behavior: mixed,
+            ..base()
+        };
+        let mut steps = 0;
+        declared
+            .validate_observed(FunctionKind::Scalar, || {
+                steps += 1;
+                Ok::<_, EffectContractError>(())
+            })
+            .unwrap();
+        assert_eq!(steps, 2);
+        for malformed in [&[][..], &[1, 1], &[2, 1]] {
+            let malformed = FunctionEffectDeclaration {
+                null_behavior: FunctionNullBehavior::StrictPositions(malformed.into()),
+                ..declared.clone()
+            };
+            assert_eq!(
+                malformed.validate(FunctionKind::Scalar),
+                Err(EffectContractError::ControlMismatch)
+            );
+        }
+        declared.argument_control = ArgumentControl::Eager;
+        assert_eq!(
+            declared.validate(FunctionKind::Scalar),
+            Err(EffectContractError::ControlMismatch)
+        );
+    }
+
+    #[test]
     fn higher_order_requires_control_defined_null_behavior() {
         use crate::EvaluationDemand;
         for body_ordinal in [0, 1] {
@@ -714,7 +878,7 @@ mod tests {
         let mut refined = call();
         base.null_behavior = FunctionNullBehavior::ControlDefined;
         refined.argument_control = base.argument_control;
-        refined.null_behavior = base.null_behavior;
+        refined.null_behavior = base.null_behavior.clone();
         refined
             .validate_refinement(&base, CallProofScope::Unconditional)
             .unwrap();

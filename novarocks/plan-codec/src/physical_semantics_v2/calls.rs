@@ -266,11 +266,12 @@ fn decode_failure(value: i32) -> Result<FunctionFailureBehavior, E> {
         _ => Err(E::InvalidShape("unknown or unspecified failure")),
     }
 }
-fn encode_null(value: FunctionNullBehavior) -> i32 {
+fn encode_null(value: &FunctionNullBehavior) -> i32 {
     match value {
         FunctionNullBehavior::Strict => wire::NullBehavior::Strict as i32,
         FunctionNullBehavior::CalledOnNull => wire::NullBehavior::CalledOnNull as i32,
         FunctionNullBehavior::ControlDefined => wire::NullBehavior::ControlDefined as i32,
+        FunctionNullBehavior::StrictPositions(_) => wire::NullBehavior::StrictPositions as i32,
     }
 }
 fn decode_null(value: i32) -> Result<FunctionNullBehavior, E> {
@@ -390,6 +391,44 @@ impl<H> CallProjection for CreatedCallProjection<'_, '_, H> {
     }
 }
 
+fn decode_null_positions<P: CallProjection>(
+    input: &wire::CallEffects,
+    resources: &mut P,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionNullBehavior, P::Error> {
+    let positions = &input.strict_argument_ordinals;
+    if input.null_behavior != wire::NullBehavior::StrictPositions as i32 {
+        if !positions.is_empty() {
+            return Err(E::InvalidShape("strict ordinals require positional null behavior").into());
+        }
+        return Ok(decode_null(input.null_behavior)?);
+    }
+    validate_strict_position_count(positions.len())?;
+    if positions.is_empty() {
+        return Err(E::InvalidShape("positional null behavior has no strict ordinal").into());
+    }
+    let mut output = resources.reserve(positions.len(), work)?;
+    for &ordinal in positions {
+        if ordinal as usize >= novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS
+            || output.last().is_some_and(|previous| *previous >= ordinal)
+        {
+            return Err(E::InvalidShape("invalid strict argument ordinal").into());
+        }
+        output.push(ordinal);
+        work.step().map_err(E::from)?;
+    }
+    Ok(FunctionNullBehavior::StrictPositions(
+        resources.boxed(output, work)?,
+    ))
+}
+
+fn validate_strict_position_count(count: usize) -> Result<(), E> {
+    if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
+        return Err(E::InvalidShape("too many strict argument ordinals"));
+    }
+    Ok(())
+}
+
 fn encode_effects<P: CallProjection>(
     value: &CallEffects,
     resources: &mut P,
@@ -399,11 +438,18 @@ fn encode_effects<P: CallProjection>(
     for reference in &value.environment {
         environment.push(encode_reference(reference, work)?);
     }
+    let positions = value.null_behavior.strict_positions();
+    let mut strict_argument_ordinals = resources.reserve(positions.len(), work)?;
+    for &ordinal in positions {
+        strict_argument_ordinals.push(ordinal);
+        work.step().map_err(E::from)?;
+    }
     Ok(wire::CallEffects {
+        strict_argument_ordinals,
         value_stability: encode_stability(value.value_stability),
         own_row_error: encode_row_error(value.own_row_error),
         failure_behavior: encode_failure(value.failure_behavior),
-        null_behavior: encode_null(value.null_behavior),
+        null_behavior: encode_null(&value.null_behavior),
         argument_control: Some(encode_argument_control(value.argument_control)),
         instance_state: encode_state(value.instance_state),
         observable_effects: Some(wire::ObservableEffects {
@@ -429,11 +475,12 @@ fn decode_effects<P: CallProjection>(
     for reference in &input.environment {
         environment.push(decode_reference(reference, work)?);
     }
+    let null_behavior = decode_null_positions(input, resources, work)?;
     Ok(CallEffects {
         value_stability: decode_stability(input.value_stability)?,
         own_row_error: decode_row_error(input.own_row_error)?,
         failure_behavior: decode_failure(input.failure_behavior)?,
-        null_behavior: decode_null(input.null_behavior)?,
+        null_behavior,
         argument_control: decode_argument_control(
             input
                 .argument_control
@@ -459,8 +506,11 @@ fn count_references(items: usize, environment: usize) -> Result<usize, E> {
     if environment > MAX_SEMANTIC_PARAMETERS {
         return Err(E::InvalidShape("too many call environment references"));
     }
+    count_dynamic_items(items, environment)
+}
+fn count_dynamic_items(items: usize, additional: usize) -> Result<usize, E> {
     let count = items
-        .checked_add(environment)
+        .checked_add(additional)
         .ok_or(E::InvalidShape("call reference count overflow"))?;
     if count > MAX_PLAN_DERIVED_CUT_ITEMS {
         return Err(E::InvalidShape("too many call dynamic items"));
@@ -641,7 +691,14 @@ fn encode_calls_core(
     resources.known::<(PhysicalCallSite, FrozenPhysicalCall)>(input.entries().len())?;
     // Guard the cumulative component footprint before output allocation.
     for call in input.entries().values() {
-        count = count_references(count, call.effects.environment.len())?;
+        let strict = call.effects.null_behavior.strict_positions().len();
+        validate_strict_position_count(strict)?;
+        count = count_dynamic_items(
+            count_references(count, call.effects.environment.len())?,
+            strict,
+        )?;
+        resources.items(strict)?;
+        resources.buffers::<u32>(strict, 1)?;
         resources.items(call.effects.environment.len())?;
         resources.buffers::<wire::SemanticParameterRef>(call.effects.environment.len(), 1)?;
         resources.known::<novarocks_type_contract::SemanticParameterRef>(
@@ -709,7 +766,12 @@ fn prepare_decode_calls_prefix(
             .effects
             .as_ref()
             .ok_or(E::InvalidShape("missing call effects"))?;
-        count = count_references(count, effects.environment.len())?;
+        let strict = effects.strict_argument_ordinals.len();
+        validate_strict_position_count(strict)?;
+        count = count_dynamic_items(count_references(count, effects.environment.len())?, strict)?;
+        resources.items(strict)?;
+        resources.buffers::<u32>(strict, 2)?;
+        resources.known::<u32>(effects.strict_argument_ordinals.capacity())?;
         resources.items(effects.environment.len())?;
         resources.buffers::<novarocks_type_contract::SemanticParameterRef>(
             effects.environment.len(),
@@ -921,6 +983,9 @@ pub fn decode_frozen_writer_call_with_creator_in<H>(
     if effects.environment.len() > MAX_SEMANTIC_PARAMETERS {
         return Err(E::InvalidShape("writer call environment exceeds original grammar").into());
     }
+    if !effects.strict_argument_ordinals.is_empty() {
+        return Err(E::InvalidShape("writer call cannot use scalar strict ordinals").into());
+    }
     let storage = creation.storage_lifetime();
     let call = decode_call_core(
         raw,
@@ -991,7 +1056,14 @@ pub(crate) fn encode_expression_claims_in(
                 source.facts.cast_chain().len(),
             )?;
         }
-        count = count_references(count, call.effects.environment.len())?;
+        let strict = call.effects.null_behavior.strict_positions().len();
+        validate_strict_position_count(strict)?;
+        count = count_dynamic_items(
+            count_references(count, call.effects.environment.len())?,
+            strict,
+        )?;
+        resources.items(strict)?;
+        resources.buffers::<u32>(strict, 1)?;
         resources.items(call.effects.environment.len())?;
         resources.buffers::<wire::SemanticParameterRef>(call.effects.environment.len(), 1)?;
         resources.gate()?;
@@ -1030,7 +1102,12 @@ fn prepare_expression_claims_decode(
             resources.known::<wire::TemporalSourceOccurrence>(source.sources.capacity())?;
             resources.known::<i32>(source.cast_chain.capacity())?;
         }
-        count = count_references(count, effects.environment.len())?;
+        let strict = effects.strict_argument_ordinals.len();
+        validate_strict_position_count(strict)?;
+        count = count_dynamic_items(count_references(count, effects.environment.len())?, strict)?;
+        resources.items(strict)?;
+        resources.buffers::<u32>(strict, 2)?;
+        resources.known::<u32>(effects.strict_argument_ordinals.capacity())?;
         resources.items(effects.environment.len())?;
         resources.buffers::<novarocks_type_contract::SemanticParameterRef>(
             effects.environment.len(),

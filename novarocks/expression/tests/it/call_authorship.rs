@@ -64,7 +64,7 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
     let input = ValueId::new(1);
     let ty = utf8();
     let argument = draft.add(None, ty.clone(), ExprKind::Value(input)).unwrap();
-    let owner = ClaimAuthor::with_exact_eager_binding(
+    let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,
         "upper",
         vec![FunctionArgument::Value {
@@ -93,7 +93,7 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
     let controls = author_call_controls(&draft, &inputs, &mut work).unwrap();
     assert_eq!(controls.len(), 1);
     assert_eq!(controls[0].0, call);
-    assert_eq!(controls[0].1.shape, ControlShape::Eager);
+    assert_eq!(controls[0].1.shape, ControlShape::OrderedNull);
     assert!(controls[0].1.temporal_sources.is_none());
     for (id, control) in controls {
         draft.definition_control(id, control).unwrap();
@@ -129,7 +129,7 @@ fn missing_overflow_policy_is_an_invariant() {
     let argument = draft
         .add(None, ty.clone(), ExprKind::Value(ValueId::new(1)))
         .unwrap();
-    let owner = ClaimAuthor::with_exact_eager_binding(
+    let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,
         "upper",
         vec![FunctionArgument::Value {
@@ -365,12 +365,18 @@ fn shared_if_authors_exact_guarded_claims_for_value_and_truth_demands() {
             authored.summaries[&id].for_use(invocation.context).unwrap(),
             ExpressionEffects::PURE_VALUE
         );
+        let condition = &flow.uses()[&invocation.arguments[0]];
+        assert_eq!(condition.context.region, invocation.context.region);
+        assert_eq!(condition.context.demand, EvaluationDemand::Value);
+        let otherwise = &flow.uses()[&invocation.arguments[2]];
+        assert_eq!(condition.definition, otherwise.definition);
+        assert_ne!(condition.context.use_id, otherwise.context.use_id);
         for (ordinal, kind) in [(1, GuardKind::IfThen), (2, GuardKind::IfElse)] {
             let child = &flow.uses()[&invocation.arguments[ordinal]];
             let domain = &flow.regions()[&child.context.region];
             assert_eq!(domain.parent, Some(invocation.context.region));
             assert_eq!(domain.guard, Some(RegionGuard { owner: id, kind }));
-            assert_eq!(child.context.demand, demand);
+            assert_eq!(child.context.demand, EvaluationDemand::Value);
         }
     }
 }

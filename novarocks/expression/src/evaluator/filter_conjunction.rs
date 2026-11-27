@@ -137,19 +137,6 @@ impl CompiledFilterConjunctionInstance {
     pub(crate) fn constructed_root_call_instances(&self, predicate: usize) -> usize {
         self.roots[predicate].instances.len()
     }
-    fn root_is_pure(root: &CompiledExpressionInstance) -> Result<bool, KernelFailure> {
-        let compiled_root = root
-            .program
-            .root(root.root)
-            .ok_or_else(|| invalid("missing actual Filter root effects site"))?;
-        let invocation = &root.program.control_flow().uses()[&compiled_root.use_id];
-        root.effects
-            .get(&compiled_root.use_id)
-            .ok_or_else(|| invalid("missing actual Filter root effects"))?
-            .for_use(invocation.context)
-            .map(|effects| effects.permits_boolean_reordering())
-            .map_err(|_| invalid("Filter root effects differ from their original context"))
-    }
     fn evaluate_once<'a, R>(
         &mut self,
         input: FrameInput<'_>,
@@ -168,11 +155,6 @@ impl CompiledFilterConjunctionInstance {
             work.step()?;
         }
         for root in &mut self.roots {
-            let pure = Self::root_is_pure(root)?;
-            work.step()?;
-            if !pure {
-                boolean.boundary(&mut terminal, &mut remaining, work)?;
-            }
             if remaining.is_empty() {
                 if selection.is_empty() {
                     // A zero-row invocation validates the entire original port,
@@ -227,7 +209,6 @@ impl CompiledFilterConjunctionInstance {
                 &remaining,
                 ControlShape::Conjunction,
                 EvaluationDemand::TruthOnly,
-                pure,
                 &mut terminal,
                 work,
             )?;

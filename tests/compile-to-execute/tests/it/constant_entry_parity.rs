@@ -402,6 +402,34 @@ fn decimal(value: Option<i128>, precision: u8, scale: i8) -> ArrayRef {
 }
 
 #[test]
+fn constant_entry_static_strict_argument_can_decide_a_late_null() {
+    let functions = shared_installed_builtin_owner_catalogue();
+    let fixture = Fixture::compile(
+        "10 / 0 = CAST(NULL AS INTEGER)",
+        Family::Constant,
+        "",
+        &functions,
+    );
+    fixture.assert_both(
+        &functions,
+        FoldOutcome::Folded,
+        Expected::Value(boolean(None)),
+    );
+
+    let fixture = Fixture::compile(
+        "concat_ws(',', CAST(NULL AS VARCHAR), 'kept')",
+        Family::Call("builtin.scalar/concat_ws/v1"),
+        "",
+        &functions,
+    );
+    fixture.assert_both(
+        &functions,
+        FoldOutcome::Folded,
+        Expected::Value(text("kept")),
+    );
+}
+
+#[test]
 fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
     let functions = shared_installed_builtin_owner_catalogue();
     metadata_cv_source_cross_entry(&functions, false);

@@ -47,7 +47,7 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::ControlDefined,
+        null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,

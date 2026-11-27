@@ -433,7 +433,7 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
             );
             assert_eq!(
                 canonical.effects().argument_control,
-                novarocks_type_contract::ArgumentControl::Eager
+                novarocks_type_contract::ArgumentControl::OrderedNull
             );
             assert_eq!(
                 canonical.effects().instance_state,

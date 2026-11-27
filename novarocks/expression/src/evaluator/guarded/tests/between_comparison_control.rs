@@ -136,7 +136,7 @@ fn between_comparison_control_every_callback_seven_causes_original_and_nullsafe_
     }
 }
 #[test]
-fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() {
+fn between_comparison_control_preserves_actual_row_error_and_exits_before_next_operand() {
     let rows = vec![0, 2];
     let selection = Selection::try_sparse(3, &rows).unwrap();
     let array: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(9)]));
@@ -179,35 +179,17 @@ fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() 
     };
     let mut state = BooleanRows::new(2, &mut w).unwrap();
     let mut errors = BTreeMap::new();
-    state
+    let remaining = state
         .consume(
             &output,
             &[0, 1],
             ControlShape::Conjunction,
             EvaluationDemand::Value,
-            true,
             &mut errors,
             &mut w,
         )
         .unwrap();
-    let dominating = SelectedValues::try_new(
-        selection,
-        &DataType::Boolean,
-        Arc::new(BooleanArray::from(vec![false, false])),
-        Box::default(),
-    )
-    .unwrap();
-    state
-        .consume(
-            &dominating,
-            &[0, 1],
-            ControlShape::Conjunction,
-            EvaluationDemand::Value,
-            true,
-            &mut errors,
-            &mut w,
-        )
-        .unwrap();
+    assert!(remaining.is_empty());
     let (array, errors) = state
         .finish(
             ControlShape::Conjunction,
@@ -216,7 +198,7 @@ fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() 
             &mut w,
         )
         .unwrap();
-    assert!(errors.is_empty());
+    assert_eq!(errors.as_ref(), output.errors());
     assert_eq!(
         array
             .as_any()
@@ -224,6 +206,6 @@ fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() 
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![Some(false), Some(false)]
+        vec![None, Some(false)]
     );
 }

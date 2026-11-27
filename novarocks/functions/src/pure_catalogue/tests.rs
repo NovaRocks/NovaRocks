@@ -142,7 +142,7 @@ impl Owner {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
-            null_behavior: base.null_behavior,
+            null_behavior: base.null_behavior.clone(),
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
@@ -726,7 +726,7 @@ fn actual_builtin_rand_and_random_install_each_exact_cpu_record_and_observable_d
                 },
             );
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert!(effects.observable_effects.rng_sampling);
             assert!(effects.environment_dependencies.is_empty());
         }
@@ -782,7 +782,7 @@ fn actual_builtin_numeric_unary_installs_trino_cpu_profiles() {
             assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert_eq!(effects.instance_state, FunctionInstanceState::None);
             assert_eq!(effects.observable_effects, ObservableEffects::NONE);
             assert!(effects.environment_dependencies.is_empty());
@@ -838,7 +838,7 @@ fn actual_builtin_numeric_binary_installs_double_cpu_profiles() {
             assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert_eq!(effects.instance_state, FunctionInstanceState::None);
             assert_eq!(effects.observable_effects, ObservableEffects::NONE);
             assert!(effects.environment_dependencies.is_empty());
@@ -899,7 +899,7 @@ fn actual_builtin_mod_installs_trino_numeric_cpu_records() {
             );
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert_eq!(effects.instance_state, FunctionInstanceState::None);
             assert_eq!(effects.observable_effects, ObservableEffects::NONE);
             assert!(effects.environment_dependencies.is_empty());
@@ -949,7 +949,7 @@ fn actual_builtin_log_sign_e_pi_install_exact_cpu_records() {
             assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
             assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-            assert_eq!(effects.argument_control, ArgumentControl::Eager);
+            assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
             assert_eq!(effects.instance_state, FunctionInstanceState::None);
             assert_eq!(effects.observable_effects, ObservableEffects::NONE);
             assert!(effects.environment_dependencies.is_empty());
@@ -1003,7 +1003,7 @@ fn actual_builtin_truncate_installs_its_exact_dynamic_cpu_record_and_complete_ef
     assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
     assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
     assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-    assert_eq!(effects.argument_control, ArgumentControl::Eager);
+    assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
     assert_eq!(effects.instance_state, FunctionInstanceState::None);
     assert_eq!(effects.observable_effects, ObservableEffects::NONE);
     assert!(effects.environment_dependencies.is_empty());
@@ -1046,7 +1046,7 @@ fn actual_builtin_round_installs_its_exact_dynamic_cpu_record_and_complete_effec
     assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::MayRaise);
     assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
     assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
-    assert_eq!(effects.argument_control, ArgumentControl::Eager);
+    assert_eq!(effects.argument_control, ArgumentControl::OrderedNull);
     assert_eq!(effects.instance_state, FunctionInstanceState::None);
     assert_eq!(effects.observable_effects, ObservableEffects::NONE);
     assert!(effects.environment_dependencies.is_empty());

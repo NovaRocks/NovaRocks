@@ -542,7 +542,7 @@ fn fold_scalar_uncached(
         _ => {}
     }
 
-    if ordered_regexp_null(arena, &node, ctx, work)? {
+    if value_type.nullable() && has_strict_constant_null(arena, &node, ctx, work)? {
         return arena.intern_observed(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
             value_type,
@@ -654,65 +654,78 @@ fn fold_scalar_uncached(
     Ok(try_fold_node_current(arena, rebuilt, ctx, work)?.unwrap_or(rebuilt))
 }
 
-fn ordered_regexp_null(
+fn has_strict_constant_null(
     arena: &ScalarArena,
     node: &ScalarNode,
     ctx: &RewriteContext<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, SqlCompileError> {
-    use novarocks_functions::{FunctionArgumentEvaluation, FunctionSpecializationFailure};
-    use novarocks_type_contract::ArgumentControl;
+    use novarocks_functions::FunctionSpecializationFailure;
 
-    let ScalarNode::FunctionCall { binding, args, .. } = node else {
+    let ScalarNode::FunctionCall {
+        binding,
+        args,
+        distinct: false,
+        ..
+    } = node
+    else {
         return Ok(false);
     };
-    if binding.semantics.argument_evaluation != FunctionArgumentEvaluation::ShortCircuit {
-        return Ok(false);
-    }
     let Some(functions) = ctx.sealed_functions() else {
         return Ok(false);
     };
-    let mut known_null = false;
-    for &argument in args {
-        let mut argument = argument;
-        loop {
-            work.step()?;
-            match arena.node(argument) {
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Null)) => known_null = true,
-                ScalarNode::Constant(value) => {
-                    known_null = value
-                        .is_null_observed(CompilePhase::FunctionSpecialization, work.control())?;
-                }
-                ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
-                    argument = *child;
-                    continue;
-                }
-                _ => {}
+    let mut declaration: Option<novarocks_functions::PureOverloadDeclaration<'_>> = None;
+    for (position, &argument) in args.iter().enumerate() {
+        if !is_known_null(arena, argument, work)? {
+            continue;
+        }
+        if declaration.is_none() {
+            declaration = Some(
+                functions
+                    .metadata()
+                    .pure_overload_declaration_observed(
+                        &binding.function_id,
+                        binding.kind,
+                        &binding.selected.overload,
+                        work.control(),
+                    )
+                    .map_err(|cause| match cause {
+                        FunctionSpecializationFailure::Control(cause) => cause.into(),
+                        cause => SqlCompileError::CompilationSource(
+                            novarocks_failure_contract::SharedFailureCause::new(cause),
+                        ),
+                    })?,
+            );
+        }
+        let effects = declaration
+            .as_ref()
+            .expect("known NULL resolved its declaration")
+            .effects();
+        if crate::binding::strict_null_argument(effects, position) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_known_null(
+    arena: &ScalarArena,
+    mut argument: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    loop {
+        work.step()?;
+        match arena.node(argument) {
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)) => return Ok(true),
+            ScalarNode::Constant(value) => {
+                return Ok(
+                    value.is_null_observed(CompilePhase::FunctionSpecialization, work.control())?
+                );
             }
-            break;
-        }
-        if known_null {
-            break;
+            ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => argument = *child,
+            _ => return Ok(false),
         }
     }
-    if !known_null {
-        return Ok(false);
-    }
-    let selected = functions
-        .metadata()
-        .pure_overload_declaration_observed(
-            &binding.function_id,
-            binding.kind,
-            &binding.selected.overload,
-            work.control(),
-        )
-        .map_err(|cause| match cause {
-            FunctionSpecializationFailure::Control(cause) => cause.into(),
-            cause => SqlCompileError::CompilationSource(
-                novarocks_failure_contract::SharedFailureCause::new(cause),
-            ),
-        })?;
-    Ok(selected.effects().argument_control == ArgumentControl::OrderedRegexp)
 }
 
 /// Fold a rebuilt node only after every direct child has become a constant.
@@ -725,7 +738,7 @@ fn try_fold_node_current(
     work.step()?;
     let node = arena.node(id);
     let out_type = arena.value_type(id);
-    if ordered_regexp_null(arena, node, ctx, work)? {
+    if out_type.nullable() && has_strict_constant_null(arena, node, ctx, work)? {
         return Ok(Some(arena.intern_observed(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
             out_type.clone(),

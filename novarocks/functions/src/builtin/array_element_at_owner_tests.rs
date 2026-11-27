@@ -143,7 +143,7 @@ fn array_element_owner_two_real_index_overloads_keep_nullable_item_and_called_on
         assert_eq!(p.contract().result_type(), &item);
         assert_eq!(
             p.contract().effects().null_behavior,
-            FunctionNullBehavior::CalledOnNull
+            FunctionNullBehavior::Strict
         );
         assert_eq!(
             p.contract().effects().own_row_error,

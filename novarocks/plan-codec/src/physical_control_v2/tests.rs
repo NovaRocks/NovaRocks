@@ -432,7 +432,7 @@ fn actual_case_and_explicit_if_preserve_guard_owner_ordinal_and_demand() {
                 .find(|item| item.id == 7)
                 .unwrap()
                 .demand,
-            wire::EvaluationDemand::TruthOnly as i32
+            wire::EvaluationDemand::Value as i32
         );
         assert_eq!(
             decode_expression_control(&definitions, &encoded, &Control::default()).unwrap(),

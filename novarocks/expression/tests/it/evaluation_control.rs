@@ -563,6 +563,228 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
 mod callback_cases;
 mod filter_conjunction;
 
+#[test]
+fn dynamic_scalar_booleans_keep_ordered_errors_and_try_scope() {
+    use arrow::array::BooleanArray;
+    use novarocks_expression::testkit::expression_text::{
+        TextColumn, TextContext, type_expression_text,
+    };
+    use novarocks_functions::DataFailureReason;
+    use novarocks_type_contract::DecimalOverflowPolicy;
+
+    let columns = [
+        TextColumn {
+            name: "b".into(),
+            value: ValueId::new(1),
+            value_type: FunctionValueType::new(DataType::Boolean, true),
+        },
+        TextColumn {
+            name: "d".into(),
+            value: ValueId::new(2),
+            value_type: FunctionValueType::new(DataType::Int64, false),
+        },
+    ];
+    let fields = columns
+        .iter()
+        .map(|column| column.value_type.try_to_field(&column.name).unwrap())
+        .collect::<Vec<_>>();
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        vec![
+            Arc::new(BooleanArray::from(vec![
+                None,
+                Some(false),
+                Some(true),
+                Some(true),
+                None,
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![0, 0, 1, 0, 1, -1])),
+        ],
+    )
+    .unwrap();
+    let allow_throw_exception = SemanticParameterRef {
+        id: SemanticParameterId::new(0),
+        expected_key: SemanticParameterKey::AllowThrowException,
+    };
+    let parameters = SemanticParameters::try_new([(
+        allow_throw_exception.id,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let context = TextContext {
+        functions: &functions,
+        constant_policy: SQL_LITERAL_POLICY,
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        parameters: &parameters,
+        allow_throw_exception,
+    };
+    for (sql, expected, error_ordinals) in [
+        (
+            "b AND 10 / d > 0",
+            [None, Some(false), Some(true), None, None, Some(false)],
+            &[0, 3][..],
+        ),
+        (
+            "10 / d > 0 AND b",
+            [None, None, Some(true), None, None, Some(false)],
+            &[0, 1, 3],
+        ),
+        (
+            "b OR 10 / d > 0",
+            [None, None, Some(true), Some(true), Some(true), None],
+            &[0, 1],
+        ),
+        (
+            "TRY(b AND 10 / d > 0)",
+            [None, Some(false), Some(true), None, None, Some(false)],
+            &[],
+        ),
+    ] {
+        let expression = type_expression_text(sql, &columns, &context, &HarnessControl)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let output = expression
+            .check_rows(&input, &HarnessControl, &HarnessControl)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+            .batch;
+        assert_eq!(
+            output
+                .values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}",
+        );
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| (error.selected_ordinal(), error.reason()))
+                .collect::<Vec<_>>(),
+            error_ordinals
+                .iter()
+                .copied()
+                .map(|ordinal| (ordinal, DataFailureReason::DivisionByZero))
+                .collect::<Vec<_>>(),
+            "{sql}",
+        );
+    }
+}
+
+#[test]
+fn try_any_match_keeps_actual_body_resource_refusal_and_skips_undemanded_tail() {
+    use arrow::{
+        array::{BooleanArray, ListArray},
+        datatypes::Int64Type,
+    };
+    use novarocks_expression::testkit::{
+        CountingAllocator,
+        expression_text::{TextColumn, TextContext, type_expression_text},
+    };
+    use novarocks_type_contract::DecimalOverflowPolicy;
+
+    let items: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some([
+        Some(0),
+        Some(1),
+        Some(100_000),
+        Some(2),
+    ])]));
+    let columns = [
+        TextColumn {
+            name: "items".into(),
+            value: ValueId::new(1),
+            value_type: FunctionValueType::new(items.data_type().clone(), true),
+        },
+        TextColumn {
+            name: "goal".into(),
+            value: ValueId::new(2),
+            value_type: FunctionValueType::new(DataType::Int64, false),
+        },
+    ];
+    let allow_throw_exception = SemanticParameterRef {
+        id: SemanticParameterId::new(0),
+        expected_key: SemanticParameterKey::AllowThrowException,
+    };
+    let parameters = SemanticParameters::try_new([(
+        allow_throw_exception.id,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let context = TextContext {
+        functions: &functions,
+        constant_policy: SQL_LITERAL_POLICY,
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        parameters: &parameters,
+        allow_throw_exception,
+    };
+    let typed = type_expression_text(
+        "TRY(any_match(items, x -> cardinality(repeat(1, x)) = goal))",
+        &columns,
+        &context,
+        &HarnessControl,
+    )
+    .unwrap();
+    let layout = typed.layout().unwrap();
+    let program = compile_fixture_unit(
+        typed.unit(),
+        typed.environment(),
+        ScopeLayouts {
+            ports: std::slice::from_ref(layout),
+            all_ports: None,
+        },
+        SQL_LITERAL_POLICY,
+        &functions,
+    );
+    for goal in [1, 2] {
+        let input = RecordBatch::try_new(
+            Arc::clone(layout.schema()),
+            vec![Arc::clone(&items), Arc::new(Int64Array::from(vec![goal]))],
+        )
+        .unwrap();
+        let allocator = Arc::new(CountingAllocator::new(64 * 1024));
+        let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+            Arc::clone(&program),
+            RootOrdinal::new(0),
+            &HarnessControl,
+            Some(allocator.clone()),
+        )
+        .unwrap();
+        let selection = Selection::all(1);
+        let result = instance.evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &HarnessControl,
+            &mut PassThroughCallHost,
+        );
+        if goal == 1 {
+            let output = result.unwrap();
+            assert_eq!(output.values().as_ref(), &BooleanArray::from(vec![true]));
+            assert!(output.errors().is_empty());
+        } else {
+            assert!(matches!(
+                result,
+                Err(ExprEvaluationFailure::Kernel(
+                    KernelFailure::ResourceExhausted
+                ))
+            ));
+        }
+        drop(instance);
+        assert_eq!(allocator.outstanding(), 0);
+        let (reserved, refunded) = allocator.reservation_totals();
+        assert!(reserved > 0);
+        assert_eq!(reserved, refunded);
+    }
+}
+
 fn integer_lists(values: &[Option<i32>]) -> ArrayRef {
     use arrow::array::{ListArray, types::Int32Type};
     Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(

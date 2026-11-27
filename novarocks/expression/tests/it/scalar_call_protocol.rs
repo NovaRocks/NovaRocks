@@ -108,7 +108,7 @@ fn fixture(name: &str, values: Vec<ArrayRef>) -> (Arc<CompiledExprSet>, RootOrdi
         .iter()
         .map(|(id, ty)| draft.add(None, ty.clone(), ExprKind::Value(*id)).unwrap())
         .collect();
-    let owner = ClaimAuthor::with_exact_eager_binding(
+    let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,
         name,
         types

@@ -124,44 +124,37 @@ fn nullable(values: &SelectedValues<'_>) -> Vec<Option<bool>> {
         .collect()
 }
 
-// Independent SQL truth table: errors are suppressible only within this pure
-// ordered region, and successful NULL differs from an errored NULL placeholder.
+// Independent ordered SQL truth table. A successfully evaluated decisive
+// operand ends the row, as does an actual error.
 fn expected(
     shape: ControlShape,
     demand: EvaluationDemand,
     pair: [Cell; 2],
-) -> (Option<bool>, bool) {
-    let has = |test: fn(Cell) -> bool| pair.iter().copied().any(test);
-    let t = has(|c| matches!(c, Cell::True));
-    let f = has(|c| matches!(c, Cell::False));
-    let n = has(|c| matches!(c, Cell::Null));
-    let e = has(|c| matches!(c, Cell::Error));
-    if shape == ControlShape::Conjunction {
-        if f || (n && demand == EvaluationDemand::TruthOnly) {
-            (Some(false), false)
-        } else if e {
-            (None, true)
-        } else if n {
-            (None, false)
-        } else {
-            (Some(true), false)
+) -> (Option<bool>, Option<usize>) {
+    let conjunction = shape == ControlShape::Conjunction;
+    let mut saw_null = false;
+    for (argument, cell) in pair.into_iter().enumerate() {
+        match cell {
+            Cell::Error => return (None, Some(argument)),
+            Cell::True if !conjunction => return (Some(true), None),
+            Cell::False if conjunction => return (Some(false), None),
+            Cell::Null if conjunction && demand == EvaluationDemand::TruthOnly => {
+                return (Some(false), None);
+            }
+            Cell::Null => saw_null = true,
+            _ => {}
         }
-    } else if t {
-        (Some(true), false)
-    } else if e {
-        (None, true)
-    } else if n {
-        (
-            (demand == EvaluationDemand::TruthOnly).then_some(false),
-            false,
-        )
-    } else {
-        (Some(false), false)
     }
+    let output = if saw_null {
+        (demand == EvaluationDemand::TruthOnly).then_some(false)
+    } else {
+        Some(conjunction)
+    };
+    (output, None)
 }
 
 #[test]
-fn exhaustive_pure_and_or_value_and_truth_only_use_actual_sparse_results() {
+fn exhaustive_ordered_and_or_value_and_truth_only_use_actual_sparse_results() {
     let cells = [Cell::True, Cell::False, Cell::Null, Cell::Error];
     let pairs = cells
         .into_iter()
@@ -176,23 +169,16 @@ fn exhaustive_pure_and_or_value_and_truth_only_use_actual_sparse_results() {
                 let mut state = BooleanRows::new(pairs.len(), work)?;
                 let mut terminal = BTreeMap::new();
                 let mut remaining = (0..pairs.len()).collect::<Vec<_>>();
-                for argument in [0, 1] {
+                for (argument, message) in ["first error", "second error"].into_iter().enumerate() {
                     let rows = remaining.iter().map(|&i| outer_rows[i]).collect::<Vec<_>>();
                     let selection = Selection::try_sparse(64, &rows).unwrap();
                     let selected = remaining
                         .iter()
                         .map(|&i| pairs[i][argument])
                         .collect::<Vec<_>>();
-                    let output = operand(selection, &selected, "actual pure operand error");
-                    remaining = state.consume(
-                        &output,
-                        &remaining,
-                        shape,
-                        demand,
-                        true,
-                        &mut terminal,
-                        work,
-                    )?;
+                    let output = operand(selection, &selected, message);
+                    remaining =
+                        state.consume(&output, &remaining, shape, demand, &mut terminal, work)?;
                 }
                 state.finish(shape, demand, terminal, work)
             })
@@ -215,10 +201,12 @@ fn exhaustive_pure_and_or_value_and_truth_only_use_actual_sparse_results() {
                 oracle
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, p)| p.1.then_some(i))
+                    .filter_map(|(i, p)| p.1.map(|_| i))
                     .collect::<Vec<_>>()
             );
             for error in result.errors() {
+                let argument = oracle[error.selected_ordinal()].1.unwrap();
+                assert_eq!(error.message(), ["first error", "second error"][argument]);
                 assert_eq!(
                     result.selection().row(error.selected_ordinal()),
                     Some(outer_rows[error.selected_ordinal()])
@@ -229,71 +217,77 @@ fn exhaustive_pure_and_or_value_and_truth_only_use_actual_sparse_results() {
 }
 
 #[test]
-fn pure_first_error_is_owned_and_suppressed_only_by_actual_deciding_value() {
-    let rows = [2, 7, 11];
-    let selection = Selection::try_sparse(12, &rows).unwrap();
-    for (shape, later) in [
-        (ControlShape::Conjunction, Cell::False),
-        (ControlShape::Disjunction, Cell::True),
-    ] {
-        let result = run(&Control::recording(), |work| {
-            let mut state = BooleanRows::new(3, work)?;
-            let mut terminal = BTreeMap::new();
-            let first = operand(
-                selection,
-                &[Cell::Error; 3],
-                "first error survives its array",
-            );
-            let weak = Arc::downgrade(first.values());
-            let remaining = state.consume(
-                &first,
-                &[0, 1, 2],
-                shape,
-                EvaluationDemand::Value,
-                true,
-                &mut terminal,
-                work,
-            )?;
-            drop(first);
-            assert!(
-                weak.upgrade().is_none(),
-                "state retains diagnostics, not operand arrays"
-            );
-            let second = operand(selection, &[later, Cell::Error, Cell::Null], "second error");
-            state.consume(
-                &second,
-                &remaining,
-                shape,
-                EvaluationDemand::Value,
-                true,
-                &mut terminal,
-                work,
-            )?;
-            state.finish(shape, EvaluationDemand::Value, terminal, work)
-        })
-        .unwrap();
-        let result = finish_values(selection, result);
-        assert_eq!(
-            nullable(&result),
-            vec![Some(shape == ControlShape::Disjunction), None, None]
+fn required_error_survives_its_operand_storage_and_exits_the_region() {
+    let input_rows = [2, 7, 11];
+    let selection = Selection::try_sparse(12, &input_rows).unwrap();
+    let result = run(&Control::recording(), |work| {
+        let mut state = BooleanRows::new(3, work)?;
+        let mut terminal = BTreeMap::new();
+        let first = operand(
+            selection,
+            &[Cell::Error, Cell::True, Cell::Error],
+            "first error survives its array",
         );
-        assert_eq!(
-            result
-                .errors()
-                .iter()
-                .map(RowDataError::selected_ordinal)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
+        let weak = Arc::downgrade(first.values());
+        let remaining = state.consume(
+            &first,
+            &[0, 1, 2],
+            ControlShape::Conjunction,
+            EvaluationDemand::Value,
+            &mut terminal,
+            work,
+        )?;
+        drop(first);
+        assert!(
+            weak.upgrade().is_none(),
+            "state retains diagnostics, not operand arrays"
+        );
+        assert_eq!(remaining, [1]);
+        let rows = [7];
+        let second = operand(
+            Selection::try_sparse(12, &rows).unwrap(),
+            &[Cell::False],
+            "unreachable error",
         );
         assert!(
-            result
-                .errors()
-                .iter()
-                .all(|e| e.message() == "first error survives its array")
+            state
+                .consume(
+                    &second,
+                    &remaining,
+                    ControlShape::Conjunction,
+                    EvaluationDemand::Value,
+                    &mut terminal,
+                    work,
+                )?
+                .is_empty()
         );
-        assert_eq!(result.selection().row(1), Some(7));
-        assert_eq!(result.selection().row(2), Some(11));
-    }
+        state.finish(
+            ControlShape::Conjunction,
+            EvaluationDemand::Value,
+            terminal,
+            work,
+        )
+    })
+    .unwrap();
+    let result = finish_values(selection, result);
+    assert_eq!(nullable(&result), [None, Some(false), None]);
+    let errors = result
+        .errors()
+        .iter()
+        .map(|error| {
+            (
+                result.selection().row(error.selected_ordinal()).unwrap(),
+                error.message(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            (2, "first error survives its array"),
+            (11, "first error survives its array"),
+        ]
+    );
 }
 
 #[test]
@@ -320,7 +314,6 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
                         &remaining,
                         ControlShape::Conjunction,
                         demand,
-                        true,
                         &mut terminal,
                         work,
                     )?;
@@ -329,15 +322,21 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
             })
             .unwrap();
             let result = finish_values(Selection::all(1), result);
-            if demand == EvaluationDemand::TruthOnly {
+            if !first_error && demand == EvaluationDemand::TruthOnly {
                 assert_eq!(nullable(&result), vec![Some(false)]);
                 assert!(result.errors().is_empty());
-                assert_eq!(consumed, if first_error { 2 } else { 1 });
             } else {
                 assert_eq!(nullable(&result), vec![None]);
                 assert_eq!(result.errors().len(), 1);
-                assert_eq!(consumed, 2);
             }
+            assert_eq!(
+                consumed,
+                if !first_error && demand == EvaluationDemand::Value {
+                    2
+                } else {
+                    1
+                }
+            );
         }
     }
     // The public author prohibits a successful Boolean payload behind an error.
@@ -359,17 +358,17 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
             &[Cell::Error],
             "error is not a successful NULL",
         );
-        assert_eq!(
-            state.consume(
-                &output,
-                &[0],
-                ControlShape::Conjunction,
-                EvaluationDemand::TruthOnly,
-                true,
-                &mut terminal,
-                work
-            )?,
-            vec![0]
+        assert!(
+            state
+                .consume(
+                    &output,
+                    &[0],
+                    ControlShape::Conjunction,
+                    EvaluationDemand::TruthOnly,
+                    &mut terminal,
+                    work,
+                )?
+                .is_empty()
         );
         state.finish(
             ControlShape::Conjunction,
@@ -380,122 +379,6 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
     })
     .unwrap();
     assert_eq!(finish_values(Selection::all(1), result).errors().len(), 1);
-}
-
-#[test]
-fn impure_boundary_promotes_pending_before_later_decider_and_preserves_sparse_parent() {
-    let outer_rows = [2, 7];
-    let outer = Selection::try_sparse(10, &outer_rows).unwrap();
-    let result = run(&Control::recording(), |work| {
-        let mut state = BooleanRows::new(2, work)?;
-        let mut terminal = BTreeMap::new();
-        let output = operand(
-            outer,
-            &[Cell::Error, Cell::True],
-            "must precede observable work",
-        );
-        let mut remaining = state.consume(
-            &output,
-            &[0, 1],
-            ControlShape::Conjunction,
-            EvaluationDemand::Value,
-            true,
-            &mut terminal,
-            work,
-        )?;
-        assert_eq!(remaining, vec![0, 1]);
-        state.boundary(&mut terminal, &mut remaining, work)?;
-        assert_eq!(remaining, vec![1]);
-        assert_eq!(
-            terminal.get(&0).unwrap().message(),
-            "must precede observable work"
-        );
-        let rows = [7];
-        let later = operand(
-            Selection::try_sparse(10, &rows).unwrap(),
-            &[Cell::False],
-            "not evaluated for parent 2",
-        );
-        state.consume(
-            &later,
-            &remaining,
-            ControlShape::Conjunction,
-            EvaluationDemand::Value,
-            false,
-            &mut terminal,
-            work,
-        )?;
-        state.finish(
-            ControlShape::Conjunction,
-            EvaluationDemand::Value,
-            terminal,
-            work,
-        )
-    })
-    .unwrap();
-    let result = finish_values(outer, result);
-    assert_eq!(nullable(&result), vec![None, Some(false)]);
-    assert_eq!(result.errors()[0].selected_ordinal(), 0);
-    assert_eq!(result.selection().row(0), Some(2));
-}
-
-#[test]
-fn immediate_impure_error_leaves_region_and_cannot_be_masked_by_later_decider() {
-    for shape in [ControlShape::Conjunction, ControlShape::Disjunction] {
-        let result = run(&Control::recording(), |work| {
-            let mut state = BooleanRows::new(2, work)?;
-            let mut terminal = BTreeMap::new();
-            let first = operand(
-                Selection::all(2),
-                &[
-                    Cell::Error,
-                    if shape == ControlShape::Conjunction {
-                        Cell::True
-                    } else {
-                        Cell::False
-                    },
-                ],
-                "impure required error",
-            );
-            let remaining = state.consume(
-                &first,
-                &[0, 1],
-                shape,
-                EvaluationDemand::Value,
-                false,
-                &mut terminal,
-                work,
-            )?;
-            assert_eq!(remaining, vec![1]);
-            let rows = [1];
-            let later = operand(
-                Selection::try_sparse(2, &rows).unwrap(),
-                &[if shape == ControlShape::Conjunction {
-                    Cell::False
-                } else {
-                    Cell::True
-                }],
-                "unused",
-            );
-            state.consume(
-                &later,
-                &remaining,
-                shape,
-                EvaluationDemand::Value,
-                true,
-                &mut terminal,
-                work,
-            )?;
-            state.finish(shape, EvaluationDemand::Value, terminal, work)
-        })
-        .unwrap();
-        let result = finish_values(Selection::all(2), result);
-        assert_eq!(
-            nullable(&result),
-            vec![None, Some(shape == ControlShape::Disjunction)]
-        );
-        assert_eq!(result.errors()[0].message(), "impure required error");
-    }
 }
 
 #[test]
@@ -535,16 +418,14 @@ fn wide_region(
         let mut state = BooleanRows::new(320, work)?;
         let mut terminal = BTreeMap::new();
         let ordinals = (0..320).collect::<Vec<_>>();
-        let mut remaining = state.consume(
+        let remaining = state.consume(
             &output,
             &ordinals,
             ControlShape::Conjunction,
             EvaluationDemand::Value,
-            true,
             &mut terminal,
             work,
         )?;
-        state.boundary(&mut terminal, &mut remaining, work)?;
         assert!(remaining.is_empty());
         state.finish(
             ControlShape::Conjunction,
@@ -593,7 +474,6 @@ fn non_boolean_operand_refusal_is_primary_and_has_no_optional_tail() {
                 &[0],
                 ControlShape::Conjunction,
                 EvaluationDemand::Value,
-                true,
                 &mut BTreeMap::new(),
                 work,
             )

@@ -41,14 +41,19 @@ pub(super) fn operation(name: &str) -> bool {
     matches!(name, "__map_element_at" | "__map_subscript" | "element_at")
 }
 
-/// A NULL probe may match the final NULL key; missing keys return NULL.
-pub(super) fn effects() -> FunctionEffectDeclaration {
+/// The legacy helper can accept a NULL probe. Trino's element and subscript
+/// overloads demand both arguments with a non-NULL convention.
+pub(super) fn effects(name: &str) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: FunctionIntrinsicRowError::MayRaise,
         failure_behavior: FunctionFailureBehavior::Propagate,
-        null_behavior: FunctionNullBehavior::CalledOnNull,
-        argument_control: ArgumentControl::Eager,
+        null_behavior: if name == "__map_element_at" {
+            FunctionNullBehavior::StrictPositions(Box::new([0]))
+        } else {
+            FunctionNullBehavior::Strict
+        },
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),
@@ -92,7 +97,7 @@ impl MapElementAtOwner {
             });
         }
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = effects(name);
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != if name == "element_at" { 3 } else { 2 }
@@ -123,19 +128,23 @@ impl MapElementAtOwner {
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
-        CallEffects {
+    fn call_effects(
+        &self,
+        selected: &FunctionBindingSelection,
+        scope: CallProofScope,
+    ) -> Result<CallEffects, FunctionBindingError> {
+        let base = self.declaration.effect_declaration(&selected.overload)?;
+        Ok(CallEffects {
             value_stability: base.value_stability,
             own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
-            null_behavior: base.null_behavior,
+            null_behavior: base.null_behavior.clone(),
             argument_control: base.argument_control,
             instance_state: base.instance_state,
             observable_effects: base.observable_effects,
             environment: Box::new([]),
             proof_scope: scope,
-        }
+        })
     }
 }
 
@@ -333,8 +342,7 @@ impl MapElementAtOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            let result = self.call_effects(input.proof_scope);
-            Ok(result)
+            Ok(self.call_effects(input.selected, input.proof_scope)?)
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -353,6 +361,9 @@ impl MapElementAtOwner {
             .map_err(compile_failure)?;
         let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
             work.step().map_err(compile_failure)?;
+            let selected_effects = self
+                .call_effects(input.selected, input.proof_scope)
+                .map_err(|_| invalid("element_at preparation has a foreign overload"))?;
             if input.function_id != self.declaration.function_id()
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
@@ -360,7 +371,7 @@ impl MapElementAtOwner {
                 || novarocks_type_contract::CallEffectContext::from(contract.context())
                     != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
+                || contract.effects() != &selected_effects
                 || !input.environment.is_empty()
             {
                 return Err(invalid(

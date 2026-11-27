@@ -529,7 +529,6 @@ impl<K> Frame<K> {
         &mut self,
         shape: ControlShape,
         arity: usize,
-        next_is_pure: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Option<Vec<usize>>, KernelFailure> {
@@ -537,12 +536,6 @@ impl<K> Frame<K> {
             && self.boolean.is_none()
         {
             self.boolean = Some(BooleanRows::new(self.rows.len(), work)?);
-        }
-        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) && !next_is_pure {
-            self.boolean
-                .as_mut()
-                .ok_or_else(|| internal("missing Boolean continuation"))?
-                .boundary(&mut self.errors, &mut self.remaining, work)?;
         }
         if self.rows.is_empty()
             && self.activation == novarocks_functions::ScalarInvocationActivation::Activated
@@ -856,7 +849,6 @@ impl<K> Frame<K> {
                 &parent_ordinals,
                 connective,
                 EvaluationDemand::Value,
-                true,
                 &mut self.errors,
                 work,
             )?;
@@ -1178,7 +1170,6 @@ impl<K> Frame<K> {
         recipes: &dyn NodeRecipes,
         shape: ControlShape,
         demand: EvaluationDemand,
-        child_is_pure: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
@@ -1188,7 +1179,15 @@ impl<K> Frame<K> {
         )>,
     ) -> Result<(), KernelFailure> {
         if shape == ControlShape::OrderedNull {
-            return self.attach_ordered_null(child, batch_rows, work);
+            let Some(PreparedPureKernel::Scalar(prepared)) = recipes.prepared_call() else {
+                return Err(invalid("ordered scalar occurrence has no prepared kernel"));
+            };
+            let rejects_null = prepared
+                .contract()
+                .effects()
+                .null_behavior
+                .rejects_null_at(self.children.len());
+            return self.attach_ordered_null(child, rejects_null, batch_rows, work);
         }
         if shape == ControlShape::NullIf {
             let Some(PreparedPureKernel::NullIf(prepared)) = recipes.prepared_call() else {
@@ -1258,7 +1257,6 @@ impl<K> Frame<K> {
                         &child.ordinals,
                         shape,
                         demand,
-                        child_is_pure,
                         &mut self.errors,
                         work,
                     )?;
@@ -1514,7 +1512,6 @@ impl<K> Frame<K> {
                     &child.ordinals,
                     shape,
                     demand,
-                    child_is_pure,
                     &mut self.errors,
                     work,
                 )?;
@@ -1889,9 +1886,22 @@ fn complete_node<'a, R, K: Ord + Clone>(
             let prepared_call = recipes
                 .prepared_call()
                 .ok_or_else(|| invalid("missing prepared node call"))?;
+            let parent_row = |row| {
+                lambda
+                    .and_then(|lambda| lambda.rows.parent_row(row))
+                    .ok_or_else(|| invalid("leaf row has no actual lambda parent"))
+            };
+            let parent = lambda.map(|_| &parent_row as scalar_groups::ParentRow<'_>);
             match prepared_call {
                 PreparedPureKernel::Scalar(prepared) if shape == ControlShape::OrderedNull => frame
-                    .complete_ordered_null(prepared, local_selection, instances, allocator, work)?,
+                    .complete_ordered_null(
+                        prepared,
+                        local_selection,
+                        parent,
+                        instances,
+                        allocator,
+                        work,
+                    )?,
                 PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
                     let prepared = match prepared_call {
                         PreparedPureKernel::Scalar(p) => scalar_invocation::PreparedCall::Kernel(p),
@@ -1923,13 +1933,6 @@ fn complete_node<'a, R, K: Ord + Clone>(
                             children.push(child.value.into_value_mapped(local_selection, work)?);
                             work.step()?;
                         }
-                        let parent = |row| {
-                            lambda
-                                .and_then(|lambda| lambda.rows.parent_row(row))
-                                .ok_or_else(|| invalid("leaf row has no actual lambda parent"))
-                        };
-                        let parent = lambda
-                            .map(|_| &parent as &dyn Fn(usize) -> Result<usize, KernelFailure>);
                         OwnedValue::from_selected(evaluate_scalar::<R, K>(
                             frame.occurrence.clone(),
                             prepared,
@@ -1999,7 +2002,7 @@ fn complete_node<'a, R, K: Ord + Clone>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
+    reason = "Keep the checked root, exact input port, selected domain, use-owned state and caller control explicit"
 )]
 pub(super) fn evaluate_tree<'a, R>(
     program: &CompiledExprSet,
@@ -2012,7 +2015,6 @@ pub(super) fn evaluate_tree<'a, R>(
     instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
     json_constants: &mut novarocks_functions::native_inlist::JsonConstantKeyCache,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     work: &mut Work<'_, '_, R>,
 ) -> Result<Value<'a>, ExprEvaluationFailure<R>> {
     let flow = program.control_flow();
@@ -2112,7 +2114,6 @@ pub(super) fn evaluate_tree<'a, R>(
         input,
         input_scope,
         allocator,
-        effects,
         needs_original,
         source_captured: false,
         source_custody: None,
@@ -2145,7 +2146,6 @@ struct TreeDriver<'s, 'input> {
     input: FrameInput<'input>,
     input_scope: RootScope,
     allocator: Option<&'s Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    effects: &'s BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     needs_original: BTreeSet<ExpressionUseId>,
     source_captured: bool,
     source_custody: Option<input_source::CapturedInputSource>,
@@ -2609,7 +2609,6 @@ impl TreeDriver<'_, '_> {
         let input = self.input;
         let input_scope = self.input_scope;
         let allocator = self.allocator;
-        let effects = self.effects;
         let batch_rows = lambda.map_or(input.num_rows(), |frame| frame.rows.element_rows());
         let flow = program.control_flow();
         let definitions = program.definitions();
@@ -2661,20 +2660,6 @@ impl TreeDriver<'_, '_> {
             {
                 None
             } else {
-                let next_is_pure = invocation
-                    .arguments
-                    .get(frame.next)
-                    .map(|child| {
-                        let occurrence = *child;
-                        effects
-                            .get(&occurrence)
-                            .ok_or_else(|| invalid("missing exact operand effects"))?
-                            .for_use(flow.uses()[child].context)
-                            .map_err(|_| invalid("operand effect context differs"))
-                            .map(|summary| summary.permits_boolean_reordering())
-                    })
-                    .transpose()?
-                    .unwrap_or(true);
                 if frame.next < invocation.arguments.len()
                     && let Some(memory) = &frame._body_memory
                 {
@@ -2686,7 +2671,6 @@ impl TreeDriver<'_, '_> {
                 frame.next_ordinals(
                     invocation.control,
                     invocation.arguments.len(),
-                    next_is_pure,
                     batch_rows,
                     work,
                 )?
@@ -2956,12 +2940,6 @@ impl TreeDriver<'_, '_> {
                 let parent_invocation = &flow.uses()[&parent.occurrence];
                 let shape = parent_invocation.control;
 
-                let child_is_pure = effects
-                    .get(&frame.occurrence)
-                    .ok_or_else(|| invalid("missing actual child effects"))?
-                    .for_use(invocation.context)
-                    .map_err(|_| invalid("child effects differ from actual occurrence"))?
-                    .permits_boolean_reordering();
                 let proven_constant = if matches!(shape, ControlShape::Membership { .. })
                     && parent.next > 1
                     && let StaticExprKind::Constant(constant) = definition.kind()
@@ -2985,7 +2963,6 @@ impl TreeDriver<'_, '_> {
                     },
                     shape,
                     parent_invocation.context.demand,
-                    child_is_pure,
                     batch_rows,
                     work,
                     allocator,

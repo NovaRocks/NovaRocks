@@ -257,8 +257,8 @@ impl LexicalReferences {
         let Some(current) = source.lambda_scope else {
             return Ok(None);
         };
-        // Direct sources already borrow their backing. A body with an atomic
-        // invocation domain, state or observable effects must keep its scope.
+        // Direct sources already borrow their backing. Demand is unchanged;
+        // reuse applies only to the same source row in its lexical scope.
         if matches!(
             source.kind,
             ExprKind::Lambda { .. }
@@ -267,7 +267,7 @@ impl LexicalReferences {
                 | ExprKind::Constant(_)
         ) || !effects
             .for_use(effects.context())?
-            .permits_boolean_reordering()
+            .permits_same_row_kernel_replay()
         {
             return Ok(None);
         }

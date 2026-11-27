@@ -529,19 +529,6 @@ pub(crate) fn evaluate_scalar_once<'a, E: From<KernelFailure>>(
     }
     for (argument, ty) in arguments.iter().zip(expected) {
         validate_argument_observed(*argument, selection, ty, control)?;
-        if contract.effects().argument_control == ArgumentControl::OrderedNull {
-            crate::kernel_input::visit_selected_nulls(
-                *argument,
-                selection,
-                control,
-                |_, _, is_null| {
-                    if is_null {
-                        return Err(invalid("ordered scalar leaf received a root NULL argument"));
-                    }
-                    Ok(())
-                },
-            )?;
-        }
     }
     if selection.is_empty() && !invoke_empty {
         return SelectedValues::try_new(

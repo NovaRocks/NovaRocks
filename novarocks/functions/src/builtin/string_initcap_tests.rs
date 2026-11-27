@@ -489,7 +489,7 @@ fn string_initcap_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_sta
         );
         assert_eq!(
             canonical.effects().argument_control,
-            novarocks_type_contract::ArgumentControl::Eager
+            novarocks_type_contract::ArgumentControl::OrderedNull
         );
         assert!(canonical.effects().environment.is_empty());
         let direct = owner

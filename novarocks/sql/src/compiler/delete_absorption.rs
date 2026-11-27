@@ -142,7 +142,12 @@ impl SqlAnalyzedQuery {
         for conjunct in conjuncts {
             work.step()?;
             if literal_cannot_match(&arena, conjunct, control)? {
-                return work.finish_result(Ok(DeleteAbsorption::Empty), SqlCompileError::from);
+                let absorption = if scan.predicates.is_empty() {
+                    DeleteAbsorption::Empty
+                } else {
+                    DeleteAbsorption::RowLevel
+                };
+                return work.finish_result(Ok(absorption), SqlCompileError::from);
             }
             if !is_true_literal(&arena, conjunct, control)? {
                 scan.predicates.push(scalar::materialize(&arena, conjunct));

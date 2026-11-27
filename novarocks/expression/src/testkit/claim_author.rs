@@ -100,8 +100,8 @@ impl ClaimAuthor {
         }
     }
 
-    /// Keep exact signature bindings and require the installed owner to declare eagerness.
-    pub fn with_exact_eager_binding(
+    /// Keep the exact signature and its installed ordinary argument protocol.
+    pub fn with_exact_ordinary_binding(
         functions: &PureEngineFunctionCatalog,
         name: &str,
         arguments: Vec<FunctionArgument>,
@@ -122,11 +122,11 @@ impl ClaimAuthor {
                 control,
             )
             .unwrap();
-        assert_eq!(
-            declaration.effects().argument_control,
-            ArgumentControl::Eager,
-            "the exact scalar owner must declare eager control",
-        );
+        let shape = match declaration.effects().argument_control {
+            ArgumentControl::Eager => ControlShape::Eager,
+            ArgumentControl::OrderedNull => ControlShape::OrderedNull,
+            other => panic!("the exact scalar owner must declare ordinary control, got {other:?}"),
+        };
         let function = BoundFunction::from_exact_signature(
             bound.function_id,
             selected.overload.clone(),
@@ -140,7 +140,7 @@ impl ClaimAuthor {
             arguments,
             decimal_policy: DecimalOverflowPolicy::ReportError,
             expected_result_type: None,
-            shape: ControlShape::Eager,
+            shape,
         }
     }
 

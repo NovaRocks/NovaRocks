@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual ordered Boolean regions. Only row data errors can be pending;
-//! outer failures never enter this state or become a successful NULL.
+//! Ordered Boolean regions settle an actual row error as soon as its operand
+//! completes. Successful rows continue according to the consumer's demand.
 use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_type_contract::EvaluationDemand;
@@ -24,7 +24,6 @@ use novarocks_type_contract::EvaluationDemand;
 pub(super) struct BooleanRows {
     decided: Vec<Option<bool>>,
     saw_null: Vec<bool>,
-    pending: BTreeMap<usize, RowDataError>,
 }
 impl BooleanRows {
     pub(super) fn new(
@@ -38,39 +37,15 @@ impl BooleanRows {
             saw_null.push(false);
             work.step()?;
         }
-        Ok(Self {
-            decided,
-            saw_null,
-            pending: BTreeMap::new(),
-        })
+        Ok(Self { decided, saw_null })
     }
-    pub(super) fn boundary(
-        &mut self,
-        terminal: &mut BTreeMap<usize, RowDataError>,
-        remaining: &mut Vec<usize>,
-        work: &mut Work<'_, '_, impl Sized>,
-    ) -> Result<(), KernelFailure> {
-        for (ordinal, error) in std::mem::take(&mut self.pending) {
-            terminal.insert(ordinal, error);
-            work.step()?;
-        }
-        let mut next = Vec::with_capacity(remaining.len());
-        for ordinal in std::mem::take(remaining) {
-            if !terminal.contains_key(&ordinal) {
-                next.push(ordinal);
-            }
-            work.step()?;
-        }
-        *remaining = next;
-        Ok(())
-    }
+
     pub(super) fn consume(
         &mut self,
         output: &SelectedValues<'_>,
         ordinals: &[usize],
         shape: ControlShape,
         demand: EvaluationDemand,
-        pure: bool,
         terminal: &mut BTreeMap<usize, RowDataError>,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Vec<usize>, KernelFailure> {
@@ -84,7 +59,6 @@ impl BooleanRows {
             ordinals,
             shape,
             demand,
-            pure,
             terminal,
             |ordinal| Ok((!values.is_null(ordinal)).then(|| values.value(ordinal))),
             work,
@@ -97,7 +71,6 @@ impl BooleanRows {
         ordinals: &[usize],
         shape: ControlShape,
         demand: EvaluationDemand,
-        pure: bool,
         terminal: &mut BTreeMap<usize, RowDataError>,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<Vec<usize>, KernelFailure> {
@@ -106,7 +79,6 @@ impl BooleanRows {
             ordinals,
             shape,
             demand,
-            pure,
             terminal,
             |ordinal| value.boolean(ordinal),
             work,
@@ -119,7 +91,6 @@ impl BooleanRows {
         ordinals: &[usize],
         shape: ControlShape,
         demand: EvaluationDemand,
-        pure: bool,
         terminal: &mut BTreeMap<usize, RowDataError>,
         mut value_at: impl FnMut(usize) -> Result<Option<bool>, KernelFailure>,
         work: &mut Work<'_, '_, impl Sized>,
@@ -135,21 +106,13 @@ impl BooleanRows {
                 let error = errors
                     .next()
                     .ok_or_else(|| internal("missing actual Boolean operand error"))?;
-                if pure {
-                    self.pending
-                        .entry(parent)
-                        .or_insert_with(|| error.with_selected_ordinal(parent));
-                    remaining.push(parent);
-                } else {
-                    terminal.insert(parent, error.with_selected_ordinal(parent));
-                }
+                terminal.insert(parent, error.with_selected_ordinal(parent));
             } else {
                 match value_at(ordinal)? {
                     None if shape == ControlShape::Conjunction
                         && demand == EvaluationDemand::TruthOnly =>
                     {
                         self.decided[parent] = Some(false);
-                        self.pending.remove(&parent);
                     }
                     None => {
                         self.saw_null[parent] = true;
@@ -157,7 +120,6 @@ impl BooleanRows {
                     }
                     Some(value) if value == deciding => {
                         self.decided[parent] = Some(deciding);
-                        self.pending.remove(&parent);
                     }
                     Some(_) => remaining.push(parent),
                 }
@@ -170,13 +132,9 @@ impl BooleanRows {
         self,
         shape: ControlShape,
         demand: EvaluationDemand,
-        mut terminal: BTreeMap<usize, RowDataError>,
+        terminal: BTreeMap<usize, RowDataError>,
         work: &mut Work<'_, '_, impl Sized>,
     ) -> Result<(ArrayRef, Box<[RowDataError]>), KernelFailure> {
-        for (ordinal, error) in self.pending {
-            terminal.insert(ordinal, error);
-            work.step()?;
-        }
         let mut output = Vec::with_capacity(self.decided.len());
         for (ordinal, decided) in self.decided.into_iter().enumerate() {
             output.push(if terminal.contains_key(&ordinal) {

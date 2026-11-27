@@ -50,14 +50,7 @@ fn assert_case_domains(program: &Fixture, has_else: bool) {
     );
     for (ordinal, child) in invocation.arguments.iter().enumerate() {
         let actual = &flow.uses()[child];
-        assert_eq!(
-            actual.context.demand,
-            if ordinal < 4 && ordinal % 2 == 0 {
-                EvaluationDemand::TruthOnly
-            } else {
-                EvaluationDemand::Value
-            }
-        );
+        assert_eq!(actual.context.demand, EvaluationDemand::Value);
         assert_ne!(actual.context.region, invocation.context.region);
         let expected = if ordinal == 4 {
             novarocks_type_contract::GuardKind::CaseElse

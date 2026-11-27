@@ -40,7 +40,9 @@
 use super::binding_control::{self, ScalarCarriers, ScalarTypes};
 use crate::{FunctionResolutionError, FunctionValueType, ResolvedFunctionSignature};
 use arrow_schema::DataType;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 
 use super::registry;
 use super::scalar_construction::{ResolutionFailure, borrow_creator, with_resolution_creation};
@@ -270,7 +272,9 @@ pub(super) fn resolve_scalar_value_signature_view_with_overload(
                 matches,
                 arguments,
                 pass,
-                |signature| super::catalogue::strict_on_unknown(name, signature),
+                |signature, work| {
+                    super::catalogue::returns_null_on_unknown(name, signature, arguments, work)
+                },
                 work,
             )? {
                 return Ok((index, decision.materialize(work)?));
@@ -457,7 +461,10 @@ fn select_match<'a>(
     matches: Vec<(usize, ScalarValueSignatureDecision<'a>)>,
     actuals: ScalarTypes<'_>,
     pass: MatchPass,
-    strict_on_unknown: impl Fn(&str) -> bool,
+    returns_null_on_unknown: impl Fn(
+        &str,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<(usize, ScalarValueSignatureDecision<'a>)>, ResolveError> {
     if !matches!(pass, MatchPass::Coercion) || matches.len() <= 1 {
@@ -529,16 +536,16 @@ fn select_match<'a>(
             specific = unknown_only;
         }
 
-        // The original strict overload does not invoke its kernel with
-        // UNKNOWN. If every remaining result type is identical, their typed
-        // NULL is the same and the stable signature can break the tie.
+        // If every candidate has the same result type and a strict UNKNOWN
+        // position, their typed NULL is the same and the stable signature
+        // can break the tie.
         let result = matches[specific[0]].1.checked_return_type.value_type();
         let mut winner = None;
         for &index in &specific {
             work.step()?;
             let decision = &matches[index].1;
             let signature = decision.signature.canonical();
-            if !strict_on_unknown(&signature)
+            if !returns_null_on_unknown(&signature, work)?
                 || !novarocks_type_contract::trino_same_type(
                     result,
                     decision.checked_return_type.value_type(),
@@ -1161,9 +1168,15 @@ mod tests {
                     .expect("unknown input is coercible to the declared argument");
                     candidates.push((index, decision));
                 }
-                select_match(candidates, arguments, MatchPass::Coercion, strict, work)?
-                    .map(|(_, winner)| winner.materialize(work))
-                    .transpose()
+                select_match(
+                    candidates,
+                    arguments,
+                    MatchPass::Coercion,
+                    |signature, _| Ok(strict(signature)),
+                    work,
+                )?
+                .map(|(_, winner)| winner.materialize(work))
+                .transpose()
             })
         };
         let winner = resolve([&binary, &varchar], &|_| true).unwrap().unwrap();

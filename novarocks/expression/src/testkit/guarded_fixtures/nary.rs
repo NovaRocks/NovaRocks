@@ -192,7 +192,7 @@ pub fn filter_roots(width: usize) -> (Arc<CompiledExprSet>, Vec<RootOrdinal>) {
     (unit, roots)
 }
 
-pub fn dual_demand_program() -> Fixture {
+pub fn shared_if_operand_program() -> Fixture {
     let mut source_pools = ConstantPools::empty();
     let functions = functions_with_if(true);
     let boolean = FunctionValueType::new(DataType::Boolean, true);
@@ -237,8 +237,7 @@ pub fn dual_demand_program() -> Fixture {
             ),
         )
         .unwrap();
-    // The same physical definition is required first as an IF condition
-    // (TruthOnly), and then as its ELSE result (Value) in another domain.
+    // Both uses require a value. The ELSE use has its own selection domain.
     let mut authors = BTreeMap::new();
     let result = add_call(&mut builder, &mut authors, owner, vec![shared, yes, shared]);
     let ExprKind::FunctionCall { function, .. } = &builder.definition(result).unwrap().kind else {

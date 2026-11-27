@@ -91,11 +91,6 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         };
 
         let arena_rc = ctx.scalar_arena();
-        if scalar_expr::can_fail(&arena_rc.borrow(), filter.predicate) {
-            // Moving even a nonthrowing sibling below the checked predicate
-            // can suppress its error by removing rows before evaluation.
-            return Ok(RewriteResult::Unchanged);
-        }
         let mut conjuncts = Vec::new();
         {
             let arena = arena_rc.borrow();
@@ -122,23 +117,25 @@ impl LogicalRewriteRule for PushDownPredicateScan {
 
         let mut pushed_any = false;
         let mut remaining = Vec::new();
-        for conj in conjuncts {
-            if scalar_expr::can_fail(&arena_rc.borrow(), conj) {
-                remaining.push(conj);
-                continue;
-            }
-            let Some(refs) = scalar_expr::collect_column_ids_strict(&arena_rc.borrow(), conj)
-            else {
-                remaining.push(conj);
-                continue;
-            };
-            if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
-                if seen.insert(predicate_key(&arena_rc.borrow(), conj)) {
+        let mut conjuncts = conjuncts.into_iter();
+        {
+            let arena = arena_rc.borrow();
+            for conj in conjuncts.by_ref() {
+                let eligible = !scalar_expr::can_fail(&arena, conj)
+                    && !scalar_expr::contains_non_replica_deterministic_function(&arena, conj)
+                    && scalar_expr::collect_column_ids_strict(&arena, conj)
+                        .is_some_and(|refs| refs.iter().all(|id| scan_ids.contains(id)));
+                if !eligible {
+                    // The residual executes after the scan. Every later operand
+                    // must still observe this operand's original demand.
+                    remaining.push(conj);
+                    remaining.extend(conjuncts);
+                    break;
+                }
+                if seen.insert(predicate_key(&arena, conj)) {
                     scan.predicates.push(conj);
                 }
                 pushed_any = true;
-            } else {
-                remaining.push(conj);
             }
         }
 

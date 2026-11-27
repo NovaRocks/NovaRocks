@@ -117,7 +117,13 @@ fn author(
     name: &str,
     arguments: Vec<FunctionArgument>,
 ) -> ClaimAuthor {
-    ClaimAuthor::with_exact_eager_binding(functions, name, arguments, constant_policy(), &Control)
+    ClaimAuthor::with_exact_ordinary_binding(
+        functions,
+        name,
+        arguments,
+        constant_policy(),
+        &Control,
+    )
 }
 fn constant_policy() -> ConstantValidation {
     novarocks_constant_contract::ConstantValidation::bounded(

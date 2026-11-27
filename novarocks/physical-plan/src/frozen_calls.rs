@@ -23,9 +23,9 @@ use crate::{
 };
 use novarocks_type_contract::{
     CallEffects, CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase,
-    DecimalOverflowPolicy, EffectContractError, EvaluationDemand, FunctionEffectDeclaration,
-    FunctionKind, MAX_CONTROL_USE_REFERENCES, PureCompileControl, RelationCallId,
-    RelationEffectContext, SemanticParameterRef,
+    DecimalOverflowPolicy, EffectContractError, EvaluationDemand, FunctionKind,
+    MAX_CONTROL_USE_REFERENCES, PureCompileControl, RelationCallId, RelationEffectContext,
+    SemanticParameterRef,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -511,22 +511,12 @@ fn validate_public_effect_shape(
     if observed_resources {
         work.flush()?;
     }
-    let shape = FunctionEffectDeclaration {
-        value_stability: effects.value_stability,
-        own_row_error: effects.own_row_error,
-        failure_behavior: effects.failure_behavior,
-        null_behavior: effects.null_behavior,
-        argument_control: effects.argument_control,
-        instance_state: effects.instance_state,
-        observable_effects: effects.observable_effects,
-        environment_dependencies: keys.into_iter().collect(),
-    };
     if observed_resources {
         work.step()?;
         work.flush()?;
     }
-    let result = shape
-        .validate(kind)
+    let result = effects
+        .validate_control(kind)
         .map_err(FrozenCallError::InvalidEffects);
     result?;
     if observed_resources {

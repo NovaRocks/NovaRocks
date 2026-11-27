@@ -142,7 +142,7 @@ pub fn prepare_kernel(
         body,
         recipe: Recipe {
             operation,
-            speculative: effects.permits_boolean_reordering(),
+            batch_parents: effects.permits_interleaved_independent_rows(),
             certain_range: operation.decisive().is_none()
                 && !effects.may_raise_row_error
                 && !effects.may_raise_invocation_data
@@ -156,7 +156,7 @@ pub fn prepare_kernel(
 #[derive(Clone)]
 struct Recipe {
     operation: Operation,
-    speculative: bool,
+    batch_parents: bool,
     certain_range: bool,
     unknown_key: bool,
     keys: Option<Arc<PreparedKeyOperations>>,
@@ -214,7 +214,7 @@ impl HigherOrderKernelInstance for Instance {
                 Box::new(sort::Sort::new(
                     input,
                     Arc::clone(&self.contract),
-                    self.recipe.speculative,
+                    self.recipe.batch_parents,
                     shared,
                     &mut work,
                 )?)
@@ -383,7 +383,6 @@ struct Parent<'input> {
     present: bool,
     next: usize,
     end: usize,
-    match_window: usize,
     saw_null: bool,
     decision: Option<bool>,
     length: usize,
@@ -398,7 +397,6 @@ impl<'input> Parent<'input> {
             present,
             next: range.start,
             end: range.end,
-            match_window: 1,
             saw_null: false,
             decision: None,
             length: 0,
@@ -496,49 +494,34 @@ impl<'input> Linear<'input> {
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<LambdaBodyBatch, KernelFailure> {
         let first_parent = self.next_parent;
-        let share = if self.recipe.speculative {
+        let share = if self.recipe.batch_parents {
             BATCH_ROWS.div_ceil(self.remaining)
         } else {
             BATCH_ROWS
         };
+        // Match predicates and fallible bodies can settle a row at the next
+        // element. Only a body with a proven required range can submit more.
+        let limit = if self.recipe.certain_range { share } else { 1 };
         let mut capacity = 0;
         let mut runs = self.storage.vec(self.remaining.min(BATCH_ROWS))?;
         for _ in 0..self.parents.len() {
             let parent = self.next_parent;
             self.next_parent = (self.next_parent + 1) % self.parents.len();
-            let row = &mut self.parents[parent];
+            let row = &self.parents[parent];
             work.step()?;
             if !row.active() {
                 continue;
             }
-            let limit = if !self.recipe.speculative && !self.recipe.certain_range {
-                1
-            } else if self.recipe.operation.decisive().is_some() {
-                row.match_window
-            } else {
-                share
-            };
-            let count = (row.end - row.next)
-                .min(limit)
-                .min(share)
-                .min(BATCH_ROWS - capacity);
+            let count = (row.end - row.next).min(limit).min(BATCH_ROWS - capacity);
             runs.push((parent, row.next..row.next + count));
             capacity += count;
-            if !self.recipe.speculative || capacity == BATCH_ROWS {
-                if !self.recipe.speculative {
-                    // An effectful row owns its complete evaluation order.
-                    self.next_parent = parent;
-                }
+            if !self.recipe.batch_parents {
+                // An effectful row owns its complete evaluation order.
+                self.next_parent = parent;
                 break;
             }
-        }
-        if self.recipe.operation.decisive().is_some() && self.recipe.speculative {
-            for (parent, span) in &runs {
-                let row = &mut self.parents[*parent];
-                // Grow from the actual admitted window. Once the per-request
-                // share fills it, the same limit applies on the next handoff.
-                row.match_window = span.len().saturating_mul(2).min(BATCH_ROWS);
-                work.step()?;
+            if capacity == BATCH_ROWS {
+                break;
             }
         }
         // The rotating scheduler grants each active row a turn. Publication

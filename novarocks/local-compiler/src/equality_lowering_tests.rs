@@ -174,7 +174,7 @@ fn seal_units(
                 .effect_declaration(&selected.overload)
                 .unwrap()
                 .argument_control
-                .matches_scalar_shape(ControlShape::Eager)
+                .matches_scalar_shape(ControlShape::OrderedNull)
         );
         let draft = builder.unit(NodeId::new(0)).unwrap();
         for &definition in rand_definitions {
@@ -194,7 +194,7 @@ fn seal_units(
             draft.definition_control(
                 definition,
                 DefinitionControl {
-                    shape: ControlShape::Eager,
+                    shape: ControlShape::OrderedNull,
                     temporal_sources: None,
                 },
             )?;

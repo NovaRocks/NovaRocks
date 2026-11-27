@@ -233,7 +233,7 @@ fn runtime_json_parse_empty_demand_constructs_no_call_instance() {
     let mut builder = unit_draft();
     let value = input(&mut builder, &port.values[0]);
     let mut authors = BTreeMap::new();
-    let owner = ClaimAuthor::with_exact_eager_binding(
+    let owner = ClaimAuthor::with_exact_ordinary_binding(
         &catalogue,
         "json_parse",
         vec![argument(&port.values[0].1)],
@@ -278,7 +278,7 @@ fn runtime_json_parse_ordered_filter_suppresses_unused_call_before_instance_crea
     let flag = input(&mut builder, &port.values[0]);
     let value = input(&mut builder, &port.values[1]);
     let mut authors = BTreeMap::new();
-    let json_owner = ClaimAuthor::with_exact_eager_binding(
+    let json_owner = ClaimAuthor::with_exact_ordinary_binding(
         &catalogue,
         "json_parse",
         vec![argument(&port.values[1].1)],

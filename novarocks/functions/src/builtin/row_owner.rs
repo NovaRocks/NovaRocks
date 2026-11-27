@@ -46,7 +46,7 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
         own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::CalledOnNull,
-        argument_control: ArgumentControl::Eager,
+        argument_control: ArgumentControl::OrderedNull,
         instance_state: FunctionInstanceState::None,
         observable_effects: ObservableEffects::NONE,
         environment_dependencies: Box::new([]),

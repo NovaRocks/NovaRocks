@@ -46,11 +46,18 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
         novarocks_type_contract::FunctionFailureBehavior::Propagate => 1,
         novarocks_type_contract::FunctionFailureBehavior::ReturnsNull => 2,
     }]);
-    hasher.update([match null_behavior {
-        FunctionNullBehavior::Strict => 1,
-        FunctionNullBehavior::CalledOnNull => 2,
-        FunctionNullBehavior::ControlDefined => 3,
-    }]);
+    match null_behavior {
+        FunctionNullBehavior::Strict => hasher.update([1]),
+        FunctionNullBehavior::CalledOnNull => hasher.update([2]),
+        FunctionNullBehavior::ControlDefined => hasher.update([3]),
+        FunctionNullBehavior::StrictPositions(positions) => {
+            hasher.update([4]);
+            hasher.update((positions.len() as u64).to_be_bytes());
+            for position in positions {
+                hasher.update(position.to_be_bytes());
+            }
+        }
+    }
     match argument_control {
         ArgumentControl::Eager => hasher.update([1]),
         ArgumentControl::TypeOnly => hasher.update([2]),

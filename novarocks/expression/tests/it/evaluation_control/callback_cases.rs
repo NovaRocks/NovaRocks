@@ -168,7 +168,7 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
             let input = draft
                 .add(None, ty.clone(), ExprKind::Value(column))
                 .unwrap();
-            let author = ClaimAuthor::with_exact_eager_binding(
+            let author = ClaimAuthor::with_exact_ordinary_binding(
                 functions,
                 "md5",
                 vec![FunctionArgument::Value {
@@ -188,7 +188,7 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
     );
     let compiled_root = unit.root(root).unwrap();
     let invocation = &unit.control_flow().uses()[&compiled_root.use_id];
-    assert_eq!(invocation.control, ControlShape::Eager);
+    assert_eq!(invocation.control, ControlShape::OrderedNull);
     let StaticExprKind::BoundCall { args, .. } = unit
         .definitions()
         .node(compiled_root.definition)

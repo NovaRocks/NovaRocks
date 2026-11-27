@@ -28,8 +28,8 @@ use crate::{
 use arrow_schema::DataType;
 use novarocks_expression_contract::{BoundExprSet, RootScope};
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError, ControlShape,
-    EvaluationDemand, FunctionArgumentType, FunctionFailureBehavior, FunctionInstanceState,
+    CallProofScope, CompileCheckpoints, CompileControlError, ControlShape, EvaluationDemand,
+    FunctionArgumentType, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionKind, FunctionNullBehavior, FunctionVolatility,
     OperatorFunction, ValueLogicalType, owned_resources::btree,
 };
@@ -378,14 +378,19 @@ fn prove_provider_comparison(
     Ok(root.scope == RootScope::Port(0)
         && root.demand == EvaluationDemand::TruthOnly
         && invocation.definition == definition.id
-        && invocation.control == ControlShape::Eager
+        && matches!(
+            invocation.control,
+            ControlShape::Eager | ControlShape::OrderedNull
+        )
         && invocation.context == claim.context
         && effects.proof_scope == CallProofScope::Region(invocation.context.region)
         && effects.value_stability == FunctionVolatility::Immutable
         && effects.failure_behavior == FunctionFailureBehavior::Propagate
         && effects.own_row_error == FunctionIntrinsicRowError::NoRowError
         && effects.null_behavior == FunctionNullBehavior::Strict
-        && effects.argument_control == ArgumentControl::Eager
+        && effects
+            .argument_control
+            .matches_scalar_shape(invocation.control)
         && effects.instance_state == FunctionInstanceState::None
         && effects.observable_effects.is_empty()
         && effects.environment.is_empty()

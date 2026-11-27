@@ -499,7 +499,7 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
     b.definition_control(
         stateful,
         DefinitionControl {
-            shape: ControlShape::Eager,
+            shape: ControlShape::OrderedNull,
             temporal_sources: None,
         },
     )
@@ -971,7 +971,7 @@ fn rand_unit() -> (BoundExprSet, PureEngineFunctionCatalog, SemanticParameters) 
     b.definition_control(
         id,
         DefinitionControl {
-            shape: ControlShape::Eager,
+            shape: ControlShape::OrderedNull,
             temporal_sources: None,
         },
     )

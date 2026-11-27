@@ -198,7 +198,7 @@ impl TemporalSyntax {
             // Even the clock forms have an eager signature with zero actual
             // arguments. NoArguments belongs to the invocation ABI that can
             // suppress the runtime channels of a different logical call.
-            argument_control: ArgumentControl::Eager,
+            argument_control: ArgumentControl::OrderedNull,
             instance_state: FunctionInstanceState::None,
             observable_effects: ObservableEffects::NONE,
             environment_dependencies: self.dependencies().into(),

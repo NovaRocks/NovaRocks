@@ -21,7 +21,9 @@ use crate::{
         PassThroughCallHost,
         guarded_fixtures::{
             CallbackControl, Fixture, NARY_CONTROL as Control, causes,
-            nary::{AND, Connective, OR, Use, batch, dual_demand_program, program, sparse_batch},
+            nary::{
+                AND, Connective, OR, Use, batch, program, shared_if_operand_program, sparse_batch,
+            },
         },
     },
 };
@@ -209,7 +211,7 @@ fn every_nary_evaluation_callback_preserves_primary_failure_and_refuses_replay()
 fn every_nary_later_child_callback_preserves_primary_failure_and_refuses_replay() {
     let program = program(Connective::Or, Use::Value, 3);
     // The actual ordered children are C,A,B. C=false cannot decide OR;
-    // A=NULL must remain pending through B=false, leaving a successful NULL.
+    // A=NULL still demands B; B=false leaves the result NULL.
     // Thus every row crosses both later-child continuation boundaries.
     let input = batch(
         &program.unit,
@@ -223,8 +225,8 @@ fn every_nary_later_child_callback_preserves_primary_failure_and_refuses_replay(
 }
 
 #[test]
-fn same_nary_definition_in_if_truth_only_and_value_domains_does_not_cache_null_as_false() {
-    let program = dual_demand_program();
+fn same_nary_definition_preserves_value_demand_in_distinct_if_regions() {
+    let program = shared_if_operand_program();
     let unit = &program.unit;
     assert_eq!(unit.calls().len(), 1); // Only the actual IF control token.
     let flow = unit.control_flow();
@@ -235,7 +237,7 @@ fn same_nary_definition_in_if_truth_only_and_value_domains_does_not_cache_null_a
     assert_eq!(condition.definition, otherwise.definition);
     assert_ne!(condition.context.use_id, otherwise.context.use_id);
     assert_ne!(condition.context.region, otherwise.context.region);
-    assert_eq!(condition.context.demand, EvaluationDemand::TruthOnly);
+    assert_eq!(condition.context.demand, EvaluationDemand::Value);
     assert_eq!(otherwise.context.demand, EvaluationDemand::Value);
     let input = batch(
         &program.unit,

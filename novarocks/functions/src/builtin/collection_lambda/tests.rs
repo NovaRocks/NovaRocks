@@ -39,7 +39,8 @@ use crate::{
     HigherOrderEvaluationInstance, HigherOrderEvaluationStep, HigherOrderPreparationOptions,
     KernelEvaluationControl, LambdaBodyBatch, RowDataError, ScopedExpressionEffects,
     SelectedValues, Selection, UnaccountedAggregateStateAllocator,
-    opaque_memory::OpaqueAllocationHost, specialize_higher_order,
+    opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge},
+    specialize_higher_order,
 };
 
 struct Control;
@@ -63,6 +64,8 @@ impl KernelEvaluationControl for Control {
 struct Ledger {
     live: AtomicUsize,
     peak: AtomicUsize,
+    refuse_opaque_bytes: Option<usize>,
+    refusals: AtomicUsize,
 }
 impl Ledger {
     fn charge(&self, bytes: usize) {
@@ -91,6 +94,10 @@ impl AggregateStateAllocator for Ledger {
 }
 impl OpaqueAllocationHost for Ledger {
     fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        if self.refuse_opaque_bytes == Some(bytes) {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(KernelFailure::ResourceExhausted);
+        }
         self.charge(bytes);
         Ok(())
     }
@@ -446,7 +453,7 @@ fn source_map() -> ArrayRef {
 }
 
 #[test]
-fn matches_grow_actual_work_and_keep_the_first_terminal_value_or_error() {
+fn matches_batch_demanded_positions_and_stop_at_each_parents_first_value_or_error() {
     let array = list([
         row([0, 1, 2, 3, 4, 5]),
         row([2, 1, 0]),
@@ -509,41 +516,68 @@ fn matches_grow_actual_work_and_keep_the_first_terminal_value_or_error() {
                 .collect::<Vec<_>>(),
             [0, 1, 4]
         );
-        assert_eq!(trial.batches[1], [(0, vec![1]), (0, vec![2])]);
+        assert_eq!(trial.batches[1], [(0, vec![1])]);
         assert_eq!(trial.batches.len(), 2);
         trial.check_release();
     }
 }
 
 #[test]
-fn actual_outer_refusal_from_a_speculative_tail_is_preserved() {
-    let array = list([row([0, 1, 2, 3, 4, 5])]);
-    let kernel = prepared(
-        "any_match",
-        &array,
-        FunctionValueType::new(DataType::Boolean, true),
-        ExpressionEffects::PURE_VALUE,
-    );
-    let mut invocations = 0;
-    let original =
-        KernelFailure::Operational(crate::KernelDiagnostic::new("original staged body refusal"));
-    let error = run(
-        kernel,
-        EvaluatedArgument::Column(&array),
-        Selection::all(1),
-        |batch| {
-            invocations += 1;
-            if invocations == 2 {
-                assert_eq!(batch.parent_ordinals(), [0, 0]);
-                return Err(original.clone());
-            }
-            Ok((Arc::new(BooleanArray::from(vec![false])), vec![]))
-        },
-    )
-    .err()
-    .unwrap();
-    assert_eq!(invocations, 2);
-    assert_eq!(error, original);
+fn only_a_required_match_element_can_request_a_refused_host_reservation() {
+    const BODY_BYTES: usize = 16_777_317;
+    let array = list([row([0, 1, 2, 3]), row([4, 5, 6])]);
+    for first_match in [1, 3] {
+        let ledger = Arc::new(Ledger {
+            refuse_opaque_bytes: Some(BODY_BYTES),
+            ..Ledger::default()
+        });
+        let host = OpaqueRetainedCharge::try_new(ledger.clone()).unwrap();
+        let mut visited = Vec::new();
+        let result = run_controlled(
+            prepared(
+                "any_match",
+                &array,
+                FunctionValueType::new(DataType::Boolean, true),
+                ExpressionEffects::PURE_VALUE,
+            ),
+            EvaluatedArgument::Column(&array),
+            Selection::all(2),
+            Arc::clone(&ledger),
+            &Control,
+            |batch| {
+                let mut output = Vec::new();
+                for ordinal in 0..batch.parent_ordinals().len() {
+                    let element = value(batch, 0, ordinal).unwrap();
+                    visited.push(element);
+                    if element == 2 {
+                        let _reservation = host.reserve_operation(BODY_BYTES)?;
+                    }
+                    output.push(element == first_match || element == 5);
+                }
+                Ok((Arc::new(BooleanArray::from(output)), vec![]))
+            },
+        );
+        if first_match == 1 {
+            let trial = result.unwrap();
+            assert_eq!(trial.output.as_ref(), &BooleanArray::from(vec![true, true]));
+            assert!(trial.errors.is_empty());
+            assert_eq!(
+                trial.batches,
+                [
+                    vec![(0, vec![0]), (1, vec![4])],
+                    vec![(0, vec![1]), (1, vec![5])]
+                ]
+            );
+            assert_eq!(visited, [0, 4, 1, 5]);
+            assert_eq!(ledger.refusals.load(Ordering::Relaxed), 0);
+            trial.check_release();
+        } else {
+            assert_eq!(result.err().unwrap(), KernelFailure::ResourceExhausted);
+            assert_eq!(visited, [0, 4, 1, 5, 2]);
+            assert_eq!(ledger.refusals.load(Ordering::Relaxed), 1);
+            assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+        }
+    }
 }
 
 #[test]
@@ -700,9 +734,9 @@ fn effectful_keys_stop_at_null_and_unknown_keys_have_no_demand() {
 }
 
 #[test]
-fn one_long_comparator_row_batches_independent_runs_and_keeps_ties_stable() {
+fn comparator_batches_across_parents_and_keeps_ties_stable() {
     let values = (0..129).rev().collect::<Vec<_>>();
-    let input = list([row(values.iter().copied())]);
+    let input = list([row(values.iter().copied()), row(values.iter().copied())]);
     let trial = run(
         prepared(
             "array_sort",
@@ -711,7 +745,7 @@ fn one_long_comparator_row_batches_independent_runs_and_keeps_ties_stable() {
             ExpressionEffects::PURE_VALUE,
         ),
         EvaluatedArgument::Column(&input),
-        Selection::all(1),
+        Selection::all(2),
         |batch| {
             let results =
                 Int32Array::from_iter_values((0..batch.parent_ordinals().len()).map(|row| {
@@ -724,47 +758,47 @@ fn one_long_comparator_row_batches_independent_runs_and_keeps_ties_stable() {
     .unwrap();
     let mut expected = values;
     expected.sort_by_key(|value| value % 7);
-    assert_eq!(&*trial.output, &*list([row(expected)]));
-    assert_eq!(trial.batches[0].len(), 64);
-    for (index, (parent, pair)) in trial.batches[0].iter().enumerate() {
-        assert_eq!(
-            (*parent, pair.as_slice()),
-            (0, &[index * 2, index * 2 + 1][..])
-        );
-    }
+    assert_eq!(
+        &*trial.output,
+        &*list([row(expected.iter().copied()), row(expected.iter().copied())])
+    );
+    assert_eq!(trial.batches[0], [(0, vec![0, 1]), (1, vec![129, 130])]);
+    assert!(trial.batches.iter().all(|batch| batch.len() == 2));
     trial.check_release();
 }
 
 #[test]
-fn effectful_comparator_does_not_request_tail_after_invalid_result() {
+fn comparator_does_not_request_tail_after_invalid_result() {
     let array = list([row(0..30)]);
-    let trial = run(
-        prepared(
-            "array_sort",
-            &array,
-            FunctionValueType::new(DataType::Int32, true),
-            ExpressionEffects {
-                has_instance_state: true,
-                ..ExpressionEffects::PURE_VALUE
+    for has_instance_state in [false, true] {
+        let trial = run(
+            prepared(
+                "array_sort",
+                &array,
+                FunctionValueType::new(DataType::Int32, true),
+                ExpressionEffects {
+                    has_instance_state,
+                    ..ExpressionEffects::PURE_VALUE
+                },
+            ),
+            EvaluatedArgument::Column(&array),
+            Selection::all(1),
+            |batch| {
+                assert_eq!(batch.parent_ordinals(), &[0]);
+                Ok((Arc::new(Int32Array::from(vec![Some(2)])), vec![]))
             },
-        ),
-        EvaluatedArgument::Column(&array),
-        Selection::all(1),
-        |batch| {
-            assert_eq!(batch.parent_ordinals(), &[0]);
-            Ok((Arc::new(Int32Array::from(vec![Some(2)])), vec![]))
-        },
-    )
-    .unwrap();
-    assert_eq!(trial.batches, [vec![(0, vec![0, 1])]]);
-    assert_eq!(
-        trial.errors[0].reason(),
-        DataFailureReason::Domain(
-            novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT
         )
-    );
-    assert!(trial.output.is_null(0));
-    trial.check_release();
+        .unwrap();
+        assert_eq!(trial.batches, [vec![(0, vec![0, 1])]]);
+        assert_eq!(
+            trial.errors[0].reason(),
+            DataFailureReason::Domain(
+                novarocks_failure_contract::kernel_reason::INVALID_FUNCTION_ARGUMENT
+            )
+        );
+        assert!(trial.output.is_null(0));
+        trial.check_release();
+    }
 }
 
 #[test]
@@ -796,7 +830,7 @@ fn rotating_requests_preserve_selected_parent_order_and_all_values() {
 }
 
 #[test]
-fn long_match_uses_geometric_demand_through_its_first_decisive_window() {
+fn long_match_requests_exactly_through_its_first_decisive_element() {
     let input = list([row(0..129)]);
     let trial = run(
         prepared(
@@ -831,8 +865,10 @@ fn long_match_uses_geometric_demand_through_its_first_decisive_window() {
     )
     .unwrap();
     assert_eq!(
-        trial.batches.iter().map(Vec::len).collect::<Vec<_>>(),
-        [1, 2, 4, 8, 16]
+        trial.batches,
+        (0..=17)
+            .map(|position| vec![(0, vec![position])])
+            .collect::<Vec<_>>()
     );
     assert_eq!(trial.output.as_ref(), &BooleanArray::from(vec![true]));
     assert!(trial.errors.is_empty());

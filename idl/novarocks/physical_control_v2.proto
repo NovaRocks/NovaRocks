@@ -45,7 +45,8 @@ message RegionGuard {
     uint32 membership_after_source_ordinal = 8;
     // Zero-based preceding argument in the ordered regexp call.
     uint32 ordered_regexp_after_argument_ordinal = 9;
-    // Zero-based preceding non-NULL argument in an ordered scalar call.
+    // Zero-based preceding argument in an ordered scalar call. Its selected
+    // declaration determines whether a successful NULL enters the next use.
     uint32 ordered_null_after_argument_ordinal = 10;
   }
 }

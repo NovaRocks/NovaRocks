@@ -19,8 +19,7 @@
 use crate::unit_creation::{UnitMessage, UnitValidationCreation, ValidationFailure};
 use crate::{ExprKind, RootOrdinal, UnitError, UnitParts};
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, ControlShape, EffectContractError,
-    FunctionEffectDeclaration, FunctionKind,
+    CallProofScope, CompileCheckpoints, ControlShape, EffectContractError, FunctionKind,
 };
 use std::collections::BTreeSet;
 
@@ -167,26 +166,12 @@ pub(crate) fn validate_core<'a, H>(
                 work.flush()?;
             }
             work.flush()?;
-            let mut environment_dependencies = Vec::new();
-            creation.reserve(&mut environment_dependencies, keys.len(), work)?;
-            for key in keys {
-                environment_dependencies.push(key);
-                work.step()?;
-            }
-            let environment_dependencies = creation.boxed(environment_dependencies, work)?;
-            let declaration = FunctionEffectDeclaration {
-                value_stability: claim.effects.value_stability,
-                own_row_error: claim.effects.own_row_error,
-                failure_behavior: claim.effects.failure_behavior,
-                null_behavior: claim.effects.null_behavior,
-                argument_control: claim.effects.argument_control,
-                instance_state: claim.effects.instance_state,
-                observable_effects: claim.effects.observable_effects,
-                environment_dependencies,
-            };
-            work.step()?;
-            work.flush()?;
-            declaration.validate(FunctionKind::Scalar)?;
+            claim.effects.validate_control(FunctionKind::Scalar)?;
+            claim.effects.null_behavior.validate_arity(args.len())?;
+            claim
+                .effects
+                .null_behavior
+                .validate_positions_observed::<ValidationFailure<'a, H>>(|| Ok(work.step()?))?;
             work.step()?;
             work.flush()?;
             match (invocation.control, &claim.temporal_source) {
@@ -258,12 +243,16 @@ pub(crate) fn validate_core<'a, H>(
                 "invocation child count differs from ordered definition occurrences",
             ));
         }
-        for (&definition, argument) in expected.iter().zip(&invocation.arguments) {
+        let ordered_nulls = (invocation.control == ControlShape::OrderedNull
+            && !node.ty.nullable())
+        .then(|| &parts.claims[&use_id].effects.null_behavior);
+        for (position, (&definition, argument)) in
+            expected.iter().zip(&invocation.arguments).enumerate()
+        {
             let child = parts.control.uses().get(argument).ok_or_else(|| {
                 ValidationFailure::invalid(Some(node.id), None, "invocation child use is absent")
             })?;
-            if invocation.control == ControlShape::OrderedNull
-                && !node.ty.nullable()
+            if ordered_nulls.is_some_and(|policy| policy.rejects_null_at(position))
                 && parts
                     .definitions
                     .get(definition.get() as usize)

@@ -1557,6 +1557,66 @@ fn integer_array_equality_keeps_nested_nulls_and_compares_mixed_width_elements()
 }
 
 #[test]
+fn strict_and_accepting_positions_preserve_the_actual_first_error() {
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    let columns = [
+        column("sep", 80, DataType::Utf8, true),
+        column("text_value", 81, DataType::Utf8, true),
+        column("divisor", 82, DataType::Int64, false),
+    ];
+    let input = batch(
+        &columns,
+        vec![
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("|"),
+                Some("|"),
+                Some("|"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("bad"),
+                None,
+                Some("bad"),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![0, 1, 0, 0])),
+        ],
+    );
+    let sql = "concat_ws(sep, CAST(CAST(text_value AS BIGINT) AS VARCHAR), CAST(10 / divisor AS VARCHAR))";
+    let checked = evaluate(&compile(sql, &columns, &context), &input);
+    let values = checked
+        .batch
+        .values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [None, Some("10"), None, None]
+    );
+    assert_eq!(
+        checked
+            .batch
+            .errors
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.reason()))
+            .collect::<Vec<_>>(),
+        [
+            (2, DataFailureReason::Domain(INVALID_CAST_ARGUMENT)),
+            (3, DataFailureReason::DivisionByZero),
+        ],
+    );
+
+    let caught = evaluate(&compile(&format!("TRY({sql})"), &columns, &context), &input);
+    assert!(caught.batch.errors.is_empty());
+    assert_eq!(caught.batch.values.as_ref(), checked.batch.values.as_ref());
+}
+
+#[test]
 fn map_concat_ordered_null_short_circuits_only_later_conversions() {
     use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
     let functions = fixture();

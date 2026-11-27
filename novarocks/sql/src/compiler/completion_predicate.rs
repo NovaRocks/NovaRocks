@@ -72,7 +72,7 @@ fn lower_provider_conjunction(
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
         work.step()?;
         let Ok(occurrence) = u32::try_from(ordinal) else {
-            continue;
+            break;
         };
         let lowered = if delete_probe {
             lower_delete_predicate(scan, columns, predicate, work)?
@@ -80,7 +80,12 @@ fn lower_provider_conjunction(
             lower_provider_atom(scan, columns, predicate, row_mutation_match, work)?
         };
         let Some((column, domain, exact_eligible)) = lowered else {
-            continue;
+            if reads_predicate_value(predicate) {
+                continue;
+            }
+            // A pruning-only offer also removes rows before engine evaluation.
+            // Later offers cannot bypass an earlier unproved operation.
+            break;
         };
         if let Ok(summary) = TupleDomain::with_column_domains(BTreeMap::from([(column, domain)])) {
             predicates.push(
@@ -669,6 +674,16 @@ fn unnest(mut expression: &TypedExpr) -> &TypedExpr {
     expression
 }
 
+/// A directly bound input or literal needs no scalar operation. An unoffered
+/// predicate of this shape can precede a later offer without hiding a body
+/// invocation or row error.
+pub(super) fn reads_predicate_value(expression: &TypedExpr) -> bool {
+    matches!(
+        unnest(expression).kind,
+        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
@@ -830,6 +845,51 @@ mod tests {
         assert_eq!(offered[1].occurrence().get(), 2);
         assert_eq!(offered[0].constraint().summary().columns().count(), 1);
         assert!(offered[0].constraint().expression().is_constant_true());
+    }
+
+    #[test]
+    fn provider_offers_keep_the_original_scan_predicate_prefix() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
+
+        let cast = |expr: TypedExpr, target: DataType| TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Explicit),
+                expr: novarocks_parser::ast::AstBox::new(expr),
+                target: target.clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: FunctionValueType::new(target, false),
+        };
+        let smallint = |value| TypedExpr {
+            value_type: FunctionValueType::new(DataType::Int16, false),
+            ..integer(value)
+        };
+        let checked = comparison(BinOp::Gt, cast(column_ref(), DataType::Int16), smallint(0));
+        for (qualifying, exact) in [
+            (comparison(BinOp::Gt, column_ref(), integer(10)), true),
+            (
+                comparison(BinOp::Lt, cast(smallint(10), DataType::Int32), column_ref()),
+                false,
+            ),
+        ] {
+            let unsafe_order = scan(vec![checked.clone(), qualifying.clone()]);
+            assert!(offered(&unsafe_order, &columns()).is_empty());
+
+            let safe_order = scan(vec![qualifying, checked.clone()]);
+            let needs = offered(&safe_order, &columns());
+            let [need] = needs.as_ref() else {
+                panic!("expected only the leading safe scan predicate")
+            };
+            assert_eq!(need.occurrence().get(), 0);
+            assert_eq!(need.exact_eligible(), exact);
+            let domain = need.constraint().summary().domain_for(&0).unwrap();
+            assert!(!domain.null_allowed());
+            let [range] = domain.values().ranges() else {
+                panic!("expected the same simple range in either operand orientation")
+            };
+            assert_eq!(range.low(), &Bound::Exclusive(ConnectorValue::Integer(10)));
+            assert_eq!(range.high(), &Bound::Unbounded);
+        }
     }
 
     #[test]

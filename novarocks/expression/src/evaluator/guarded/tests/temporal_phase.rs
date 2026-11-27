@@ -129,7 +129,6 @@ fn error_placeholders_never_trigger_whole_invocation_null_guard() {
             .next_ordinals(
                 ControlShape::TemporalSource(S::SecondsCastOther),
                 3,
-                true,
                 7,
                 &mut work
             )
@@ -159,7 +158,6 @@ fn demanded_deepest_data_error_projects_all_successes_preserving_prior_child_err
             .next_ordinals(
                 ControlShape::TemporalSource(S::SecondsCastOther),
                 3,
-                true,
                 7,
                 &mut work
             )

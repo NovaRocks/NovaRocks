@@ -147,10 +147,10 @@ fn shared_if_retains_independent_value_truth_uses_and_hand_checked_guards() {
         assert_eq!(owner.control, ControlShape::If);
         let condition = &sealed.uses()[&owner.arguments[0]];
         assert_eq!(condition.context.region, owner.context.region);
-        assert_eq!(condition.context.demand, EvaluationDemand::TruthOnly);
+        assert_eq!(condition.context.demand, EvaluationDemand::Value);
         for (index, kind) in [(1, GuardKind::IfThen), (2, GuardKind::IfElse)] {
             let child = &sealed.uses()[&owner.arguments[index]];
-            assert_eq!(child.context.demand, demand);
+            assert_eq!(child.context.demand, EvaluationDemand::Value);
             let region = &sealed.control_flow().regions()[&child.context.region];
             assert_eq!(region.parent, Some(owner.context.region));
             assert_eq!(region.guard, Some(RegionGuard { owner: root, kind }));
@@ -515,11 +515,7 @@ fn intrinsic_boolean_and_both_case_shapes_keep_ordered_hand_checked_guards() {
                 id,
                 first + arm * 2,
                 GuardKind::CaseWhen { arm: arm as u32 },
-                if simple {
-                    EvaluationDemand::Value
-                } else {
-                    EvaluationDemand::TruthOnly
-                },
+                EvaluationDemand::Value,
             );
             assert_guard(
                 &unit,
@@ -721,64 +717,6 @@ fn no_arguments_keeps_static_children_but_does_not_invent_runtime_uses() {
     assert!(sealed.uses().values().next().unwrap().arguments.is_empty());
     with_call_claims(sealed, ArgumentControl::NoArguments, &mut work).unwrap();
     work.finish().unwrap();
-}
-#[test]
-fn nested_truth_only_use_must_have_a_boolean_full_type() {
-    let mut b = BoundExprSetBuilder::new(limits());
-    let condition = b
-        .add(None, integer(false), ExprKind::Value(ValueId::new(9)))
-        .unwrap();
-    let branch = b
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(8)))
-        .unwrap();
-    let f = function(
-        "fixture/unit/if",
-        vec![
-            FunctionArgumentType::Value(integer(false)),
-            FunctionArgumentType::Value(boolean(true)),
-            FunctionArgumentType::Value(boolean(true)),
-        ],
-        boolean(true),
-    );
-    let req = request(&f);
-    let root = b
-        .add(
-            None,
-            boolean(true),
-            ExprKind::FunctionCall {
-                function: f,
-                args: Box::new([condition, branch, branch]),
-            },
-        )
-        .unwrap();
-    b.request(root, req).unwrap();
-    b.definition_control(
-        root,
-        DefinitionControl {
-            shape: ControlShape::If,
-            temporal_sources: None,
-        },
-    )
-    .unwrap();
-    b.root(root, EvaluationDemand::Value, RootScope::Port(0))
-        .unwrap();
-    let c = Control::good();
-    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Validate).unwrap();
-    let sealed = b
-        .seal(
-            vec![ExprPort {
-                values: Box::new([
-                    (ValueId::new(9), integer(false)),
-                    (ValueId::new(8), boolean(true)),
-                ]),
-            }],
-            &mut work,
-        )
-        .unwrap();
-    let error = with_call_claims(sealed, ArgumentControl::If, &mut work).unwrap_err();
-    assert!(
-        matches!(error,UnitError::Invalid {definition:Some(id),message,..} if id==condition && message.contains("TruthOnly"))
-    );
 }
 #[test]
 fn neutral_parts_cannot_bind_an_independent_root_inside_another_roots_guard() {

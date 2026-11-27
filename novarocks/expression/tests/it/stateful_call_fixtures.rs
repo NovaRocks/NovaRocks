@@ -134,7 +134,7 @@ fn call_author(
     name: &str,
     args: &[FunctionValueType],
 ) -> ClaimAuthor {
-    ClaimAuthor::with_exact_eager_binding(
+    ClaimAuthor::with_exact_ordinary_binding(
         catalogue,
         name,
         args.iter()

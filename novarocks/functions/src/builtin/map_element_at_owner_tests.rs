@@ -143,7 +143,7 @@ fn map_lookup_real_public_arity_and_nullable_result_match_original_binding() {
     );
     assert_eq!(
         p.contract().effects().null_behavior,
-        FunctionNullBehavior::CalledOnNull
+        FunctionNullBehavior::StrictPositions(Box::new([0]))
     );
     assert_eq!(
         p.contract().effects().own_row_error,
@@ -328,7 +328,7 @@ fn uninhabited_key_profile_preserves_complete_map_value_and_independent_probe() 
                     prepared_for_test("__map_element_at", &[map.clone(), probe.clone()]).unwrap();
                 assert_eq!(
                     prepared.contract().effects().argument_control,
-                    ArgumentControl::Eager
+                    ArgumentControl::OrderedNull
                 );
                 assert_eq!(
                     prepared.contract().effects().failure_behavior,

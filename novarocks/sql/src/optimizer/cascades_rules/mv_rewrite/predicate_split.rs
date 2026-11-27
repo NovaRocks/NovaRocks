@@ -27,6 +27,7 @@ use crate::column_id::ColumnId;
 use crate::common::{BinOp, LiteralValue};
 use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+use crate::optimizer::scalar_expr;
 use novarocks_type_contract::{
     CharacterKind, CompileCheckpoints, CompilePhase, PureCompileControl, ValueKind,
 };
@@ -335,13 +336,26 @@ pub(crate) fn check_containment(
 ) -> Result<Option<ContainmentResult>, SqlCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = (|| {
-        let Some(q) = classify(query_arena, query_conjuncts, query_base_names, &mut work)? else {
+        let mut prefix_len = 0;
+        for &conjunct in query_conjuncts {
+            work.step()?;
+            if scalar_expr::can_fail(query_arena, conjunct)
+                || scalar_expr::contains_non_replica_deterministic_function(query_arena, conjunct)
+            {
+                break;
+            }
+            prefix_len += 1;
+        }
+        // The materialized view filters before compensation. Only the source
+        // prefix can prove which rows it may discard before required effects.
+        let (prefix, _) = query_conjuncts.split_at(prefix_len);
+        let Some(q) = classify(query_arena, prefix, query_base_names, &mut work)? else {
             return Ok(None);
         };
         let Some(m) = classify(mv_arena, mv_conjuncts, mv_base_names, &mut work)? else {
             return Ok(None);
         };
-        let mut compensation = Vec::new();
+        let mut implied = std::collections::HashSet::new();
         for (col, (mv_range, _)) in &m.ranges {
             work.flush()?;
             let contained = q.ranges.get(col).and_then(|(q_range, _)| {
@@ -364,9 +378,9 @@ pub(crate) fn check_containment(
                 .is_some_and(|(mv_range, _)| mv_range == q_range);
             work.step()?;
             work.flush()?;
-            if !equal {
+            if equal {
                 for original in originals {
-                    compensation.push(*original);
+                    implied.insert(*original);
                     work.step()?;
                 }
             }
@@ -382,8 +396,15 @@ pub(crate) fn check_containment(
         }
         for (qn, original) in q.residuals.iter().zip(&q.residual_ids) {
             work.flush()?;
-            if !norm_contains(&m.residuals, qn, control)? {
-                compensation.push(*original);
+            if norm_contains(&m.residuals, qn, control)? {
+                implied.insert(*original);
+            }
+            work.step()?;
+        }
+        let mut compensation = Vec::new();
+        for (position, &conjunct) in query_conjuncts.iter().enumerate() {
+            if position >= prefix_len || !implied.contains(&conjunct) {
+                compensation.push(conjunct);
             }
             work.step()?;
         }
@@ -594,6 +615,36 @@ mod tests {
         // the tighter (exclusive) query bound is re-applied as compensation.
         let r = check_containment(&[gt_a(5)], &[ge_a(5)], &n, &n).expect("contained");
         assert_eq!(r.compensation.len(), 1);
+    }
+
+    #[test]
+    fn mv_range_cannot_discard_a_row_before_a_required_conversion() {
+        let n = names();
+        let text = OutputColumn {
+            column_id: ColumnId(2),
+            name: "s".into(),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+            is_internal: false,
+        };
+        let checked = bin(
+            TypedExpr {
+                kind: ExprKind::Cast {
+                    cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                    expr: novarocks_parser::ast::AstBox::new(col_ref(&text)),
+                    target: DataType::Int64,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+                value_type: a().value_type,
+            },
+            BinOp::Gt,
+            int_lit(0),
+        );
+        let mv = [gt_a(0)];
+        assert!(check_containment(&[checked.clone(), gt_a(0)], &mv, &n, &n).is_none());
+        let accepted = check_containment(&[gt_a(0), checked], &mv, &n, &n)
+            .expect("the same range rejects the row before the conversion");
+        assert_eq!(accepted.compensation.len(), 1);
     }
 
     #[test]

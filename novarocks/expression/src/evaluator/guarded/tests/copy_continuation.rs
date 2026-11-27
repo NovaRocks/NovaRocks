@@ -331,7 +331,7 @@ fn alias_prepared(ty: &FunctionValueType) -> Arc<dyn novarocks_functions::Prepar
                 value_stability: self.0.value_stability,
                 own_row_error: self.0.own_row_error,
                 failure_behavior: self.0.failure_behavior,
-                null_behavior: self.0.null_behavior,
+                null_behavior: self.0.null_behavior.clone(),
                 argument_control: self.0.argument_control,
                 instance_state: self.0.instance_state,
                 observable_effects: self.0.observable_effects,

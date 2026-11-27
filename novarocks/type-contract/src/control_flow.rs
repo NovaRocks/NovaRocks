@@ -71,7 +71,8 @@ pub enum ControlShape {
     /// Demand source and pattern in order, compile the non-NULL pattern at
     /// its original position, then demand the remaining arguments in order.
     OrderedRegexp,
-    /// Demand ordered arguments on surviving non-NULL rows and invoke a scalar leaf.
+    /// Demand each next argument on successful rows, applying the selected
+    /// overload's NULL policy to the preceding position.
     OrderedNull,
     /// Four ordered source occurrences and two intervening comparisons.
     Between {
@@ -128,7 +129,7 @@ pub enum GuardKind {
     OrderedRegexpAfterArgument {
         ordinal: u32,
     },
-    /// The preceding argument succeeded and returned a non-NULL value.
+    /// The preceding argument succeeded and either permits NULL or is present.
     OrderedNullAfterArgument {
         ordinal: u32,
     },
@@ -801,7 +802,7 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::NullIf => count == 2,
         ControlShape::Try => count == 1,
         ControlShape::OrderedRegexp => (2..=4).contains(&count),
-        ControlShape::OrderedNull => count > 0,
+        ControlShape::OrderedNull => true,
         ControlShape::Between { .. } => count == 4,
         ControlShape::Membership { .. } => count > 0,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
@@ -897,7 +898,7 @@ fn control_argument_demand(
     ordinal: usize,
     owner: crate::EvaluationDemand,
 ) -> crate::EvaluationDemand {
-    use crate::EvaluationDemand::{TruthOnly, Value};
+    use crate::EvaluationDemand::Value;
     match shape {
         ControlShape::Eager
         | ControlShape::TypeOnly
@@ -918,13 +919,6 @@ fn control_argument_demand(
                 Value
             }
         }
-        ControlShape::If => {
-            if ordinal == 0 {
-                TruthOnly
-            } else {
-                owner
-            }
-        }
         ControlShape::HigherOrder {
             body_ordinal,
             body_demand,
@@ -935,19 +929,7 @@ fn control_argument_demand(
                 Value
             }
         }
-        ControlShape::Case { simple, arms, .. } => {
-            if simple && ordinal == 0 {
-                return Value;
-            }
-            let ordinal = ordinal - usize::from(simple);
-            if ordinal == arms as usize * 2 || ordinal % 2 == 1 {
-                owner
-            } else if simple {
-                Value
-            } else {
-                TruthOnly
-            }
-        }
+        ControlShape::If | ControlShape::Case { .. } => Value,
     }
 }
 
@@ -1191,7 +1173,7 @@ mod tests {
                 EvaluationDemand::TruthOnly
             ),
             Ok((
-                EvaluationDemand::TruthOnly,
+                EvaluationDemand::Value,
                 Some(GuardKind::CaseThen { arm: 0 })
             ))
         );
@@ -1270,7 +1252,7 @@ mod tests {
         }
         assert_eq!(
             control_argument_semantics(ControlShape::OrderedNull, 0, 0, EvaluationDemand::Value,),
-            Err(ExpressionControlFlowError::InvalidControlShape)
+            Err(ExpressionControlFlowError::InvalidReference)
         );
     }
 

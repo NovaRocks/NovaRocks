@@ -836,6 +836,37 @@ fn actual_scalar_occurrences_preserve_all_nine_fields_ordered_refs_and_independe
 }
 
 #[test]
+fn positional_null_effects_transfer_canonical_ordinals_and_reject_malformed_claims() {
+    let control = TestControl::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut selected = rich_effects(EvaluationRegionId::new(0));
+    selected.argument_control = ArgumentControl::OrderedNull;
+    selected.null_behavior = FunctionNullBehavior::StrictPositions(Box::new([0, 2]));
+    let mut resources = Projection::plain();
+    let wire = encode_effects(&selected, &mut resources, &mut work).unwrap();
+    assert_eq!(wire.strict_argument_ordinals, [0, 2]);
+    assert_eq!(
+        decode_effects(&wire, &mut resources, &mut work).unwrap(),
+        selected
+    );
+    for invalid in [vec![], vec![2, 2], vec![2, 0], vec![u32::MAX]] {
+        let mut malformed = wire.clone();
+        malformed.strict_argument_ordinals = invalid;
+        assert!(matches!(
+            decode_effects(&malformed, &mut resources, &mut work),
+            Err(E::InvalidShape(_))
+        ));
+    }
+    let mut malformed = wire;
+    malformed.null_behavior = wire::NullBehavior::CalledOnNull as i32;
+    assert!(matches!(
+        decode_effects(&malformed, &mut resources, &mut work),
+        Err(E::InvalidShape(_))
+    ));
+    work.finish().unwrap();
+}
+
+#[test]
 fn policy_absence_unspecified_and_unknown_are_never_defaulted() {
     let fixture = scalar_fixture(1, 0);
     let dto = encode_checked(&fixture.checked().unwrap(), &TestControl::default()).unwrap();
@@ -1028,7 +1059,7 @@ fn every_closed_effect_enum_rejects_unspecified_and_unknown_values() {
         FunctionNullBehavior::CalledOnNull,
         FunctionNullBehavior::ControlDefined,
     ] {
-        assert_eq!(decode_null(encode_null(v)).unwrap(), v);
+        assert_eq!(decode_null(encode_null(&v)).unwrap(), v);
     }
     for v in [
         FunctionInstanceState::None,

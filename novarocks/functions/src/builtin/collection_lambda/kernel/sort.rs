@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stable bottom-up position merges. Each active run has one depended-on
-//! comparison; separate runs in the same pass may request work together.
+//! Stable bottom-up position merges. Every parent requests its next required
+//! comparison, since an invalid result terminates that parent's sort.
 
 use arrow_array::Int32Array;
 
@@ -28,7 +28,7 @@ pub(super) struct Sort<'input> {
     values: [ArrayRef; 2],
     parents: Scratch<SortParent<'input>>,
     pending: Scratch<(usize, usize)>,
-    speculative: bool,
+    batch_parents: bool,
     next_parent: usize,
     remaining: usize,
     storage: Storage,
@@ -38,7 +38,7 @@ impl<'input> Sort<'input> {
     pub(super) fn new(
         input: HigherOrderCallInput<'_, 'input>,
         contract: Arc<HigherOrderCallContract>,
-        speculative: bool,
+        batch_parents: bool,
         storage: Storage,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Self, KernelFailure> {
@@ -73,7 +73,7 @@ impl<'input> Sort<'input> {
             values: [Arc::clone(&values), values],
             parents,
             pending: storage.vec(0)?,
-            speculative,
+            batch_parents,
             next_parent: 0,
             remaining,
             storage,
@@ -86,11 +86,6 @@ impl<'input> Sort<'input> {
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<LambdaBodyBatch, KernelFailure> {
         let first_parent = self.next_parent;
-        let share = if self.speculative {
-            BATCH_ROWS.div_ceil(self.remaining)
-        } else {
-            1
-        };
         let mut pairs = self.storage.vec(0)?;
         for _ in 0..self.parents.len() {
             let parent = self.next_parent;
@@ -100,36 +95,25 @@ impl<'input> Sort<'input> {
             if !row.active() {
                 continue;
             }
-            let count = share.min(BATCH_ROWS - pairs.len());
             row.ensure_pass(&self.storage, work)?;
             for _ in 0..row.merges.len() {
-                if pairs.len() == BATCH_ROWS || row.requested == count {
-                    break;
-                }
-                let merge_index = row.next_merge;
-                let merge = &row.merges[merge_index];
-                row.next_merge = (row.next_merge + 1) % row.merges.len();
+                let merge = &row.merges[row.next_merge];
                 work.step()?;
                 if merge.done() {
+                    row.next_merge = (row.next_merge + 1) % row.merges.len();
                     continue;
                 }
                 let pair = [row.positions[merge.left], row.positions[merge.right]];
                 self.storage.push(&mut pairs, pair)?;
                 self.storage
-                    .push(&mut self.pending, (parent, merge_index))?;
-                row.requested += 1;
-                if !self.speculative {
-                    // Retain parent-major and merge-run order for the next
-                    // comparison even while this run advances one side.
-                    row.next_merge = merge_index;
-                    break;
-                }
+                    .push(&mut self.pending, (parent, row.next_merge))?;
+                break;
             }
-            row.requested = 0;
-            if !self.speculative || pairs.len() == BATCH_ROWS {
-                if !self.speculative {
-                    self.next_parent = parent;
-                }
+            if !self.batch_parents {
+                self.next_parent = parent;
+                break;
+            }
+            if pairs.len() == BATCH_ROWS {
                 break;
             }
         }
@@ -272,7 +256,6 @@ struct SortParent<'input> {
     merges: Scratch<Merge>,
     next_merge: usize,
     remaining_merges: usize,
-    requested: usize,
     error: Option<ParentError<'input>>,
 }
 impl<'input> SortParent<'input> {
@@ -300,7 +283,6 @@ impl<'input> SortParent<'input> {
             merges: storage.vec(0)?,
             next_merge: 0,
             remaining_merges: 0,
-            requested: 0,
             error: None,
         })
     }
