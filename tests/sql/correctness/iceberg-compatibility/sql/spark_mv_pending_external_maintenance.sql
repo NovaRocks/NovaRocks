@@ -64,7 +64,10 @@ SPARK_SCALA
   cat "$out/rewrite-pending-target.log"
   exit 1
 }
-grep -Fx SPARK_PENDING_REPLACE_OK "$out/rewrite-pending-target.log"
+tr '\r' '\n' < "$out/rewrite-pending-target.log" | grep -Fx SPARK_PENDING_REPLACE_OK || {
+  cat "$out/rewrite-pending-target.log"
+  exit 1
+}
 
 -- query 4
 -- @skip_result_check=true
@@ -116,7 +119,10 @@ SPARK_SCALA
   cat "$out/append-pending-target.log"
   exit 1
 }
-grep -Fx SPARK_PENDING_APPEND_OK "$out/append-pending-target.log"
+tr '\r' '\n' < "$out/append-pending-target.log" | grep -Fx SPARK_PENDING_APPEND_OK || {
+  cat "$out/append-pending-target.log"
+  exit 1
+}
 
 -- query 10
 -- @expect_error=explicit rebuild is required
@@ -169,7 +175,10 @@ SPARK_SCALA
   cat "$out/rewrite-retired-target.log"
   exit 1
 }
-grep -Fx SPARK_RETIRED_REPLACE_OK "$out/rewrite-retired-target.log"
+tr '\r' '\n' < "$out/rewrite-retired-target.log" | grep -Fx SPARK_RETIRED_REPLACE_OK || {
+  cat "$out/rewrite-retired-target.log"
+  exit 1
+}
 
 -- query 16
 -- @expect_error=requires an explicit rebuild

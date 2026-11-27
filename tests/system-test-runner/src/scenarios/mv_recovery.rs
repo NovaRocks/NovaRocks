@@ -19,6 +19,9 @@ use novarocks_cluster_harness::publication_catalog::{
     PublicationAction, PublicationCatalogFixture, PublicationFault, RetainedMvCommit,
 };
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
+use novarocks_failpoint::observation_marker::{
+    MV_SCAN_PRUNING_COVERAGE, RF_SPLIT_INITIAL_WAIT_RESOLVED,
+};
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -860,8 +863,12 @@ impl Scenario for MvContentPendingRecovery {
             Self::TARGET,
         )?;
         assert_content_refresh_explain(context, &mut conn, "StrictRecovery")?;
+        // This MANUAL view has no background refresh. The only statement in
+        // this FE log interval is the successful strict replay.
         let before_pruning = context.handle().fe_server_info_log()?;
-        refresh(context, &mut conn, Self::TARGET)?;
+        let refreshed = refresh(context, &mut conn, Self::TARGET);
+        let pruning = record_content_recovery_pruning(context, &before_pruning);
+        refreshed?;
         if self.mode == ContentRecoveryMode::SlotChange {
             let slot = query(
                 context,
@@ -880,26 +887,6 @@ impl Scenario for MvContentPendingRecovery {
                 slot.rows
             );
         }
-        let after_pruning = context.handle().fe_server_info_log()?;
-        let original_ledger = |text: &str| {
-            text.lines()
-                .filter(|line| {
-                    line.contains(novarocks_failpoint::observation_marker::MV_SCAN_PRUNING_COVERAGE)
-                        && line.contains("basis=DynamicFilter")
-                        && line.contains("identity_digest=")
-                        && line.split_whitespace().any(|field| {
-                            field
-                                .strip_prefix("files=")
-                                .and_then(|count| count.parse::<u64>().ok())
-                                .is_some_and(|count| count != 0)
-                        })
-                })
-                .count()
-        };
-        ensure!(
-            original_ledger(&after_pruning) > original_ledger(&before_pruning),
-            "the successful exact target enumeration did not account for demand-based file pruning"
-        );
         assert_rows(
             context,
             &mut conn,
@@ -919,7 +906,8 @@ impl Scenario for MvContentPendingRecovery {
             "SELECT k1, v2 FROM orders WHERE v2 > 0 ORDER BY k1",
             &[(2, 20), (3, 30)],
             "verify the full source result for the recovered window",
-        )
+        )?;
+        pruning
     }
 
     fn teardown(&self) -> Result<()> {
@@ -930,6 +918,71 @@ impl Scenario for MvContentPendingRecovery {
             .take();
         fixture.map_or(Ok(()), |mut fixture| fixture.shutdown())
     }
+}
+
+fn record_content_recovery_pruning(context: &mut ScenarioContext, before: &str) -> Result<()> {
+    let after = context.handle().fe_server_info_log()?;
+    let appended = after
+        .strip_prefix(before)
+        .context("the recovery FE log was replaced or truncated during the refresh")?;
+    let markers = appended
+        .split_inclusive('\n')
+        .filter(|line| {
+            line.contains(MV_SCAN_PRUNING_COVERAGE) || line.contains(RF_SPLIT_INITIAL_WAIT_RESOLVED)
+        })
+        .collect::<Vec<_>>();
+    let artifact = context
+        .scenario_root()
+        .join("strict-recovery-scan-pruning.log");
+    fs::write(&artifact, markers.concat())
+        .with_context(|| format!("write strict recovery scan evidence {}", artifact.display()))?;
+
+    let coverage_marker = format!(r#"marker="{MV_SCAN_PRUNING_COVERAGE}""#);
+    let pruned = markers.iter().any(|line| {
+        line.contains(&coverage_marker)
+            && line.contains(" identity_digest=[")
+            && line
+                .split_whitespace()
+                .any(|field| field == "basis=DynamicFilter")
+            && line.split_whitespace().any(|field| {
+                field
+                    .strip_prefix("files=")
+                    .and_then(|count| count.parse::<u64>().ok())
+                    .is_some_and(|count| count != 0)
+            })
+    });
+    // Maintenance installs demand feedback only on its content target. A
+    // retried refresh must use its latest target wait for the fail-open case.
+    let target_wait = markers
+        .iter()
+        .rev()
+        .find_map(|line| content_recovery_wait_outcome(line));
+    ensure!(
+        pruned || target_wait == Some("\"deadline_elapsed\""),
+        "strict recovery needs a positive DynamicFilter ledger or its target wait deadline: {}",
+        artifact.display()
+    );
+    Ok(())
+}
+
+fn content_recovery_wait_outcome(line: &str) -> Option<&str> {
+    let (_, details) = line.trim_end().split_once(RF_SPLIT_INITIAL_WAIT_RESOLVED)?;
+    let (execution, scan) = details
+        .strip_prefix(" execution_id=")?
+        .split_once(" scan=fragment ")?;
+    let (query_high, query) = execution.split_once(':')?;
+    let (query_low, attempt) = query.split_once(':')?;
+    let query_high = query_high.parse::<i64>().ok()?;
+    let query_low = query_low.parse::<i64>().ok()?;
+    if query_high == 0 && query_low == 0 {
+        return None;
+    }
+    attempt.parse::<std::num::NonZeroU64>().ok()?;
+    let (fragment, node) = scan.split_once(" node ")?;
+    let (node, outcome) = node.split_once(" outcome=")?;
+    fragment.parse::<i32>().ok()?;
+    node.parse::<i32>().ok()?;
+    Some(outcome)
 }
 
 fn assert_content_refresh_explain(

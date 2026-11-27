@@ -21,7 +21,7 @@
 use super::super::*;
 use super::{Host, columns, readable, wait};
 use crate::exec::{
-    chunk::Chunk,
+    chunk::{ArrayNormalizationStep, Chunk, ChunkSlotSchema},
     operators::logical_change_summary::SummaryUnitObligation,
     pipeline::{
         driver_step::DriverStep,
@@ -33,12 +33,16 @@ use crate::exec::{
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, new_null_array};
 use novarocks_functions::{
     KernelEvaluationControl,
+    array_projection::observe_value_hydration,
     selected_copy::{
         self, CopyConstructionError, CopyIndices, CopyOperationError, OriginalCopyData,
     },
 };
 use novarocks_result_contract::SummaryValue;
 use novarocks_type_contract::ValueSchemaCreation;
+use novarocks_value_arrays::hydrate::{
+    HydrateEvent, HydrateOptions, HydratePlan, HydrateProjection,
+};
 
 pub(super) struct ProbeCursor {
     pub(super) input: Chunk,
@@ -174,7 +178,7 @@ fn probe_page(
     let schema = &host.prepared()?.schema;
     let output = host.owner()?;
     let mut result = funded_vec(output.as_ref(), schema.slots().len())?;
-    for array in arrays.into_iter().chain(position_arrays) {
+    for (ordinal, array) in arrays.into_iter().chain(position_arrays).enumerate() {
         let copied = selected_copy::take_copy_in(
             array,
             indices.clone(),
@@ -189,9 +193,73 @@ fn probe_page(
                 ExecutionFailure::from_domain(TargetGatherFailure(cause))
             }
         })?;
-        result.push(copied.into_values());
+        result.push(project_probe_output_column(
+            copied.into_values(),
+            &schema.slots()[ordinal],
+            ordinal,
+            output.as_ref(),
+            work.control,
+            conversions,
+        )?);
     }
     output_chunk(host, output.as_ref(), result, rows, -1).map(Some)
+}
+
+fn project_probe_output_column(
+    array: ArrayRef,
+    slot: &ChunkSlotSchema,
+    ordinal: usize,
+    owner: &dyn InputConstructionOwner,
+    control: &dyn KernelEvaluationControl,
+    conversions: &mut ValueConversionContext,
+) -> ExecutionResult<ArrayRef> {
+    if array.data_type() == slot.data_type() {
+        return Ok(array);
+    }
+
+    // Exchange may widen physical child NULL flags while retaining the original
+    // complete binding. The output requires its frozen carrier, and only the
+    // selected rows can authorize the projection to that carrier.
+    let storage = owner.storage_lifetime();
+    let mut growth = |layout| owner.request(layout).map_err(ExecutionFailure::from);
+    let mut work = |_| control.checkpoint(0).map_err(ExecutionFailure::from);
+    let mut observe = |event: HydrateEvent<'_>| {
+        observe_value_hydration(event, &mut |step| {
+            let path = match &step {
+                ArrayNormalizationStep::RebuildArray { path, .. }
+                | ArrayNormalizationStep::ValueStructure { path, .. } => *path,
+                _ => &[],
+            };
+            owner
+                .observe(ordinal, path, step)
+                .map_err(ExecutionFailure::from)
+        })
+    };
+    let failure = |error| match error {
+        ValueFailure::Caller(cause) => cause,
+        ValueFailure::Value(cause) => ExecutionFailure::from_domain(cause),
+    };
+    let plan = HydratePlan::plan_with_options_and_storage_observed(
+        &array,
+        slot.typed_binding(),
+        HydrateOptions {
+            projection: HydrateProjection::PermissivePhysicalNullability {
+                project_byte_layouts: false,
+            },
+            ..Default::default()
+        },
+        conversions,
+        &storage,
+        &mut |_, _| false,
+        &mut growth,
+        &mut work,
+        &mut observe,
+    )
+    .map_err(failure)?;
+    plan.require_complete()
+        .map_err(ExecutionFailure::from_domain)?;
+    plan.execute_observed(conversions, &mut growth, &mut work, &mut observe)
+        .map_err(failure)
 }
 
 #[derive(Debug)]
@@ -360,3 +428,6 @@ pub(super) fn drive_tail(
     };
     Ok(StepResult::new(output, next, 0))
 }
+
+#[cfg(test)]
+mod tests;
