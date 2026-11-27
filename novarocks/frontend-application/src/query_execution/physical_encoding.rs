@@ -64,11 +64,11 @@ use crate::query_execution::preparation::attempt_access::{
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
 
-/// Production encoding borrows the admitted statement window. Pure semantic
-/// fixtures name their separate author explicitly and cannot enter production.
+/// Production encoding checks the original statement scope before freezing.
+/// Pure semantic fixtures have no statement scope.
 #[derive(Clone, Copy)]
 pub(crate) enum EncodingAuthor<'a> {
-    Statement(&'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding),
+    Statement(&'a novarocks_workload_control::WorkScope),
     #[cfg(test)]
     SemanticFixture,
 }
@@ -173,7 +173,7 @@ pub(crate) fn encode_completed_plan(
         carrier,
         write_targets,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 
@@ -508,7 +508,7 @@ pub(crate) fn encode_completed_plan_borrowed(
         access,
         carrier,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 
@@ -536,7 +536,7 @@ pub(crate) fn encode_completed_write_plan_borrowed(
         carrier,
         write_targets,
         control,
-        EncodingAuthor::Statement(capacity),
+        EncodingAuthor::Statement(capacity.scope()),
     )
 }
 

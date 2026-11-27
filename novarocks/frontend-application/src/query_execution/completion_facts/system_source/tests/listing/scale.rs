@@ -293,40 +293,18 @@ async fn round_trip(rows: usize, padding_bytes: usize) {
             .collect::<Vec<_>>();
         assert!(sizes.len() > 1);
         assert_eq!(sizes.iter().sum::<usize>(), rows);
-        let requests = std::cell::RefCell::new(Vec::new());
         let window = source.scope.capacity.window_alias();
         let before = window.retained_payload_bytes();
-        let artifact = crate::query_execution::required_constant_eval::with_root_value_creation(
-            source.scope.capacity.root_scope(), &window, &control,
-            |creation| {
-                let storage = creation.storage_lifetime();
-                let original = std::cell::RefCell::new(creation);
-                let mut request = |layout: std::alloc::Layout| {
-                    requests.borrow_mut().push(layout.size());
-                    original.borrow_mut().request_layout(layout)
-                };
-                let mut opaque = |bytes| {
-                    requests.borrow_mut().push(bytes);
-                    original.borrow_mut().observe_opaque_upper_bound(bytes)
-                };
-                let mut observed = novarocks_type_contract::ValueSchemaCreation::new(storage, &mut request, &mut opaque);
-                crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_package_with_creator(
-                    package, completed.plan().edges(), &carrier, &control, &mut observed,
-                )
-            },
-        ).unwrap();
-        if artifact.is_err() {
-            let mut largest = requests.borrow().clone();
-            largest.sort_unstable_by(|a, b| b.cmp(a));
-            eprintln!(
-                "system encoding capacity: rows={rows}, budget={}, before={before}, request_count={}, requested={}, largest={:?}",
-                window.payload_capacity_bytes(),
-                requests.borrow().len(),
-                requests.borrow().iter().sum::<usize>(),
-                &largest[..largest.len().min(12)]
-            );
-        }
-        let artifact = artifact.unwrap();
+        let artifact =
+            crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_statement_package(
+                source.scope.capacity.root_scope(),
+                package,
+                completed.plan().edges(),
+                &carrier,
+                &control,
+            )
+            .unwrap();
+        assert_eq!(window.retained_payload_bytes(), before);
         let envelope = novarocks_proto_models::novarocks::FrozenFragment::decode(
             artifact.content().bytes().clone(),
         )

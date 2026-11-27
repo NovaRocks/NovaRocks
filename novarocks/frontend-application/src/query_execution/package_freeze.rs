@@ -57,8 +57,7 @@ use crate::query_execution::provider_read_facts::FrozenReadEncoding;
 /// Host-owned configuration of the compiled package carrier.
 ///
 /// Structural ceilings and the immutable generated receiver model are supplied
-/// by the one startup composition. The statement owner grants capacity for
-/// actual package creation.
+/// by the one startup composition.
 #[derive(Clone)]
 pub struct CompiledPackageCarrier {
     plan_limits: PlanLimits,
@@ -293,7 +292,7 @@ pub(crate) fn encode_checked_package(
     Ok(bytes)
 }
 
-/// Original caller-funded wire projection, including the final prost Vec.
+/// Projects the checked package and qualifies the exact bytes for the receiver.
 pub(crate) fn encode_checked_package_with_creator(
     package: &FragmentPackage,
     carrier: &CompiledPackageCarrier,
@@ -311,7 +310,20 @@ pub(crate) fn encode_checked_package_with_creator(
                 ProjectionFailure::Codec(other) => PackageFreezeError::Encode(other),
             }
         })?;
-    let layout = std::alloc::Layout::array::<u8>(wire.encoded_len()).map_err(|_| {
+    let bytes = encode_freeze_buffer(&wire, creation)?;
+    carrier
+        .receiver_model
+        .preflight(&bytes, carrier.receiver_limits, control)?;
+    Ok(bytes)
+}
+
+/// Encodes either freeze layer into a buffer whose entire capacity was reserved.
+pub(crate) fn encode_freeze_buffer(
+    message: &impl Message,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, CompileControlError>,
+) -> Result<Vec<u8>, PackageFreezeError> {
+    let len = message.encoded_len();
+    let layout = std::alloc::Layout::array::<u8>(len).map_err(|_| {
         PackageFreezeError::Control(CompileControlError::from_domain(
             novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
         ))
@@ -319,10 +331,18 @@ pub(crate) fn encode_checked_package_with_creator(
     creation
         .request_layout(layout)
         .map_err(PackageFreezeError::Control)?;
-    let bytes = wire.encode_to_vec();
-    carrier
-        .receiver_model
-        .preflight(&bytes, carrier.receiver_limits, control)?;
+    let mut bytes = reserve_freeze_buffer(len)?;
+    message
+        .encode(&mut bytes)
+        .map_err(|error| PackageFreezeError::Facts(format!("encode frozen buffer: {error}")))?;
+    Ok(bytes)
+}
+
+fn reserve_freeze_buffer(len: usize) -> Result<Vec<u8>, PackageFreezeError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| PackageFreezeError::Control(CompileControlError::ResourceExhausted))?;
     Ok(bytes)
 }
 
@@ -331,6 +351,18 @@ mod error_projection_tests {
     use super::*;
     use novarocks_plan_codec::PhysicalEncodeError;
     use novarocks_sql::compiler::PackageSemanticsError;
+
+    #[test]
+    fn whole_freeze_buffer_reservation_failure_is_typed_resource() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+
+        let error = reserve_freeze_buffer(isize::MAX as usize + 1).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(
+            PhysicalEncodeError::from(error),
+            PhysicalEncodeError::Control(CompileControlError::ResourceExhausted)
+        );
+    }
 
     #[test]
     fn receiver_refusals_keep_original_resource_data_and_schema_authors() {
