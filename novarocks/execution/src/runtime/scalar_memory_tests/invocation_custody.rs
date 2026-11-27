@@ -357,73 +357,84 @@ fn runtime_json_object_rolls_back_capacity_failure_before_publication() {
 
 #[test]
 fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
-    // A LIMIT preserves one ordered Filter above the original row selection.
-    let sql = r#"SELECT n FROM (SELECT n, k, flag FROM t LIMIT 3) s
-                 WHERE flag AND JSON_OBJECT(k VALUE n) = '{"b":3}'"#;
-    let mut selected = None;
+    let sql = r#"SELECT n FROM t WHERE flag AND JSON_OBJECT(k VALUE n) = '{"b":3}'"#;
+    let mut scan = None;
+    let mut residual = None;
     for program in programs(sql) {
         for node in program.graph().nodes() {
-            let predicates = match node.kind() {
-                ProgramNodeKind::Filter { predicates, .. } => predicates.as_ref(),
-                ProgramNodeKind::Scan { residuals, .. } => residuals.as_slice(),
+            let (site, predicates) = match node.kind() {
+                ProgramNodeKind::Scan { residuals, .. } => (&mut scan, residuals.as_slice()),
+                ProgramNodeKind::Filter { predicates, .. } => (&mut residual, predicates.as_ref()),
                 _ => continue,
             };
-            if predicates.len() != 2 {
-                continue;
-            }
-            let units = predicates
-                .iter()
-                .map(|site| (program.unit(site.unit).unwrap().clone(), site.root))
-                .collect::<Vec<_>>();
-            let (unit, ordinal) = &units[0];
-            let root = unit.root(*ordinal).unwrap();
+            let [predicate] = predicates else {
+                panic!("one predicate at each authored filter site");
+            };
+            let unit = program.unit(predicate.unit).unwrap();
+            let root = unit.root(predicate.root).unwrap();
             let schema = unit.scope(root.scope).unwrap().schema().clone();
             assert!(
-                selected.replace((units, schema)).is_none(),
-                "one ordered pair"
+                site.replace(((unit.clone(), predicate.root), schema))
+                    .is_none()
             );
         }
     }
-    let (predicates, schema) = selected.expect("SQL produced an ordered two-predicate Filter/Scan");
+    let (scan, scan_schema) = scan.expect("necessary flag predicate in the Scan");
+    let (residual, residual_schema) = residual.expect("JSON check in the residual Filter");
     for demanded in [false, true] {
         let memory = demanded.then(super::bound);
         let mut control = super::control(memory.as_ref(), Arc::default());
         if demanded {
             control.bind_mem_tracker(MemTracker::new_root("native-json-filter"));
         }
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|f| match f.data_type() {
-                DataType::Boolean => {
-                    Arc::new(BooleanArray::from(vec![false, demanded, demanded])) as ArrayRef
-                }
-                DataType::Int64 => Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
-                DataType::Utf8 => {
-                    Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef
-                }
-                other => panic!("unexpected filter fixture field {other:?}"),
-            })
-            .collect();
-        let input = RecordBatch::try_new(schema.clone(), columns).unwrap();
-        let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
-            &predicates,
-            &control,
-            control.allocator(),
-        )
-        .unwrap();
-        let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = actual
-            .evaluate(
-                EvaluationInput::Batch {
-                    batch: &input,
-                    source: None,
-                },
-                Selection::all(3),
+        let apply = |predicate, schema: &arrow::datatypes::SchemaRef, selection| {
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Boolean => {
+                        Arc::new(BooleanArray::from(vec![false, demanded, demanded])) as ArrayRef
+                    }
+                    DataType::Int64 => Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                    DataType::Utf8 => {
+                        Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef
+                    }
+                    other => panic!("unexpected filter fixture field {other:?}"),
+                })
+                .collect();
+            let input = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            let mut actual = CompiledFilterConjunctionInstance::try_new_with_allocator(
+                std::slice::from_ref(predicate),
                 &control,
-                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                control.allocator(),
             )
-            .map_err(ExecutionFailure::from);
+            .unwrap();
+            let mut journal = RuntimeScalarMemoryJournal::default();
+            actual
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &input,
+                        source: None,
+                    },
+                    selection,
+                    &control,
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                )
+                .map_err(ExecutionFailure::from)
+        };
+        let scanned = apply(&scan, &scan_schema, Selection::all(3)).unwrap();
+        let flags = scanned.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            flags.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(demanded), Some(demanded)]
+        );
+        let rows = flags
+            .iter()
+            .enumerate()
+            .filter_map(|(row, flag)| (flag == Some(true)).then_some(row))
+            .collect::<Vec<_>>();
+        let selection = Selection::try_sparse(3, &rows).unwrap();
+        let result = apply(&residual, &residual_schema, selection);
         if demanded {
             let failure = result.unwrap_err();
             let ExecutionFailureCause::RequiredRow(row) = failure.cause() else {
@@ -432,9 +443,7 @@ fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
             assert_eq!(row.batch_row(), 1);
             assert_null_key(row.error());
         } else {
-            let output = result.unwrap();
-            let values = output.as_any().downcast_ref::<BooleanArray>().unwrap();
-            assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(false); 3]);
+            assert!(result.unwrap().is_empty());
         }
     }
 }
