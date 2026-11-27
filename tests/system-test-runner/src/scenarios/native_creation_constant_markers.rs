@@ -26,8 +26,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_failpoint::observation_marker::{
-    ObservationAction, PARTICIPATION_TERMINATION_COMPLETED, TASK_CONSTANT_IPC_RECORD,
-    TASK_CREATE_APPLIED, TASK_TERMINAL_RETAINED, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
+    ObservationAction, PARTICIPATION_ABORT_APPLIED, TASK_CONSTANT_IPC_RECORD, TASK_CREATE_APPLIED,
+    TASK_TERMINAL_RETAINED, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
 };
 use serde::Serialize;
 
@@ -233,8 +233,7 @@ pub(super) fn await_refused_attempt_tasks(
         let established =
             backends_with_marker(context, PARTICIPATION_ESTABLISH_APPLIED, execution)?;
         let released = backends_with_marker(context, RELEASE_APPLIED, execution)?;
-        let terminated =
-            backends_with_marker(context, PARTICIPATION_TERMINATION_COMPLETED, execution)?;
+        let aborted = backends_with_marker(context, PARTICIPATION_ABORT_APPLIED, execution)?;
         let mut tasks = Vec::new();
         for index in 0..context.handle().be_count() {
             ensure!(
@@ -268,19 +267,21 @@ pub(super) fn await_refused_attempt_tasks(
                 execution,
             )?);
         }
+        // TaskTerminalRetained is emitted by the original disposal worker
+        // after it drops the physical Task payload. AbortApplied identifies
+        // the failed participation's cleanup operation.
         if tasks.iter().all(|task| {
             task.created
                 && task.terminal.is_some()
-                && (released.contains(&task.backend_index)
-                    || terminated.contains(&task.backend_index))
+                && (released.contains(&task.backend_index) || aborted.contains(&task.backend_index))
         }) && established
             .iter()
-            .all(|index| released.contains(index) || terminated.contains(index))
+            .all(|index| released.contains(index) || aborted.contains(index))
         {
             return Ok(tasks);
         }
         let remaining = context.remaining(&format!(
-            "observe terminal Tasks and actual participation exits for {execution}; established={established:?}, released={released:?}, terminated={terminated:?}, tasks={tasks:?}",
+            "observe terminal Tasks and actual participation exits for {execution}; established={established:?}, released={released:?}, aborted={aborted:?}, tasks={tasks:?}",
         ))?;
         thread::sleep(remaining.min(Duration::from_millis(25)));
     }
