@@ -354,7 +354,9 @@ impl IcebergTypedBoundary {
                 "frozen write target",
             )?;
         let original = match selector {
-            OriginalTargetSnapshot::Signed(_) | OriginalTargetSnapshot::Statement(_) => {
+            OriginalTargetSnapshot::Signed(_)
+            | OriginalTargetSnapshot::MutationMatch { .. }
+            | OriginalTargetSnapshot::Statement(_) => {
                 original_source
                     .value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?
             }
@@ -390,7 +392,8 @@ impl IcebergTypedBoundary {
             .map_err(|error| invalid(format!("decode frozen write target metadata: {error}")))?;
         let metadata = original.access.metadata();
         let snapshot_id = match selector {
-            OriginalTargetSnapshot::Signed(snapshot_id) => snapshot_id,
+            OriginalTargetSnapshot::Signed(snapshot_id)
+            | OriginalTargetSnapshot::MutationMatch { snapshot_id, .. } => snapshot_id,
             OriginalTargetSnapshot::Statement(version) => {
                 use crate::metadata::TableMetadataProjection as P;
                 if !match (version, original.projection) {
@@ -436,6 +439,17 @@ impl IcebergTypedBoundary {
             .ok_or_else(|| {
                 invalid("frozen write target schema is absent from its original metadata")
             })?;
+        if let OriginalTargetSnapshot::MutationMatch {
+            source_schema_digest,
+            ..
+        } = selector
+        {
+            self.check_request_active()?;
+            let actual = crate::metadata::projected_schema_with_metadata(&payload, &[], metadata)?;
+            novarocks_spi::connector::ConnectorRowMutationPreparation::validate_match_source_schema_observed(
+                source_schema_digest, &actual, || self.check_request_active(),
+            )?;
+        }
         Ok((original, schema))
     }
 
@@ -1587,6 +1601,10 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
 #[derive(Clone, Copy)]
 enum OriginalTargetSnapshot {
     Signed(Option<i64>),
+    MutationMatch {
+        snapshot_id: Option<i64>,
+        source_schema_digest: [u8; 32],
+    },
     Current,
     Statement(ConnectorReadRelationVersion),
 }
@@ -1771,6 +1789,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 table,
                 original_source,
                 snapshot_id,
+                source_schema_digest,
                 ..
             } = request.kind()
             {
@@ -1778,7 +1797,10 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     name,
                     table,
                     original_source,
-                    OriginalTargetSnapshot::Signed(*snapshot_id),
+                    OriginalTargetSnapshot::MutationMatch {
+                        snapshot_id: *snapshot_id,
+                        source_schema_digest: *source_schema_digest,
+                    },
                 )?;
                 return Ok(Some(IcebergPreparedRelation {
                     prepared_manifest_list: None,
@@ -2043,7 +2065,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             }
             K::RowMutationMatch {
                 snapshot_id,
-                preparation_digest,
+                preparation_identity,
                 ..
             } => {
                 let metadata = physical.table.metadata();
@@ -2059,7 +2081,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     crate::commit::conflict_scope::RewrittenTargetBinding {
                         table_uuid: metadata.uuid(),
                         snapshot_id: *snapshot_id,
-                        preparation_digest: *preparation_digest,
+                        preparation_identity: preparation_identity.clone(),
                     },
                 );
                 Some(crate::typed_read::IcebergRuntimeRelation::Table(
@@ -6430,6 +6452,16 @@ mod prepared_source_relation_tests {
                 .unwrap(),
             )
             .unwrap();
+            let signed_schema = crate::metadata::projected_schema_with_metadata(
+                &match_source,
+                &[],
+                source.access.metadata(),
+            )
+            .unwrap();
+            let preparation =
+                crate::commit::preparation_for_test_source(signed.clone(), signed_schema);
+            let preparation_identity = preparation.preparation_identity().clone();
+            let source_schema_digest = preparation.match_source_schema_digest();
             let read = fresh();
             let req = R::new(
                 name.clone(),
@@ -6437,7 +6469,8 @@ mod prepared_source_relation_tests {
                     table: signed.clone(),
                     original_source: original.clone(),
                     snapshot_id,
-                    preparation_digest: [1; 32],
+                    preparation_identity: preparation_identity.clone(),
+                    source_schema_digest,
                 },
             );
             let prepared = executor
@@ -6474,7 +6507,7 @@ mod prepared_source_relation_tests {
                 crate::commit::conflict_scope::RewrittenTargetBinding {
                     table_uuid: source.access.metadata().uuid(),
                     snapshot_id,
-                    preparation_digest: [1; 32],
+                    preparation_identity: preparation_identity.clone(),
                 },
             );
             let ordinary = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::Table(
@@ -6491,13 +6524,30 @@ mod prepared_source_relation_tests {
                 read.load_pinned_relation(name).unwrap().table.metadata(),
                 source.access.metadata(),
             );
+            let wrong_schema = R::new(
+                name.clone(),
+                K::RowMutationMatch {
+                    table: signed.clone(),
+                    original_source: original.clone(),
+                    snapshot_id,
+                    preparation_identity: preparation_identity.clone(),
+                    source_schema_digest: [0; 32],
+                },
+            );
+            let rejected = fresh();
+            let result = executor.block_on(rejected.prepare_relation(&session, &wrong_schema));
+            assert!(
+                matches!(result, Err(ref error) if error.message().contains("schema differs from its signed contents"))
+            );
+            assert!(rejected.load_pinned_relation(name).is_err());
             let wrong = R::new(
                 name.clone(),
                 K::RowMutationMatch {
                     table: signed,
                     original_source: original.clone(),
                     snapshot_id: Some(42),
-                    preparation_digest: [1; 32],
+                    preparation_identity: preparation_identity.clone(),
+                    source_schema_digest,
                 },
             );
             assert!(

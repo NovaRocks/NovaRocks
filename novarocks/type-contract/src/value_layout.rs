@@ -796,7 +796,7 @@ pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Op
 
 #[cfg(test)]
 mod tests {
-    use crate::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES};
+    use crate::MAX_VALUE_TYPE_DEPTH;
     use std::{
         collections::hash_map::DefaultHasher,
         sync::atomic::{AtomicUsize, Ordering},
@@ -1220,7 +1220,7 @@ mod tests {
             Err(ExecutionValueTypeError::Depth)
         ));
         let wide = DataType::Struct(
-            (0..MAX_VALUE_TYPE_NODES)
+            (0..4096)
                 .map(|_| Arc::new(Field::new("v", DataType::Int64, true)))
                 .collect(),
         );

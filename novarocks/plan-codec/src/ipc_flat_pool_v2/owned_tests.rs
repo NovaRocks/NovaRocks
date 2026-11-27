@@ -54,7 +54,7 @@ fn parent_flat_same_source_stream_and_every_real_prefix() {
     .unwrap();
     assert_eq!(bytes, plain);
     compare_standard_batch(&bytes, &standard(&source), source.field().data_type());
-    let batch = standard_read(&bytes);
+    let batch = standard_read(&bytes, source.field_ref());
     assert_eq!(batch.schema().field(0), source.field());
     assert_eq!(batch.num_rows(), 3);
     let column = batch
@@ -89,7 +89,7 @@ fn parent_flat_known_header_and_emit_refusals_precede_late_control() {
             work.step().unwrap();
         }
         let mut l = limits();
-        l.max_new_allocation_request_bytes = 0;
+        l.max_rows = 0;
         assert!(matches!(
             prepare_flat_pool_write_in(&source, invoice(&source), l, &mut |_| Ok(()), &mut work),
             Err(TypeCodecError::Control(
@@ -121,7 +121,7 @@ fn parent_flat_known_header_and_emit_refusals_precede_late_control() {
     assert_eq!(control.trace(), before);
 }
 #[test]
-fn parent_flat_metadata_capture_gate_and_foreign_controller() {
+fn parent_flat_batch_request_gate_and_foreign_controller() {
     let array: ArrayRef = Arc::new(Int32Array::from(vec![7]));
     let field = Arc::new(Field::new("original", DataType::Int32, true).with_metadata(
         HashMap::from([("original-key".into(), "payload-value".into())]),
@@ -130,7 +130,7 @@ fn parent_flat_metadata_capture_gate_and_foreign_controller() {
     let control = controller(None);
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut l = limits();
-    l.schema.max_string_bytes = source.field().name().len();
+    l.max_new_allocation_request_bytes = 0;
     assert!(matches!(
         prepare_flat_pool_write_in(&source, invoice(&source), l, &mut |_| Ok(()), &mut work),
         Err(TypeCodecError::Control(

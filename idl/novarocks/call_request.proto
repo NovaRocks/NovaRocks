@@ -84,6 +84,8 @@ message IpcConstantPool {
   optional uint32 value_type_id = 2;
   optional uint32 source_field_id = 3;
   IpcCompression compression = 4;
+  // One continuation-prefixed V5 RecordBatch and its padded body. The
+  // original Field and ValueType are resolved from the package type table.
   bytes arrow_ipc = 5;
 }
 

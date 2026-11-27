@@ -17,8 +17,6 @@
 
 use super::*;
 use arrow::datatypes::{TimeUnit, UnionFields, UnionMode};
-use novarocks_physical_plan::MAX_FIXED_SIZE_LENGTH;
-use novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES;
 use std::sync::Mutex;
 
 const CAUSES: [CompileControlError; 3] = [
@@ -103,7 +101,7 @@ fn prefixes(source: &[DataType], ordinary: bool) -> Vec<u32> {
 }
 
 #[test]
-fn shallow_struct_5000_passes_without_authorizing_full_value_tree() {
+fn wide_struct_passes_shared_full_validation() {
     let ty = DataType::Struct(
         (0..5000)
             .map(|i| Field::new(format!("column{i}"), DataType::Int64, false))
@@ -113,10 +111,7 @@ fn shallow_struct_5000_passes_without_authorizing_full_value_tree() {
     let control = Control::default();
     run(std::slice::from_ref(&ty), false, &control).unwrap();
     assert_eq!(trace(&control), [0, 1]);
-    assert!(matches!(
-        run(&[ty], true, &Control::default()),
-        Err(TypeCodecError::ValueType(ValueTypeError::TooManyNodes))
-    ));
+    run(&[ty], true, &Control::default()).unwrap();
 }
 
 #[test]
@@ -130,15 +125,9 @@ fn shallow_parent_does_not_validate_its_child_or_field_attributes() {
             "invalid Arrow constant carrier parameters"
         )))
     ));
-    let bad_name = Arc::new(Field::new("n".repeat(1025), DataType::Int64, false));
-    let parent = DataType::List(bad_name);
-    run(std::slice::from_ref(&parent), false, &Control::default()).unwrap();
-    assert!(matches!(
-        run(&[parent], true, &Control::default()),
-        Err(TypeCodecError::InvalidShape(
-            "Arrow field attributes exceed their owner bounds"
-        ))
-    ));
+    let long_name = Arc::new(Field::new("n".repeat(1025), DataType::Int64, false));
+    let parent = DataType::List(long_name);
+    run(&[parent], true, &Control::default()).unwrap();
 }
 
 #[test]
@@ -231,7 +220,7 @@ fn shallow_carrier_parameters_keep_original_closed_diagnostics() {
 
 #[test]
 fn shallow_fixed_size_and_timezone_exact_owner_bounds_are_preserved() {
-    for n in [0, MAX_FIXED_SIZE_LENGTH] {
+    for n in [0, (1 << 20), (1 << 20) + 1, i32::MAX] {
         run(&[DataType::FixedSizeBinary(n)], false, &Control::default()).unwrap();
         run(
             &[DataType::FixedSizeList(field(DataType::Int64, false), n)],
@@ -240,21 +229,7 @@ fn shallow_fixed_size_and_timezone_exact_owner_bounds_are_preserved() {
         )
         .unwrap();
     }
-    for ty in [
-        DataType::FixedSizeBinary(MAX_FIXED_SIZE_LENGTH + 1),
-        DataType::FixedSizeList(field(DataType::Int64, false), MAX_FIXED_SIZE_LENGTH + 1),
-    ] {
-        assert!(matches!(
-            run(&[ty], false, &Control::default()),
-            Err(TypeCodecError::InvalidShape(
-                "Arrow fixed size exceeds its owner bound"
-            ))
-        ));
-    }
-    for zone in [
-        String::new(),
-        "é".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES / 2),
-    ] {
+    for zone in [String::new(), "é".repeat(1024 / 2 + 1)] {
         run(
             &[DataType::Timestamp(
                 TimeUnit::Microsecond,
@@ -265,19 +240,6 @@ fn shallow_fixed_size_and_timezone_exact_owner_bounds_are_preserved() {
         )
         .unwrap();
     }
-    let ty = DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some(
-            "é".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES / 2 + 1)
-                .into(),
-        ),
-    );
-    assert!(matches!(
-        run(&[ty], false, &Control::default()),
-        Err(TypeCodecError::InvalidShape(
-            "Arrow timestamp zone exceeds its owner bound"
-        ))
-    ));
 }
 
 #[test]

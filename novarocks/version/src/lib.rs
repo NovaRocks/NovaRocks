@@ -93,6 +93,8 @@ impl StaticPlanInterpreter {
 /// Native JSON bytes replace the text carrier with plan revision 46, new
 /// root-result descriptor discriminants, and a changed sealed function catalog.
 /// Those exact inputs separate the compatibility islands under epoch 18.
+/// Plan revision 48 replaces constant IPC streams with a single RecordBatch
+/// frame. The exact plan revision distinguishes those compatibility islands.
 /// Epoch 16 carries exact Exchange route failure stops in the existing
 /// refusal envelope. Epoch-15 senders treat this observation as a new Task
 /// failure, so they cannot share the same island.

@@ -134,7 +134,7 @@ where
             MAX_PRIVATE_RETAINED_BYTES,
             MAX_PRIVATE_READ_BYTES,
             1_000_000,
-            64,
+            novarocks_spi::connector::MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
         )
         .expect("Iceberg read decode limits are finite and non-zero")
     }

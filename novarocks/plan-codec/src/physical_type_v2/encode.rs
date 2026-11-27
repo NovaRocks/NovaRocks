@@ -1381,13 +1381,7 @@ fn encode_writer_sources_with_host_core<H>(
                 max_expanded_nodes: limits.max_expanded_nodes,
                 max_string_bytes: limits.max_string_bytes,
             },
-            None => TypeProjectionLimits::for_validated_source_root_count(
-                values
-                    .len()
-                    .checked_add(fields.len())
-                    .and_then(|roots| roots.checked_add(writer_fields))
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-            )?,
+            None => TypeProjectionLimits::INPUT_DERIVED,
         },
         Some(resources),
         work,

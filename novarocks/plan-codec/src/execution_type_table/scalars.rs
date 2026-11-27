@@ -22,7 +22,7 @@ use super::{
 };
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use novarocks_proto_models::{plan, value_type as logical};
-use novarocks_type_contract::{MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueKind};
+use novarocks_type_contract::ValueKind;
 use wire::arrow_physical_type::Kind;
 
 fn primitive(value: plan::ArrowPrimitiveType) -> Kind {
@@ -170,9 +170,6 @@ pub(super) fn validate<H>(
         Kind::Primitive(value) => decode_primitive(*value)?,
         Kind::Timestamp(value) => {
             if let Some(zone) = &value.timezone {
-                if zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
-                    return Err(invalid("value layout timezone exceeds byte bound"));
-                }
                 for _ in zone.bytes() {
                     context.step()?;
                 }

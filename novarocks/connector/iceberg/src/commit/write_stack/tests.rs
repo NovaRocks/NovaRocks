@@ -3440,7 +3440,7 @@ impl FrozenRewriteLake {
             crate::commit::conflict_scope::RewrittenTargetBinding {
                 table_uuid: table.metadata().uuid(),
                 snapshot_id: snapshot,
-                preparation_digest: preparation.digest(),
+                preparation_identity: preparation.preparation_identity().clone(),
             },
             table.metadata().current_schema().clone(),
             &novarocks_spi::connector::read_stack::TupleDomain::all(),

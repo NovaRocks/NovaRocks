@@ -201,7 +201,7 @@ fn request_through(
 ) -> FileReadRequest {
     FileReadRequest {
         file: file.clone(),
-        format: FileFormat::Parquet,
+        format: FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         range: FileReadRange::WholeFile,
         projection: FileProjection::All,
         sizing: ReaderSizing {
@@ -297,10 +297,20 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
             page_indices: vec![1],
         });
     };
-    let mut blocking = fixture.request(FileFormat::Parquet, FileProjection::All, 3, 1 << 20);
+    let mut blocking = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        3,
+        1 << 20,
+    );
     selective(&mut blocking);
     let expected = collect(open_file_reader(blocking).expect("open").as_mut()).expect("read");
-    let mut awaited = fixture.request(FileFormat::Parquet, FileProjection::All, 3, 1 << 20);
+    let mut awaited = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        3,
+        1 << 20,
+    );
     selective(&mut awaited);
     let actual = fixture.io.handle().block_on(async {
         let mut reader = open_file_reader_async(awaited, None).await.expect("open");

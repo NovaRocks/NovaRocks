@@ -193,7 +193,6 @@ fn from_declaration_with_nominals(
         nominals,
         purpose,
         1,
-        &mut 0,
         creation,
     )?;
     creation.request(ValueLayout::storage_allocation_layout().map_err(|_| resource())?)?;
@@ -220,15 +219,15 @@ fn author(
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
     purpose: DeclarationPurpose,
     depth: usize,
-    nodes: &mut usize,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<(DataType, DataType, ValueTypeRef), Failure> {
     creation.work(1)?;
-    *nodes = nodes.checked_add(1).ok_or_else(resource)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        || *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-    {
-        return Err(resource());
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
+        )
+        .into());
     }
     let storage = creation.storage();
     let (source, layout, kind) = match declaration {
@@ -318,7 +317,6 @@ fn author(
                     nominals,
                     purpose,
                     depth + 1,
-                    nodes,
                     creation,
                 )?;
                 let source_name = creation.text(&field.name)?;
@@ -354,7 +352,6 @@ fn author(
                 nominals,
                 purpose,
                 depth + 1,
-                nodes,
                 creation,
             )?;
             let source_name = creation.text(&item.name)?;
@@ -384,8 +381,7 @@ fn author(
                 None,
                 nominals,
                 purpose,
-                depth + 2,
-                nodes,
+                depth + 1,
                 creation,
             )?;
             let (value_source, value_layout, value) = author(
@@ -397,8 +393,7 @@ fn author(
                 None,
                 nominals,
                 purpose,
-                depth + 2,
-                nodes,
+                depth + 1,
                 creation,
             )?;
             for (field, source_type, layout_type, role) in [

@@ -24,6 +24,10 @@ use arrow_schema::DataType;
 /// wrapper per logical node, including the leaf.
 pub const MAX_ARROW_TYPE_PATH_DEPTH: usize = 3 * MAX_VALUE_TYPE_DEPTH - 1;
 
+/// A canonical path has its logical nodes and at most one Map scaffold per
+/// edge. It contains no runtime encoding wrappers.
+pub const MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH: usize = 2 * MAX_VALUE_TYPE_DEPTH - 1;
+
 /// A boundary selects its existing policy explicitly. Value profiles do not
 /// grant support for a particular encoding; that stays with its real consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

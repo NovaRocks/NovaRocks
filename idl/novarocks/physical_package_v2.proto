@@ -43,6 +43,7 @@ message FragmentPackage {
   Fragment fragment = 3;
   novarocks.physical_type_v2.TypeTable types = 4;
   repeated SchemaDefinition schemas = 5;
+  // Starting at revision 48, each constant carries one RecordBatch frame.
   repeated novarocks.call_request.IpcConstantPool constants = 6;
   repeated FunctionBindingDefinition function_bindings = 7;
   repeated AggregateBindingDefinition aggregate_bindings = 8;
@@ -71,7 +72,10 @@ message FragmentPackage {
   reserved 27;
   reserved "source_constant_policy";
 }
-message RequiredContracts { uint32 plan_contract_revision = 1; }
+message RequiredContracts {
+  // Check the exact revision before interpreting the package's typed tables.
+  uint32 plan_contract_revision = 1;
+}
 message Fragment {
   uint32 id = 1;
   optional uint32 root_node_id = 2;

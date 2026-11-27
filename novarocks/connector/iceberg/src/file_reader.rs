@@ -383,7 +383,7 @@ pub(crate) async fn visit_parquet_batches_async_with_options(
     );
     request.predicates = predicates;
     request.sizing = sizing;
-    request.options = iceberg_reader_options(options);
+    request.options = options;
     let mut reader = open_file_reader_async(request, None)
         .await
         .map_err(map_file_error)?;
@@ -458,17 +458,6 @@ fn bind(access: &FsAccessHandle, path: &str, size: u64) -> Result<BoundFile, Str
         .map_err(|error| error.to_string())
 }
 
-/// Iceberg table metadata and the real Parquet schema own read semantics.
-/// Arrow's optional embedded schema must never assign or erase field IDs.
-// Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
-pub(crate) fn iceberg_reader_options(
-    mut options: novarocks_fs::FileReaderOptions,
-) -> novarocks_fs::FileReaderOptions {
-    options.parquet_interpretation_policy =
-        novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint;
-    options
-}
-
 pub(crate) fn default_parquet_reader_sizing() -> ReaderSizing {
     let defaults = crate::catalog_config::IcebergCatalogReadConfig::default();
     ReaderSizing {
@@ -485,13 +474,14 @@ fn whole_file_request(
 ) -> FileReadRequest {
     FileReadRequest {
         file,
-        format: FileFormat::Parquet,
+        // Iceberg metadata and the physical footer own field identities (ADR-0213).
+        format: FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint),
         range: FileReadRange::WholeFile,
         projection,
         sizing: default_parquet_reader_sizing(),
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
-        options: iceberg_reader_options(Default::default()),
+        options: Default::default(),
         cache: None,
         prepared_input: None,
         context,

@@ -164,11 +164,7 @@ pub(crate) fn canonical_data_write_fields_from_declaration(
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let original = crate::scalar_integer_domain::sql_schema_from_document(schema, document)?;
     let integers = crate::scalar_integer_domain::of_schema(schema, &document.integers)?;
-    // Stack backing is initialized once for the original clone grammar, not
-    // requested as a heap allocation or recreated for each field.
-    creation
-        .work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound())
-        .map_err(crate::metadata::metadata_creation_error)?;
+    // Reuse one fixed cursor for the original clone grammar across all fields.
     let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut fields = creation
         .reserve(schema.as_struct().fields().len())
@@ -572,7 +568,6 @@ mod tests {
             &mut work,
         );
         let result = (|| {
-            creation.work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()).map_err(crate::metadata::metadata_creation_error)?;
             let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
             let output = if changed {
                 project_write_field(

@@ -396,33 +396,13 @@ pub struct TypeProjectionLimits {
 }
 
 impl TypeProjectionLimits {
-    /// Finite source grammar bound, derived from this owner's actual root count.
-    /// Source attributes have their own byte laws and never authorize values.
-    pub fn for_validated_source_root_count(roots: usize) -> Result<Self, CompileControlError> {
-        use novarocks_type_contract::{
-            MAX_ARROW_FIELD_METADATA_BYTES as ATTRS, MAX_ARROW_FIELD_NAME_BYTES as NAME,
-            MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES as ZONE, MAX_VALUE_TYPE_DEPTH as D,
-            MAX_VALUE_TYPE_NODES as N,
-        };
-        let overflow = || CompileControlError::ResourceExhausted;
-        let nodes = roots
-            .checked_mul(N.checked_add(1).ok_or_else(overflow)?)
-            .ok_or_else(overflow)?;
-        let definitions = nodes.checked_mul(2).ok_or_else(overflow)?;
-        Ok(Self {
-            max_definitions: definitions,
-            max_expanded_nodes: definitions
-                .checked_mul(D.checked_add(1).ok_or_else(overflow)?)
-                .ok_or_else(overflow)?,
-            max_string_bytes: nodes
-                .checked_mul(
-                    NAME.checked_add(ATTRS)
-                        .and_then(|n| n.checked_add(ZONE))
-                        .ok_or_else(overflow)?,
-                )
-                .ok_or_else(overflow)?,
-        })
-    }
+    /// Production bounds follow the actual definition and source extents.
+    /// Depth, checked arithmetic, and original resource admission still apply.
+    pub const INPUT_DERIVED: Self = Self {
+        max_definitions: usize::MAX,
+        max_expanded_nodes: usize::MAX,
+        max_string_bytes: usize::MAX,
+    };
 }
 
 // The physical backing and its allocation responsibility travel together.
@@ -1701,41 +1681,10 @@ pub(crate) fn validate_field(
     field: &Field,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    use novarocks_type_contract::{
-        MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-        MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-        MAX_ARROW_FIELD_NAME_BYTES,
-    };
     work.step()?;
-    if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES
-        || field.metadata().len() > MAX_ARROW_FIELD_METADATA_ENTRIES
-    {
-        return Err(TypeCodecError::InvalidShape(
-            "Arrow field attributes exceed their owner bounds",
-        ));
-    }
     observe_bytes(field.name().as_bytes(), work)?;
-    let mut bytes = 0usize;
     for (key, value) in field.metadata() {
         work.step()?;
-        if key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
-            || value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES
-        {
-            return Err(TypeCodecError::InvalidShape(
-                "Arrow field metadata entry exceeds its owner bound",
-            ));
-        }
-        bytes = bytes
-            .checked_add(key.len())
-            .and_then(|n| n.checked_add(value.len()))
-            .ok_or(TypeCodecError::InvalidShape(
-                "Arrow field metadata size overflow",
-            ))?;
-        if bytes > MAX_ARROW_FIELD_METADATA_BYTES {
-            return Err(TypeCodecError::InvalidShape(
-                "Arrow field metadata exceeds its owner bound",
-            ));
-        }
         observe_bytes(key.as_bytes(), work)?;
         observe_bytes(value.as_bytes(), work)?;
     }
@@ -1743,35 +1692,19 @@ pub(crate) fn validate_field(
 }
 
 /// Validate this carrier's own parameters without traversing child fields.
-/// Root-domain traversal stays with its owner: a writer root must not inherit
-/// the Value owner's unfolded-node or field-metadata limits.
+/// Node parameters and observed bytes apply independently of the root role.
 pub(crate) fn validate_type_node(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
     validate_arrow_carrier_parameters_observed(ty, || work.step().map_err(TypeCodecError::from))?;
-    match ty {
-        DataType::FixedSizeBinary(size) | DataType::FixedSizeList(_, size)
-            if *size > novarocks_physical_plan::MAX_FIXED_SIZE_LENGTH =>
-        {
-            return Err(TypeCodecError::InvalidShape(
-                "Arrow fixed size exceeds its owner bound",
-            ));
-        }
-        DataType::Timestamp(_, Some(zone)) => {
-            if zone.len() > novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
-                return Err(TypeCodecError::InvalidShape(
-                    "Arrow timestamp zone exceeds its owner bound",
-                ));
-            }
-            observe_bytes(zone.as_bytes(), work)?;
-        }
-        _ => {}
+    if let DataType::Timestamp(_, Some(zone)) = ty {
+        observe_bytes(zone.as_bytes(), work)?;
     }
     Ok(())
 }
 
-fn validate_type_visit(
+pub(crate) fn validate_type_visit(
     visit: ValueTypeVisit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
@@ -1783,6 +1716,7 @@ fn validate_type_visit(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_type(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
@@ -1839,7 +1773,8 @@ pub(crate) fn validate_type_with_scratch_observed<'source>(
     .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
-pub(crate) fn validate_type_with_scratch_host_observed<'source, H>(
+#[cfg(test)]
+fn validate_type_with_scratch_host_observed<'source, H>(
     ty: &'source DataType,
     admit_scratch: &mut impl FnMut(
         std::alloc::Layout,

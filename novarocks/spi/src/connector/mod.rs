@@ -210,10 +210,8 @@ pub use metadata::{
     ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
     ConnectorTableObjectSnapshotFuture, ConnectorTablePlanningFacts, ConnectorTablePreparation,
     ConnectorTablePreparationFuture, ConnectorTableRequest, ConnectorTableResolution,
-    ConnectorTableUniqueConstraint, MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH,
-    MAX_CONNECTOR_COLUMN_DEFAULT_NODES, MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS,
-    MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES,
-    MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES, MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
+    ConnectorTableUniqueConstraint, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
+    MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
@@ -326,8 +324,8 @@ pub use row_mutation::{
     ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
     ConnectorMutationTargetField, ConnectorRowMutationCurrent, ConnectorRowMutationEffect,
     ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    ConnectorRowMutationPreparationIdentity, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use scoped_begin::ConnectorScopedBeginCause;

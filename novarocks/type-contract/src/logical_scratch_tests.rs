@@ -116,7 +116,7 @@ fn borrowed_scratch_uses_the_same_carrier_grammar_and_event_order() {
 #[test]
 fn borrowed_scratch_preserves_original_limit_and_logical_failure_events() {
     let child = Arc::new(Field::new("child", DataType::Int32, true));
-    compare(&DataType::Struct(vec![child; MAX_VALUE_TYPE_NODES].into()));
+    compare(&DataType::Struct(vec![child; 4096].into()));
     let mut root = DataType::Int32;
     for _ in 0..MAX_VALUE_TYPE_DEPTH + 1 {
         root = DataType::List(Arc::new(Field::new("child", root, true)));

@@ -844,9 +844,7 @@ mod tests {
         };
         try_runtime_input_construction_factory(
             InputConstructionProfile {
-                max_requests: 4096,
                 max_request_bytes: 1 << 20,
-                max_opaque_requests: 4096,
                 max_opaque_bytes: 1 << 20,
                 max_work: usize::MAX,
                 max_depth: 64,
@@ -1486,7 +1484,7 @@ mod tests {
     }
     #[test]
     fn initial_timezone_validation_counts_all_three_sources_without_emission() {
-        let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
+        let zone = "z".repeat(1024);
         let input = chunk(
             Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone())),
             None,
@@ -1511,13 +1509,9 @@ mod tests {
         assert_eq!(untouched, [0xa5; 128]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
         assert_eq!(turn.status, RenderTurnStatus::Yielded);
-        assert_eq!(
-            turn.examined_bytes,
-            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-        );
+        assert_eq!(turn.examined_bytes, 6 * 1024);
         assert!(turn.visited_cells <= 1024);
-        // Valid execution types cap timezone bytes below one render quantum.
-        // All three immutable sources are still checked, counting both inputs.
+        // All three immutable sources fit this turn, counting both inputs.
         assert!(cursor.encoded_len().is_some());
         assert_eq!(cursor.encoded_len(), Some(32));
         let before = cursor.offset;
@@ -1529,7 +1523,7 @@ mod tests {
     }
     #[test]
     fn equal_length_valid_timezone_mismatch_is_rejected_and_latched() {
-        let original_zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
+        let original_zone = "z".repeat(1024);
         let input = chunk(
             Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(original_zone.clone())),
             None,
@@ -1564,22 +1558,24 @@ mod tests {
         ));
     }
     #[test]
-    fn timezone_over_execution_profile_is_refused_before_scalar_cursor_construction() {
-        let array: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(
-            "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1),
-        ));
-        let error = try_chunk(array, None, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("timezone exceeds the byte limit"),
-            "{error}"
+    fn scalar_cursor_compares_timestamp_attributes_above_the_former_byte_limit() {
+        let timezone = "z".repeat(1024 + 1);
+        let array: ArrayRef =
+            Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(timezone.clone()));
+        let input = try_chunk(array, None, None).unwrap();
+        let schema = schema(
+            ScalarValueType::Timestamp {
+                unit: ScalarTimestampUnit::Nanosecond,
+                timezone: Some(timezone),
+            },
+            true,
         );
+        validate_to_completion(&input, &schema).unwrap();
     }
     #[test]
     fn immutable_typed_constructor_refuses_batch_timezone_drift_and_target_stays_exact() {
         use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
-        let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
+        let zone = "z".repeat(1024);
         let good = TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone());
         let input = chunk(Arc::new(good), None, None);
         let mut wrong = zone.clone().into_bytes();

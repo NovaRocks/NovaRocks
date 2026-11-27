@@ -575,10 +575,22 @@ fn shared_doubling(levels: usize) -> wire::TypeTable {
     table
 }
 #[test]
-fn repeated_reference_dag_expansion_enforces_owner_node_bound_before_constructing_arrow_tree() {
+fn repeated_reference_dag_uses_the_callers_actual_expansion_budget() {
     let near = shared_doubling(11); // 4095 expanded type nodes, despite only 12 carriers.
     decode_type_table(&near, limits(), &Control::default()).unwrap();
-    reject(&shared_doubling(12)); // 8191 expanded type nodes.
+    let shared = shared_doubling(12); // 8191 nodes along its deepest root.
+    decode_type_table(&shared, limits(), &Control::default()).unwrap();
+    assert!(
+        decode_type_table(
+            &shared,
+            TypeProjectionLimits {
+                max_expanded_nodes: 4096,
+                ..limits()
+            },
+            &Control::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]

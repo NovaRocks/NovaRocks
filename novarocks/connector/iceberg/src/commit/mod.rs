@@ -64,6 +64,8 @@ pub(crate) mod retirement;
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]
+pub(crate) use row_mutation_preparation::preparation_for_test_source;
+#[cfg(test)]
 pub(crate) mod run;
 mod selected_rewrite;
 pub(crate) mod slot_change;

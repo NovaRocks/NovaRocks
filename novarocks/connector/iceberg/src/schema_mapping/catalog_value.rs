@@ -104,9 +104,6 @@ fn table_from_document(
         .len()
         .checked_add(pseudo_columns.len() + 2 * usize::from(mutation.is_some()))
         .ok_or_else(bad)?;
-    if count > novarocks_connector_contract::MAX_CONNECTOR_RECIPE_COLUMNS {
-        return Err(bad());
-    }
     let mut fields = creation.reserve(count)?;
     let mut bindings = creation.reserve(count)?;
     for field in declaration.as_struct().fields() {

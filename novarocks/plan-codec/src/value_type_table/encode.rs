@@ -16,10 +16,7 @@
 // under the License.
 
 use arrow::datatypes::DataType;
-use novarocks_type_contract::{
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueField, ValueKind,
-    ValueTypeRef,
-};
+use novarocks_type_contract::{ValueField, ValueKind, ValueTypeRef};
 
 use super::{
     Failure, LogicalTypeRoot, LogicalTypeTableLimits,
@@ -52,9 +49,6 @@ fn count<H>(
                  context: &mut Context<'_, '_, H>|
      -> Result<(), Failure<H>> {
         context.step()?;
-        if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES {
-            return Err(invalid("logical field name exceeds its byte bound"));
-        }
         add(
             &mut counts.strings,
             field.name().len(),
@@ -64,9 +58,6 @@ fn count<H>(
     };
     match value.kind() {
         ValueKind::Scalar(DataType::Timestamp(_, Some(zone))) => {
-            if zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
-                return Err(invalid("logical timezone exceeds its byte bound"));
-            }
             add(&mut counts.strings, zone.len(), limits.max_string_bytes)?;
         }
         ValueKind::List(item) | ValueKind::FixedSizeList { item, .. } => {

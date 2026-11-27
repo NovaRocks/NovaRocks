@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Complete package header and local annotation projection. Reference legality
-//! and required contract support remain with the original Package constructor.
+//! Package header and local annotation projection. The wire revision is
+//! validated before decoding any namespace that uses its representation.
 //! These contributions join a caller invoice; they are not allocation grants.
 
 use crate::physical_node_v2::{self as resource, Model, NodeCodecError};
@@ -37,6 +37,7 @@ pub enum PackageMetadataCodecError {
     Identity(p::IdentityError),
     Projection(NodeCodecError),
     InvalidShape(&'static str),
+    PlanContractRevision { required: u32 },
 }
 type Error = PackageMetadataCodecError;
 impl From<CompileControlError> for Error {
@@ -59,6 +60,11 @@ impl fmt::Display for Error {
             Self::Identity(error) => error.fmt(f),
             Self::Projection(error) => error.fmt(f),
             Self::InvalidShape(message) => f.write_str(message),
+            Self::PlanContractRevision { required } => write!(
+                f,
+                "fragment package plan contract revision differs: expected {}, got {required}",
+                p::PLAN_CONTRACT_REVISION,
+            ),
         }
     }
 }
@@ -222,7 +228,7 @@ pub fn encode_package_metadata_observed(
 }
 
 /// Decode every original local annotation into fresh bounded owned backing.
-/// Sparse IDs and unknown revisions are preserved for original Package law.
+/// Reject an unknown wire revision before projecting annotations.
 pub fn decode_package_metadata_observed(
     input: &wire::FragmentPackage,
     source_retained_bytes: usize,
@@ -243,9 +249,13 @@ pub fn decode_package_metadata_observed(
         .try_into()
         .map_err(|_| Error::InvalidShape("plan version must contain exactly 16 bytes"))?;
     let version = p::PlanVersionId::try_new(bytes).map_err(Error::Identity)?;
+    let revision =
+        required(input.required.as_ref(), "required contracts are absent")?.plan_contract_revision;
+    if revision != p::PLAN_CONTRACT_REVISION {
+        return Err(Error::PlanContractRevision { required: revision });
+    }
     let required = p::RequiredContracts {
-        plan_contract_revision: required(input.required.as_ref(), "required contracts are absent")?
-            .plan_contract_revision,
+        plan_contract_revision: revision,
     };
     let mut known = resource::add(
         size_of::<wire::FragmentPackage>(),

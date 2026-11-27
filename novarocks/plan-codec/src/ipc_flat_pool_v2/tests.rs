@@ -105,21 +105,14 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 16 * 1024 * 1024,
     }
 }
-fn schema_limits() -> IpcSchemaProjectionLimits {
-    IpcSchemaProjectionLimits {
-        max_field_occurrences: 64,
-        max_type_occurrences: 64,
-        max_string_bytes: 65536,
-        max_flatbuffer_bytes: 1024 * 1024,
-    }
-}
+
 fn limits() -> FlatPoolWriteLimits {
     FlatPoolWriteLimits {
         max_rows: 4096,
         max_buffer_descriptors: 4096,
         max_body_bytes: 4 * 1024 * 1024,
         max_encoded_stream_bytes: 8 * 1024 * 1024,
-        schema: schema_limits(),
+
         max_new_allocation_request_bytes: 128 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
         max_cumulative_library_work: 512 * 1024 * 1024,
@@ -128,7 +121,7 @@ fn limits() -> FlatPoolWriteLimits {
 fn stream_limits() -> FlatStreamProjectionLimits {
     FlatStreamProjectionLimits {
         max_input_bytes: 8 * 1024 * 1024,
-        schema: schema_limits(),
+
         batch: FlatBatchProjectionLimits {
             max_metadata_bytes: 1024 * 1024,
             max_body_bytes: 4 * 1024 * 1024,
@@ -181,7 +174,7 @@ fn invoice(pool: &ConstantPool) -> usize {
             .map(|(k, v)| k.capacity() + v.capacity())
             .sum::<usize>()
 }
-fn standard(pool: &ConstantPool) -> Vec<u8> {
+fn standard_legacy(pool: &ConstantPool) -> Vec<u8> {
     let schema = Arc::new(Schema::new([Arc::clone(pool.field_ref())]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(pool.array())]).unwrap();
     let options = IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5).unwrap();
@@ -193,19 +186,17 @@ fn standard(pool: &ConstantPool) -> Vec<u8> {
     }
     bytes
 }
+fn standard(pool: &ConstantPool) -> Vec<u8> {
+    crate::ipc_flat_stream_v2::standard_test_record_frame(&standard_legacy(pool)).to_vec()
+}
 fn batch_parts(bytes: &[u8]) -> (ipc::RecordBatch<'_>, &[u8]) {
     assert_eq!(&bytes[..4], &[255; 4]);
-    let schema_end = 8 + u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let body_start = schema_end
-        + 8
-        + u32::from_le_bytes(bytes[schema_end + 4..schema_end + 8].try_into().unwrap()) as usize;
-    let message = ipc::root_as_message(&bytes[schema_end + 8..body_start]).unwrap();
-    let end = body_start + message.bodyLength() as usize;
-    assert_eq!(&bytes[end..], &[255, 255, 255, 255, 0, 0, 0, 0]);
-    (
-        message.header_as_record_batch().unwrap(),
-        &bytes[body_start..end],
-    )
+    let end = 8 + u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let message = ipc::root_as_message(&bytes[8..end]).unwrap();
+    assert_eq!(message.version(), ipc::MetadataVersion::V5);
+    let body = &bytes[end..];
+    assert_eq!(body.len(), usize::try_from(message.bodyLength()).unwrap());
+    (message.header_as_record_batch().unwrap(), body)
 }
 fn buffer<'a>(body: &'a [u8], descriptor: &ipc::Buffer) -> &'a [u8] {
     &body[descriptor.offset() as usize..(descriptor.offset() + descriptor.length()) as usize]
@@ -279,11 +270,17 @@ fn materialize(bytes: &[u8], original: &ConstantPool) -> ConstantPool {
     assert_eq!(result.value_type(), original.value_type());
     result
 }
-fn standard_read(bytes: &[u8]) -> RecordBatch {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
-    let batch = reader.next().unwrap().unwrap();
-    assert!(reader.next().is_none());
-    batch
+fn standard_read(bytes: &[u8], field: &Arc<Field>) -> RecordBatch {
+    let (batch, body) = batch_parts(bytes);
+    ipc::reader::read_record_batch(
+        &arrow::buffer::Buffer::from(body),
+        batch,
+        Arc::new(Schema::new([Arc::clone(field)])),
+        &HashMap::new(),
+        None,
+        &ipc::MetadataVersion::V5,
+    )
+    .unwrap()
 }
 fn assert_prefixes(
     pool: &ConstantPool,
@@ -447,7 +444,7 @@ fn actual_flat_writer_fixed_bits_and_interval_match_independent_standard_reader(
         let original = pool(array);
         let bytes = encoded(&original);
         compare_standard_batch(&bytes, &standard(&original), original.array().data_type());
-        let batch = standard_read(&bytes);
+        let batch = standard_read(&bytes, original.field_ref());
         let decoded = materialize(&bytes, &original);
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.column(0).logical_null_count(), 1);
@@ -531,7 +528,7 @@ fn actual_flat_writer_day_time_slice_preserves_components_null_and_selected_ordi
     let control = Control::good(CompilePhase::Encode);
     let bytes = encode_flat_pool(&original, source_invoice, exact, &control).unwrap();
     compare_standard_batch(&bytes, &standard(&original), field.data_type());
-    let standard_batch = standard_read(&bytes);
+    let standard_batch = standard_read(&bytes, original.field_ref());
     let decoded = materialize(&bytes, &original);
     assert_eq!(decoded.resource_facts().rows, 4);
     assert_eq!(decoded.value(1).unwrap().ordinal(), 1);
@@ -679,7 +676,7 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
         };
         let original = pool(Arc::new(a));
         let bytes = encoded(&original);
-        let batch = standard_read(&bytes);
+        let batch = standard_read(&bytes, original.field_ref());
         assert_eq!(
             batch.column(0).data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, zone.map(Into::into))
@@ -691,7 +688,13 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
         );
         if zone == Some("") {
             assert_eq!(
-                standard_read(&standard(&original)).column(0).data_type(),
+                StreamReader::try_new(Cursor::new(standard_legacy(&original)), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .column(0)
+                    .data_type(),
                 &DataType::Timestamp(TimeUnit::Nanosecond, None)
             );
         }
@@ -719,7 +722,7 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
             ty,
         );
         let bytes = encoded(&original);
-        let batch = standard_read(&bytes);
+        let batch = standard_read(&bytes, original.field_ref());
         assert_eq!(
             batch.schema().field(0).metadata(),
             original.field().metadata()
@@ -984,9 +987,12 @@ fn actual_flat_writer_converted_metadata_keeps_source_invoice_independent_of_sta
         upper.new_allocation_request_bytes_upper_bound,
         lower.new_allocation_request_bytes_upper_bound
     );
-    assert!(upper.cumulative_library_work_upper_bound > lower.cumulative_library_work_upper_bound);
+    assert_eq!(
+        upper.cumulative_library_work_upper_bound,
+        lower.cumulative_library_work_upper_bound
+    );
     let mut bound = limits();
-    bound.max_cumulative_library_work = lower.cumulative_library_work_upper_bound;
+    bound.max_cumulative_library_work = lower.cumulative_library_work_upper_bound - 1;
     let c = Control::good(CompilePhase::Encode);
     assert!(matches!(
         encode_flat_pool(&original, retained + extra, bound, &c),
@@ -1103,8 +1109,7 @@ fn pure_writer_without_source_invoice_uses_the_same_stream_body() {
     )
     .unwrap();
     assert_eq!(pure, observed);
-    let mut reader = StreamReader::try_new(Cursor::new(pure), None).unwrap();
-    let batch = reader.next().unwrap().unwrap();
+    let batch = standard_read(&pure, pool.field_ref());
     assert_eq!(batch.column(0).as_ref(), pool.array().as_ref());
 }
 

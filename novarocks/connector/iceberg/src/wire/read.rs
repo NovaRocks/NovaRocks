@@ -671,12 +671,18 @@ fn scan_message(
                 let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let nested = take(&mut input, len, &path)?;
+                // Only Identity recurs. Count its nodes below the Column
+                // owner, independently of the finite table or split envelope.
+                let child_position = match (schema, child) {
+                    (Schema::Column, Schema::Identity) => 2,
+                    _ => depth + 1,
+                };
                 scan_message(
                     nested,
                     context,
                     path.field(format!("field_{field}")),
                     child,
-                    depth + 1,
+                    child_position,
                 )?;
             }
             WireValue::MapI32String | WireValue::MapStringString => {
@@ -3996,6 +4002,75 @@ mod compile_control_tests {
             ConnectorDecodeLimits::try_new(4 << 20, 8 << 20, 4 << 20, 100_000, 64).unwrap(),
         )
     }
+
+    #[test]
+    fn split_statistics_admit_depth_64_under_the_change_window_envelope() {
+        use dto::iceberg_change_split::Rows;
+        use dto::iceberg_read_split_payload::Split;
+        use novarocks_spi::connector::MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH;
+        use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+
+        let wrap = |identity: dto::ColumnIdentity, id| dto::ColumnIdentity {
+            field_id: id,
+            name: "element".into(),
+            category: dto::ColumnIdentityCategory::Array as i32,
+            children: vec![identity],
+        };
+        let leaf = dto::ColumnIdentity {
+            field_id: 1,
+            name: "element".into(),
+            category: dto::ColumnIdentityCategory::Primitive as i32,
+            children: vec![],
+        };
+        let identity = (2..=MAX_VALUE_TYPE_DEPTH as i32).fold(leaf, wrap);
+        let decode = |identity| {
+            let data = dto::IcebergSplit {
+                file_statistics_domain: Some(dto::TupleDomain {
+                    column_domains: vec![dto::ColumnDomain {
+                        column: Some(dto::IcebergColumnHandle {
+                            base_column_identity: Some(identity),
+                            ..Default::default()
+                        }),
+                        domain: None,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let raw = dto::IcebergReadSplitPayload {
+                split: Some(Split::ChangeWindow(dto::IcebergChangeSplit {
+                    rows: Some(Rows::VisibilityDifference(
+                        dto::IcebergVisibilityDifference {
+                            data: Some(data),
+                            ..Default::default()
+                        },
+                    )),
+                })),
+            };
+            let limits = ConnectorDecodeLimits::try_new(
+                4 << 20,
+                8 << 20,
+                4 << 20,
+                100_000,
+                MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+            )
+            .unwrap();
+            let mut ledger = ConnectorDecodeLedger::new(limits);
+            let expected = header(ConnectorCodecCategory::ReadSplit);
+            let decoded = decode_root::<dto::IcebergReadSplitPayload>(
+                &raw.encode_to_vec(),
+                &mut ConnectorDecodeContext::new(&expected, &mut ledger),
+                ConnectorFieldPath::root("iceberg_read_split"),
+                Schema::ReadSplit,
+            )?;
+            assert_eq!(decoded, raw);
+            Ok::<(), ConnectorCodecError>(())
+        };
+        decode(identity.clone()).unwrap();
+        let error = decode(wrap(identity, MAX_VALUE_TYPE_DEPTH as i32 + 1)).unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+    }
+
     fn column() -> IcebergColumnHandle {
         IcebergColumnHandle::try_new(IcebergColumnHandleParams {
             base_column_identity: ColumnIdentity::try_new(

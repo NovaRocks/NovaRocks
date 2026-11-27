@@ -136,7 +136,10 @@ fn no_allocation<T>(operation: impl FnOnce() -> T) -> T {
 }
 
 fn fixture(wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
-    let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
+    fixture_with_timezone_bytes(novarocks_type_contract::wrong_last_byte)
+}
+fn fixture_with_timezone_bytes(bytes: usize, wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
+    let zone = "z".repeat(bytes);
     let array =
         Arc::new(TimestampNanosecondArray::from(vec![-7]).with_timezone(zone.clone())) as ArrayRef;
     let field = Field::new("value", array.data_type().clone(), true);
@@ -236,55 +239,28 @@ fn returned(budget: &Arc<ResultRetainedBudget>) {
 }
 #[test]
 fn constructor_and_all_turns_fit_original_scratch_without_extra_allocation() {
-    let oversized = Field::new(
-        "value",
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Nanosecond,
-            Some(
-                "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1)
-                    .into(),
-            ),
-        ),
-        true,
-    );
-    let refusal = ChunkSlotSchema::try_new_with_field(SlotId::new(7), oversized, None, None)
-        .expect_err("execution timezone keeps its original type bound");
-    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
-    let expected = novarocks_type_contract::ExecutionValueTypeError::Invalid(
-        "value layout timezone exceeds the byte limit",
-    );
-    assert_eq!(refusal.failure_fact(), expected.failure_fact());
-    assert_eq!(refusal.failure_fact().class(), FailureClass::Invariant);
-    let mut source = std::error::Error::source(&refusal);
-    let mut original = None;
-    while let Some(cause) = source {
-        if let Some(cause) =
-            cause.downcast_ref::<novarocks_type_contract::ExecutionValueTypeError>()
-        {
-            original = Some(cause);
-            break;
-        }
-        source = cause.source();
-    }
-    assert_eq!(original, Some(&expected));
-    let (input, schema) = fixture(false);
+    let timezone_bytes = 16 * 1024;
+    let (input, schema) = fixture_with_timezone_bytes(timezone_bytes, false);
     let (budget, credit) = budget_and_credit();
     let mut owned = begin(&input, schema, credit);
     assert_eq!(owned.cursor.encoded_len(), None);
     held(&budget);
-    for index in 0..1 {
+    let mut total_examined = 0;
+    let mut validation_turns = 0;
+    while owned.cursor.encoded_len().is_none() {
         let mut untouched = [0xa5; 32];
         let turn = no_allocation(|| owned.cursor.step(&mut untouched).unwrap());
         assert_eq!(untouched, [0xa5; 32]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-        assert_eq!(
-            turn.examined_bytes,
-            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-        );
+        assert!(turn.examined_bytes > 0 && turn.examined_bytes <= 64 * 1024);
         assert!(turn.visited_cells <= 1024);
         assert_eq!(turn.status, RenderTurnStatus::Yielded);
-        assert_eq!(owned.cursor.encoded_len().is_some(), index == 0);
+        total_examined += turn.examined_bytes;
+        validation_turns += 1;
+        assert!(validation_turns <= 4);
     }
+    assert!(validation_turns > 1);
+    assert_eq!(total_examined, 6 * timezone_bytes);
     let mut output = [0; 32];
     let turn = no_allocation(|| owned.cursor.step(&mut output).unwrap());
     assert_eq!((turn.emitted_bytes, turn.completed_rows), (32, 1));
@@ -434,10 +410,7 @@ fn empty_schema_witness_emits_neither_value_nor_absent_record() {
         let turn = no_allocation(|| owned.cursor.step(output).unwrap());
         assert_eq!(untouched, [0xa5; 32]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-        assert_eq!(
-            turn.examined_bytes,
-            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-        );
+        assert_eq!(turn.examined_bytes, 6 * 1024);
         assert!(turn.visited_cells <= 1024);
         assert_eq!(
             turn.status,

@@ -94,18 +94,11 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 4 * 1024 * 1024,
     }
 }
-fn schema_limits() -> IpcSchemaProjectionLimits {
-    IpcSchemaProjectionLimits {
-        max_field_occurrences: 1,
-        max_type_occurrences: 1,
-        max_string_bytes: 65536,
-        max_flatbuffer_bytes: 65536,
-    }
-}
+
 fn stream_limits() -> FlatStreamProjectionLimits {
     FlatStreamProjectionLimits {
         max_input_bytes: 1024 * 1024,
-        schema: schema_limits(),
+
         batch: FlatBatchProjectionLimits {
             max_metadata_bytes: 65536,
             max_body_bytes: 1024 * 1024,
@@ -150,6 +143,14 @@ fn retained(input: &Vec<u8>, field: &Field) -> usize {
             .map(|(k, v)| k.capacity() + v.capacity())
             .sum::<usize>()
 }
+struct FixtureEncodeControl;
+impl PureCompileControl for FixtureEncodeControl {
+    fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+        assert_eq!(phase, CompilePhase::Encode);
+        Ok(())
+    }
+}
+
 fn writer_stream(array: ArrayRef, field: &Arc<Field>) -> Vec<u8> {
     let schema = Arc::new(Schema::new([Arc::clone(field)]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
@@ -160,17 +161,9 @@ fn writer_stream(array: ArrayRef, field: &Arc<Field>) -> Vec<u8> {
         writer.write(&batch).unwrap();
         writer.finish().unwrap();
     }
-    input
+    super::standard_test_record_frame(&input).to_vec()
 }
-// Fixture schema construction has its own Encode observation, outside the
-// materialization trace asserted by Control.
-struct FixtureEncodeControl;
-impl PureCompileControl for FixtureEncodeControl {
-    fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        assert_eq!(phase, CompilePhase::Encode);
-        Ok(())
-    }
-}
+
 fn frame(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     let padded = metadata.len().next_multiple_of(8);
     let mut bytes = vec![255; 4];
@@ -180,18 +173,7 @@ fn frame(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(body);
     bytes
 }
-fn exact_schema_stream(input: &[u8], field: &Field) -> Vec<u8> {
-    let schema_end = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-    let schema = crate::ipc_schema_v2::encode_single_field_schema(
-        field,
-        schema_limits(),
-        &FixtureEncodeControl,
-    )
-    .unwrap();
-    [frame(&schema, &[]), input[schema_end..].to_vec()].concat()
-}
 fn raw_stream(
-    field: &Field,
     rows: i64,
     nulls: i64,
     descriptors: &[(i64, i64)],
@@ -227,26 +209,13 @@ fn raw_stream(
         },
     );
     ipc::finish_message_buffer(&mut builder, message);
-    let schema = crate::ipc_schema_v2::encode_single_field_schema(
-        field,
-        schema_limits(),
-        &FixtureEncodeControl,
-    )
-    .unwrap();
-    [
-        frame(&schema, &[]),
-        frame(builder.finished_data(), body),
-        vec![255, 255, 255, 255, 0, 0, 0, 0],
-    ]
-    .concat()
+    frame(builder.finished_data(), body)
 }
 fn mutate_buffer(input: &mut [u8], index: usize, offset: usize, replacement: &[u8]) {
     // This independently locates a descriptor in an already valid writer
     // fixture. Its payload mutation deliberately bypasses no acceptance gate.
-    let start = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-    let body =
-        start + 8 + u32::from_le_bytes(input[start + 4..start + 8].try_into().unwrap()) as usize;
-    let message = ipc::root_as_message(&input[start + 8..body]).unwrap();
+    let body = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+    let message = ipc::root_as_message(&input[8..body]).unwrap();
     let descriptor = message
         .header_as_record_batch()
         .unwrap()
@@ -415,7 +384,7 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
     for (array, ty, metadata) in cases {
         let field =
             Arc::new(Field::new("source", ty.data_type().clone(), true).with_metadata(metadata));
-        let input = exact_schema_stream(&writer_stream(array, &field), &field);
+        let input = writer_stream(array, &field);
         let stream = checked(&input, &field);
         let retention = retained(&input, &field);
         let control = Control::good();
@@ -679,7 +648,7 @@ fn actual_reader_compact_null_keeps_final_semantic_nullability_obligation() {
 fn actual_reader_empty_offsets_and_variadic_empty_headers_have_real_output_owners() {
     let strings = Arc::new(Field::new("source", DataType::Utf8, true));
     let ty = FunctionValueType::new(DataType::Utf8, true);
-    let input = raw_stream(&strings, 0, 0, &[(0, 0), (0, 0), (0, 0)], None, &[]);
+    let input = raw_stream(0, 0, &[(0, 0), (0, 0), (0, 0)], None, &[]);
     let stream = checked(&input, &strings);
     let retention = retained(&input, &strings);
     let facts = stream
@@ -704,14 +673,7 @@ fn actual_reader_empty_offsets_and_variadic_empty_headers_have_real_output_owner
     let view_ty = FunctionValueType::new(DataType::Utf8View, true);
     let mut header_bounds = Vec::new();
     for count in [0usize, 32] {
-        let input = raw_stream(
-            &view,
-            0,
-            0,
-            &vec![(0, 0); count + 2],
-            Some(count as i64),
-            &[],
-        );
+        let input = raw_stream(0, 0, &vec![(0, 0); count + 2], Some(count as i64), &[]);
         let stream = checked(&input, &view);
         let retention = retained(&input, &view);
         let facts = stream
@@ -750,7 +712,7 @@ fn actual_reader_empty_offsets_and_variadic_empty_headers_have_real_output_owner
     }
     assert!(header_bounds[1] > header_bounds[0]);
     // A useful prefix plus a partial typed element remains a pre-reader refusal.
-    let bad = raw_stream(&strings, 1, 0, &[(0, 0), (0, 9), (9, 0)], None, &[0; 16]);
+    let bad = raw_stream(1, 0, &[(0, 0), (0, 9), (9, 0)], None, &[0; 16]);
     assert!(matches!(
         preflight_flat_constant_stream(
             &bad,

@@ -19,7 +19,7 @@ use super::*;
 use crate::{
     CatalogHandle, CatalogVersion, ConnectorCodecRevision, ConnectorEnvelopeHeader,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, WRITE_FIELD_ALLOCATION_CHARGE,
 };
 use arrow_schema::{DataType, Field, Fields, UnionFields, UnionMode};
 use std::{collections::HashMap, sync::Mutex};

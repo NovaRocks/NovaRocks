@@ -69,13 +69,6 @@ pub(crate) fn field_comparison_work(name: &str) -> Result<usize, crate::Executio
     comparison_work_add(COMPARISON_HEADER_WORK, comparison_bytes_work(name.len())?)
 }
 
-pub const MAX_ARROW_FIELD_NAME_BYTES: usize = 1024;
-pub const MAX_ARROW_FIELD_METADATA_ENTRIES: usize = 256;
-pub const MAX_ARROW_FIELD_METADATA_KEY_BYTES: usize = 1024;
-pub const MAX_ARROW_FIELD_METADATA_VALUE_BYTES: usize = 16 * 1024;
-pub const MAX_ARROW_FIELD_METADATA_BYTES: usize = 64 * 1024;
-pub const MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES: usize = 1024;
-
 /// Compare every Arrow physical field attribute recursively. Arrow's built-in
 /// `Field::eq` deliberately ignores dictionary ids and dictionary ordering,
 /// which is appropriate for logical schema compatibility but not for a frozen
@@ -681,7 +674,7 @@ mod tests {
             Err(ValueTypeError::TooDeep)
         );
         assert!(arrow_data_types_exact(&over, &over));
-        let fields: Vec<_> = (0..crate::MAX_VALUE_TYPE_NODES)
+        let fields: Vec<_> = (0..4096)
             .map(|_| Field::new("x", DataType::Int64, false))
             .collect();
         let over = DataType::Struct(fields.into());

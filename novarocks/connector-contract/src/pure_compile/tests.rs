@@ -683,7 +683,7 @@ fn a_single_struct_with_five_thousand_fields_stays_inside_the_writer_owner_domai
         )],
     });
     assert_eq!(original.input().field_count(), 1);
-    assert!(original.charged_bytes() < MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
+    assert!(original.charged_bytes() > 5_000 * WRITE_FIELD_ALLOCATION_CHARGE);
     let compiler = Compiler::normal();
     let control = compiler.control(None, false, Target::Any);
     let recipe =

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 #[test]
 fn wide_node_visits_all_siblings_in_declaration_order() {
-    let fields: Vec<_> = (0..crate::MAX_VALUE_TYPE_NODES + 1)
+    let fields: Vec<_> = (0..4096 + 1)
         .map(|index| Arc::new(Field::new(index.to_string(), DataType::Int32, true)))
         .collect();
     let ty = DataType::Struct(fields.clone().into());

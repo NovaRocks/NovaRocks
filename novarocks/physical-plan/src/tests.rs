@@ -2138,12 +2138,13 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
 
 #[test]
 fn arrow_data_type_depth_is_bounded_iteratively() {
+    use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
     use std::sync::Arc;
 
     use arrow_schema::Field;
 
     let mut data_type = DataType::Int64;
-    for _ in 0..MAX_DATA_TYPE_DEPTH {
+    for _ in 0..MAX_VALUE_TYPE_DEPTH {
         data_type = DataType::List(Arc::new(Field::new_list_field(data_type, true)));
     }
     assert_eq!(
@@ -2200,10 +2201,7 @@ fn declared_value_names_are_exact_and_provider_metadata_is_not_execution_semanti
     use arrow_schema::Field;
     use std::{collections::HashMap, sync::Arc};
     let mut metadata = HashMap::new();
-    metadata.insert(
-        "key".to_owned(),
-        "v".repeat(MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES + 1),
-    );
+    metadata.insert("key".to_owned(), "v".repeat((16 * 1024) + 1));
     let name = "n".repeat(1025);
     let field = Field::new(name.clone(), DataType::Int64, true).with_metadata(metadata.clone());
     let structure = ValueType::try_with_logical_type(

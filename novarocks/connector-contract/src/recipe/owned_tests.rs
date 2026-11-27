@@ -143,8 +143,10 @@ fn observed_read_recipe_retains_original_header_and_limit_errors_without_string_
         Bytes::from(vec![0; MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES + 1]),
         Bytes::new(),
     );
-    let too_many = vec![columns[0].clone(); MAX_CONNECTOR_RECIPE_COLUMNS + 1];
-    for (input, columns) in [(wrong, vec![]), (oversized, vec![]), (input, too_many)] {
+    let wide = vec![columns[0].clone(); 4097];
+    let recipe = invoke(&binding, input, wide, &Control::default(), &mut |_| Ok(())).unwrap();
+    assert_eq!(recipe.columns().len(), 4097);
+    for (input, columns) in [(wrong, vec![]), (oversized, vec![])] {
         let expected = ConnectorReadRelationRecipeDraft::try_new(
             binding.clone(),
             input.clone(),

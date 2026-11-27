@@ -272,71 +272,11 @@ fn writer_schema_every_arrow_branch_has_independent_charge_and_plain_observed_pa
 }
 
 #[test]
-fn writer_schema_pure_headers_and_metadata_exact_boundaries_keep_original_mutated_charge() {
+fn writer_schema_charges_actual_attributes_and_detects_overflow() {
     let mut bytes = 0;
-    charge_write_field_header(&"n".repeat(1024), 64, &mut bytes).unwrap();
-    assert_eq!(bytes, 128 + 1024);
-    let start = bytes;
-    contract(
-        charge_write_field_header(&"n".repeat(1025), 0, &mut bytes),
-        "write relation field name exceeds the byte limit",
-    );
-    assert_eq!(bytes, start);
-    contract(
-        charge_write_field_header("x", 65, &mut bytes),
-        "write relation field metadata exceeds the entry limit",
-    );
-    assert_eq!(bytes, start);
-    let mut bytes = 0;
-    charge_write_metadata_entry(&"k".repeat(1024), &"v".repeat(65536), &mut bytes).unwrap();
-    assert_eq!(bytes, 1024 + 65536 + 2 * size_of::<String>());
-    let start = bytes;
-    contract(
-        charge_write_metadata_entry(&"k".repeat(1025), "v", &mut bytes),
-        "write relation field metadata key exceeds the byte limit",
-    );
-    assert_eq!(bytes, start);
-    contract(
-        charge_write_metadata_entry("k", &"v".repeat(65537), &mut bytes),
-        "write relation field metadata value exceeds the byte limit",
-    );
-    assert_eq!(bytes, start);
-    let mut bytes = 0;
-    charge_write_type_header(32, Some("UTC"), &mut bytes).unwrap();
-    assert_eq!(bytes, 67);
-    contract(
-        charge_write_type_header(33, None, &mut bytes),
-        "write relation Arrow type exceeds the nesting depth limit",
-    );
-    assert_eq!(bytes, 67);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 67;
-    charge_write_type_header(1, Some("UTC"), &mut bytes).unwrap();
-    assert_eq!(bytes, 16 * 1024 * 1024);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 66;
-    contract(
-        charge_write_type_header(1, Some("UTC"), &mut bytes),
-        "write relation schema exceeds the decoded allocation limit",
-    );
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES + 1);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 132;
-    charge_write_field_header("root", 0, &mut bytes).unwrap();
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 131;
-    contract(
-        charge_write_field_header("root", 0, &mut bytes),
-        "write relation schema exceeds the decoded allocation limit",
-    );
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES + 1);
-    let entry_charge = 2 + 2 * size_of::<String>();
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - entry_charge;
-    charge_write_metadata_entry("k", "v", &mut bytes).unwrap();
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - entry_charge + 1;
-    contract(
-        charge_write_metadata_entry("k", "v", &mut bytes),
-        "write relation schema exceeds the decoded allocation limit",
-    );
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES + 1);
+    charge_write_field_header(&"n".repeat(1025), &mut bytes).unwrap();
+    charge_write_metadata_entry(&"k".repeat(1025), &"v".repeat(65537), &mut bytes).unwrap();
+    assert_eq!(bytes, 128 + 1025 + 1025 + 65537 + 2 * size_of::<String>());
     let mut bytes = usize::MAX;
     contract(
         charge_write_schema(&mut bytes, 1),
@@ -346,35 +286,30 @@ fn writer_schema_pure_headers_and_metadata_exact_boundaries_keep_original_mutate
 }
 
 #[test]
-fn writer_schema_recursive_depth_and_16_mib_limit_preserve_error_and_partial_charge() {
-    let mut ty = DataType::Int64;
-    for _ in 0..31 {
-        ty = DataType::List(Arc::new(Field::new("x", ty, true)));
+fn writer_schema_uses_same_logical_depth_for_lists_and_map_scaffolding() {
+    for map in [false, true] {
+        let wrap = |child| {
+            if map {
+                let entries = DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", child, true),
+                    ]
+                    .into(),
+                );
+                DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+            } else {
+                DataType::List(Arc::new(Field::new("item", child, true)))
+            }
+        };
+        let nested = (1..MAX_VALUE_TYPE_DEPTH).fold(DataType::Int64, |ty, _| wrap(ty));
+        assert!(parity(&field(nested.clone()), 1, 0) > MAX_VALUE_TYPE_DEPTH);
+        let invalid = field(wrap(nested));
+        let error = validate_write_field_schema(&invalid, 1, &mut 0).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains(&MAX_VALUE_TYPE_DEPTH.to_string()));
+        parity(&invalid, 1, 0);
     }
-    let f = field(ty.clone());
-    let mut bytes = 0;
-    validate_write_field_schema(&f, 1, &mut bytes).unwrap();
-    assert_eq!(bytes, 132 + 32 * 64 + 31 * 129);
-    parity(&f, 1, 0);
-    let invalid = field(DataType::List(Arc::new(Field::new("x", ty, true))));
-    let mut bytes = 0;
-    contract(
-        validate_write_field_schema(&invalid, 1, &mut bytes),
-        "write relation Arrow type exceeds the nesting depth limit",
-    );
-    assert_eq!(bytes, 132 + 32 * 64 + 32 * 129);
-    parity(&invalid, 1, 0);
-    let f = Field::new("x", DataType::Int64, false);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 193;
-    validate_write_field_schema(&f, 1, &mut bytes).unwrap();
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
-    let mut bytes = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 192;
-    contract(
-        validate_write_field_schema(&f, 1, &mut bytes),
-        "write relation schema exceeds the decoded allocation limit",
-    );
-    assert_eq!(bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES + 1);
-    parity(&f, 1, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - 192);
 }
 
 #[test]
@@ -406,11 +341,11 @@ fn writer_schema_large_metadata_is_legal_in_writer_owner_without_foreign_value_c
     );
     parity(&f, 1, 0);
     let mut bytes = 0;
-    contract(
-        validate_write_field_schema(&f, 1, &mut bytes),
-        "write relation field metadata exceeds the entry limit",
+    validate_write_field_schema(&f, 1, &mut bytes).unwrap();
+    assert_eq!(
+        bytes,
+        196 + 65 * (1 + 2 * size_of::<String>()) + 10 * 2 + 55 * 3
     );
-    assert_eq!(bytes, 0);
 }
 
 #[test]
@@ -434,36 +369,21 @@ fn writer_schema_real_draft_struct_5000_has_hand_charge_984086_without_value_nod
         panic!("expected Struct")
     };
     assert_eq!(fields.len(), 5000);
-    let ty = wide(5000);
-    assert!(matches!(
-        novarocks_type_contract::validate_value_type_structure_observed::<
-            novarocks_type_contract::ValueTypeError,
-        >(ty.data_type(), |_| Ok(())),
-        Err(novarocks_type_contract::ValueTypeError::TooManyNodes)
-    ));
 }
 
 #[test]
 fn writer_schema_plain_and_observed_original_error_categories_and_metadata_order_match() {
-    let invalids = [
-        Field::new("n".repeat(1025), DataType::Int64, false),
-        field(DataType::Int64).with_metadata(HashMap::from([("k".repeat(1025), "v".into())])),
-        field(DataType::Int64).with_metadata(HashMap::from([("k".into(), "v".repeat(65537))])),
-        field(DataType::Int64).with_metadata(HashMap::from([(
-            "nr_logical_type".into(),
-            "not-a-logical-type".into(),
-        )])),
-    ];
-    for (f, expected_calls) in invalids.iter().zip([0, 1, 1, 0]) {
-        assert_eq!(parity(f, 1, 17), expected_calls);
-    }
-    let f = &invalids[3];
+    let f = field(DataType::Int64).with_metadata(HashMap::from([(
+        "nr_logical_type".into(),
+        "not-a-logical-type".into(),
+    )]));
+    assert_eq!(parity(&f, 1, 17), 0);
     let mut bytes = 17;
-    let e = validate_write_field_schema(f, 1, &mut bytes).unwrap_err();
+    let e = validate_write_field_schema(&f, 1, &mut bytes).unwrap_err();
     assert_eq!(e.kind(), ConnectorErrorKind::InvalidRequest);
     assert_eq!(e.message(), "unknown logical type metadata");
     assert_eq!(bytes, 17);
-    // Invalid logical metadata precedes metadata entry limits in the original field author.
+    // Invalid logical metadata precedes processing other attributes.
     let mut metadata: HashMap<_, _> = (0..65).map(|i| (format!("k{i}"), "v".into())).collect();
     metadata.insert("nr_logical_type".into(), "not-a-logical-type".into());
     let both_invalid = field(DataType::Int64).with_metadata(metadata);

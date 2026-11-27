@@ -2850,7 +2850,7 @@ fn table_writer_provider_name_accepts_wide_nonempty_names() {
     invalid_table_writer_fragment(TableWriterFixture::ProviderName(1), &mut fixture_constants)
         .unwrap();
     invalid_table_writer_fragment(
-        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES),
+        TableWriterFixture::ProviderName(1024),
         &mut fixture_constants,
     )
     .unwrap();

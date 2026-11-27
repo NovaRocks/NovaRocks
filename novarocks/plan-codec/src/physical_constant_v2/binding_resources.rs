@@ -16,20 +16,17 @@
 // under the License.
 
 //! Admit borrowed exact binding comparisons before entering their original
-//! owner. The trusted invoice includes BOTH pool and type-table sources,
-//! strings and deleted HashMap buckets. This is not an allocation grant.
+//! owner. The source invoice continues to cover the original retained pool.
 
 use super::PhysicalConstantCodecError;
 use crate::physical_type_v2::TypeCodecError;
-#[cfg(test)]
-use arrow::datatypes::DataType;
-use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Field};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, NR_LOGICAL_TYPE_KEY, ValueTypeVisit,
-    validate_value_type_structure_with_scratch_observed,
+    validate_value_type_structure_observed,
 };
-use std::{mem, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ConstantBindingResourceFacts {
@@ -93,59 +90,55 @@ struct Metrics {
     fields: usize,
     edges: usize,
     entries: usize,
-    squared_entries: usize,
+    value_bytes: usize,
     /// Field events precede the sole walker's logical-domain lookup. The root
     /// Field is compared directly and therefore has no walker lookup.
     logical_probes: usize,
     model_visits: usize,
 }
 impl Metrics {
-    fn field(&mut self, field: &Field, logical_probe: bool) -> Result<(), TypeCodecError> {
-        let entries = field.metadata().len();
+    fn field(
+        &mut self,
+        field: &Field,
+        logical_probe: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), TypeCodecError> {
         self.fields = add(self.fields, 1)?;
-        self.entries = add(self.entries, entries)?;
-        self.squared_entries = add(self.squared_entries, mul(entries, entries)?)?;
-        self.logical_probes = add(self.logical_probes, usize::from(logical_probe))?;
+        self.entries = add(self.entries, field.metadata().len())?;
+        self.value_bytes = add(self.value_bytes, field.name().len())?;
+        if logical_probe {
+            // Comparing to the fixed annotation key visits at most this many
+            // bytes per candidate, regardless of actual metadata key length.
+            self.logical_probes = add(self.logical_probes, field.metadata().len())?;
+        }
+        for (key, value) in field.metadata() {
+            self.value_bytes = add(self.value_bytes, add(key.len(), value.len())?)?;
+            work.step()?;
+        }
         Ok(())
     }
 
-    fn bound(&self, source: usize, prefix: usize) -> Result<usize, TypeCodecError> {
-        // In each exact metadata comparison equal counts K permit one left
-        // scan and <=K right scans; unequal counts terminate before scanning.
-        // Their opaque bucket scans and repeated key bytes are covered by
-        // 3K source visits. Values and names add <=3 source visits per Field;
-        // timestamp zones add <=one per type node. This also covers aliases:
-        // the same retained backing may be visited at every left occurrence.
-        let source_visits = add(
-            add(mul(3, self.entries)?, mul(3, self.fields)?)?,
-            self.types,
-        )?;
-        // Candidate visits and byte-length checks: <=2K²+2K. Separate node,
-        // Field and edge headers cover closed tags, nullability, dictionary
-        // attributes, child counts and Union IDs without relying on B>0.
-        let candidates = add(mul(2, self.squared_entries)?, mul(2, self.entries)?)?;
+    fn bound(&self) -> Result<usize, TypeCodecError> {
+        // Ordered metadata entries, type parameters, and names are compared
+        // by length then bytes. A successful length check bounds both operands
+        // by the observed side. Keep allowance for the original field/type
+        // comparison and its work checkpoints.
+        let bytes = mul(4, self.value_bytes)?;
+        let probes = mul(self.logical_probes, NR_LOGICAL_TYPE_KEY.len() + 1)?;
+        let entries = mul(8, self.entries)?;
         let headers = add(
             add(mul(4, self.types)?, mul(8, self.fields)?)?,
             mul(2, self.edges)?,
         )?;
-        // A fixed-key logical lookup hashes NR_LOGICAL_TYPE_KEY once and
-        // inspects at most the original retained bucket/string backing. Public
-        // HashMap capacity is deliberately absent, including after deletion.
-        let probes = mul(self.logical_probes, add(source, NR_LOGICAL_TYPE_KEY.len())?)?;
         add(
-            add(prefix, self.model_visits)?,
-            add(
-                add(mul(source, source_visits)?, candidates)?,
-                add(headers, probes)?,
-            )?,
+            self.model_visits,
+            add(add(bytes, probes)?, add(entries, headers)?)?,
         )
     }
 
     fn observe(
         &mut self,
         event: ValueTypeVisit<'_>,
-        source: usize,
-        prefix: usize,
         limit: usize,
         admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
@@ -155,12 +148,17 @@ impl Metrics {
             ValueTypeVisit::Field(_) | ValueTypeVisit::ChildEdge(_)
         );
         match event {
-            ValueTypeVisit::TypeNode(_) => self.types = admission.numeric(add(self.types, 1))?,
+            ValueTypeVisit::TypeNode(ty) => {
+                self.types = admission.numeric(add(self.types, 1))?;
+                if let DataType::Timestamp(_, Some(zone)) = ty {
+                    self.value_bytes = admission.numeric(add(self.value_bytes, zone.len()))?;
+                }
+            }
             ValueTypeVisit::ChildEdge(_) => self.edges = admission.numeric(add(self.edges, 1))?,
-            ValueTypeVisit::Field(field) => admission.numeric(self.field(field, true))?,
+            ValueTypeVisit::Field(field) => self.field(field, true, work)?,
         }
         self.model_visits = admission.numeric(add(self.model_visits, 1))?;
-        let bound = admission.numeric(self.bound(source, prefix))?;
+        let bound = admission.numeric(self.bound())?;
         admission.known(bound, limit)?;
         let admitted = cap(bound, limit);
         // One completed constant-size numerical/event operation. This is not
@@ -177,7 +175,7 @@ impl Metrics {
     }
 }
 
-/// Both shapes are original checked owners. Only the sole shared scratch walk
+/// Both shapes are original checked owners. The shared fixed path cursor
 /// supplies topology and Field events; no cloned types, shadow grammar, map
 /// bucket table or heap-backed pending traversal is introduced. The caller
 /// owns ordinary/success finish and the ensuing exact comparison operations.
@@ -226,15 +224,6 @@ fn preflight_core(
     admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConstantBindingResourceFacts, PhysicalConstantCodecError> {
-    // The fixed scratch request is known without inspecting source metadata.
-    // Its numerical refusal precedes a pending original observation.
-    if admission.parent.is_some() {
-        let scratch_bytes = mem::size_of::<
-            novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
-        >();
-        let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
-        admission.known(prefix, max_work)?;
-    }
     work.flush()?;
     let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
         .map_err(|_| shape("constant binding source retention is not representable"))?;
@@ -243,40 +232,19 @@ fn preflight_core(
     if !covers_pool {
         return Err(shape("constant binding source invoice omits checked pool backing").into());
     }
-    let scratch_bytes = mem::size_of::<
-        novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
-    >();
-    let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
-    admission.known(prefix, max_work)?;
-    let admitted = cap(prefix, max_work);
-    work.step()?;
-    admitted?;
-    work.flush()?;
-    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
-    work.flush()?;
     let mut metrics = Metrics::default();
-    validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
+    validate_value_type_structure_observed::<TypeCodecError>(
         pool.value_type().data_type(),
-        &mut scratch,
-        |event| {
-            metrics.observe(
-                event,
-                source_retained_bytes,
-                prefix,
-                max_work,
-                admission,
-                work,
-            )
-        },
+        |event| metrics.observe(event, max_work, admission, work),
     )?;
     let compare_full_field = !Arc::ptr_eq(pool.field_ref(), expected_field);
     if admission.parent.is_none() {
         work.step()?;
     }
     if compare_full_field {
-        admission.numeric(metrics.field(pool.field(), false))?;
+        metrics.field(pool.field(), false, work)?;
         metrics.model_visits = admission.numeric(add(metrics.model_visits, 1))?;
-        let bound = admission.numeric(metrics.bound(source_retained_bytes, prefix))?;
+        let bound = admission.numeric(metrics.bound())?;
         admission.known(bound, max_work)?;
         let admitted = cap(bound, max_work);
         if admission.parent.is_some() {
@@ -284,25 +252,15 @@ fn preflight_core(
         }
         work.step()?;
         admitted?;
-        validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
+        validate_value_type_structure_observed::<TypeCodecError>(
             pool.field().data_type(),
-            &mut scratch,
-            |event| {
-                metrics.observe(
-                    event,
-                    source_retained_bytes,
-                    prefix,
-                    max_work,
-                    admission,
-                    work,
-                )
-            },
+            |event| metrics.observe(event, max_work, admission, work),
         )?;
     }
     if admission.parent.is_some() && !compare_full_field {
         work.step()?;
     }
-    let work_upper_bound = admission.numeric(metrics.bound(source_retained_bytes, prefix))?;
+    let work_upper_bound = admission.numeric(metrics.bound())?;
     admission.known(work_upper_bound, max_work)?;
     work.flush()?;
     Ok(ConstantBindingResourceFacts {
@@ -446,7 +404,7 @@ mod tests {
             ))
         ));
         let larger = run(&pool, &copied, SOURCE + 4096, WORK, &Control::default()).unwrap();
-        assert!(larger.work_upper_bound() > facts.work_upper_bound());
+        assert_eq!(larger.work_upper_bound(), facts.work_upper_bound());
         assert!(matches!(
             run(&pool, &copied, 0, WORK, &Control::default()),
             Err(PhysicalConstantCodecError::Type(
@@ -481,12 +439,12 @@ mod tests {
     }
 
     #[test]
-    fn caller_binding_known_scratch_work_refuses_before_pending_late_control() {
+    fn caller_binding_initial_control_precedes_actual_field_work() {
         let pool = pool();
         for pending in [0, 254, 255] {
             for cause in CAUSES {
                 let control = Control {
-                    refusal: Some((1, cause)),
+                    refusal: Some((1, cause.clone())),
                     ..Control::default()
                 };
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
@@ -498,16 +456,14 @@ mod tests {
                     pool.field_ref(),
                     SOURCE,
                     0,
-                    &mut |_| panic!("parent called after known local scratch refusal"),
+                    &mut |_| panic!("parent called after control refusal"),
                     &mut work,
                 );
                 assert!(matches!(
                     result,
-                    Err(PhysicalConstantCodecError::Control(
-                        CompileControlError::ResourceExhausted
-                    ))
+                    Err(PhysicalConstantCodecError::Control(actual)) if actual == cause
                 ));
-                assert_eq!(*control.trace.lock().unwrap(), vec![0]);
+                assert_eq!(*control.trace.lock().unwrap(), vec![0, pending]);
             }
         }
     }

@@ -3019,7 +3019,7 @@ impl IcebergWriteSessionControl {
                     crate::commit::conflict_scope::RewrittenTargetBinding {
                         table_uuid: metadata.uuid(),
                         snapshot_id: base_snapshot_id,
-                        preparation_digest: admission.preparation_digest,
+                        preparation_identity: admission.preparation_identity.clone(),
                     },
                     metadata.as_ref(),
                 )

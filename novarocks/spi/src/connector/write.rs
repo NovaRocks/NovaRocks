@@ -2031,7 +2031,6 @@ impl ConnectorWrite {
         request.validate(&self.provider_binding_key)?;
         let outcome = self.control.prepare_row_mutation(request)?;
         if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
-            preparation.validate()?;
             if preparation.owner() != &self.provider_binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,

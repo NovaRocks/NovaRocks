@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::commit::conflict_scope::tests::{binding, metadata};
+use crate::commit::conflict_scope::tests::{metadata, preparation};
 use crate::iceberg::spec::{PrimitiveType, Type};
 use novarocks_spi::connector::read_stack::TupleDomain;
 use novarocks_spi::connector::{ConnectorProcessLocalPayload, ConnectorProviderBinding};
@@ -46,7 +46,18 @@ pub(super) fn sealed(
 #[test]
 fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_preparation() {
     let metadata = metadata(Type::Primitive(PrimitiveType::Long), None);
-    let original = binding(&metadata);
+    let issued = preparation();
+    let independent = preparation();
+    assert_eq!(issued.operation_id(), independent.operation_id());
+    assert_ne!(
+        issued.preparation_identity(),
+        independent.preparation_identity()
+    );
+    let original = RewrittenTargetBinding {
+        table_uuid: metadata.uuid(),
+        snapshot_id: metadata.current_snapshot_id(),
+        preparation_identity: issued.preparation_identity().clone(),
+    };
     let provider = owner("receiving", [2; 16]);
     let target = WriteTargetOrdinal::try_new(0).unwrap();
     let targets = [IcebergSealedWriteTarget::new(
@@ -55,7 +66,7 @@ fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_prepara
     )];
     let mut receiving = IcebergReceiving::new(None);
     receiving
-        .bind_rewritten_target(provider.clone(), original, &metadata)
+        .bind_rewritten_target(provider.clone(), original.clone(), &metadata)
         .unwrap();
     let proof = received_write_proof(
         target,
@@ -69,7 +80,7 @@ fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_prepara
             &metadata,
             RewrittenTargetBinding {
                 table_uuid: uuid::Uuid::nil(),
-                ..original
+                ..original.clone()
             },
             provider.clone(),
         )),
@@ -77,19 +88,23 @@ fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_prepara
             &metadata,
             RewrittenTargetBinding {
                 snapshot_id: Some(77),
-                ..original
+                ..original.clone()
             },
             provider.clone(),
         )),
         Some(sealed(
             &metadata,
             RewrittenTargetBinding {
-                preparation_digest: [9; 32],
-                ..original
+                preparation_identity: independent.preparation_identity().clone(),
+                ..original.clone()
             },
             provider.clone(),
         )),
-        Some(sealed(&metadata, original, owner("receiving", [3; 16]))),
+        Some(sealed(
+            &metadata,
+            original.clone(),
+            owner("receiving", [3; 16]),
+        )),
         Some(ConnectorProcessLocalPayload::new(
             provider.clone(),
             Arc::new("not a provider fact"),
@@ -103,7 +118,14 @@ fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_prepara
         assert!(receiving.is_unstarted());
         assert!(production.is_some());
     }
-    let good = sealed(&metadata, original, provider);
+    let good = sealed(
+        &metadata,
+        RewrittenTargetBinding {
+            preparation_identity: issued.clone().preparation_identity().clone(),
+            ..original
+        },
+        provider,
+    );
     receiving
         .begin_query(query, &[target], &mut production, &targets, Some(&good))
         .unwrap();

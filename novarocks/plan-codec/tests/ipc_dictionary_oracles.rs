@@ -285,7 +285,7 @@ fn actual_arrow_ipc_dictionary_shared_authored_id_keeps_independent_struct_value
 }
 
 #[test]
-fn actual_arrow_ipc_bare_nested_dictionary_is_a_legal_constant_but_both_writers_refuse() {
+fn direct_nested_dictionary_is_rejected_before_constant_ipc() {
     let inner: ArrayRef = Arc::new(
         DictionaryArray::<Int16Type>::try_new(
             Int16Array::from(vec![1, 0]),
@@ -303,27 +303,13 @@ fn actual_arrow_ipc_bare_nested_dictionary_is_a_legal_constant_but_both_writers_
         )),
     );
     assert_eq!(outer.data_type(), &original_type);
-    let source = pool(dict_field("nested_bare", original_type.clone(), -99), outer);
-    assert_eq!(
-        source
-            .value(0)
-            .unwrap()
-            .utf8_observed(CompilePhase::Validate, &TestControl)
-            .unwrap(),
-        Some("inner-one")
-    );
-    assert_eq!(source.field().data_type(), &original_type);
-    assert_eq!(
-        source
-            .value(1)
-            .unwrap()
-            .utf8_observed(CompilePhase::Validate, &TestControl)
-            .unwrap(),
-        Some("inner-zero")
-    );
-    // Arrow 60.1 rejects the schema before writing, rather than producing
-    // the older flattened schema whose record batch could not be decoded.
-    let batch = batch(&source);
+    let field = dict_field("nested_bare", original_type.clone(), -99);
+    assert!(matches!(
+        novarocks_type_contract::validate_nested_logical_types(field.data_type()),
+        Err(novarocks_type_contract::ValueTypeError::InvalidType(_))
+    ));
+    assert!(FunctionValueType::try_from_field(&field).is_err());
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![outer]).unwrap();
     let mut output = Vec::new();
     let error = match StreamWriter::try_new(&mut output, batch.schema().as_ref()) {
         Err(source) => source,
@@ -337,26 +323,6 @@ fn actual_arrow_ipc_bare_nested_dictionary_is_a_legal_constant_but_both_writers_
         "Arrow IPC field metadata cannot encode direct dictionary-of-dictionary values for field \"nested_bare\""
     );
     assert!(output.is_empty());
-
-    // This was already a first-party IPC profile refusal. ConstantPool
-    // admission above grants neither schema flattening nor a codec capability.
-    let error = novarocks_plan_codec::ipc_schema_v2::encode_single_field_schema(
-        source.field(),
-        novarocks_plan_codec::ipc_schema_v2::IpcSchemaProjectionLimits {
-            max_field_occurrences: 64,
-            max_type_occurrences: 128,
-            max_string_bytes: 4096,
-            max_flatbuffer_bytes: 64 * 1024,
-        },
-        &TestControl,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        novarocks_plan_codec::physical_type_v2::TypeCodecError::InvalidShape(
-            "direct nested dictionary has no inner IPC Field identity"
-        )
-    ));
 }
 
 #[test]

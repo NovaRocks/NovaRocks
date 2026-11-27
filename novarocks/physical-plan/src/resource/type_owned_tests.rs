@@ -540,7 +540,7 @@ fn map_type(layers: usize) -> DataType {
 
 #[test]
 fn typed_map_logical64_keeps_plan_owned_node_and_name_usage() {
-    let ty = ValueType::new(map_type(MAX_DATA_TYPE_DEPTH - 1), false);
+    let ty = ValueType::new(map_type(MAX_VALUE_TYPE_DEPTH - 1), false);
     let out = run(&ty, 1024 * 1024, OPEN, &Control::default()).unwrap();
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert_plain(&ty, &out);
@@ -557,18 +557,18 @@ fn typed_map_logical64_keeps_plan_owned_node_and_name_usage() {
 #[test]
 fn raw_plan_type_uses_logical_depth_for_map_scaffolding() {
     assert!(
-        raw(&map_type(MAX_DATA_TYPE_DEPTH - 1), 1024 * 1024)
+        raw(&map_type(MAX_VALUE_TYPE_DEPTH - 1), 1024 * 1024)
             .errors
             .is_empty()
     );
-    let over = raw(&map_type(MAX_DATA_TYPE_DEPTH), 1024 * 1024);
+    let over = raw(&map_type(MAX_VALUE_TYPE_DEPTH), 1024 * 1024);
     assert_eq!(
         over.errors[0].category(),
         ValidationErrorCategory::UnsupportedCapability
     );
     assert_eq!(
         over.errors[0].message(),
-        format!("Arrow data type exceeds the nesting depth limit of {MAX_DATA_TYPE_DEPTH}")
+        format!("Arrow data type exceeds the nesting depth limit of {MAX_VALUE_TYPE_DEPTH}")
     );
 }
 

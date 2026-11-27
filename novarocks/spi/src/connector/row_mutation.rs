@@ -18,9 +18,8 @@
 //! Provider-owned row-mutation admission and signed match contract.
 //! Design: ADR-0049 (docs/adr/ADR-0049-provider-row-mutation-strategy-identity-routes-and-cohorts.md)
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit, UnionMode};
 use bytes::Bytes;
@@ -34,11 +33,8 @@ use super::{
     ConnectorWriteOperationId, ConnectorWriteTargetRef, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
 };
 
-mod match_bounds;
 #[cfg(test)]
-mod match_bounds_tests;
-#[cfg(test)]
-thread_local! { static MATCH_LAYOUT_ALLOCATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+mod match_layout_tests;
 
 pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 3;
 
@@ -77,6 +73,13 @@ impl From<novarocks_type_contract::ValueTypeError> for MutationFieldValidationFa
         Self::Value(error)
     }
 }
+fn mutation_field_error(error: MutationFieldValidationFailure) -> ConnectorError {
+    match error {
+        MutationFieldValidationFailure::Caller(error) => error,
+        MutationFieldValidationFailure::Value(error) => invalid_match(error.to_string()),
+    }
+}
+
 fn validate_mutation_execution_field(
     field: &Field,
     execution_type: &novarocks_type_contract::FunctionValueType,
@@ -87,12 +90,7 @@ fn validate_mutation_execution_field(
     >(field, execution_type, |units| {
         observe(units).map_err(MutationFieldValidationFailure::Caller)
     })
-    .map_err(|error| match error {
-        MutationFieldValidationFailure::Caller(error) => error,
-        MutationFieldValidationFailure::Value(error) => {
-            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-        }
-    })?;
+    .map_err(mutation_field_error)?;
     if !matches {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -306,7 +304,6 @@ pub struct ConnectorMutationMatchContract {
     before_fields: Vec<ConnectorMutationTargetField>,
     after_fields: Vec<ConnectorMutationTargetField>,
     effect_field: ConnectorMutationEffectField,
-    digest: [u8; 32],
 }
 
 impl ConnectorMutationMatchContract {
@@ -319,15 +316,91 @@ impl ConnectorMutationMatchContract {
         after_fields: Vec<ConnectorMutationTargetField>,
         effect_field: ConnectorMutationEffectField,
     ) -> Result<Self, ConnectorError> {
-        let digest = Self::validate_match_layout(
-            &owner,
-            &table,
-            &base_version,
-            &identity_fields,
-            &before_fields,
-            &after_fields,
-            &effect_field,
-        )?;
+        Self::try_new_observed(
+            owner,
+            table,
+            base_version,
+            identity_fields,
+            before_fields,
+            after_fields,
+            effect_field,
+            || Ok(()),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "observe the original match field roles"
+    )]
+    pub fn try_new_observed(
+        owner: ConnectorProviderBindingKey,
+        table: ConnectorTableHandle,
+        base_version: ConnectorWriteBaseVersion,
+        identity_fields: Vec<ConnectorMutationSourceField>,
+        before_fields: Vec<ConnectorMutationTargetField>,
+        after_fields: Vec<ConnectorMutationTargetField>,
+        effect_field: ConnectorMutationEffectField,
+        mut check_active: impl FnMut() -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        check_active()?;
+        if table.owner() != &owner.instance_id || identity_fields.is_empty() {
+            return Err(invalid_match(
+                "row-mutation match contract needs an exact owner and identity",
+            ));
+        }
+        base_version.validate()?;
+        let count = identity_fields
+            .len()
+            .checked_add(before_fields.len())
+            .and_then(|count| count.checked_add(after_fields.len()))
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "row-mutation match layout exceeds u32 match field ordinals",
+                )
+            })?;
+        let mut tokens = HashSet::new();
+        let mut ordinal = 0;
+        let mut add = |token, supplied_ordinal| {
+            check_active()?;
+            if !tokens.insert(token) || supplied_ordinal != ordinal {
+                return Err(invalid_match(
+                    "row-mutation match fields require unique tokens and dense ordinals in role order",
+                ));
+            }
+            ordinal += 1;
+            Ok(())
+        };
+        let mut names = HashSet::new();
+        for value in &identity_fields {
+            add(value.token, value.source_ordinal)?;
+            if !names.insert(value.field.name()) || value.execution_type().is_none() {
+                return Err(invalid_match(
+                    "row-mutation identity requires unique names and complete execution declarations",
+                ));
+            }
+        }
+        for (fields, is_before) in [(&before_fields, true), (&after_fields, false)] {
+            names.clear();
+            for value in fields {
+                add(value.token, value.target_ordinal)?;
+                if is_before && value.storage_type().is_some() {
+                    return Err(invalid_match(
+                        "row-mutation before fields cannot carry write storage projections",
+                    ));
+                }
+                if !names.insert(value.field.name()) || value.execution_type().is_none() {
+                    return Err(invalid_match(
+                        "row-mutation target role requires unique names and complete execution declarations",
+                    ));
+                }
+            }
+        }
+        add(effect_field.token, effect_field.target_ordinal)?;
+        debug_assert_eq!(ordinal, count);
+        check_active()?;
         Ok(Self {
             owner,
             table,
@@ -336,107 +409,9 @@ impl ConnectorMutationMatchContract {
             before_fields,
             after_fields,
             effect_field,
-            digest,
         })
     }
 
-    #[allow(clippy::ptr_arg)]
-    fn validate_match_layout(
-        owner: &ConnectorProviderBindingKey,
-        table: &ConnectorTableHandle,
-        base_version: &ConnectorWriteBaseVersion,
-        identity_fields: &Vec<ConnectorMutationSourceField>,
-        before_fields: &Vec<ConnectorMutationTargetField>,
-        after_fields: &Vec<ConnectorMutationTargetField>,
-        effect_field: &ConnectorMutationEffectField,
-    ) -> Result<[u8; 32], ConnectorError> {
-        if table.owner() != &owner.instance_id || identity_fields.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation match contract needs an exact owner and identity",
-            ));
-        }
-        match_bounds::preflight(identity_fields, before_fields, after_fields, effect_field)?;
-        base_version.validate()?;
-        if before_fields
-            .iter()
-            .any(|field| field.storage_type().is_some())
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation before fields cannot carry write storage projections",
-            ));
-        }
-        #[cfg(test)]
-        MATCH_LAYOUT_ALLOCATION_CALLS.with(|n| n.set(n.get() + 1));
-        let mut tokens = HashSet::new();
-        let mut field_ordinals = HashSet::new();
-        for value in identity_fields {
-            if !tokens.insert(value.token) || !field_ordinals.insert(value.source_ordinal) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "row-mutation identity has duplicate token or source ordinal",
-                ));
-            }
-        }
-        for value in before_fields.iter().chain(after_fields) {
-            if !tokens.insert(value.token) || !field_ordinals.insert(value.target_ordinal) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "row-mutation target field has duplicate token or match field ordinal",
-                ));
-            }
-        }
-        if !tokens.insert(effect_field.token) || !field_ordinals.insert(effect_field.target_ordinal)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation effect field conflicts with the match layout",
-            ));
-        }
-        if field_ordinals.len() != tokens.len()
-            || !(0..u32::try_from(field_ordinals.len()).map_err(|_| {
-                ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "row-mutation match layout exceeds u32 match field ordinals",
-                )
-            })?)
-                .all(|ordinal| field_ordinals.contains(&ordinal))
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation match layout match field ordinals must be dense from zero",
-            ));
-        }
-        match_digest(
-            owner,
-            table,
-            base_version,
-            identity_fields,
-            before_fields,
-            after_fields,
-            effect_field,
-        )
-    }
-
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        let expected = Self::validate_match_layout(
-            &self.owner,
-            &self.table,
-            &self.base_version,
-            &self.identity_fields,
-            &self.before_fields,
-            &self.after_fields,
-            &self.effect_field,
-        )?;
-        if expected != self.digest {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "row-mutation match contract digest does not match contents",
-            ));
-        }
-        Ok(())
-    }
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
@@ -457,10 +432,6 @@ impl ConnectorMutationMatchContract {
     }
     pub fn effect_field(&self) -> &ConnectorMutationEffectField {
         &self.effect_field
-    }
-
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
     }
 }
 
@@ -505,25 +476,54 @@ pub struct ConnectorRowMutationCurrent {
 
 fn projected_before_storage<'a>(
     before: &ConnectorMutationTargetField,
-    after_fields: &'a [ConnectorMutationTargetField],
-) -> Option<&'a novarocks_type_contract::FunctionValueType> {
-    let value = before.execution_type()?.typed_binding().borrowed();
-    after_fields.iter().find_map(|after| {
-        let storage = after.storage_type()?;
-        if after.field().name() != before.field().name()
-            || after.field().data_type() != before.field().data_type()
-        {
-            return None;
-        }
-        let input = after.execution_type()?.typed_binding().borrowed();
-        value
-            .same_physical_binding_ignoring_nullability_observed(input, || {
-                Ok::<(), std::convert::Infallible>(())
-            })
-            .expect("the observer is infallible")
-            .then_some(storage)
-    })
+    after: &'a ConnectorMutationTargetField,
+    mut check_active: impl FnMut() -> Result<(), ConnectorError>,
+) -> Result<Option<&'a novarocks_type_contract::FunctionValueType>, ConnectorError> {
+    let Some(storage) = after.storage_type() else {
+        return Ok(None);
+    };
+    let (Some(before_type), Some(after_type)) = (before.execution_type(), after.execution_type())
+    else {
+        return Ok(None);
+    };
+    if after.field().name() != before.field().name()
+        || after.field().data_type() != before.field().data_type()
+    {
+        return Ok(None);
+    }
+    Ok(before_type
+        .typed_binding()
+        .borrowed()
+        .same_physical_binding_ignoring_nullability_observed(
+            after_type.typed_binding().borrowed(),
+            &mut check_active,
+        )?
+        .then_some(storage))
 }
+
+fn invalid_match(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}
+
+/// Process-local identity of one successful preparation issuance. A clone
+/// keeps the allocation alive, so simultaneous issuances cannot alias.
+#[derive(Clone)]
+pub struct ConnectorRowMutationPreparationIdentity(Arc<IssuedRowMutationPreparation>);
+
+struct IssuedRowMutationPreparation;
+
+impl std::fmt::Debug for ConnectorRowMutationPreparationIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectorRowMutationPreparationIdentity")
+    }
+}
+
+impl PartialEq for ConnectorRowMutationPreparationIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ConnectorRowMutationPreparationIdentity {}
 
 impl ConnectorRowMutationCurrent {
     pub fn identity(&self) -> &super::ConnectorTableIdentity {
@@ -560,7 +560,7 @@ pub struct ConnectorRowMutationPreparation {
     strategy: ConnectorRowMutationStrategy,
     base_version_ordinal: Option<i64>,
     payload: Bytes,
-    digest: [u8; 32],
+    identity: ConnectorRowMutationPreparationIdentity,
 }
 
 impl ConnectorRowMutationPreparation {
@@ -582,6 +582,43 @@ impl ConnectorRowMutationPreparation {
         base_version_ordinal: Option<i64>,
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_observed(
+            owner,
+            operation_id,
+            table,
+            match_source,
+            match_source_schema,
+            target_ref,
+            intent,
+            base_version,
+            match_contract,
+            strategy,
+            base_version_ordinal,
+            payload,
+            || Ok(()),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "observe the original preparation facts before issuing an identity"
+    )]
+    pub fn try_new_observed(
+        owner: ConnectorProviderBindingKey,
+        operation_id: ConnectorWriteOperationId,
+        table: ConnectorTableHandle,
+        match_source: ConnectorTableHandle,
+        match_source_schema: SchemaRef,
+        target_ref: ConnectorWriteTargetRef,
+        intent: ConnectorRowMutationIntent,
+        base_version: ConnectorWriteBaseVersion,
+        match_contract: ConnectorMutationMatchContract,
+        strategy: ConnectorRowMutationStrategy,
+        base_version_ordinal: Option<i64>,
+        payload: Bytes,
+        mut check_active: impl FnMut() -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        check_active()?;
         if table.owner() != &owner.instance_id
             || match_source.owner() != &owner.instance_id
             || match_contract.owner() != &owner
@@ -595,8 +632,25 @@ impl ConnectorRowMutationPreparation {
         }
         intent.validate()?;
         base_version.validate()?;
-        match_contract.validate()?;
-        let match_source_schema_digest = canonical_schema_digest(match_source_schema.as_ref())?;
+        let match_source_schema_digest =
+            canonical_schema_digest_observed(&match_source_schema, &mut check_active)?;
+        let mut source_by_name = HashMap::new();
+        for field in match_source_schema.fields() {
+            check_active()?;
+            if source_by_name
+                .insert(field.name().as_str(), field.as_ref())
+                .is_some()
+            {
+                return Err(invalid_match(
+                    "row-mutation match source schema repeats a field name",
+                ));
+            }
+        }
+        let mut after_by_name = HashMap::new();
+        for field in match_contract.after_fields() {
+            check_active()?;
+            after_by_name.insert(field.field().name().as_str(), field);
+        }
         for (expected, storage, before, temporal_source) in match_contract
             .identity_fields()
             .iter()
@@ -618,42 +672,37 @@ impl ConnectorRowMutationPreparation {
                 )
             }))
         {
-            let mut matching = match_source_schema
-                .fields()
-                .iter()
-                .filter(|actual| actual.name() == expected.name());
-            let actual = matching.next().ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "row-mutation match source omits a signed match field",
-                )
-            })?;
+            check_active()?;
+            let actual = source_by_name
+                .get(expected.name().as_str())
+                .ok_or_else(|| {
+                    invalid_match("row-mutation match source omits a signed match field")
+                })?;
             let storage = if let Some(before) = before
                 && actual.data_type() != expected.data_type()
+                && let Some(after) = after_by_name.get(before.field().name().as_str())
             {
-                projected_before_storage(before, match_contract.after_fields())
+                projected_before_storage(before, after, &mut check_active)?
             } else {
                 storage
             };
-            let matches = matching.next().is_none()
-                && !(actual.is_nullable() && !expected.is_nullable())
+            let matches = (!actual.is_nullable() || expected.is_nullable())
                 && if let Some(source_digest) = temporal_source {
-                    temporal_match_source_digest(actual)? == source_digest
+                    temporal_match_source_digest_observed(actual, &mut check_active)?
+                        == source_digest
                 } else if let Some(storage) = storage {
                     // The match source keeps formal storage. When a before
                     // field uses the same checked byte projection as the
                     // canonical input, the after field supplies the original
                     // storage proof for both roles.
                     novarocks_type_contract::value_layout_matches_carrier_observed::<
-                        novarocks_type_contract::ValueTypeError,
+                        MutationFieldValidationFailure,
                     >(
                         storage.typed_binding().layout(),
                         actual.data_type(),
-                        |_| Ok(()),
+                        |_| check_active().map_err(MutationFieldValidationFailure::Caller),
                     )
-                    .map_err(|error| {
-                        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-                    })?
+                    .map_err(mutation_field_error)?
                 } else {
                     actual.data_type() == expected.data_type()
                 };
@@ -665,20 +714,7 @@ impl ConnectorRowMutationPreparation {
             }
         }
         validate_payload(&payload)?;
-        let digest = preparation_digest(
-            &owner,
-            operation_id,
-            &table,
-            &match_source,
-            match_source_schema_digest,
-            &target_ref,
-            &intent,
-            &base_version,
-            &match_contract,
-            strategy,
-            base_version_ordinal,
-            &payload,
-        );
+        check_active()?;
         Ok(Self {
             owner,
             operation_id,
@@ -693,32 +729,12 @@ impl ConnectorRowMutationPreparation {
             strategy,
             base_version_ordinal,
             payload,
-            digest,
+            identity: ConnectorRowMutationPreparationIdentity(Arc::new(
+                IssuedRowMutationPreparation,
+            )),
         })
     }
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        let expected = Self::try_new(
-            self.owner.clone(),
-            self.operation_id,
-            self.table.clone(),
-            self.match_source.clone(),
-            self.match_source_schema.clone(),
-            self.target_ref.clone(),
-            self.intent.clone(),
-            self.base_version.clone(),
-            self.match_contract.clone(),
-            self.strategy,
-            self.base_version_ordinal,
-            self.payload.clone(),
-        )?;
-        if expected.digest != self.digest {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "row-mutation preparation digest does not match contents",
-            ));
-        }
-        Ok(())
-    }
+
     pub fn current_source(
         &self,
         table: &super::ConnectorTableMetadata,
@@ -775,6 +791,19 @@ impl ConnectorRowMutationPreparation {
     pub const fn match_source_schema_digest(&self) -> [u8; 32] {
         self.match_source_schema_digest
     }
+    /// Compare independently reprojected source content with the signed schema.
+    pub fn validate_match_source_schema_observed(
+        expected: [u8; 32],
+        current: &Schema,
+        mut check_active: impl FnMut() -> Result<(), ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        if canonical_schema_digest_observed(current, &mut check_active)? != expected {
+            return Err(invalid_match(
+                "row-mutation match source schema differs from its signed contents",
+            ));
+        }
+        Ok(())
+    }
     pub fn target_ref(&self) -> &ConnectorWriteTargetRef {
         &self.target_ref
     }
@@ -804,8 +833,8 @@ impl ConnectorRowMutationPreparation {
     pub fn payload(&self) -> &Bytes {
         &self.payload
     }
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
+    pub fn preparation_identity(&self) -> &ConnectorRowMutationPreparationIdentity {
+        &self.identity
     }
 }
 
@@ -874,215 +903,53 @@ fn digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
 }
-fn digest_owner(hasher: &mut Sha256, owner: &ConnectorProviderBindingKey) {
-    digest_bytes(hasher, owner.instance_id.as_str().as_bytes());
-    hasher.update(owner.incarnation.to_bytes());
-}
-// Every argument is a distinct field of the digest this function seals. Folding
-// them into a struct would add a type whose only purpose is to be destructured
-// again here, and would let a caller build a partially-populated digest input.
-fn match_digest(
-    owner: &ConnectorProviderBindingKey,
-    table: &ConnectorTableHandle,
-    base: &ConnectorWriteBaseVersion,
-    identity: &[ConnectorMutationSourceField],
-    before: &[ConnectorMutationTargetField],
-    after: &[ConnectorMutationTargetField],
-    effect: &ConnectorMutationEffectField,
-) -> Result<[u8; 32], ConnectorError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-row-mutation-match.v3\0");
-    digest_owner(&mut hasher, owner);
-    digest_bytes(&mut hasher, table.payload());
-    hasher.update(base.digest());
-    for field in identity {
-        hasher.update(field.token.to_bytes());
-        hasher.update(field.source_ordinal.to_be_bytes());
-        match_bounds::digest_debug_field(&mut hasher, &field.field)?;
-        digest_match_execution_type(&mut hasher, field.execution_type())?;
-    }
-    for field in before.iter().chain(after) {
-        hasher.update(field.token.to_bytes());
-        hasher.update(field.target_ordinal.to_be_bytes());
-        match_bounds::digest_debug_field(&mut hasher, &field.field)?;
-        digest_match_execution_type(&mut hasher, field.execution_type())?;
-        novarocks_connector_contract::write_input_projection_identity_observed(
-            field.execution_type(),
-            field.storage_type(),
-            |part| {
-                hasher.update(part);
-                Ok::<_, ConnectorError>(())
-            },
-        )?;
-        if let Some(source) = field.temporal_match_source {
-            hasher.update(b"temporal-match-source\0");
-            hasher.update(source);
-        }
-    }
-    hasher.update(effect.token.to_bytes());
-    hasher.update(effect.target_ordinal.to_be_bytes());
-    match_bounds::digest_debug_field(&mut hasher, &effect.field)?;
-    Ok(hasher.finalize().into())
-}
-fn digest_match_execution_type(
-    hasher: &mut Sha256,
-    execution_type: Option<&novarocks_type_contract::FunctionValueType>,
-) -> Result<(), ConnectorError> {
-    match execution_type {
-        Some(value) => {
-            hasher.update(b"complete-execution-binding\0");
-            match_bounds::digest_execution_type(hasher, value)
-        }
-        None => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "row-mutation match field lacks its complete execution declaration",
-        )),
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The digest covers each sealed preparation field in canonical order before the record is constructed"
-)]
-fn preparation_digest(
-    owner: &ConnectorProviderBindingKey,
-    operation: ConnectorWriteOperationId,
-    table: &ConnectorTableHandle,
-    match_source: &ConnectorTableHandle,
-    match_source_schema_digest: [u8; 32],
-    target_ref: &ConnectorWriteTargetRef,
-    intent: &ConnectorRowMutationIntent,
-    base: &ConnectorWriteBaseVersion,
-    contract: &ConnectorMutationMatchContract,
-    strategy: ConnectorRowMutationStrategy,
-    base_version_ordinal: Option<i64>,
-    payload: &Bytes,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-row-mutation-preparation.v3\0");
-    digest_owner(&mut hasher, owner);
-    hasher.update(operation.to_bytes());
-    digest_bytes(&mut hasher, table.payload());
-    digest_bytes(&mut hasher, match_source.payload());
-    hasher.update(match_source_schema_digest);
-    digest_bytes(&mut hasher, target_ref.as_str().as_bytes());
-    match intent {
-        ConnectorRowMutationIntent::Delete => hasher.update([1]),
-        ConnectorRowMutationIntent::Update => hasher.update([2]),
-        ConnectorRowMutationIntent::Merge { effects } => {
-            hasher.update([3]);
-            for effect in effects {
-                hasher.update([effect_tag(*effect)]);
-            }
-        }
-    };
-    hasher.update(base.digest());
-    hasher.update(contract.digest());
-    hasher.update([strategy_tag(strategy)]);
-    match base_version_ordinal {
-        None => hasher.update([0]),
-        Some(value) => {
-            hasher.update([1]);
-            hasher.update(value.to_be_bytes());
-        }
-    }
-    digest_bytes(&mut hasher, payload);
-    hasher.finalize().into()
-}
-
-// The match-source signature is still consumed by MOR preparation. Keep its
-// original schema shape and retained-metadata boundaries in the hash author;
-// RowConverter construction, synthetic NULL and encoded-row costs are retired.
-struct CanonicalSchemaHash {
+// The encoding describes only source content. The borrowed structural walk
+// first checks the shared logical depth and Arrow encoding syntax, bounding the
+// recursive encoder without a second source-specific resource quota.
+struct CanonicalSchemaHash<'a, F> {
     hasher: Sha256,
-    retained_bytes: usize,
-    types: usize,
+    check_active: &'a mut F,
 }
 
-impl CanonicalSchemaHash {
-    fn exhausted() -> ConnectorError {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "row-mutation canonical schema exceeds its bounded source structure",
-        )
-    }
-
-    fn charge(&mut self, bytes: usize) -> Result<(), ConnectorError> {
-        self.retained_bytes = self
-            .retained_bytes
-            .checked_add(bytes)
-            .ok_or_else(Self::exhausted)?;
-        if self.retained_bytes > match_bounds::MAX_CANONICAL_SCHEMA_BYTES {
-            return Err(Self::exhausted());
-        }
-        Ok(())
-    }
-
-    fn slots<T>(&mut self, count: usize) -> Result<(), ConnectorError> {
-        self.charge(
-            std::mem::size_of::<T>()
-                .checked_mul(count)
-                .ok_or_else(Self::exhausted)?,
-        )
-    }
-
-    fn metadata(
-        &mut self,
-        metadata: &arrow::datatypes::Metadata,
-        emit: bool,
-    ) -> Result<(), ConnectorError> {
-        self.charge(
-            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
-                metadata.len(),
-            )
-            .map_err(|_| Self::exhausted())?,
-        )?;
-        if emit {
-            self.hasher.update((metadata.len() as u64).to_be_bytes());
-        }
-        // Arrow 60 Metadata already iterates in canonical key order.
+impl<F: FnMut() -> Result<(), ConnectorError>> CanonicalSchemaHash<'_, F> {
+    fn metadata(&mut self, metadata: &arrow::datatypes::Metadata) -> Result<(), ConnectorError> {
+        self.hasher.update((metadata.len() as u64).to_be_bytes());
+        // Arrow Metadata iterates in canonical key order.
         for (key, value) in metadata {
-            self.charge(key.capacity())?;
-            self.charge(value.capacity())?;
-            if emit {
-                digest_bytes(&mut self.hasher, key.as_bytes());
-                digest_bytes(&mut self.hasher, value.as_bytes());
-            }
+            (self.check_active)()?;
+            digest_bytes(&mut self.hasher, key.as_bytes());
+            digest_bytes(&mut self.hasher, value.as_bytes());
         }
         Ok(())
     }
 
-    fn field(&mut self, field: &Field, depth: usize, emit: bool) -> Result<(), ConnectorError> {
-        self.charge(std::mem::size_of::<Field>() + 2 * std::mem::size_of::<usize>())?;
-        self.charge(field.name().capacity())?;
-        if emit {
-            digest_bytes(&mut self.hasher, field.name().as_bytes());
-            self.hasher.update([u8::from(field.is_nullable())]);
-        }
-        self.data_type(field.data_type(), depth, emit)?;
-        self.metadata(field.metadata(), emit)
+    fn root_field(&mut self, field: &Field) -> Result<(), ConnectorError> {
+        novarocks_type_contract::validate_arrow_layout_structure_observed(
+            field.data_type(),
+            |_| (self.check_active)().map_err(MutationFieldValidationFailure::Caller),
+        )
+        .map_err(mutation_field_error)?;
+        self.field(field)
     }
 
-    fn data_type(
-        &mut self,
-        data_type: &DataType,
-        depth: usize,
-        emit: bool,
-    ) -> Result<(), ConnectorError> {
-        // These are the existing source-schema limits, independent of any
-        // RowConverter workspace or actual row population.
-        if depth >= 64 || self.types >= 4096 {
-            return Err(Self::exhausted());
-        }
-        self.types += 1;
-        self.charge(std::mem::size_of::<DataType>())?;
+    fn field(&mut self, field: &Field) -> Result<(), ConnectorError> {
+        (self.check_active)()?;
+        digest_bytes(&mut self.hasher, field.name().as_bytes());
+        self.hasher.update([u8::from(field.is_nullable())]);
+        self.data_type(field.data_type())?;
+        self.metadata(field.metadata())
+    }
+
+    fn data_type(&mut self, data_type: &DataType) -> Result<(), ConnectorError> {
+        (self.check_active)()?;
         match data_type {
             DataType::FixedSizeBinary(width) | DataType::FixedSizeList(_, width) if *width < 0 => {
-                return Err(Self::exhausted());
+                return Err(invalid_match(
+                    "row-mutation canonical schema cannot contain a negative fixed width",
+                ));
             }
             DataType::Union(fields, _) if fields.is_empty() => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
+                return Err(invalid_match(
                     "row-mutation canonical schema cannot contain an empty Union",
                 ));
             }
@@ -1123,110 +990,81 @@ impl CanonicalSchemaHash {
             DataType::LargeListView(_) => 31,
             DataType::Struct(_) => 32,
             DataType::Union(_, _) => 33,
-            DataType::Dictionary(key, value) => {
-                // Key representation is not part of this logical signature,
-                // but its source structure still has to satisfy the old bounds.
-                self.data_type(key, depth + 1, false)?;
-                return self.data_type(value, depth + 1, emit);
+            DataType::Dictionary(_, value) => {
+                // The validated dictionary key is a physical representation choice.
+                return self.data_type(value);
             }
             DataType::Decimal32(_, _) => 35,
             DataType::Decimal64(_, _) => 36,
             DataType::Decimal128(_, _) => 37,
             DataType::Decimal256(_, _) => 38,
-            DataType::Map(_, _) => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "row-mutation canonical schema Map values are not supported",
-                ));
-            }
+            DataType::Map(_, _) => 39,
             DataType::RunEndEncoded(_, _) => 40,
         };
-        if emit {
-            self.hasher.update([tag]);
-        }
+        self.hasher.update([tag]);
         match data_type {
             DataType::Timestamp(unit, timezone) => {
-                if emit {
-                    hash_time_unit(&mut self.hasher, *unit);
-                }
-                match timezone {
-                    Some(timezone) => {
-                        self.charge(timezone.len())?;
-                        self.charge(2 * std::mem::size_of::<usize>())?;
-                        if emit {
-                            self.hasher.update([1]);
-                            digest_bytes(&mut self.hasher, timezone.as_bytes());
-                        }
-                    }
-                    None if emit => self.hasher.update([0]),
-                    None => {}
+                hash_time_unit(&mut self.hasher, *unit);
+                if let Some(timezone) = timezone {
+                    self.hasher.update([1]);
+                    digest_bytes(&mut self.hasher, timezone.as_bytes());
+                } else {
+                    self.hasher.update([0]);
                 }
             }
             DataType::Time32(unit) | DataType::Time64(unit) | DataType::Duration(unit) => {
-                if emit {
-                    hash_time_unit(&mut self.hasher, *unit);
-                }
+                hash_time_unit(&mut self.hasher, *unit);
             }
-            DataType::Interval(unit) if emit => self.hasher.update([match unit {
+            DataType::Interval(unit) => self.hasher.update([match unit {
                 IntervalUnit::YearMonth => 1,
                 IntervalUnit::DayTime => 2,
                 IntervalUnit::MonthDayNano => 3,
             }]),
-            DataType::FixedSizeBinary(size) if emit => self.hasher.update(size.to_be_bytes()),
+            DataType::FixedSizeBinary(size) => self.hasher.update(size.to_be_bytes()),
             DataType::List(child)
             | DataType::ListView(child)
             | DataType::LargeList(child)
-            | DataType::LargeListView(child) => self.field(child, depth + 1, emit)?,
+            | DataType::LargeListView(child) => self.field(child)?,
             DataType::FixedSizeList(child, size) => {
-                if emit {
-                    self.hasher.update(size.to_be_bytes());
-                }
-                self.field(child, depth + 1, emit)?;
+                self.hasher.update(size.to_be_bytes());
+                self.field(child)?;
             }
             DataType::Struct(fields) => {
-                self.charge(2 * std::mem::size_of::<usize>())?;
-                self.slots::<std::sync::Arc<Field>>(fields.len())?;
-                if emit {
-                    self.hasher.update((fields.len() as u64).to_be_bytes());
-                }
+                self.hasher.update((fields.len() as u64).to_be_bytes());
                 for child in fields {
-                    self.field(child, depth + 1, emit)?;
+                    self.field(child)?;
                 }
             }
             DataType::Union(fields, mode) => {
-                self.charge(2 * std::mem::size_of::<usize>())?;
-                self.slots::<(i8, std::sync::Arc<Field>)>(fields.len())?;
-                if emit {
-                    self.hasher.update([match mode {
-                        UnionMode::Sparse => 1,
-                        UnionMode::Dense => 2,
-                    }]);
-                }
+                self.hasher.update([match mode {
+                    UnionMode::Sparse => 1,
+                    UnionMode::Dense => 2,
+                }]);
+                self.hasher.update((fields.len() as u64).to_be_bytes());
                 for (type_id, child) in fields.iter() {
                     if type_id < 0 {
-                        return Err(ConnectorError::new(
-                            ConnectorErrorKind::InvalidRequest,
+                        return Err(invalid_match(
                             "row-mutation canonical schema cannot contain a negative Union type id",
                         ));
                     }
-                    if emit {
-                        self.hasher.update(type_id.to_be_bytes());
-                    }
-                    self.field(child, depth + 1, emit)?;
+                    self.hasher.update(type_id.to_be_bytes());
+                    self.field(child)?;
                 }
             }
             DataType::Decimal32(precision, scale)
             | DataType::Decimal64(precision, scale)
             | DataType::Decimal128(precision, scale)
-            | DataType::Decimal256(precision, scale)
-                if emit =>
-            {
+            | DataType::Decimal256(precision, scale) => {
                 self.hasher.update([*precision]);
                 self.hasher.update(scale.to_be_bytes());
             }
+            DataType::Map(entries, sorted) => {
+                self.hasher.update([u8::from(*sorted)]);
+                self.field(entries)?;
+            }
             DataType::RunEndEncoded(run_ends, values) => {
-                self.field(run_ends, depth + 1, emit)?;
-                self.field(values, depth + 1, emit)?;
+                self.field(run_ends)?;
+                self.field(values)?;
             }
             _ => {}
         }
@@ -1234,40 +1072,51 @@ impl CanonicalSchemaHash {
     }
 }
 
+#[cfg(test)]
 fn canonical_schema_digest(schema: &Schema) -> Result<[u8; 32], ConnectorError> {
-    if schema.fields().len() > 4096 {
-        return Err(CanonicalSchemaHash::exhausted());
-    }
+    canonical_schema_digest_observed(schema, &mut || Ok(()))
+}
+
+fn canonical_schema_digest_observed(
+    schema: &Schema,
+    check_active: &mut impl FnMut() -> Result<(), ConnectorError>,
+) -> Result<[u8; 32], ConnectorError> {
+    check_active()?;
     let mut state = CanonicalSchemaHash {
         hasher: Sha256::new(),
-        retained_bytes: 0,
-        types: 0,
+        check_active,
     };
-    state.charge(std::mem::size_of::<Schema>() + 4 * std::mem::size_of::<usize>())?;
-    state.slots::<std::sync::Arc<Field>>(schema.fields().len())?;
     state
         .hasher
         .update(b"novarocks.connector-row-mutation-arrow-schema.v1\0");
-    state.metadata(schema.metadata(), true)?;
+    state.metadata(schema.metadata())?;
     state
         .hasher
         .update((schema.fields().len() as u64).to_be_bytes());
     for field in schema.fields() {
-        state.field(field, 0, true)?;
+        state.root_field(field)?;
     }
+    (state.check_active)()?;
     Ok(state.hasher.finalize().into())
 }
 
 fn temporal_match_source_digest(field: &Field) -> Result<[u8; 32], ConnectorError> {
+    temporal_match_source_digest_observed(field, &mut || Ok(()))
+}
+
+fn temporal_match_source_digest_observed(
+    field: &Field,
+    check_active: &mut impl FnMut() -> Result<(), ConnectorError>,
+) -> Result<[u8; 32], ConnectorError> {
     let mut state = CanonicalSchemaHash {
         hasher: Sha256::new(),
-        retained_bytes: 0,
-        types: 0,
+        check_active,
     };
     state
         .hasher
         .update(b"novarocks.connector-row-mutation-temporal-source-field.v1\0");
-    state.field(field, 0, true)?;
+    state.root_field(field)?;
+    (state.check_active)()?;
     Ok(state.hasher.finalize().into())
 }
 
@@ -1278,22 +1127,6 @@ fn hash_time_unit(hasher: &mut Sha256, unit: TimeUnit) {
         TimeUnit::Microsecond => 3,
         TimeUnit::Nanosecond => 4,
     }]);
-}
-
-const fn effect_tag(effect: ConnectorRowMutationEffect) -> u8 {
-    match effect {
-        ConnectorRowMutationEffect::Delete => 1,
-        ConnectorRowMutationEffect::Replace => 2,
-        ConnectorRowMutationEffect::Insert => 3,
-    }
-}
-const fn strategy_tag(strategy: ConnectorRowMutationStrategy) -> u8 {
-    match strategy {
-        ConnectorRowMutationStrategy::PositionDelete => 1,
-        ConnectorRowMutationStrategy::DeletionVector => 2,
-        ConnectorRowMutationStrategy::MergeOnRead => 3,
-        ConnectorRowMutationStrategy::EqualityDelete => 5,
-    }
 }
 
 #[cfg(test)]
@@ -1497,7 +1330,13 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                projected_before_storage(&before, valid.match_contract().after_fields()).is_some(),
+                projected_before_storage(
+                    &before,
+                    &valid.match_contract().after_fields()[0],
+                    || Ok(())
+                )
+                .unwrap()
+                .is_some(),
                 domain == novarocks_type_contract::ValueLogicalType::Physical,
             );
         }
@@ -1542,141 +1381,125 @@ mod tests {
     }
 
     #[test]
-    fn base_version_ordinal_round_trips_and_is_digest_bound() {
+    fn preparation_identity_is_shared_by_clones_and_unique_per_successful_issuance() {
         let absent = preparation_with_base_version_ordinal(None);
         assert_eq!(absent.base_version_ordinal(), None);
-        absent.validate().expect("absent ordinal validates");
-
         let present = preparation_with_base_version_ordinal(Some(41));
+        let independently_issued = preparation_with_base_version_ordinal(Some(41));
         assert_eq!(present.base_version_ordinal(), Some(41));
-        present.validate().expect("present ordinal validates");
-        assert_ne!(
-            present.digest(),
-            preparation_with_base_version_ordinal(Some(42)).digest()
-        );
-        assert_ne!(present.digest(), absent.digest());
-
-        let mut tampered = present;
-        tampered.base_version_ordinal = Some(42);
+        assert_eq!(present.operation_id(), independently_issued.operation_id());
         assert_eq!(
-            tampered.validate().unwrap_err().kind(),
-            ConnectorErrorKind::CorruptData
+            present.preparation_identity(),
+            present.clone().preparation_identity()
+        );
+        assert_ne!(
+            present.preparation_identity(),
+            independently_issued.preparation_identity()
+        );
+        assert_eq!(
+            present.match_source_schema_digest(),
+            independently_issued.match_source_schema_digest()
         );
     }
 
     #[test]
-    fn canonical_schema_keeps_its_source_shape_boundaries() {
-        fn nested(depth: usize) -> DataType {
-            let mut ty = DataType::Int64;
-            for _ in 0..depth {
-                ty = DataType::List(Arc::new(Field::new("item", ty, true)));
-            }
-            ty
-        }
+    fn canonical_schema_keeps_logical_depth_and_normalizes_dictionary_keys() {
+        let depth = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
         let schema = |ty| Schema::new(vec![Field::new("value", ty, true)]);
-        assert!(canonical_schema_digest(&schema(nested(63))).is_ok());
-        assert_eq!(
-            canonical_schema_digest(&schema(nested(64)))
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        // The key does not enter the logical digest, but its physical source
-        // still has to satisfy the same structure boundary before hashing.
-        assert_eq!(
-            canonical_schema_digest(&schema(DataType::Dictionary(
-                Box::new(nested(63)),
-                Box::new(DataType::Int64),
-            )))
-            .unwrap_err()
-            .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            canonical_schema_digest(&schema(DataType::Dictionary(
-                Box::new(DataType::Int8),
-                Box::new(DataType::Int64),
-            )))
-            .unwrap(),
-            canonical_schema_digest(&schema(DataType::Dictionary(
-                Box::new(DataType::Int16),
-                Box::new(DataType::Int64),
-            )))
-            .unwrap()
-        );
-        // A schema signature does not construct width-sized synthetic NULL
-        // arrays; that RowConverter-only workspace has no remaining consumer.
-        assert!(
-            canonical_schema_digest(&schema(DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Int64, true)),
-                i32::MAX,
-            )))
-            .is_ok()
-        );
-        let field = Arc::new(Field::new("value", DataType::Int64, true));
-        assert!(canonical_schema_digest(&Schema::new(vec![field.clone(); 4096])).is_ok());
-        assert_eq!(
-            canonical_schema_digest(&Schema::new(vec![field.clone(); 4097]))
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            canonical_schema_digest(&schema(DataType::Struct(vec![field; 4096].into())))
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        for ty in [
-            DataType::FixedSizeBinary(-1),
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, true)), -1),
-        ] {
-            assert_eq!(
-                canonical_schema_digest(&schema(ty)).unwrap_err().kind(),
-                ConnectorErrorKind::ResourceExhausted
-            );
-        }
-        for ty in [
-            DataType::Union(arrow::datatypes::UnionFields::empty(), UnionMode::Sparse),
+        let chain =
+            |wrap: fn(DataType) -> DataType| (1..depth).fold(DataType::Int64, |ty, _| wrap(ty));
+        let list = |ty| DataType::List(Arc::new(Field::new("item", ty, true)));
+        let map = |ty| {
             DataType::Map(
                 Arc::new(Field::new(
                     "entries",
                     DataType::Struct(
                         vec![
                             Field::new("key", DataType::Int64, false),
-                            Field::new("value", DataType::Utf8, true),
+                            Field::new("value", ty, true),
                         ]
                         .into(),
                     ),
                     false,
                 )),
                 false,
-            ),
+            )
+        };
+        for wrap in [list as fn(DataType) -> DataType, map] {
+            let within = chain(wrap);
+            let expected = canonical_schema_digest(&schema(within.clone())).unwrap();
+            for key in [DataType::Int8, DataType::Int16] {
+                let encoded = DataType::Dictionary(Box::new(key), Box::new(within.clone()));
+                assert_eq!(canonical_schema_digest(&schema(encoded)).unwrap(), expected);
+            }
+            let error = canonical_schema_digest(&schema(wrap(within))).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(error.message().contains(&depth.to_string()));
+        }
+        for invalid in [
+            DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Int64)),
+            DataType::FixedSizeBinary(-1),
+            DataType::Union(arrow::datatypes::UnionFields::empty(), UnionMode::Sparse),
         ] {
             assert_eq!(
-                canonical_schema_digest(&schema(ty)).unwrap_err().kind(),
+                canonical_schema_digest(&schema(invalid))
+                    .unwrap_err()
+                    .kind(),
                 ConnectorErrorKind::InvalidRequest
             );
         }
+        assert!(
+            canonical_schema_digest(&schema(DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int64, true)),
+                i32::MAX
+            )))
+            .is_ok()
+        );
     }
 
     #[test]
-    fn canonical_schema_counts_shared_metadata_capacity_at_each_source_occurrence() {
-        // A small allocation with spare capacity exercises the inherited
-        // source-byte bound without materializing a 256-MiB payload.
-        let mut value = String::with_capacity(4 * 1024 * 1024);
-        value.push('x');
-        let field = Arc::new(
-            Field::new("value", DataType::Int64, true)
-                .with_metadata(HashMap::from([("capacity".into(), value)])),
+    fn canonical_schema_uses_actual_wide_occurrences_and_source_metadata() {
+        let field = Arc::new(Field::new("value", DataType::Int64, true));
+        let wide = Schema::new(vec![field.clone(); 16_385]);
+        let digest = canonical_schema_digest(&wide).unwrap();
+        let mut fields = wide.fields().to_vec();
+        fields[16_384] = Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_metadata([("k".to_owned(), "v".to_owned())]),
         );
-        assert!(field.metadata()["capacity"].capacity() >= 4 * 1024 * 1024);
-        assert!(canonical_schema_digest(&Schema::new(vec![field.clone()])).is_ok());
-        assert_eq!(
-            canonical_schema_digest(&Schema::new(vec![field; 64]))
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
+        assert_ne!(
+            canonical_schema_digest(&Schema::new(fields)).unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn source_schema_and_temporal_signatures_preserve_distinct_attributes() {
+        let base = Field::new(
+            "value",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )
+        .with_metadata([("PARQUET:field_id".to_string(), "17".to_string())]);
+        let expected = temporal_match_source_digest(&base).unwrap();
+        let mut changed = base
+            .clone()
+            .with_metadata([("PARQUET:field_id".to_string(), "18".to_string())]);
+        assert_ne!(temporal_match_source_digest(&changed).unwrap(), expected);
+        changed = base.clone().with_data_type(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        assert_ne!(temporal_match_source_digest(&changed).unwrap(), expected);
+        assert_ne!(
+            temporal_match_source_digest(&base.clone().with_nullable(false)).unwrap(),
+            expected
+        );
+        assert_ne!(
+            canonical_schema_digest(&Schema::new(vec![base])).unwrap(),
+            expected
         );
     }
 
@@ -1848,7 +1671,7 @@ mod typed_execution_fields_tests {
 }
 
 #[cfg(test)]
-mod typed_match_digest_tests {
+mod typed_match_contract_tests {
     use super::typed_execution_fields_tests::value;
     use super::*;
     use novarocks_type_contract::{FunctionValueType, ValueKind, ValueLogicalType};
@@ -1935,11 +1758,14 @@ mod typed_match_digest_tests {
     #[test]
     fn match_identity_covers_same_carrier_domain_in_each_declared_role() {
         let baseline = contract(binary(), binary(), binary(), HashMap::new());
-        for changed in [
+        for (role, changed) in [
             contract(json(), binary(), binary(), HashMap::new()),
             contract(binary(), json(), binary(), HashMap::new()),
             contract(binary(), binary(), json(), HashMap::new()),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             // Arrow names, NULL promises, attrs and carriers are identical.
             assert_eq!(
                 baseline.identity_fields()[0].field(),
@@ -1953,8 +1779,22 @@ mod typed_match_digest_tests {
                 baseline.after_fields()[0].field(),
                 changed.after_fields()[0].field()
             );
-            assert_ne!(baseline.digest(), changed.digest());
-            changed.validate().unwrap();
+            let declarations = [
+                changed.identity_fields()[0].execution_type(),
+                changed.before_fields()[0].execution_type(),
+                changed.after_fields()[0].execution_type(),
+            ];
+            assert_eq!(
+                declarations[role].unwrap().logical_type(),
+                ValueLogicalType::Json
+            );
+            assert_eq!(
+                declarations
+                    .iter()
+                    .filter(|value| value.unwrap().logical_type() == ValueLogicalType::Json)
+                    .count(),
+                1
+            );
         }
     }
     #[test]
@@ -1976,7 +1816,10 @@ mod typed_match_digest_tests {
             second.after_fields()[0].field()
         );
         assert!(first.after_fields()[0].field().metadata().is_empty());
-        assert_ne!(first.digest(), second.digest());
+        assert_ne!(
+            first.after_fields()[0].execution_type(),
+            second.after_fields()[0].execution_type()
+        );
     }
     #[test]
     fn match_identity_reads_complete_nested_binding_and_is_owner_independent() {
@@ -2006,8 +1849,14 @@ mod typed_match_digest_tests {
             first.after_fields()[0].field(),
             binary_child.after_fields()[0].field()
         );
-        assert_eq!(first.digest(), independently_equal.digest());
-        assert_ne!(first.digest(), binary_child.digest());
+        assert_eq!(
+            first.after_fields()[0].execution_type(),
+            independently_equal.after_fields()[0].execution_type()
+        );
+        assert_ne!(
+            first.after_fields()[0].execution_type(),
+            binary_child.after_fields()[0].execution_type()
+        );
     }
     #[test]
     fn match_source_attributes_and_schema_identity_stay_separate() {
@@ -2027,7 +1876,12 @@ mod typed_match_digest_tests {
             first.after_fields()[0].execution_type(),
             second.after_fields()[0].execution_type()
         );
-        assert_ne!(first.digest(), second.digest());
+        assert_ne!(
+            canonical_schema_digest(&Schema::new(vec![first.after_fields()[0].field().clone()]))
+                .unwrap(),
+            canonical_schema_digest(&Schema::new(vec![second.after_fields()[0].field().clone()]))
+                .unwrap(),
+        );
         let schema = Schema::new(vec![Field::new("after", DataType::LargeBinary, false)]);
         assert_eq!(
             canonical_schema_digest(&schema).unwrap(),
@@ -2044,11 +1898,16 @@ mod typed_match_digest_tests {
     fn match_identity_refuses_missing_declaration_in_tests_and_production() {
         let mut typed = contract(text(), text(), json(), HashMap::new());
         typed.identity_fields[0].execution_type = None;
-        let failure = typed.validate().unwrap_err();
+        let failure = ConnectorMutationMatchContract::try_new(
+            typed.owner,
+            typed.table,
+            typed.base_version,
+            typed.identity_fields,
+            typed.before_fields,
+            typed.after_fields,
+            typed.effect_field,
+        )
+        .unwrap_err();
         assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(
-            failure.message(),
-            "row-mutation match field lacks its complete execution declaration"
-        );
     }
 }

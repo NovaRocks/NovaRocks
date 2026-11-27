@@ -21,13 +21,18 @@
 //! lifetime. These wrappers never retain a Query or provider service and never
 //! infer field IDs, defaults or logical types from generic attributes.
 
-use crate::{ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_RECIPE_COLUMNS};
+use crate::{ConnectorError, ConnectorErrorKind};
+
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
     FunctionValueType, MAX_VALUE_TYPE_DEPTH, ValueTypeStorageLifetime, ValueTypeVisit,
-    validate_arrow_layout_structure_with_scratch_observed,
+    validate_arrow_layout_structure_observed,
 };
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
+
+/// One top-level column ordinal plus up to two positions per logical edge:
+/// a Map child is addressed through the synthetic Arrow entries Field.
+pub const MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH: usize = 1 + 2 * (MAX_VALUE_TYPE_DEPTH - 1);
 
 fn invalid(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
@@ -186,7 +191,7 @@ impl ConnectorSourceFieldFacts {
         mut work: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Self, E> {
         work(1)?;
-        if path.is_empty() || path.len() > MAX_VALUE_TYPE_DEPTH + 1 {
+        if path.is_empty() || path.len() > MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH {
             return Err(E::from(invalid(
                 "source field path has an invalid occurrence depth",
             )));
@@ -558,14 +563,11 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
     work: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<(), E> {
     work(1)?;
-    if !schema.metadata().is_empty() || schema.fields().len() > MAX_CONNECTOR_RECIPE_COLUMNS {
+    if !schema.metadata().is_empty() {
         return Err(E::from(invalid(
-            "source/execution shape has attributes or exceeds the frozen column count",
+            "source/execution shape retains generic attributes",
         )));
     }
-    // Admit the exact fixed stack initialization before visiting any source.
-    work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound())?;
-    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     for field in schema.fields() {
         work(1)?;
         if !field.metadata().is_empty() {
@@ -573,21 +575,17 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
                 "source/execution shape field retains generic attributes",
             )));
         }
-        validate_arrow_layout_structure_with_scratch_observed::<ShapeFailure<E>>(
-            field.data_type(),
-            &mut scratch,
-            |visit| {
-                work(1).map_err(ShapeFailure::Caller)?;
-                if let ValueTypeVisit::Field(field) = visit
-                    && !field.metadata().is_empty()
-                {
-                    return Err(ShapeFailure::Source(invalid(
-                        "source/execution nested shape field retains generic attributes",
-                    )));
-                }
-                Ok(())
-            },
-        )
+        validate_arrow_layout_structure_observed::<ShapeFailure<E>>(field.data_type(), |visit| {
+            work(1).map_err(ShapeFailure::Caller)?;
+            if let ValueTypeVisit::Field(field) = visit
+                && !field.metadata().is_empty()
+            {
+                return Err(ShapeFailure::Source(invalid(
+                    "source/execution nested shape field retains generic attributes",
+                )));
+            }
+            Ok(())
+        })
         .map_err(|cause| match cause {
             ShapeFailure::Caller(cause) => cause,
             ShapeFailure::Source(cause) => E::from(cause),
@@ -611,8 +609,7 @@ enum ShapeFailure<E> {
 impl<E> From<novarocks_type_contract::ValueTypeError> for ShapeFailure<E> {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
         let kind = match error {
-            novarocks_type_contract::ValueTypeError::TooDeep
-            | novarocks_type_contract::ValueTypeError::TooManyNodes => {
+            novarocks_type_contract::ValueTypeError::TooManyNodes => {
                 ConnectorErrorKind::ResourceExhausted
             }
             _ => ConnectorErrorKind::InvalidRequest,

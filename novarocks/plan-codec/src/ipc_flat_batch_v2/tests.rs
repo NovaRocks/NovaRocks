@@ -449,34 +449,16 @@ fn actual_float_interval_decimal_payloads_and_empty_timezone_keep_source_identit
             .to_be_bytes(),
         [0x01; 32]
     );
-    let expected = Field::new(
-        "source",
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from(""))),
-        true,
+    let expected = Arc::<str>::from("");
+    let (field, metadata, body) = encoded(Arc::new(
+        TimestampNanosecondArray::from(vec![Some(-1), None]).with_timezone(expected.clone()),
+    ));
+    preflight(&metadata, &body, &field, &Control::good()).unwrap();
+    let batch = read(&metadata, &body, &field);
+    assert_eq!(
+        batch.column(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some(expected))
     );
-    let schema_limits = crate::ipc_schema_v2::IpcSchemaProjectionLimits {
-        max_field_occurrences: 4,
-        max_type_occurrences: 4,
-        max_string_bytes: 128,
-        max_flatbuffer_bytes: 4096,
-    };
-    let schema = crate::ipc_schema_v2::encode_single_field_schema(
-        &expected,
-        schema_limits,
-        &Control::good(),
-    )
-    .unwrap();
-    crate::ipc_schema_v2::verify_single_field_schema_message(
-        &schema,
-        &expected,
-        schema_limits,
-        &verifier(),
-        &Control::good(),
-    )
-    .unwrap();
-    let message = ipc::root_as_message(&schema).unwrap();
-    let decoded = ipc::convert::try_fb_to_schema(message.header_as_schema().unwrap()).unwrap();
-    assert_eq!(decoded.field(0).data_type(), expected.data_type());
 }
 
 #[test]

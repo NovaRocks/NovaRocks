@@ -1033,42 +1033,24 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
 }
 
 #[test]
-fn call_preparation_bounds_typed_names_and_timezones_at_checked_author() {
-    use novarocks_type_contract::{
-        MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueLogicalType,
-    };
-    for (boundary, oversized) in [
-        (
-            DataType::Struct(
-                vec![arrow_schema::Field::new(
-                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES),
-                    DataType::Int64,
-                    false,
-                )]
-                .into(),
-            ),
-            DataType::Struct(
-                vec![arrow_schema::Field::new(
-                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES + 1),
-                    DataType::Int64,
-                    false,
-                )]
-                .into(),
-            ),
+fn call_preparation_accepts_names_and_timezones_beyond_former_limits() {
+    use novarocks_type_contract::ValueLogicalType;
+    for carrier in [
+        DataType::Struct(
+            vec![arrow_schema::Field::new(
+                "n".repeat(1024 + 1),
+                DataType::Int64,
+                false,
+            )]
+            .into(),
         ),
-        (
-            DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES).into()),
-            ),
-            DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1).into()),
-            ),
+        DataType::Timestamp(
+            arrow_schema::TimeUnit::Nanosecond,
+            Some("z".repeat(1024 + 1).into()),
         ),
     ] {
         let state =
-            FunctionValueType::try_with_logical_type(boundary, false, ValueLogicalType::Physical)
+            FunctionValueType::try_with_logical_type(carrier, false, ValueLogicalType::Physical)
                 .unwrap();
         let fixture = Fixture::new(&[], &[], state);
         let input = fixture.input();
@@ -1080,9 +1062,5 @@ fn call_preparation_bounds_typed_names_and_timezones_at_checked_author() {
             &CompileControl(None),
         )
         .unwrap();
-        assert!(
-            FunctionValueType::try_with_logical_type(oversized, false, ValueLogicalType::Physical)
-                .is_err()
-        );
     }
 }

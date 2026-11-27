@@ -23,6 +23,7 @@ use arrow_schema::{
     DataType, Field, TimeUnit,
 };
 use novarocks_connector_contract::ConnectorEncodedPayload;
+use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
 use novarocks_type_contract::{
     ArrowTypeProfile, CompileCheckpoints, CompileControlError, ValueTypeError, ValueTypeVisit,
     validate_arrow_layout_structure_with_profile_observed,
@@ -47,21 +48,6 @@ pub const MAX_PLAN_DYNAMIC_ITEMS: usize = 16 * 1024 * 1024;
 pub const MAX_PLAN_DYNAMIC_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_ITEMS: usize = 32 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_BYTES: usize = 512 * 1024 * 1024;
-pub const MAX_DATA_TYPE_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
-pub const MAX_DATA_TYPE_NODES: usize = novarocks_type_contract::MAX_VALUE_TYPE_NODES;
-pub const MAX_DATA_TYPE_FIELD_NAME_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_ENTRIES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_ENTRIES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_KEY_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_BYTES;
-pub const MAX_TIMESTAMP_TIMEZONE_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES;
-pub const MAX_FIXED_SIZE_LENGTH: i32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 struct ResourceUsage {
@@ -2131,7 +2117,7 @@ fn validate_data_type_with_profile_core<P: TypeValidationPolicy>(
             ValidationErrorCategory::UnsupportedCapability,
             path,
             format_args!(
-                "Arrow data type exceeds the nesting depth limit of {MAX_DATA_TYPE_DEPTH}"
+                "Arrow data type exceeds the nesting depth limit of {MAX_VALUE_TYPE_DEPTH}"
             ),
             type_message_bound(
                 "Arrow data type exceeds the nesting depth limit of ".len() + TYPE_USIZE_WIDTH,

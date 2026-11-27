@@ -576,7 +576,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{MAX_VALUE_TYPE_NODES, ValueLogicalType, ValueTypeStorageHold};
+    use crate::{ValueLogicalType, ValueTypeStorageHold};
 
     fn pure() -> ValueTypeStorageLifetime {
         ValueTypeStorageLifetime::pure()
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(field.value_type().expanded_nodes(), 2);
         // All individual trees are valid. Their aggregate is not limited by
         // the per-value limit; deployable owners have different schema profiles.
-        let field_count = MAX_VALUE_TYPE_NODES + 1;
+        let field_count = 4096 + 1;
         let fields = vec![field; field_count];
         let schema = ValueSchema::try_new(fields.clone(), pure()).unwrap();
         assert_eq!(schema.expanded_nodes(), field_count * 2);

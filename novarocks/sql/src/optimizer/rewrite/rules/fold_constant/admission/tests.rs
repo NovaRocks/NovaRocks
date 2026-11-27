@@ -194,10 +194,8 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
 
 #[test]
 fn source_annotations_do_not_mint_a_type_resource_refusal() {
-    let field = Field::new("item", DataType::Utf8, true).with_metadata([(
-        "provider.fact",
-        "x".repeat(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
-    )]);
+    let field = Field::new("item", DataType::Utf8, true)
+        .with_metadata([("provider.fact", "x".repeat((16 * 1024) + 1))]);
     let annotated = DataType::List(Arc::new(field));
     let target = FunctionValueType::new(annotated, true);
     let plain = FunctionValueType::new(

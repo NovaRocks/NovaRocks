@@ -41,7 +41,9 @@ pub use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorReadRelationPayload,
 };
 
-pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
+/// A private type path carries its envelope root in addition to its logical nodes.
+pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize =
+    novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1;
 pub const MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES: usize = 512;
 

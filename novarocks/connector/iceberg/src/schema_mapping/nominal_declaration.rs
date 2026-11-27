@@ -628,8 +628,9 @@ pub(crate) fn append_definition(
 ) -> Result<(), ConnectorError> {
     use novarocks_spi::connector::ConnectorDataType as D;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(corrupt(
-            "Iceberg nominal definition nesting exceeds the hard limit",
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
         ));
     }
     let domain = match definition {

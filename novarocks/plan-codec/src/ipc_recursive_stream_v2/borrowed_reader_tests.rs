@@ -30,7 +30,7 @@ fn table(
     let limits = TypeProjectionLimits {
         max_definitions: 4096,
         max_expanded_nodes: 16384,
-        max_string_bytes: schema_limits().max_string_bytes,
+        max_string_bytes: 1 << 20,
     };
     let wire = encode_type_table(&[(u32::MAX, ty.clone())], limits, &Control::default()).unwrap();
     let values = decode_type_table(&wire, limits, &Control::default()).unwrap();

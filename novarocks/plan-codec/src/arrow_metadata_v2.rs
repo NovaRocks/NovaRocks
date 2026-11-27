@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The original Arrow metadata canonical sorter and spelling-copy author.
-//! Caller admission covers source iteration, scratch, output, requests and
-//! opaque library work. Field-specific bounds remain with the Field owner.
+//! Exact sorted Arrow metadata projection with cooperative string copies.
 
 use crate::{allocation_exit_v2::reserve_exit, physical_type_v2::TypeCodecError};
 use novarocks_proto_models::plan;
@@ -78,41 +76,14 @@ pub(crate) fn ordered_key(
     }
 }
 
-/// Retain the existing Field spelling-copy author without imposing new schema
-/// limits. Metadata has ordered BTree cursor traversal; caller admission still
-/// covers the original scratch and copied output before allocation/traversal.
-/// This scope neither enters nor finishes another control owner.
+/// The original Arrow metadata order is lexical key order. Emit each actual
+/// entry once, copying key and value into the prepared wire output.
 pub(crate) fn encode_metadata(
     source: &arrow::datatypes::Metadata,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<plan::ArrowFieldMetadataEntry>, TypeCodecError> {
-    let mut sorted: Vec<(&str, &str)> = reserve(source.len(), work)?;
-    work.flush()?;
-    let mut iter = source.iter();
-    work.step()?;
-    work.flush()?;
-    loop {
-        work.flush()?;
-        let next = iter.next();
-        work.step()?;
-        work.flush()?;
-        let Some((key, value)) = next else {
-            break;
-        };
-        sorted.push((key.as_str(), value.as_str()));
-        work.step()?;
-        let mut index = sorted.len() - 1;
-        while index > 0 {
-            if compare_keys(sorted[index - 1].0, sorted[index].0, work)? != Ordering::Greater {
-                break;
-            }
-            sorted.swap(index - 1, index);
-            work.step()?;
-            index -= 1;
-        }
-    }
-    let mut output = reserve(sorted.len(), work)?;
-    for (key, value) in sorted {
+    let mut output = reserve(source.len(), work)?;
+    for (key, value) in source {
         let entry = plan::ArrowFieldMetadataEntry {
             key: copy_string(key, work)?,
             value: copy_string(value, work)?,

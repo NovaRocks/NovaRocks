@@ -34,7 +34,6 @@ pub enum ValueLogicalType {
 
 pub const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
 pub const MAX_VALUE_TYPE_DEPTH: usize = 64;
-pub const MAX_VALUE_TYPE_NODES: usize = 4096;
 
 impl ValueLogicalType {
     pub const fn metadata_value(self) -> Option<&'static str> {
@@ -800,7 +799,7 @@ mod tests {
             validate_nested_logical_types(&over),
             Err(ValueTypeError::TooDeep)
         );
-        let fields = (0..MAX_VALUE_TYPE_NODES - 1)
+        let fields = (0..4096 - 1)
             .map(|i| Field::new(format!("v{i}"), DataType::Int64, false))
             .collect::<Vec<_>>();
         validate_nested_logical_types(&DataType::Struct(fields.clone().into())).unwrap();

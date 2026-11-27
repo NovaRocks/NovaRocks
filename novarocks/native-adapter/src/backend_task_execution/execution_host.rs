@@ -6283,9 +6283,6 @@ pub(crate) mod tests {
         fn before_allocation(&mut self, _: std::alloc::Layout) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
-            Ok(())
-        }
         fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
             unreachable!("fixture encoder does not decode")
         }
@@ -10236,8 +10233,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             let old = authored.types.as_ref().unwrap();
-            let roots = old.value_types.len().checked_add(old.fields.len()).unwrap();
-            let limits = TypeProjectionLimits::for_validated_source_root_count(roots).unwrap();
+            let limits = TypeProjectionLimits::INPUT_DERIVED;
             let original = decode_type_table_pure(old, limits, &Unbounded).unwrap();
             let fresh = old
                 .value_types
@@ -10270,10 +10266,7 @@ pub(crate) mod tests {
             let encoded = encode_borrowed_type_table_associated_sources_pure_in(
                 &values,
                 &fields,
-                TypeProjectionLimits::for_validated_source_root_count(
-                    roots.checked_add(1).unwrap(),
-                )
-                .unwrap(),
+                TypeProjectionLimits::INPUT_DERIVED,
                 &mut encode,
             )
             .unwrap()

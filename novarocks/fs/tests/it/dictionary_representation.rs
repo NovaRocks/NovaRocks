@@ -137,8 +137,12 @@ fn read_fixture(
     policy: ParquetInterpretationPolicy,
     rows: usize,
 ) -> Vec<FileBatch> {
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, rows, u64::MAX);
-    request.options.parquet_interpretation_policy = policy;
+    let request = fixture.request(
+        FileFormat::Parquet(policy),
+        FileProjection::All,
+        rows,
+        u64::MAX,
+    );
     let mut reader = open_file_reader(request).expect("open Parquet reader");
     collect(reader.as_mut()).expect("read batches")
 }
@@ -309,8 +313,12 @@ fn absent_page_and_size_statistics_allow_reading_with_view_carriers() {
     assert!(column.page_encoding_stats_mask().is_none());
     assert!(column.unencoded_byte_array_data_bytes().is_none());
 
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 8, 4096);
-    request.options.parquet_interpretation_policy = DICTIONARY;
+    let request = fixture.request(
+        FileFormat::Parquet(DICTIONARY),
+        FileProjection::All,
+        8,
+        4096,
+    );
     let mut reader = open_file_reader(request).expect("open with missing optional statistics");
     assert!((1..=8).contains(&reader.reader_batch_rows().expect("nonempty fixture")));
     let batches = collect(reader.as_mut()).expect("all batches");
@@ -345,8 +353,12 @@ fn decoded_size_statistics_supply_plain_view_backing_estimate() {
         Some(16 * 32)
     );
     // 16 bytes per view descriptor, plus 32 bytes of backing per value.
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 16, 2 * (16 + 32));
-    request.options.parquet_interpretation_policy = VIEWS;
+    let request = fixture.request(
+        FileFormat::Parquet(VIEWS),
+        FileProjection::All,
+        16,
+        2 * (16 + 32),
+    );
     let mut reader = open_file_reader(request).expect("open with size statistics");
     assert_eq!(reader.reader_batch_rows(), Some(2));
     let batches = collect(reader.as_mut()).expect("all batches");
@@ -362,13 +374,12 @@ fn repeated_long_value_uses_the_dictionary_backing_at_view_decode() {
     let keys = Int32Array::from(vec![0; ROWS]);
     let array = DictionaryArray::try_new(keys, values).expect("one valid dictionary value");
     let fixture = write_fixture(Arc::new(array), WriterProperties::default(), false);
-    let mut request = fixture.request(
-        FileFormat::Parquet,
+    let request = fixture.request(
+        FileFormat::Parquet(VIEWS),
         FileProjection::All,
         ROWS,
         16 * 1024 * 1024,
     );
-    request.options.parquet_interpretation_policy = VIEWS;
     let mut reader = open_file_reader(request).expect("open compact fixture");
     assert_eq!(reader.reader_batch_rows(), Some(ROWS));
     let batch = reader
@@ -435,7 +446,12 @@ fn derived_policy_has_separate_cache_identity_and_reuses_exact_prepared_footer()
         datacache_ttl_seconds: 0,
         datacache_sharing_work_period: None,
     });
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, u64::MAX);
+    let mut request = fixture.request(
+        FileFormat::Parquet(ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        u64::MAX,
+    );
     let inspect = |policy| {
         inspect_parquet_metadata(
             fixture.file.clone(),
@@ -454,7 +470,7 @@ fn derived_policy_has_separate_cache_identity_and_reuses_exact_prepared_footer()
         inspect(DICTIONARY).schema()
     ));
     assert_eq!(dictionary.schema().field(0).data_type(), &DataType::Utf8);
-    request.options.parquet_interpretation_policy = DICTIONARY;
+    request.format = FileFormat::Parquet(DICTIONARY);
     assert_eq!(
         plan_parquet_input_ranges(&request, &views)
             .unwrap_err()

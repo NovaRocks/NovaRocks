@@ -413,8 +413,7 @@ fn metadata_type(size: usize) -> FunctionValueType {
 
 #[test]
 fn request_selected_result_and_expected_hold_metadata_free_value_facts() {
-    let annotated =
-        metadata_type(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1);
+    let annotated = metadata_type((16 * 1024) + 1);
     let plain = metadata_type(0);
     assert_eq!(annotated, plain);
     for channel in 0..4 {

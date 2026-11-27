@@ -54,14 +54,6 @@ pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS: usize = 1_024;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS: usize = 1_024;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS: usize = 256;
 pub const MAX_CONNECTOR_TABLE_PLANNING_FACT_PARTITION_SOURCE_COLUMNS: usize = 256;
-pub const MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS: usize = 4_096;
-pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES: usize = 16_384;
-pub const MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH: usize = 64;
-/// Upper bounds for one column's write-default value tree. The node budget is
-/// charged per planning-facts value, not per column, so a single table cannot
-/// smuggle an unbounded literal through many shallow columns.
-pub const MAX_CONNECTOR_COLUMN_DEFAULT_NODES: usize = 16_384;
-pub const MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH: usize = 64;
 
 const TABLE_PLANNING_FACT_COLUMN_BYTES: usize = 16;
 const TABLE_PLANNING_FACT_CONSTRAINT_BYTES: usize = 16;
@@ -589,7 +581,6 @@ fn validate_column_facts(
         ));
     }
     let mut write_default_bytes = 0usize;
-    let mut nodes = 0usize;
     for (expected, fact) in column_facts.iter().enumerate() {
         let expected = u32::try_from(expected).map_err(|_| {
             ConnectorError::new(
@@ -660,17 +651,14 @@ fn validate_column_facts(
                     "connector column write default cannot be NULL at the top level",
                 ));
             }
-            write_default_bytes = write_default_bytes.saturating_add(validate_column_default(
-                write_default,
-                0,
-                &mut nodes,
-            )?);
+            write_default_bytes =
+                write_default_bytes.saturating_add(validate_column_default(write_default, 1)?);
         }
     }
     Ok(write_default_bytes)
 }
 
-/// Validate one write-default subtree, charging depth, node count and bytes.
+/// Validate one write-default subtree and account its actual bytes.
 ///
 /// The invariants mirror the neutral column-default vocabulary this value is
 /// projected to: a FIXED default must match its declared width, a map key can
@@ -679,20 +667,12 @@ fn validate_column_facts(
 fn validate_column_default(
     value: &ConnectorColumnDefault,
     depth: usize,
-    nodes: &mut usize,
 ) -> Result<usize, ConnectorError> {
-    if depth > MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH {
-        return Err(ConnectorError::new(
-            super::ConnectorErrorKind::ResourceExhausted,
-            "connector column write default exceeds the value depth limit",
-        ));
-    }
-    *nodes = nodes.saturating_add(1);
-    if *nodes > MAX_CONNECTOR_COLUMN_DEFAULT_NODES {
-        return Err(ConnectorError::new(
-            super::ConnectorErrorKind::ResourceExhausted,
-            "connector column write default exceeds the value node limit",
-        ));
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(corrupt_column_default(format!(
+            "connector column write default: {}",
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
 
     let mut bytes = COLUMN_DEFAULT_NODE_BYTES;
@@ -735,12 +715,12 @@ fn validate_column_default(
             for (name, field_value) in fields {
                 bytes = bytes
                     .saturating_add(name.len())
-                    .saturating_add(validate_column_default(field_value, depth + 1, nodes)?);
+                    .saturating_add(validate_column_default(field_value, depth + 1)?);
             }
         }
         ConnectorColumnDefault::Array(elements) => {
             for element in elements {
-                bytes = bytes.saturating_add(validate_column_default(element, depth + 1, nodes)?);
+                bytes = bytes.saturating_add(validate_column_default(element, depth + 1)?);
             }
         }
         ConnectorColumnDefault::Map(entries) => {
@@ -757,8 +737,8 @@ fn validate_column_default(
                     ));
                 }
                 bytes = bytes
-                    .saturating_add(validate_column_default(key, depth + 1, nodes)?)
-                    .saturating_add(validate_column_default(map_value, depth + 1, nodes)?);
+                    .saturating_add(validate_column_default(key, depth + 1)?)
+                    .saturating_add(validate_column_default(map_value, depth + 1)?);
                 keys.push(key);
             }
         }
@@ -1172,13 +1152,6 @@ impl ConnectorTableDefinitionFacts {
         table_comment: Option<Arc<str>>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        if columns.len() > MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS {
-            return Err(ConnectorError::new(
-                super::ConnectorErrorKind::ResourceExhausted,
-                "connector table definition exceeds the column limit",
-            ));
-        }
-
         let expected_ordinals = if planning_facts.column_facts().is_empty() {
             (0..schema.fields().len()).collect::<Vec<_>>()
         } else {
@@ -1199,7 +1172,6 @@ impl ConnectorTableDefinitionFacts {
             .len()
             .saturating_mul(TABLE_DEFINITION_COLUMN_BYTES)
             .saturating_add(table_comment.as_ref().map_or(0, |value| value.len()));
-        let mut nodes = 0_usize;
         for (column, expected_ordinal) in columns.iter().zip(expected_ordinals) {
             let expected_ordinal = u32::try_from(expected_ordinal).map_err(|_| {
                 corrupt_definition("connector table definition schema ordinal does not fit u32")
@@ -1216,8 +1188,7 @@ impl ConnectorTableDefinitionFacts {
                 ));
             }
             bytes = bytes.saturating_add(column.comment.as_ref().map_or(0, |value| value.len()));
-            bytes =
-                bytes.saturating_add(validate_definition_type(&column.data_type, 1, &mut nodes)?);
+            bytes = bytes.saturating_add(validate_definition_type(&column.data_type, 1)?);
         }
         if bytes > context.max_total_payload_bytes() {
             return Err(ConnectorError::new(
@@ -1248,20 +1219,12 @@ impl ConnectorTableDefinitionFacts {
 fn validate_definition_type(
     data_type: &ConnectorTableDefinitionType,
     depth: usize,
-    nodes: &mut usize,
 ) -> Result<usize, ConnectorError> {
-    if depth > MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH {
-        return Err(ConnectorError::new(
-            super::ConnectorErrorKind::ResourceExhausted,
-            "connector table definition exceeds the type depth limit",
-        ));
-    }
-    *nodes = nodes.saturating_add(1);
-    if *nodes > MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES {
-        return Err(ConnectorError::new(
-            super::ConnectorErrorKind::ResourceExhausted,
-            "connector table definition exceeds the type node limit",
-        ));
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(corrupt_definition(format!(
+            "connector table definition: {}",
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
 
     let mut bytes = TABLE_DEFINITION_TYPE_NODE_BYTES;
@@ -1281,12 +1244,12 @@ fn validate_definition_type(
             ));
         }
         ConnectorTableDefinitionType::Array(element) => {
-            bytes = bytes.saturating_add(validate_definition_type(element, depth + 1, nodes)?);
+            bytes = bytes.saturating_add(validate_definition_type(element, depth + 1)?);
         }
         ConnectorTableDefinitionType::Map(key, value) => {
             bytes = bytes
-                .saturating_add(validate_definition_type(key, depth + 1, nodes)?)
-                .saturating_add(validate_definition_type(value, depth + 1, nodes)?);
+                .saturating_add(validate_definition_type(key, depth + 1)?)
+                .saturating_add(validate_definition_type(value, depth + 1)?);
         }
         ConnectorTableDefinitionType::Struct(fields) => {
             let mut names = std::collections::BTreeSet::new();
@@ -1297,9 +1260,9 @@ fn validate_definition_type(
                         "connector table definition contains an empty or duplicate struct field",
                     ));
                 }
-                bytes = bytes.saturating_add(field.name.len()).saturating_add(
-                    validate_definition_type(&field.data_type, depth + 1, nodes)?,
-                );
+                bytes = bytes
+                    .saturating_add(field.name.len())
+                    .saturating_add(validate_definition_type(&field.data_type, depth + 1)?);
             }
         }
         _ => {}
@@ -3041,28 +3004,24 @@ mod tests {
     #[test]
     fn spi5g_write_default_rejects_excessive_depth() {
         let mut nested = ConnectorColumnDefault::Int32(1);
-        for _ in 0..=MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH {
+        for _ in 0..novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
             nested = ConnectorColumnDefault::Array(vec![nested]);
         }
         let error = facts_with_write_default(nested, 1 << 20)
             .expect_err("value depth beyond the limit is rejected");
-        assert_eq!(
-            error.kind(),
-            super::super::ConnectorErrorKind::ResourceExhausted
-        );
+        assert_eq!(error.kind(), super::super::ConnectorErrorKind::CorruptData);
     }
 
     #[test]
-    fn spi5g_write_default_rejects_excessive_node_count() {
+    fn spi5g_write_default_wide_tree_uses_original_payload_budget() {
         let wide = ConnectorColumnDefault::Array(
-            (0..=MAX_CONNECTOR_COLUMN_DEFAULT_NODES)
+            (0..=16384)
                 .map(|index| ConnectorColumnDefault::Int32(index as i32))
                 .collect(),
         );
-        // The budget is deliberately larger than the node tree's byte cost so
-        // the node limit, not the payload budget, is what rejects this value.
-        let error = facts_with_write_default(wide, 1 << 20)
-            .expect_err("value node count beyond the limit is rejected");
+        facts_with_write_default(wide.clone(), 1 << 20)
+            .expect("wide value fits the original payload budget");
+        let error = facts_with_write_default(wide, 4096).expect_err("payload budget exceeded");
         assert_eq!(
             error.kind(),
             super::super::ConnectorErrorKind::ResourceExhausted
@@ -3531,7 +3490,7 @@ mod tests {
     fn spi5ef_table_definition_facts_enforce_depth_and_payload_budget() {
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
         let mut nested = ConnectorTableDefinitionType::String;
-        for _ in 0..MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH {
+        for _ in 0..novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
             nested = ConnectorTableDefinitionType::Array(Box::new(nested));
         }
         let depth = ConnectorTableDefinitionFacts::try_new(
@@ -3542,10 +3501,7 @@ mod tests {
             &context(4_096),
         )
         .expect_err("excessive type depth must fail");
-        assert_eq!(
-            depth.kind(),
-            super::super::ConnectorErrorKind::ResourceExhausted
-        );
+        assert_eq!(depth.kind(), super::super::ConnectorErrorKind::CorruptData);
 
         let budget = ConnectorTableDefinitionFacts::try_new(
             &schema,
@@ -3660,7 +3616,7 @@ mod tests {
         .expect_err("zero fixed-binary length must fail");
         assert_eq!(fixed.kind(), super::super::ConnectorErrorKind::CorruptData);
 
-        let fields = (0..MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES)
+        let fields = (0..=16384)
             .map(|ordinal| {
                 ConnectorTableDefinitionStructField::new(
                     format!("field_{ordinal}"),
@@ -3668,7 +3624,7 @@ mod tests {
                 )
             })
             .collect();
-        let nodes = ConnectorTableDefinitionFacts::try_new(
+        let wide = ConnectorTableDefinitionFacts::try_new(
             &schema,
             &ConnectorTablePlanningFacts::empty(),
             vec![ConnectorTableDefinitionColumn::new(
@@ -3678,12 +3634,9 @@ mod tests {
                 None,
             )],
             None,
-            &context(4_096),
+            &context(1 << 22),
         )
-        .expect_err("type node limit must fail");
-        assert_eq!(
-            nodes.kind(),
-            super::super::ConnectorErrorKind::ResourceExhausted
-        );
+        .expect("wide definition fits the original payload budget");
+        assert_eq!(wide.columns().len(), 1);
     }
 }
