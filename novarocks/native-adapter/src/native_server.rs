@@ -560,7 +560,7 @@ impl TransportExecutor {
         clippy::disallowed_methods,
         reason = "The original Native transport service starts and drains its connection and stream tasks; see ADR-0218."
     )]
-    fn start<F>(&self, make: impl FnOnce() -> F)
+    fn start<F>(&self, make: impl FnOnce() -> F + 'static)
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -582,10 +582,10 @@ where
     }
 }
 
-pub(crate) fn observe_native_work<F: std::future::Future, Make: FnOnce() -> F>(
+pub(crate) fn observe_native_work<F: std::future::Future>(
     owner: Option<novarocks_memory::LaneShards>,
-    make: Make,
-) -> impl std::future::Future<Output = F::Output> + use<F> {
+    make: impl FnOnce() -> F,
+) -> impl std::future::Future<Output = F::Output> {
     enum Work<F> {
         Observed(novarocks_memory::attribution::future::AttributedFuture<F>),
         Plain(F),
