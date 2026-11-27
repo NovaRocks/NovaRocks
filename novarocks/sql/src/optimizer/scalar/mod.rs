@@ -26,6 +26,7 @@
 //! still use the `TypedExpr` bridge during the migration.
 #![allow(dead_code)] // wired into operators in M1.
 
+mod effects;
 mod interner;
 
 use std::collections::HashMap;
@@ -218,10 +219,8 @@ pub(crate) struct ScalarArena {
     constant_policy: novarocks_functions::ConstantValidation,
     nodes: Vec<ScalarNode>,
     value_types: Vec<FunctionValueType>,
-    /// Function semantics resolved at scalar interning time.  It is kept
-    /// alongside the compact node representation so optimizer passes never
-    /// have to carry their own name-based volatility policy.
-    function_volatility: Vec<Option<FunctionVolatility>>,
+    definition_effects: Vec<crate::analysis::scalar_effects::ScalarEffects>,
+    effect_environment: Option<effects::EffectEnvironment>,
     intern: HashMap<u64, Vec<ScalarId>>,
     column_displays: HashMap<ColumnId, StoredColumnDisplay>,
 }
@@ -234,7 +233,20 @@ impl ScalarArena {
 
     #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn new() -> Self {
-        Self::with_constant_policy(crate::constant::test_constant_policy())
+        let arena = Self::with_constant_policy(crate::constant::test_constant_policy());
+        #[cfg(test)]
+        let arena = {
+            let mut arena = arena;
+            arena
+                .bind_effect_environment(
+                    crate::functions::test_function_catalog_snapshot(),
+                    true,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .expect("test scalar effect environment");
+            arena
+        };
+        arena
     }
 
     pub(crate) fn with_constant_policy(
@@ -244,7 +256,8 @@ impl ScalarArena {
             constant_policy,
             nodes: Vec::new(),
             value_types: Vec::new(),
-            function_volatility: Vec::new(),
+            definition_effects: Vec::new(),
+            effect_environment: None,
             intern: HashMap::new(),
             column_displays: HashMap::new(),
         }
@@ -324,15 +337,6 @@ impl ScalarArena {
 
     pub(crate) fn value_type(&self, id: ScalarId) -> &FunctionValueType {
         &self.value_types[id.0 as usize]
-    }
-
-    /// Returns the resolved volatility for a scalar function node.
-    ///
-    /// Non-function nodes intentionally return `None`; callers that recurse
-    /// through an expression can distinguish node-local semantics from a
-    /// volatile descendant.
-    pub(crate) fn function_volatility(&self, id: ScalarId) -> Option<FunctionVolatility> {
-        self.function_volatility[id.0 as usize]
     }
 
     fn remember_column_display(
@@ -820,12 +824,12 @@ mod tests {
         );
 
         assert_eq!(
-            arena.function_volatility(volatile),
-            Some(FunctionVolatility::Volatile)
+            arena.effects(volatile).expression.value_stability,
+            FunctionVolatility::Volatile
         );
         assert_eq!(
-            arena.function_volatility(immutable),
-            Some(FunctionVolatility::Immutable)
+            arena.effects(immutable).expression.value_stability,
+            FunctionVolatility::Immutable
         );
     }
 

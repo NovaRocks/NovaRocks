@@ -16,7 +16,8 @@
 // under the License.
 
 //! PushSemiAntiRightOnlyCondition — push right-only conjuncts of a
-//! SEMI/ANTI join's inner condition into the right child.
+//! SEMI/ANTI join's condition into the right child when pair elimination
+//! cannot remove an output row or suppress required evaluation.
 //!
 //! Example:
 //!   LEFT SEMI (store_sales CROSS date_dim)
@@ -69,7 +70,7 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let j = join_payload_after_pattern_gate(expr);
         matches!(
             j.join_type,
-            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi
         ) && j.condition.is_some()
     }
 
@@ -86,7 +87,12 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let Operator::LogicalJoin(join) = op else {
             return Ok(RewriteResult::Unchanged);
         };
-        if children.len() != 2 {
+        if children.len() != 2
+            || !matches!(
+                join.join_type,
+                JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi
+            )
+        {
             return Ok(RewriteResult::Unchanged);
         }
         let Some(cond_id) = join.condition else {
@@ -98,6 +104,13 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
 
+        // A retained right row in RightAnti can only be removed by an
+        // actual match. On the admitted sides, filtering changes which pairs
+        // reach ON, so preserve the full condition if any part can expose
+        // errors or observe the original pair domain.
+        if !arena.effects(cond_id).can_share() {
+            return Ok(RewriteResult::Unchanged);
+        }
         let mut conjuncts = Vec::new();
         scalar_expr::split_conjuncts(&arena, cond_id, &mut conjuncts);
         let mut right_ids = collect_output_ids_opt(&right);
@@ -490,6 +503,57 @@ mod tests {
             matches!(result, RewriteResult::Unchanged),
             "same column name must not make a predicate right-only without a right ColumnId"
         );
+    }
+
+    #[test]
+    fn right_anti_retains_rows_for_false_and_unknown_right_on_while_right_semi_can_filter() {
+        for (kind, expect_push) in [(JoinKind::RightAnti, false), (JoinKind::RightSemi, true)] {
+            let mut arena = ScalarArena::new();
+            let mut right = values_with_output("k", 202);
+            let Operator::LogicalValues(values) = &mut right.op else {
+                unreachable!();
+            };
+            let control = crate::optimizer::test_optimizer_control();
+            // For ON r.k > 0, these two right rows cannot match. They both
+            // belong in RIGHT ANTI output and neither belongs in RIGHT SEMI.
+            values.rows = [LiteralValue::Int(-1), LiteralValue::Null]
+                .map(|literal| {
+                    vec![
+                        intern_typed(
+                            &mut arena,
+                            &TypedExpr {
+                                kind: ExprKind::Literal(literal),
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Int64,
+                                    true,
+                                ),
+                            },
+                            control,
+                        )
+                        .unwrap(),
+                    ]
+                })
+                .into();
+            let condition = gt_typed(col_with_id_typed("r", "k", 202), int_lit_typed(0));
+            let mut join = semi_join(
+                &mut arena,
+                values_with_output("k", 101),
+                right,
+                Some(condition),
+            );
+            let Operator::LogicalJoin(op) = &mut join.op else {
+                unreachable!();
+            };
+            op.join_type = kind;
+            let result = PushSemiAntiRightOnlyCondition
+                .apply(join, &mut make_ctx(arena))
+                .unwrap();
+            assert_eq!(
+                matches!(result, RewriteResult::Changed(_)),
+                expect_push,
+                "{kind:?}"
+            );
+        }
     }
 
     // Test 1: LEFT SEMI ON (ss_sold_date_sk=d_date_sk AND corr AND d_year=2002)

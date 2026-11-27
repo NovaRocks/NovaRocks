@@ -65,12 +65,7 @@ pub(crate) fn flatten_join_chain(
     let mut predicates: Vec<(ScalarId, u32)> = Vec::new();
 
     for &pred in &raw_predicates {
-        if crate::optimizer::scalar_expr::can_fail(&memo.scalars, pred)
-            || crate::optimizer::scalar_expr::contains_non_replica_deterministic_function(
-                &memo.scalars,
-                pred,
-            )
-        {
+        if !memo.scalars.effects(pred).can_share() {
             return Ok(None);
         }
         let mask = relation_mask(&memo.scalars, pred, &atom_cols);

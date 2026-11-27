@@ -39,7 +39,7 @@ pub(crate) fn derive_inner_join_predicates(
     if join_groups
         .iter()
         .chain(filter_groups.iter())
-        .any(|group| !group.deterministic || group.can_fail)
+        .any(|group| !group.effects.can_share())
     {
         return Ok(Vec::new());
     }
@@ -99,7 +99,7 @@ pub(crate) fn derive_inner_join_predicates(
         )?);
     }
 
-    Ok(dedupe_groups(derived))
+    Ok(dedupe_groups(arena, derived))
 }
 
 fn extract_column_pair_equality(
@@ -248,7 +248,7 @@ fn derive_or_branch_side_filters(
     group: &PredicateGroup,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<PredicateGroup>, crate::compiler::SqlCompileError> {
-    if !group.deterministic || group.can_fail {
+    if !group.effects.can_share() {
         return Ok(Vec::new());
     }
 
@@ -355,7 +355,7 @@ fn derive_or_branch_side_filters(
         }
     }
 
-    Ok(dedupe_groups(derived))
+    Ok(dedupe_groups(arena, derived))
 }
 
 #[derive(Clone, Debug)]

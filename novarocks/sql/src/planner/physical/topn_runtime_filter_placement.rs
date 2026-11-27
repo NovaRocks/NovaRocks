@@ -459,7 +459,7 @@ mod tests {
     };
     use crate::planner::physical::runtime_filter::AggregateTopNRuntimeFilterBuildIntent;
     use crate::planner::physical::runtime_filter_placement::{
-        RUNTIME_FILTER_RULE, place_runtime_filters, place_runtime_filters_for_compiled,
+        RUNTIME_FILTER_RULE, place_runtime_filters, place_runtime_filters_for_compiled_test,
     };
     use crate::planner::physical::{
         AggMode, AggregateOutputLayout, HashSource, PhysicalHashAggregateNode,
@@ -479,7 +479,7 @@ mod tests {
                 for nulls_first in [false, true] {
                     let mut plan =
                         eligible_direct_partial_plan(DataType::Utf8, nullable, asc, nulls_first);
-                    place_runtime_filters_for_compiled(
+                    place_runtime_filters_for_compiled_test(
                         &mut plan,
                         &SessionOptimizerSettings::default(),
                     );
@@ -518,12 +518,15 @@ mod tests {
     fn compiled_policy_preserves_global_and_direct_partial_placement() {
         {
             let mut global = eligible_topn_plan(DataType::Int32, true, false);
-            place_runtime_filters_for_compiled(&mut global, &SessionOptimizerSettings::default());
+            place_runtime_filters_for_compiled_test(
+                &mut global,
+                &SessionOptimizerSettings::default(),
+            );
             assert_eq!(aggregate_topn_builds(&global).len(), 1);
             assert_eq!(source_probes(&global).len(), 1);
         }
         let mut local = eligible_direct_partial_plan(DataType::Utf8, true, true, false);
-        place_runtime_filters_for_compiled(&mut local, &SessionOptimizerSettings::default());
+        place_runtime_filters_for_compiled_test(&mut local, &SessionOptimizerSettings::default());
         assert_eq!(aggregate_topn_builds(&local).len(), 1);
         assert_eq!(source_probes(&local).len(), 1);
     }
@@ -615,12 +618,15 @@ mod tests {
         for (label, mutate) in cases {
             let mut plan = eligible_direct_partial_plan(DataType::Utf8, true, true, true);
             mutate(&mut plan);
-            place_runtime_filters_for_compiled(&mut plan, &SessionOptimizerSettings::default());
+            place_runtime_filters_for_compiled_test(
+                &mut plan,
+                &SessionOptimizerSettings::default(),
+            );
             assert!(aggregate_topn_builds(&plan).is_empty(), "{label}");
             assert!(source_probes(&plan).is_empty(), "{label}");
         }
         let mut integer = eligible_direct_partial_plan(DataType::Int64, true, true, true);
-        place_runtime_filters_for_compiled(&mut integer, &SessionOptimizerSettings::default());
+        place_runtime_filters_for_compiled_test(&mut integer, &SessionOptimizerSettings::default());
         assert!(aggregate_topn_builds(&integer).is_empty());
         assert!(source_probes(&integer).is_empty());
     }

@@ -3,3 +3,18 @@
 x	y
 7	10
 11	16
+NULL	NULL
+
+-- query 6
+-- types	double	double	varchar
+x	y	input_type
+7.0	10.0	double
+11.0	16.0	double
+NULL	NULL	double
+
+-- query 9
+-- types	double	double	varchar
+x	y	input_type
+7.0	10.0	double
+11.0	16.0	double
+NULL	NULL	double

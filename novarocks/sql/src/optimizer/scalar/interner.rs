@@ -580,15 +580,12 @@ fn intern_inner(
     }
     let id =
         ScalarId(u32::try_from(arena.nodes.len()).map_err(|_| SqlCompileError::ResourceExhausted)?);
-    let volatility = match &node {
-        ScalarNode::FunctionCall { volatility, .. } => Some(*volatility),
-        _ => None,
-    };
     // All fallible observed work precedes publication. These legacy index and
     // vector allocations still require a separate host resource admission.
+    let effects = arena.new_definition_effects(&node, &value_type, control)?;
     arena.nodes.push(node);
     arena.value_types.push(value_type);
-    arena.function_volatility.push(volatility);
+    arena.definition_effects.push(effects);
     arena.intern.entry(fingerprint).or_default().push(id);
     Ok(id)
 }

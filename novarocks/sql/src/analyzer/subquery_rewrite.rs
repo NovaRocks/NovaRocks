@@ -350,7 +350,8 @@ impl<'a> AnalyzerContext<'a> {
                 filter,
                 &inner_scope,
                 scope,
-            ));
+                &self.scalar_effects(),
+            )?);
         }
 
         // 3. Collect correlation column ids after semantic-preserving filter
@@ -2867,7 +2868,8 @@ impl<'a> AnalyzerContext<'a> {
                 filter,
                 &inner_scope,
                 scope,
-            ));
+                &self.scalar_effects(),
+            )?);
         }
 
         // Detect correlation by examining the subquery's WHERE for predicates
@@ -6196,11 +6198,17 @@ fn factor_common_correlation_from_or(
     expr: &TypedExpr,
     inner_scope: &super::scope::AnalyzerScope,
     outer_scope: &super::scope::AnalyzerScope,
-) -> TypedExpr {
+    effects: &crate::analysis::scalar_effects::ScalarEffectQuery<'_>,
+) -> Result<TypedExpr, AnalyzeError> {
     // Only act on top-level OR
     let branches = split_or(expr);
-    if branches.len() < 2 || !correlation_factor_is_total(expr) {
-        return expr.clone();
+    if branches.len() < 2
+        || !effects
+            .typed(expr)
+            .map_err(crate::analysis::scalar_effects::as_analyze_error)?
+            .can_share()
+    {
+        return Ok(expr.clone());
     }
 
     // Collect AND conjuncts for each OR branch, identify correlation predicates
@@ -6223,7 +6231,7 @@ fn factor_common_correlation_from_or(
     }
 
     if common_corr.is_empty() {
-        return expr.clone();
+        return Ok(expr.clone());
     }
 
     // Remove common correlation preds from each branch, rebuild OR
@@ -6253,7 +6261,7 @@ fn factor_common_correlation_from_or(
     let or_part = disjoin(new_branches);
     let mut result_parts = common_corr;
     result_parts.push(or_part);
-    conjoin(result_parts)
+    Ok(conjoin(result_parts))
 }
 
 /// Check if an expression is a correlation equality: `inner_col = outer_col`.
@@ -6269,54 +6277,6 @@ fn is_correlation_eq(
         (l_outer && !r_outer) || (!l_outer && r_outer)
     } else {
         false
-    }
-}
-
-/// Factoring can skip evaluations even when it preserves Boolean truth.
-#[recursive::recursive]
-fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
-    match &expression.kind {
-        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => true,
-        ExprKind::Nested(inner) | ExprKind::IsNull { expr: inner, .. } => {
-            correlation_factor_is_total(inner)
-        }
-        ExprKind::BinaryOp {
-            left,
-            op:
-                BinOp::And
-                | BinOp::Or
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge,
-            right,
-            ..
-        } => correlation_factor_is_total(left) && correlation_factor_is_total(right),
-        ExprKind::Cast {
-            expr,
-            decimal_overflow_policy,
-            cast_mode,
-            ..
-        } => {
-            !crate::optimizer::scalar_expr::scalar_cast_can_fail(
-                &expr.value_type,
-                &expression.value_type,
-                *decimal_overflow_policy,
-                *cast_mode,
-            ) && correlation_factor_is_total(expr)
-        }
-        ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr,
-        } => correlation_factor_is_total(expr),
-        ExprKind::FunctionCall { binding, args, .. } => {
-            binding.semantics.volatility.is_replica_deterministic()
-                && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)
-                && args.iter().all(correlation_factor_is_total)
-        }
-        _ => false,
     }
 }
 

@@ -18653,6 +18653,97 @@ mod tests {
     }
 
     #[test]
+    fn hash_probe_after_topn_freezes_at_the_producing_join_input() {
+        for has_residual in [false, true] {
+            let left_key = column(1, "probe_key", DataType::Int64, false);
+            let right_key = column(2, "build_key", DataType::Int64, false);
+            let probe = PhysicalPlanNode {
+                kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                    items: vec![sort_item(&left_key, true, false)],
+                    limit: Some(1),
+                    offset: None,
+                    phase: SqlTopNPhase::Final,
+                    is_split: false,
+                }),
+                children: vec![values(
+                    vec![left_key.clone()],
+                    vec![vec![literal_int(1)], vec![literal_int(2)]],
+                )],
+                output_columns: vec![left_key.clone()],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            };
+            let mut join = hash_join(
+                crate::common::JoinKind::Inner,
+                PhysicalHashJoinBuildSide::Right,
+                SqlJoinDistribution::Singleton,
+                Some(JoinExecutionMode::Singleton),
+                probe,
+                values(vec![right_key.clone()], vec![vec![literal_int(2)]]),
+                vec![left_key.clone(), right_key.clone()],
+            );
+            if has_residual {
+                let PhysicalPlanKind::HashJoin(hash) = &mut join.kind else {
+                    unreachable!();
+                };
+                let novarocks_physical_plan::HashJoinCondition::Ordinary { residual, .. } =
+                    &mut hash.condition
+                else {
+                    unreachable!();
+                };
+                *residual = Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: novarocks_parser::ast::AstBox::new(column_ref(&left_key)),
+                        op: BinOp::Lt,
+                        right: novarocks_parser::ast::AstBox::new(column_ref(&right_key)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+                });
+            }
+            crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled_test(
+                &mut join,
+                &crate::optimizer::options::SessionOptimizerSettings::default(),
+            );
+            assert_eq!(join.probe_runtime_filters.len(), 1);
+            assert!(join.children[0].probe_runtime_filters.is_empty());
+            assert!(
+                join.children[0].children[0]
+                    .probe_runtime_filters
+                    .is_empty()
+            );
+
+            let plan = finish_for_test(&join).expect("an exact join-probe runtime-filter package");
+            let mut filters = plan.runtime_filters().values();
+            let filter = filters.next().expect("the build admits a runtime filter");
+            assert!(filters.next().is_none());
+            let [consumer] = filter.consumers.as_ref() else {
+                panic!("only the producing join may filter the probe");
+            };
+            let producer = &filter.producers[0];
+            assert_eq!(consumer.endpoint.fragment, producer.endpoint.fragment);
+            assert_eq!(consumer.endpoint.node, producer.endpoint.node);
+            assert_eq!(
+                consumer.apply_point,
+                novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 }
+            );
+            assert!(matches!(
+                consumer.target,
+                RuntimeFilterConsumerTarget::JoinProbeKey { .. }
+            ));
+            let fragment = &plan.fragments()[&consumer.endpoint.fragment];
+            let join = &fragment.nodes()[&consumer.endpoint.node];
+            let probe = &fragment.nodes()[&join.inputs[0]];
+            assert!(matches!(probe.kind, NodeKind::TopN { .. }));
+            assert_runtime_filter_attachments_match_endpoints(&plan);
+        }
+    }
+
+    #[test]
     fn runtime_filter_placement_preserves_mixed_scan_and_join_consumers() {
         let build = PendingRuntimeFilterBuild::Join {
             fragment: FragmentId::new(10),

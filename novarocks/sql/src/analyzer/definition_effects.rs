@@ -386,11 +386,23 @@ impl<'a> BindingFinalizer<'a> {
             ));
             defer_environment = true;
         }
+        let static_effects = if resolved.kind == novarocks_functions::FunctionKind::Scalar {
+            crate::analysis::scalar_effects::ScalarEffectQuery {
+                functions: Some(self.catalog),
+                allow_throw_exception: true,
+                control: self.control,
+            }
+            .selected_call(&resolved)
+            .map_err(crate::analysis::scalar_effects::as_analyze_error)?
+        } else {
+            None
+        };
         let binding = SqlFunctionBinding::from_analyzed(FinalizedAnalysisCall {
             resolved,
             decimal_overflow_policy: self.decimal_overflow_policy,
             origin,
             target,
+            static_effects,
         });
         if defer_environment {
             Ok(binding)
@@ -409,6 +421,7 @@ pub(crate) struct FinalizedAnalysisCall {
     decimal_overflow_policy: DecimalOverflowPolicy,
     origin: SqlResultConstraintOrigin,
     target: Option<FunctionValueType>,
+    static_effects: Option<novarocks_functions::StaticScalarCallEffects>,
 }
 
 impl FinalizedAnalysisCall {
@@ -419,12 +432,14 @@ impl FinalizedAnalysisCall {
         DecimalOverflowPolicy,
         SqlResultConstraintOrigin,
         Option<FunctionValueType>,
+        Option<novarocks_functions::StaticScalarCallEffects>,
     ) {
         (
             self.resolved,
             self.decimal_overflow_policy,
             self.origin,
             self.target,
+            self.static_effects,
         )
     }
 }

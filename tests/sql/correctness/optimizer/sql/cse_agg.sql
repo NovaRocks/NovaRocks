@@ -21,7 +21,7 @@
 -- the Aggregate as an internal CSE Project item while aggregate results stay stable.
 DROP TABLE IF EXISTS ${case_db}.cse_agg_t;
 CREATE TABLE ${case_db}.cse_agg_t (a BIGINT, b BIGINT);
-INSERT INTO ${case_db}.cse_agg_t VALUES ROW(2, 3), ROW(4, 5), ROW(6, 7);
+INSERT INTO ${case_db}.cse_agg_t VALUES ROW(2, 3), ROW(4, 5), ROW(6, 7), ROW(8, NULL);
 
 SELECT SUM(a * b) AS sum_ab, AVG(a * b) AS avg_ab
 FROM ${case_db}.cse_agg_t;
@@ -29,5 +29,17 @@ FROM ${case_db}.cse_agg_t;
 -- @explain_contains=__cse_0
 -- @result_not_contains=__cse_
 SELECT SUM(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS sum_ab,
-       AVG(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS avg_ab
+       AVG(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS avg_ab,
+       COUNT(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS count_ab
 FROM ${case_db}.cse_agg_t;
+
+SET SESSION enable_common_subexpr_reuse = false;
+
+-- @explain_not_contains=__cse_
+-- @result_not_contains=__cse_
+SELECT SUM(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS sum_ab,
+       AVG(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS avg_ab,
+       COUNT(CAST(a AS DOUBLE) * CAST(b AS DOUBLE)) AS count_ab
+FROM ${case_db}.cse_agg_t;
+
+SET SESSION enable_common_subexpr_reuse = true;

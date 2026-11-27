@@ -24,7 +24,7 @@
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
 use crate::compiler::SqlCompileError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
@@ -33,10 +33,7 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
-use crate::optimizer::rewrite::rules::utils::{
-    collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
-};
+use crate::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
 use crate::optimizer::scalar_expr;
 
 pub(crate) struct PushDownPredicateScan;
@@ -91,60 +88,65 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         };
 
         let arena_rc = ctx.scalar_arena();
-        if scalar_expr::can_fail(&arena_rc.borrow(), filter.predicate) {
-            // Moving even a nonthrowing sibling below the checked predicate
-            // can suppress its error by removing rows before evaluation.
-            return Ok(RewriteResult::Unchanged);
-        }
-        let mut conjuncts = Vec::new();
+        let mut pushed = Vec::new();
+        let mut remaining = Vec::new();
         {
             let arena = arena_rc.borrow();
-            scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
-        }
-
-        // Build a temporary OptExpr to use collect_output_ids_opt.
-        let scan_for_ids = OptExpr {
-            op: Operator::LogicalScan(scan.clone()),
-            children: vec![],
-            required_output_columns: required_output_columns.clone(),
-        };
-        let mut scan_ids = collect_output_ids_opt(&scan_for_ids);
-        scan_ids.remove(&crate::column_id::ColumnId::UNSET);
-
-        // Canonical keys of predicates already on the scan to avoid duplicate pushdown.
-        let mut seen: HashSet<String> = {
-            let arena = arena_rc.borrow();
-            scan.predicates
+            // A connector may execute a pushed atom before every scan residual.
+            // If it leaves the atom to SQL, residual evaluation preserves the
+            // supplied order. Both placements must be allowed to remove rows.
+            if scan.predicates.iter().any(|&predicate| {
+                !arena.effects(predicate).permits_filter_row_elimination
+                    || scalar_expr::is_internal_assertion(&arena, predicate)
+            }) {
+                return Ok(RewriteResult::Unchanged);
+            }
+            let columns: HashMap<_, _> = scan
+                .columns
                 .iter()
-                .map(|id| predicate_key(&arena, *id))
-                .collect()
-        };
-
-        let mut pushed_any = false;
-        let mut remaining = Vec::new();
-        for conj in conjuncts {
-            if scalar_expr::can_fail(&arena_rc.borrow(), conj) {
-                remaining.push(conj);
-                continue;
+                .map(|column| (column.column_id, &column.value_type))
+                .collect();
+            if columns.len() != scan.columns.len() {
+                return Ok(RewriteResult::Unchanged);
             }
-            let Some(refs) = scalar_expr::collect_column_ids_strict(&arena_rc.borrow(), conj)
-            else {
-                remaining.push(conj);
-                continue;
-            };
-            if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
-                if seen.insert(predicate_key(&arena_rc.borrow(), conj)) {
-                    scan.predicates.push(conj);
+            let mut conjuncts = Vec::new();
+            scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
+            let mut seen = HashSet::new();
+            let mut can_move = true;
+            for conjunct in conjuncts {
+                let effects = arena.effects(conjunct);
+                let may_eliminate_rows = effects.permits_filter_row_elimination
+                    && !scalar_expr::is_internal_assertion(&arena, conjunct);
+                if can_move
+                    && may_eliminate_rows
+                    && effects.expression.permits_earlier_evaluation()
+                    && scalar_expr::all_column_refs_match(&arena, conjunct, |id, ty| {
+                        columns
+                            .get(&id)
+                            .is_some_and(|&column_type| column_type == ty)
+                    })
+                {
+                    // Interner equality is exact typed definition equality. A
+                    // total pure conjunct needs no second occurrence on surviving rows.
+                    if seen.insert(conjunct) {
+                        pushed.push(conjunct);
+                    }
+                } else {
+                    remaining.push(conjunct);
+                    can_move &= may_eliminate_rows;
                 }
-                pushed_any = true;
-            } else {
-                remaining.push(conj);
             }
+            if pushed.is_empty() {
+                return Ok(RewriteResult::Unchanged);
+            }
+            scan.predicates
+                .retain(|predicate| !seen.contains(predicate));
         }
 
-        if !pushed_any {
-            return Ok(RewriteResult::Unchanged);
-        }
+        // Keep these before surviving scan residuals even when the connector
+        // does not consume them. Existing residuals stay in their original order.
+        pushed.append(&mut scan.predicates);
+        scan.predicates = pushed;
 
         let new_scan = OptExpr {
             op: Operator::LogicalScan(scan),
@@ -160,14 +162,6 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         )?;
         Ok(RewriteResult::Changed(result))
     }
-}
-
-/// Canonical key for structural predicate equality.
-fn predicate_key(
-    arena: &crate::optimizer::scalar::ScalarArena,
-    expr: crate::optimizer::scalar::ScalarId,
-) -> String {
-    canonical_predicate_key(arena, expr).as_str().to_string()
 }
 
 #[cfg(test)]
@@ -529,5 +523,176 @@ mod tests {
             },
             other => panic!("expected Changed, got {:?}", other),
         }
+    }
+    fn bound_call(name: &str, arg: TypedExpr) -> TypedExpr {
+        use novarocks_functions::{
+            FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+        };
+        let arguments = [FunctionArgument::Value {
+            value_type: arg.value_type.clone(),
+            constant: None,
+        }];
+        let binding = crate::functions::builtin_engine_function_catalog()
+            .resolve_bound_trusted(
+                name,
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        let FunctionResultType::Scalar(value_type) = binding.selected.result_type.clone() else {
+            unreachable!()
+        };
+        let volatility = binding.semantics.volatility;
+        TypedExpr {
+            value_type,
+            kind: ExprKind::FunctionCall {
+                name: name.into(),
+                args: vec![arg].into(),
+                distinct: false,
+                binding: crate::binding::SqlFunctionBinding::from_test(
+                    binding,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                volatility,
+            },
+        }
+    }
+
+    fn ordered_parts(
+        arena: &ScalarArena,
+        filter: &OptExpr,
+    ) -> Vec<crate::optimizer::scalar::ScalarId> {
+        let Operator::LogicalFilter(filter) = &filter.op else {
+            panic!("expected distinct Filter");
+        };
+        let mut parts = Vec::new();
+        scalar_expr::split_conjuncts(arena, filter.predicate, &mut parts);
+        parts
+    }
+
+    #[test]
+    fn moves_only_the_total_necessary_term_across_selected_wait() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a", "b"]);
+        let checked = eq(
+            TypedExpr {
+                value_type: col("a").value_type,
+                kind: ExprKind::BinaryOp {
+                    left: novarocks_parser::ast::AstBox::new(int_lit(12)),
+                    op: BinOp::Div,
+                    right: novarocks_parser::ast::AstBox::new(col("a")),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            },
+            int_lit(4),
+        );
+        let wait = bound_call("sleep", col("b"));
+        let filter = filter_opt(
+            &mut arena,
+            and(wait, and(checked, eq(col("a"), int_lit(3)))),
+            scan,
+        );
+        let parts = ordered_parts(&arena, &filter);
+        assert!(arena.effects(parts[0]).permits_filter_row_elimination);
+        assert!(arena.effects(parts[1]).expression.may_raise_row_error);
+        let mut ctx = make_ctx(arena);
+        let RewriteResult::Changed(out) = PushDownPredicateScan.apply(filter, &mut ctx).unwrap()
+        else {
+            panic!("total term moves across the original wait and checked division");
+        };
+        assert_eq!(
+            ordered_parts(&ctx.scalar_arena().borrow(), &out),
+            parts[..2]
+        );
+        let Operator::LogicalScan(scan) = &out.unary_input().op else {
+            panic!("residual Filter input is the original Scan");
+        };
+        assert_eq!(scan.predicates, parts[2..]);
+    }
+
+    #[test]
+    fn unconsumed_scan_necessary_term_precedes_existing_ordered_residuals() {
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "b"]);
+        let [wait, necessary] =
+            [bound_call("sleep", col("b")), eq(col("a"), int_lit(3))].map(|predicate| {
+                crate::planner::optimizer_bridge::scalar::intern_typed(
+                    &mut arena,
+                    &predicate,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap()
+            });
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        // The id already occurs below the wait. The necessary term still needs
+        // its earlier slot when the provider retains it as a SQL residual.
+        scan_op.predicates = vec![wait, necessary];
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp {
+                predicate: necessary,
+            }),
+            vec![scan],
+        );
+        let mut ctx = make_ctx(arena);
+        let RewriteResult::Changed(out) = PushDownPredicateScan.apply(filter, &mut ctx).unwrap()
+        else {
+            panic!("the already present necessary term can move");
+        };
+        let Operator::LogicalScan(scan) = &out.op else {
+            panic!("no residual Filter");
+        };
+        assert_eq!(scan.predicates, [necessary, wait]);
+    }
+
+    #[test]
+    fn necessary_term_cannot_cross_whole_invocation_data() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "doc"]);
+        let doc_type = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        scan_op.columns[1].value_type = doc_type.clone();
+        let mut doc = col("doc");
+        doc.value_type = doc_type;
+        let atomic = is_not_null(bound_call("__json_canonical_key", doc));
+        let filter = filter_opt(&mut arena, and(atomic, eq(col("a"), int_lit(3))), scan);
+        let parts = ordered_parts(&arena, &filter);
+        assert!(arena.effects(parts[0]).expression.may_raise_invocation_data);
+        assert!(!arena.effects(parts[0]).permits_filter_row_elimination);
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            PushDownPredicateScan.apply(filter, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_same_column_id_with_different_null_promise() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let mut wrong = col("a");
+        wrong.value_type = wrong.value_type.with_nullable(false).unwrap();
+        let filter = filter_opt(&mut arena, eq(wrong, int_lit(1)), scan);
+        assert!(matches!(
+            PushDownPredicateScan
+                .apply(filter, &mut make_ctx(arena))
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 }

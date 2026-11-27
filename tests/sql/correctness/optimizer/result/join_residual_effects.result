@@ -1,0 +1,44 @@
+-- query 14
+-- types	bigint
+k
+2
+
+-- query 16
+-- types	bigint
+cnt
+0
+
+-- query 17
+-- types	bigint
+k
+2
+
+-- query 18
+-- types	bigint
+k
+NULL
+
+-- query 21
+-- types	bigint	double
+k	d
+2	2.0
+
+-- query 22
+-- types	bigint
+cnt
+0
+
+-- query 24
+-- types	bigint
+k
+2
+
+-- query 26
+-- types	bigint
+cnt
+0
+
+-- query 28
+-- types	bigint
+k
+2

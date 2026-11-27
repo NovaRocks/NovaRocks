@@ -265,7 +265,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
 
 fn optimize_with_root_property(
     plan_expr: OptExpr,
-    scalar_arena: ScalarArena,
+    mut scalar_arena: ScalarArena,
     stats_input: OptimizerStatsInput,
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
@@ -313,6 +313,11 @@ fn optimize_with_root_property(
     rewrite_ctx.set_fold_dependency_observer(fold_dependency_observer);
     rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
     rewrite_ctx.set_sealed_functions(Arc::clone(&sealed_functions));
+    scalar_arena.bind_effect_environment(
+        Arc::clone(&function_catalog),
+        root_allow_throw_exception,
+        control,
+    )?;
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
     let rewritten_expr =
@@ -355,6 +360,7 @@ fn optimize_with_root_property(
         .into_inner();
     control.checkpoint(CompilePhase::Validate, 0)?;
     let mut memo = Memo::with_scalar_arena(arena.borrow().clone());
+    memo.hash_join_enabled = options.is_enabled("JoinToHashJoin");
     memo.function_catalog = Some(function_catalog);
     memo.factory = factory;
     let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo, control)?;

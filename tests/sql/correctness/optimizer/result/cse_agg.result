@@ -2,3 +2,13 @@
 -- types	bigint	double
 sum_ab	avg_ab
 68	22.666666666666668
+
+-- query 5
+-- types	double	double	bigint
+sum_ab	avg_ab	count_ab
+68.0	22.666666666666668	3
+
+-- query 7
+-- types	double	double	bigint
+sum_ab	avg_ab	count_ab
+68.0	22.666666666666668	3

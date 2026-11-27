@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::column_id::ColumnId;
 use crate::common::BinOp;
@@ -24,12 +24,6 @@ use crate::optimizer::scalar_expr;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PredicateKey(String);
-
-impl PredicateKey {
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PredicateOrigin {
@@ -67,8 +61,7 @@ pub(crate) struct PredicateGroup {
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
     pub(crate) derived: PredicateDerivedKind,
-    pub(crate) deterministic: bool,
-    pub(crate) can_fail: bool,
+    pub(crate) effects: crate::analysis::scalar_effects::ScalarEffects,
 }
 
 impl PredicateGroup {
@@ -83,15 +76,13 @@ impl PredicateGroup {
             .into_iter()
             .collect();
         let key = predicate_key(arena, expr);
-        let deterministic = !scalar_expr::contains_non_deterministic_function(arena, expr);
         Self {
             expr,
             referenced_ids,
             key,
             origin,
             derived,
-            deterministic,
-            can_fail: scalar_expr::can_fail(arena, expr),
+            effects: arena.effects(expr),
         }
     }
 
@@ -111,15 +102,20 @@ impl PredicateGroup {
 
 pub(crate) fn predicate_key(arena: &ScalarArena, expr: ScalarId) -> PredicateKey {
     PredicateKey(
-        signed_column_literal_equality_key(arena, expr)
+        signed_column_literal_equality(arena, expr)
+            .map(|(column, value)| {
+                let ty = arena.value_type(column);
+                let result = arena.value_type(expr);
+                format!("SignedColumnLiteralEquality({column:?},{ty:?},{result:?},{value})")
+            })
             .unwrap_or_else(|| canonical_expr_key(arena, expr)),
     )
 }
 
 /// A propagated signed column equality can return in the optimizer's binary
-/// representation. Recognize the original bound equality without changing
-/// either expression or comparing the semantics of other operator domains.
-fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Option<String> {
+/// representation. Share a meaning only for the original exact, total bound
+/// equality or the corresponding primitive on identical signed operands.
+fn signed_column_literal_equality(arena: &ScalarArena, expr: ScalarId) -> Option<(ScalarId, i64)> {
     use arrow::datatypes::DataType;
     use novarocks_functions::{FunctionKind, FunctionResultType};
     use novarocks_type_contract::{
@@ -139,16 +135,13 @@ fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Op
             args,
             binding,
             distinct: false,
-            volatility,
             ..
         } if binding.function_id.as_str() == OperatorFunction::Equal.function_id_text()
             && Some(binding.selected.overload.as_str())
                 == OperatorFunction::Equal.comparison_overload_text()
             && binding.kind == FunctionKind::Scalar
             && binding.logical_argument_count == 2
-            && volatility.is_replica_deterministic()
-            && binding.semantics.volatility.is_replica_deterministic()
-            && !scalar_expr::scalar_call_can_fail(binding) =>
+            && arena.effects(expr).can_share() =>
         {
             let [left, right] = args.as_slice() else {
                 return None;
@@ -180,7 +173,7 @@ fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Op
     } else {
         (right, left)
     };
-    let column_id = scalar_expr::column_id(arena, column)?;
+    scalar_expr::column_id(arena, column)?;
     let column_type = arena.value_type(column);
     let literal_type = arena.value_type(literal);
     if column_type.logical_type() != ValueLogicalType::Physical
@@ -191,14 +184,11 @@ fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Op
                 DataType::Boolean,
                 column_type.nullable() || literal_type.nullable(),
             )
-        || scalar_expr::can_fail(arena, literal)
+        || arena.effects(literal).may_raise_data()
     {
         return None;
     }
-    let value = scalar_expr::signed_integer_literal(arena, literal)?;
-    Some(format!(
-        "SignedColumnLiteralEquality({column_id:?},{column_type:?},{result:?},{value})"
-    ))
+    Some((column, scalar_expr::signed_integer_literal(arena, literal)?))
 }
 
 fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
@@ -417,15 +407,65 @@ fn canonical_expr_list_key(arena: &ScalarArena, exprs: &[ScalarId]) -> String {
         .join(",")
 }
 
-pub(crate) fn dedupe_groups(groups: Vec<PredicateGroup>) -> Vec<PredicateGroup> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for group in groups {
-        if seen.insert(group.key.clone()) {
-            out.push(group);
-        }
+/// A structural key indexes candidates. Elision also needs exact identity
+/// (or the proven signed comparison equivalence) in the caller's pure region.
+#[derive(Default)]
+pub(crate) struct ElidablePredicates(HashMap<PredicateKey, Vec<ScalarId>>);
+
+impl ElidablePredicates {
+    pub(crate) fn contains(&self, arena: &ScalarArena, expr: ScalarId) -> bool {
+        self.0
+            .get(&predicate_key(arena, expr))
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|&prior| same_elidable_predicate(arena, prior, expr))
+            })
     }
-    out
+
+    pub(crate) fn insert(&mut self, arena: &ScalarArena, expr: ScalarId) -> bool {
+        self.insert_candidate(arena, expr, predicate_key(arena, expr))
+    }
+
+    fn insert_candidate(&mut self, arena: &ScalarArena, expr: ScalarId, key: PredicateKey) -> bool {
+        if !arena.effects(expr).can_share() {
+            return true;
+        }
+        let entries = self.0.entry(key).or_default();
+        if entries
+            .iter()
+            .any(|&prior| same_elidable_predicate(arena, prior, expr))
+        {
+            return false;
+        }
+        entries.push(expr);
+        true
+    }
+}
+
+pub(super) fn same_elidable_predicate(
+    arena: &ScalarArena,
+    prior: ScalarId,
+    next: ScalarId,
+) -> bool {
+    arena.effects(prior).can_share()
+        && arena.effects(next).can_share()
+        && (prior == next
+            || (arena.value_type(prior) == arena.value_type(next)
+                && signed_column_literal_equality(arena, prior).is_some_and(|meaning| {
+                    Some(meaning) == signed_column_literal_equality(arena, next)
+                })))
+}
+
+pub(crate) fn dedupe_groups(
+    arena: &ScalarArena,
+    groups: Vec<PredicateGroup>,
+) -> Vec<PredicateGroup> {
+    let mut seen = ElidablePredicates::default();
+    groups
+        .into_iter()
+        .filter(|group| seen.insert_candidate(arena, group.expr, group.key.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -564,6 +604,37 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_retains_the_same_display_shape_with_different_complete_types() {
+        let comparison = |carrier| {
+            let mut input = col("a", 1);
+            input.value_type = novarocks_type_contract::FunctionValueType::new(carrier, true);
+            TypedExpr {
+                kind: ExprKind::IsNull {
+                    expr: novarocks_parser::ast::AstBox::new(input),
+                    negated: false,
+                },
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+            }
+        };
+        let mut arena = ScalarArena::new();
+        let groups = [DataType::Int32, DataType::Int64].map(|carrier| {
+            group_from_typed(
+                &mut arena,
+                comparison(carrier),
+                PredicateOrigin::JoinCondition,
+                PredicateDerivedKind::None,
+            )
+        });
+        assert_eq!(groups[0].key, groups[1].key);
+        assert!(groups.iter().all(|group| group.effects.can_share()));
+        assert_ne!(groups[0].expr, groups[1].expr);
+        assert_eq!(dedupe_groups(&arena, groups.into()).len(), 2);
+    }
+
+    #[test]
     fn dedupe_keeps_first_group_for_same_canonical_key() {
         let mut arena = ScalarArena::new();
         let first = group_from_typed(
@@ -579,7 +650,7 @@ mod tests {
             PredicateDerivedKind::Equivalence,
         );
 
-        let deduped = dedupe_groups(vec![first.clone(), second]);
+        let deduped = dedupe_groups(&arena, vec![first.clone(), second]);
 
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].origin, first.origin);
@@ -678,7 +749,7 @@ mod tests {
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
         .unwrap();
-        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
+        assert!(arena.effects(id).expression.value_stability.is_volatile());
     }
 
     #[test]
@@ -694,7 +765,7 @@ mod tests {
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
         .unwrap();
-        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
+        assert!(arena.effects(id).expression.value_stability.is_volatile());
     }
 
     #[test]
@@ -720,6 +791,6 @@ mod tests {
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
         .unwrap();
-        assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
+        assert!(arena.effects(id).expression.value_stability.is_volatile());
     }
 }

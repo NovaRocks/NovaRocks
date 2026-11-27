@@ -22,7 +22,6 @@ use crate::common::BinOp;
 use crate::optimizer::operator::{LogicalAggregateOp, LogicalJoinOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
-use crate::optimizer::scalar_expr;
 
 use super::context::{AggregatePushDownContext, ColumnRefIdentity, PushPlan, Side};
 
@@ -73,7 +72,11 @@ pub(crate) fn entry_safety_check(
             if !matches!(arena.node(*arg_id), ScalarNode::ColumnRef(_)) {
                 return None;
             }
-            if scalar_expr::contains_non_deterministic_function(arena, *arg_id) {
+            if !arena
+                .effects(*arg_id)
+                .expression
+                .permits_earlier_evaluation()
+            {
                 return None;
             }
         }

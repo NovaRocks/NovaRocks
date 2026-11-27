@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real SQL binding and optimizer rules preserve whole-call Data in both modes.
+//! Real SQL bindings preserve selected row errors and whole-invocation Data.
 use super::*;
 use crate::optimizer::{OptimizedOperatorNode, operator::Operator, scalar::ScalarNode};
 use arrow::datatypes::DataType;
@@ -99,7 +99,7 @@ fn compile_with_id_type(sql: &str, id_type: DataType) -> SqlOptimizedOutput {
         .unwrap()
 }
 
-fn whole_data_project(node: &OptimizedOperatorNode) -> bool {
+fn json_row_error_project(node: &OptimizedOperatorNode) -> bool {
     let Operator::PhysicalProject(project) = &node.op else {
         return false;
     };
@@ -120,37 +120,53 @@ fn whole_data_project(node: &OptimizedOperatorNode) -> bool {
             binding.admitted_execution_abi,
             Some(PureKernelAbi::ScalarV1)
         );
-        assert!(crate::optimizer::scalar_expr::can_fail(arena, item.expr));
+        let effects = arena.effects(item.expr).expression;
+        assert!(effects.may_raise_row_error);
+        assert!(!effects.may_raise_invocation_data);
         assert_eq!(arena.data_type(item.expr), &DataType::LargeBinary);
         true
     })
 }
-fn subtree_has_whole_data(node: &OptimizedOperatorNode) -> bool {
-    whole_data_project(node) || node.children.iter().any(subtree_has_whole_data)
+fn subtree_has_json_row_error(node: &OptimizedOperatorNode) -> bool {
+    json_row_error_project(node) || node.children.iter().any(subtree_has_json_row_error)
 }
-fn count_preserved_filter(node: &OptimizedOperatorNode) -> usize {
-    let own = match &node.op {
-        Operator::PhysicalFilter(_) => {
-            usize::from(node.children.iter().any(subtree_has_whole_data))
-        }
-        Operator::PhysicalScan(scan) => {
-            assert!(
-                scan.predicates.is_empty(),
-                "no predicate hides the throwing project"
-            );
-            0
-        }
-        _ => 0,
+fn invocation_data_project(node: &OptimizedOperatorNode) -> bool {
+    let Operator::PhysicalProject(project) = &node.op else {
+        return false;
     };
-    own + node
-        .children
-        .iter()
-        .map(count_preserved_filter)
-        .sum::<usize>()
+    let arena = node.execution_props.scalar_arena.as_ref().unwrap();
+    project.items.iter().any(|item| {
+        matches!(
+            arena.node(item.expr),
+            ScalarNode::FunctionCall { binding, .. }
+                if binding.function_id.as_str() == "builtin.scalar/__array_struct_subfield/v1"
+                    && binding.admitted_execution_abi == Some(PureKernelAbi::ScalarInvocationV1)
+                    && arena.effects(item.expr).expression.may_raise_invocation_data
+        )
+    })
+}
+
+fn subtree_has_invocation_data(node: &OptimizedOperatorNode) -> bool {
+    invocation_data_project(node) || node.children.iter().any(subtree_has_invocation_data)
+}
+
+fn filter_above_invocation_data(node: &OptimizedOperatorNode) -> bool {
+    (matches!(&node.op, Operator::PhysicalFilter(_))
+        && node.children.iter().any(subtree_has_invocation_data))
+        || node.children.iter().any(filter_above_invocation_data)
 }
 
 #[test]
-fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_for_compiled() {
+fn scalar_invocation_data_keeps_an_unreferenced_project_and_its_original_filter_boundary() {
+    let output = compile(
+        "SELECT id FROM (SELECT id, __array_struct_subfield(ARRAY[CAST(ROW(n) AS ROW(field_value bigint))], 'field_value') AS unused_error FROM t) s WHERE id = 2 ORDER BY id",
+    );
+    assert!(subtree_has_invocation_data(&output.optimized_tree));
+    assert!(filter_above_invocation_data(&output.optimized_tree));
+}
+
+#[test]
+fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_selected_row_error_for_compiled() {
     {
         for filtered in [false, true] {
             let suffix = if filtered {
@@ -163,21 +179,15 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_for_
             );
             let output = compile(&sql);
             assert!(
-                subtree_has_whole_data(&output.optimized_tree),
-                "PruneProjectColumns must retain the unreferenced whole-call Data use"
+                subtree_has_json_row_error(&output.optimized_tree),
+                "PruneProjectColumns retains the unreferenced selected-row error use"
             );
-            if filtered {
-                assert!(
-                    count_preserved_filter(&output.optimized_tree) > 0,
-                    "PushFilterThroughProject must retain the outer filter above Data"
-                );
-            }
         }
     }
 }
 
 #[test]
-fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_for_compiled() {
+fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_row_error_for_compiled() {
     fn check(node: &OptimizedOperatorNode) -> usize {
         let mut count = 0;
         if let Operator::PhysicalProject(project) = &node.op {
@@ -189,7 +199,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 if binding.function_id.as_str() != "builtin.scalar/__json_object_null/v1" {
                     continue;
                 }
-                assert!(whole_data_project(node));
+                assert!(json_row_error_project(node));
                 let ScalarNode::FunctionCall {
                     binding,
                     args: key_access,
@@ -277,9 +287,6 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
             );
             let output = compile_with_id_type(&sql, DataType::Int32);
             assert_eq!(check(&output.optimized_tree), 1);
-            if filtered {
-                assert!(count_preserved_filter(&output.optimized_tree) > 0);
-            }
         }
     }
 }

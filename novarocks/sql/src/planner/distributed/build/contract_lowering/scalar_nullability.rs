@@ -132,34 +132,25 @@ impl ScalarEmission<'_, '_> {
         source: ExprId,
         candidates: &[ExprId],
     ) -> Result<bool, ContractLoweringError> {
-        use novarocks_functions::PreparedCompositeComparisonRecipe;
         let source = self.expression_value_type(source)?;
         if source.nullable() {
             return Ok(true);
         }
-        let composite = PreparedCompositeComparisonRecipe::is_composite(&source);
         for &candidate in candidates {
             self.work.step()?;
             let candidate = self.expression_value_type(candidate)?;
-            if candidate.nullable() {
+            if crate::compiler::selected_scalar_call::membership_operand_can_return_null(
+                &source,
+                &candidate,
+                self.control,
+            )
+            .map_err(|error| match error.control_error() {
+                Some(cause) => ContractLoweringError::Control(cause),
+                None => ContractLoweringError::InvalidFunctionBinding {
+                    detail: error.to_string(),
+                },
+            })? {
                 return Ok(true);
-            }
-            if composite {
-                let recipe = PreparedCompositeComparisonRecipe::try_new(
-                    novarocks_type_contract::KeyRelation::Equal,
-                    &source,
-                    &candidate,
-                    self.control,
-                )
-                .map_err(|error| match error.control_error() {
-                    Some(cause) => ContractLoweringError::Control(cause),
-                    None => ContractLoweringError::InvalidFunctionBinding {
-                        detail: error.to_string(),
-                    },
-                })?;
-                if recipe.nullable_result() {
-                    return Ok(true);
-                }
             }
         }
         Ok(false)

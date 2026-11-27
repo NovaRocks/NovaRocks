@@ -830,6 +830,14 @@ impl<'a> AnalyzerContext<'a> {
         )
     }
 
+    fn scalar_effects(&self) -> crate::analysis::scalar_effects::ScalarEffectQuery<'_> {
+        crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: Some(self.function_catalog),
+            allow_throw_exception: self.sql_semantics.sql_mode().allow_throw_exception(),
+            control: self.control,
+        }
+    }
+
     pub(super) fn check_control(&self) -> Result<(), AnalyzeError> {
         novarocks_type_contract::PureCompileControl::checkpoint(
             self.control,
@@ -3375,12 +3383,19 @@ impl<'a> AnalyzerContext<'a> {
                             // `SELECT a.c, b.c ... ORDER BY a.c, b.c` would
                             // produce two unqualified `c` refs and collapse
                             // both keys onto the first projection slot.
-                            let separately_evaluated_aggregate = matches!(
+                            let separately_evaluated_aggregate = if matches!(
                                 ast_item,
                                 ast::SelectItem::SingleColumn(column)
                                     if self.expr_contains_aggregate(&column.expression)
-                                    && !crate::analysis::expr_identity::expression_can_share_evaluation(&ir_item.expr)
-                            );
+                            ) {
+                                !self
+                                    .scalar_effects()
+                                    .typed(&ir_item.expr)
+                                    .map_err(crate::analysis::scalar_effects::as_analyze_error)?
+                                    .can_share()
+                            } else {
+                                false
+                            };
                             if ast_expr_text == ob_text && !separately_evaluated_aggregate {
                                 matched_alias = Some(ir_item.expr.clone());
                                 break;

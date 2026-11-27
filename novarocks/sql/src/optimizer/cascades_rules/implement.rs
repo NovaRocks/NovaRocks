@@ -129,25 +129,40 @@ fn hash_join_key_type_is_supported(data_type: &DataType) -> bool {
     )
 }
 
-fn coerce_hash_join_eq_condition(
+fn place_hash_join_key(
     arena: &ScalarArena,
     eq: ScalarHashJoinEqCondition,
-) -> Option<ScalarHashJoinEqCondition> {
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarHashJoinEqCondition>, crate::compiler::SqlCompileError> {
+    if !safe_key_operand(arena, eq.origin)
+        || !safe_key_operand(arena, eq.left)
+        || !safe_key_operand(arena, eq.right)
+    {
+        return Ok(None);
+    }
+    let Some(eq) = orient_eq_pair(eq, arena, left_ids, right_ids) else {
+        return Ok(None);
+    };
     let left = arena.value_type(eq.left);
     let right = arena.value_type(eq.right);
-    if eq.bound_comparison {
-        return (left.value_type().kind() == right.value_type().kind()
-            && left.data_type() == right.data_type()
-            && eq
-                .match_relation
-                .supports(left.data_type(), left.logical_type(), eq.null_safe)
-            && hash_join_key_type_is_supported(left.data_type()))
-        .then_some(eq);
+    let Ok(common) = crate::compiler::selected_scalar_call::comparison_type(left, right) else {
+        return Ok(None);
+    };
+    if !hash_join_key_type_is_supported(common.data_type())
+        || !eq
+            .match_relation
+            .supports(common.data_type(), common.logical_type(), eq.null_safe)
+        || (eq.bound_comparison
+            && (left.value_type().kind() != right.value_type().kind()
+                || left.data_type() != right.data_type()
+                || left.logical_type() != right.logical_type()))
+        || !arena.comparison_casts_can_share(left, right, control)?
+    {
+        return Ok(None);
     }
-    // The original membership and wider-number author can leave a compatible
-    // common carrier for physical comparison lowering. Preserve that route.
-    let carrier = novarocks_types::wider_type(left.data_type(), right.data_type());
-    hash_join_key_type_is_supported(&carrier).then_some(eq)
+    Ok(Some(eq))
 }
 
 fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinEqCondition> {
@@ -161,6 +176,38 @@ fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinE
             OperatorFunction::Identical => true,
             _ => return None,
         };
+        let ScalarNode::FunctionCall {
+            binding,
+            distinct: false,
+            ..
+        } = arena.node(expr)
+        else {
+            return None;
+        };
+        use novarocks_functions::FunctionResultType;
+        use novarocks_type_contract::{FunctionArgumentType, FunctionKind};
+        let (
+            [
+                FunctionArgumentType::Value(selected_left),
+                FunctionArgumentType::Value(selected_right),
+            ],
+            FunctionResultType::Scalar(result),
+        ) = (
+            binding.selected.argument_types.as_ref(),
+            &binding.selected.result_type,
+        )
+        else {
+            return None;
+        };
+        if binding.kind != FunctionKind::Scalar
+            || binding.logical_argument_count != 2
+            || Some(binding.selected.overload.as_str()) != operator.comparison_overload_text()
+            || selected_left != arena.value_type(left)
+            || selected_right != arena.value_type(right)
+            || result != arena.value_type(expr)
+        {
+            return None;
+        }
         (left, right, null_safe, true)
     } else {
         let ScalarNode::BinaryOp {
@@ -194,77 +241,12 @@ fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinE
     })
 }
 
-fn append_residual_condition(
-    arena: &mut ScalarArena,
-    other: &mut Option<ScalarId>,
-    residual: ScalarId,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<(), crate::compiler::SqlCompileError> {
-    *other = Some(match other.take() {
-        Some(existing) => arena.intern_observed(
-            ScalarNode::BinaryOp {
-                left: existing,
-                op: BinOp::And,
-                right: residual,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-            control,
-        )?,
-        None => residual,
-    });
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helper: extract equality conditions from a join predicate
-// ---------------------------------------------------------------------------
-
-/// Walk a join condition and split top-level AND-connected `a = b` pairs from
-/// the remaining predicate. Returns `(eq_pairs, remaining_condition)`.
-///
-/// Also handles OR-connected disjuncts: if the top-level condition (or a
-/// top-level conjunct) is `(A AND eq) OR (B AND eq) OR …`, the equality
-/// pairs that appear in *every* OR branch are extracted as hash join keys.
-///
-/// For cross joins (condition is `None`) or when no equalities are found,
-/// `eq_pairs` will be empty.
-fn extract_eq_conditions(
-    condition: Option<ScalarId>,
-    _join_type: &JoinKind,
-    arena: &mut ScalarArena,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<(Vec<ScalarHashJoinEqCondition>, Option<ScalarId>), crate::compiler::SqlCompileError> {
-    let Some(cond) = condition else {
-        return Ok((vec![], None));
-    };
-    // Pre-matching can suppress required expressions or run a key early.
-    // A whole-condition totality and stability proof keeps both evaluations
-    // equivalent, including when common keys are lifted out of OR branches.
-    if !safe_key_operand(arena, cond) {
-        return Ok((vec![], Some(cond)));
-    }
-    let mut eq_pairs = Vec::new();
-    let mut others = Vec::new();
-    collect_conjuncts(arena, cond, &mut eq_pairs, &mut others);
-
-    // If no equalities were found from top-level AND, try to extract common
-    // equalities from OR branches among the "other" predicates.
-    if eq_pairs.is_empty() {
-        let mut new_others = Vec::new();
-        for part in others {
-            let (common, rewritten) = try_extract_common_eq_from_or(arena, part, control)?;
-            eq_pairs.extend(common);
-            if let Some(r) = rewritten {
-                new_others.push(r);
-            }
-        }
-        others = new_others;
-    }
-
-    let remaining = scalar_expr::combine_conjuncts(arena, others, control)?;
-    Ok((eq_pairs, remaining))
+pub(crate) fn strict_comparison_operands(
+    arena: &ScalarArena,
+    expr: ScalarId,
+) -> Option<[ScalarId; 2]> {
+    let key = comparison_key(arena, expr)?;
+    (!key.null_safe).then_some([key.left, key.right])
 }
 
 /// Recursively flatten top-level AND nodes and classify each conjunct as
@@ -301,13 +283,10 @@ fn collect_conjuncts(
     }
 }
 
-/// Split a top-level OR expression into its disjuncts.
-/// Check if two eq pairs are structurally equal (possibly with swapped sides).
+/// The interned definition includes the original comparison binding,
+/// ordered operands, and every operand and result type.
 fn eq_pair_matches(a: &ScalarHashJoinEqCondition, b: &ScalarHashJoinEqCondition) -> bool {
-    a.null_safe == b.null_safe
-        && a.match_relation == b.match_relation
-        && a.bound_comparison == b.bound_comparison
-        && ((a.left == b.left && a.right == b.right) || (a.left == b.right && a.right == b.left))
+    a.origin == b.origin
 }
 
 /// Try to extract common equality conditions from an OR expression.
@@ -519,8 +498,7 @@ type ScalarJoinCondition =
     novarocks_physical_plan::HashJoinCondition<Vec<PhysicalHashJoinEqCondition>, ScalarId>;
 
 pub(crate) fn safe_key_operand(arena: &ScalarArena, expression: ScalarId) -> bool {
-    !scalar_expr::can_fail(arena, expression)
-        && !scalar_expr::contains_non_replica_deterministic_function(arena, expression)
+    arena.effects(expression).can_share()
 }
 
 /// Admit only the original NOT IN author's complete C, with its Value-demand
@@ -566,12 +544,7 @@ fn null_aware_hash_condition(
     }
     let mut value_equal_keys = Vec::new();
     for pair in comparisons {
-        if !safe_key_operand(arena, pair.left) || !safe_key_operand(arena, pair.right) {
-            return Ok(None);
-        }
-        let Some(pair) = orient_eq_pair(pair, arena, left_ids, right_ids)
-            .and_then(|pair| coerce_hash_join_eq_condition(arena, pair))
-        else {
+        let Some(pair) = place_hash_join_key(arena, pair, left_ids, right_ids, control)? else {
             return Ok(None);
         };
         value_equal_keys.push(PhysicalHashJoinEqCondition {
@@ -589,21 +562,20 @@ fn null_aware_hash_condition(
         scalar_expr::split_conjuncts(arena, eligibility, &mut conjuncts);
         let mut safe_prefix = true;
         for conjunct in conjuncts {
-            let pair = comparison_key(arena, conjunct);
             // A nullable Value-demand prefix cannot suppress required work
             // after UNKNOWN. A nonnullable safe prefix, or a total E, can.
-            let extracted = pair
-                .filter(|pair| {
-                    safe_key_operand(arena, pair.left)
-                        && safe_key_operand(arena, pair.right)
-                        && (total
-                            || (safe_prefix
-                                && (pair.null_safe
-                                    || (!arena.nullable(pair.left)
-                                        && !arena.nullable(pair.right)))))
-                })
-                .and_then(|pair| orient_eq_pair(pair, arena, left_ids, right_ids))
-                .and_then(|pair| coerce_hash_join_eq_condition(arena, pair));
+            let candidate = comparison_key(arena, conjunct).filter(|pair| {
+                total
+                    || (safe_prefix
+                        && (pair.null_safe
+                            || (!arena.nullable(conjunct)
+                                && !arena.nullable(pair.left)
+                                && !arena.nullable(pair.right))))
+            });
+            let extracted = match candidate {
+                Some(pair) => place_hash_join_key(arena, pair, left_ids, right_ids, control)?,
+                None => None,
+            };
             if let Some(pair) = extracted {
                 scope_keys.push(PhysicalHashJoinEqCondition {
                     left: pair.left,
@@ -631,6 +603,111 @@ fn null_aware_hash_condition(
     ))
 }
 
+/// Prove a placement from the original ordinary TruthOnly condition.
+fn ordinary_hash_condition(
+    condition: ScalarId,
+    arena: &mut ScalarArena,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarJoinCondition>, crate::compiler::SqlCompileError> {
+    let effects = arena.effects(condition);
+    // Hash changes the evaluated pair domain and physical traversal order.
+    // A pair-local error can be skipped on an excluded pair in this pure
+    // TruthOnly region. Stateful work or invocation Data needs a different
+    // pair-domain proof, even when the individual equality is total.
+    if !effects.expression.permits_boolean_reordering() || !effects.permits_filter_row_elimination {
+        return Ok(None);
+    }
+
+    let mut conjuncts = Vec::new();
+    scalar_expr::split_conjuncts(arena, condition, &mut conjuncts);
+    let mut keys = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+        let pair = match comparison_key(arena, conjunct) {
+            Some(pair) => place_hash_join_key(arena, pair, left_ids, right_ids, control)?,
+            None => None,
+        };
+        if let Some(pair) = pair {
+            keys.push(pair);
+        } else {
+            residual.push(conjunct);
+        }
+    }
+    // Retain the original total AND/OR path. Factoring inside a condition
+    // that can raise is not licensed by the outer TruthOnly proof.
+    if keys.is_empty() && effects.can_share() {
+        let mut rewritten = Vec::new();
+        for part in residual {
+            let (common, remaining) = try_extract_common_eq_from_or(arena, part, control)?;
+            let mut placed = Vec::new();
+            for pair in common {
+                let Some(pair) = place_hash_join_key(arena, pair, left_ids, right_ids, control)?
+                else {
+                    placed.clear();
+                    break;
+                };
+                placed.push(pair);
+            }
+            if placed.is_empty() {
+                rewritten.push(part);
+            } else {
+                keys.extend(placed);
+                rewritten.extend(remaining);
+            }
+        }
+        residual = rewritten;
+    }
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(novarocks_physical_plan::HashJoinCondition::Ordinary {
+        keys: keys
+            .into_iter()
+            .map(|eq| PhysicalHashJoinEqCondition {
+                left: eq.left,
+                right: eq.right,
+                null_safe: eq.null_safe,
+                match_relation: eq.match_relation,
+            })
+            .collect(),
+        residual: scalar_expr::combine_conjuncts(arena, residual, control)?,
+    }))
+}
+
+fn choose_hash_join(
+    op: &LogicalJoinOp,
+    children: &[GroupId],
+    memo: &mut Memo,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<PhysicalHashJoinOp>, crate::compiler::SqlCompileError> {
+    let ([left, right], Some(condition), Some(build_side)) = (
+        children,
+        op.condition,
+        crate::optimizer::operator::exact_hash_join_build_side(op.join_type),
+    ) else {
+        return Ok(None);
+    };
+    let left_ids = get_group_column_ids(memo, *left);
+    let right_ids = get_group_column_ids(memo, *right);
+    let condition = if matches!(
+        op.join_type,
+        JoinKind::NullAwareLeftAnti | JoinKind::LeftMark { .. }
+    ) {
+        null_aware_hash_condition(op, &left_ids, &right_ids, &mut memo.scalars, control)?
+    } else {
+        ordinary_hash_condition(condition, &mut memo.scalars, &left_ids, &right_ids, control)?
+    };
+    Ok(condition.map(|condition| PhysicalHashJoinOp {
+        join_type: op.join_type,
+        build_side,
+        distribution: JoinDistribution::Unknown,
+        condition,
+    }))
+}
+
 impl Rule for JoinToHashJoin {
     fn name(&self) -> &str {
         "JoinToHashJoin"
@@ -647,96 +724,18 @@ impl Rule for JoinToHashJoin {
         memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
-        let _ = control;
-
         let Operator::LogicalJoin(op) = &expr.op else {
             return Ok(vec![]);
         };
-        if matches!(
-            op.join_type,
-            JoinKind::NullAwareLeftAnti | JoinKind::LeftMark { .. }
-        ) {
-            if expr.children.len() != 2 {
-                return Ok(vec![]);
-            }
-            let left_ids = get_group_column_ids(memo, expr.children[0]);
-            let right_ids = get_group_column_ids(memo, expr.children[1]);
-            let Some(condition) =
-                null_aware_hash_condition(op, &left_ids, &right_ids, &mut memo.scalars, control)?
-            else {
-                return Ok(vec![]);
-            };
-            return Ok(vec![NewExpr {
-                op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                    join_type: op.join_type,
-                    condition,
-                    build_side: HashJoinBuildSide::Right,
-                    distribution: JoinDistribution::Unknown,
-                }),
+        Ok(choose_hash_join(op, &expr.children, memo, control)?
+            .map(|hash| NewExpr {
+                op: Operator::PhysicalHashJoin(hash),
                 children: expr.children.clone(),
-            }]);
-        }
-        let (raw_eq_conds, mut other) =
-            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
-
-        // Orient eq_conditions so that pair.0 references the left child's
-        // columns and pair.1 references the right child's columns.  Pairs
-        // that reference only one side (e.g., inner predicates in a SEMI
-        // JOIN condition) are demoted into other_condition.
-        let mut eq_conds = Vec::new();
-        if expr.children.len() == 2 {
-            let left_ids = get_group_column_ids(memo, expr.children[0]);
-            let right_ids = get_group_column_ids(memo, expr.children[1]);
-            for pair in raw_eq_conds {
-                let original = pair.origin;
-                let oriented = orient_eq_pair(pair, &memo.scalars, &left_ids, &right_ids)
-                    .and_then(|pair| coerce_hash_join_eq_condition(&memo.scalars, pair));
-                if let Some(pair) = oriented {
-                    eq_conds.push(pair);
-                } else {
-                    append_residual_condition(&mut memo.scalars, &mut other, original, control)?;
-                }
-            }
-        } else {
-            eq_conds = raw_eq_conds;
-        }
-
-        if eq_conds.is_empty() {
-            // No equality conditions — JoinToNestLoop should handle this.
-            return Ok(vec![]);
-        }
-        let eq_conditions = eq_conds
-            .into_iter()
-            .map(|eq| PhysicalHashJoinEqCondition {
-                left: eq.left,
-                right: eq.right,
-                null_safe: eq.null_safe,
-                match_relation: eq.match_relation,
             })
-            .collect();
-        let other_condition = other;
-        let Some(build_side) = crate::optimizer::operator::exact_hash_join_build_side(op.join_type)
-        else {
-            return Ok(vec![]);
-        };
-        Ok(vec![NewExpr {
-            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                join_type: op.join_type,
-                build_side,
-                distribution: JoinDistribution::Unknown,
-                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
-                    keys: eq_conditions,
-                    residual: other_condition,
-                },
-            }),
-            children: expr.children.clone(),
-        }])
+            .into_iter()
+            .collect())
     }
 }
-
-// ---------------------------------------------------------------------------
-// 5. JoinToNestLoop
-// ---------------------------------------------------------------------------
 
 pub(crate) struct JoinToNestLoop;
 
@@ -756,61 +755,18 @@ impl Rule for JoinToNestLoop {
         memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
-        let _ = control;
-
         let Operator::LogicalJoin(op) = &expr.op else {
             return Ok(vec![]);
         };
-        if matches!(op.join_type, JoinKind::LeftMark { .. }) {
-            // Hash marks have an authored null-aware condition and physical
-            // key contract. Relation marks consume the complete predicate.
-            return Ok(if op.naa_author.is_some() || op.condition.is_none() {
-                vec![]
-            } else {
-                vec![NewExpr {
-                    op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
-                        join_type: op.join_type,
-                        condition: op.condition,
-                    }),
-                    children: expr.children.clone(),
-                }]
-            });
-        }
-        // NestLoop is used for cross joins or joins without equality
-        // conditions. We must check feasibility after `orient_eq_pair`,
-        // not just the raw equality count — a `=` whose two sides each
-        // reference columns from BOTH children (e.g. CROSS JOIN with
-        // `abs(t0.x + t1.y) = abs(t0.u + t1.v)`) cannot be used as a hash
-        // key, so JoinToHashJoin will demote it and bail out with no
-        // physical alternatives. Without this guard, the memo group has no
-        // feasible implementation and the optimizer surfaces "no feasible
-        // plan for group N".
-        let (eq_conds, _) =
-            extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
-        if op.join_type == JoinKind::NullAwareLeftAnti && expr.children.len() == 2 {
-            let left_ids = get_group_column_ids(memo, expr.children[0]);
-            let right_ids = get_group_column_ids(memo, expr.children[1]);
-            if null_aware_hash_condition(op, &left_ids, &right_ids, &mut memo.scalars, control)?
-                .is_some()
-            {
-                return Ok(vec![]);
-            }
-        } else if !eq_conds.is_empty()
-            && op.join_type != JoinKind::Cross
-            && expr.children.len() == 2
+        if matches!(op.join_type, JoinKind::LeftMark { .. })
+            && (op.naa_author.is_some() || op.condition.is_none())
         {
-            let left_ids = get_group_column_ids(memo, expr.children[0]);
-            let right_ids = get_group_column_ids(memo, expr.children[1]);
-            let has_orientable_pair = eq_conds
-                .iter()
-                .filter_map(|p| orient_eq_pair(p.clone(), &memo.scalars, &left_ids, &right_ids))
-                .any(|p| coerce_hash_join_eq_condition(&memo.scalars, p).is_some());
-            if has_orientable_pair {
-                // Has at least one usable equi-key — JoinToHashJoin handles this.
-                return Ok(vec![]);
-            }
-        } else if !eq_conds.is_empty() && op.join_type != JoinKind::Cross {
-            // 1-child join (shouldn't happen for binary joins) — defer.
+            // Relation marks consume the complete predicate. Authored hash
+            // marks have a distinct Value-demand comparison placement.
+            return Ok(vec![]);
+        }
+        let hash_available = memo.hash_join_enabled || op.join_type == JoinKind::NullAwareLeftAnti;
+        if hash_available && choose_hash_join(op, &expr.children, memo, control)?.is_some() {
             return Ok(vec![]);
         }
         Ok(vec![NewExpr {
@@ -1907,463 +1863,7 @@ mod eq_pair_tests {
 }
 
 #[cfg(test)]
-mod join_demotion_tests {
-    use super::*;
-    use crate::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
-    use crate::column_id::ColumnId;
-    use crate::optimizer::memo::{LogicalProperties, MExpr, Memo};
-    use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
-    use crate::optimizer::scalar::ScalarId;
-    use crate::planner::table::TableDef;
-
-    use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
-    use arrow::datatypes::{DataType, Field};
-    use std::sync::Arc;
-
-    fn test_col_id(name: &str) -> ColumnId {
-        match name {
-            "a_id" => ColumnId::new_for_test(10),
-            "a_name" => ColumnId::new_for_test(11),
-            "a_arr" => ColumnId::new_for_test(12),
-            "b_id" => ColumnId::new_for_test(20),
-            "b_arr" => ColumnId::new_for_test(21),
-            _ => ColumnId::new_for_test(100),
-        }
-    }
-
-    fn col(name: &str) -> TypedExpr {
-        col_typed(name, DataType::Int32)
-    }
-
-    fn col_typed(name: &str, data_type: DataType) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: test_col_id(name),
-                qualifier: None,
-                column: name.into(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
-        }
-    }
-
-    fn list_type(item_type: DataType) -> DataType {
-        DataType::List(Arc::new(Field::new("item", item_type, true)))
-    }
-
-    /// Create a scan group whose logical_props report the given output columns.
-    fn mk_scan_group(memo: &mut Memo, col_names: &[&str]) -> usize {
-        let output_columns: Vec<OutputColumn> = col_names
-            .iter()
-            .map(|name| OutputColumn {
-                column_id: test_col_id(name),
-                name: (*name).into(),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-
-                is_internal: false,
-            })
-            .collect();
-        let scan_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalScan(ScanOp {
-                database: "db".into(),
-                table: TableDef {
-                    name: "t".into(),
-                    columns: vec![],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::compiler::mv_rewrite::test_scan_source(
-                        crate::planner::table::SqlScanKind::ConnectorRead,
-                    ),
-                },
-                alias: None,
-                stats_ref: None,
-                columns: output_columns.clone(),
-                predicates: vec![],
-                required_columns: None,
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-        };
-        let gid = memo.new_group(scan_mexpr);
-        // Inject logical_props so side ownership can be derived from ColumnId.
-        memo.groups[gid].logical_props = Some(LogicalProperties::new(output_columns, 100.0));
-        gid
-    }
-
-    /// Build `left op right` as a TypedExpr.
-    fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
-    }
-
-    fn logical_join_expr(
-        memo: &mut Memo,
-        join_type: JoinKind,
-        condition: TypedExpr,
-        children: Vec<GroupId>,
-    ) -> MExpr {
-        let id = memo.next_expr_id();
-        let condition = Some(
-            intern_typed(
-                &mut memo.scalars,
-                &condition,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap(),
-        );
-        MExpr {
-            id,
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                naa_author: None,
-                join_type,
-                condition,
-            }),
-            children,
-        }
-    }
-
-    fn mat(memo: &Memo, expr: ScalarId) -> TypedExpr {
-        materialize(&memo.scalars, expr)
-    }
-
-    fn assert_col_id(expr: &TypedExpr, expected: ColumnId, message: &str) {
-        match &expr.kind {
-            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, expected, "{message}"),
-            other => panic!("expected ColumnRef for {message}, got {:?}", other),
-        }
-    }
-
-    /// The full demotion path: a same-side eq pair must land in other_condition
-    /// while an orientable pair lands (correctly oriented) in eq_conditions.
-    #[test]
-    fn demoted_single_side_pair_ends_in_other_condition() {
-        let mut memo = Memo::new();
-
-        // Left side: columns [a_id, a_name].  Right side: column [b_id].
-        let left_group = mk_scan_group(&mut memo, &["a_id", "a_name"]);
-        let right_group = mk_scan_group(&mut memo, &["b_id"]);
-
-        // Condition: (a_id = b_id) AND (a_id = a_name)
-        //   • First pair  (a_id, b_id)  — orientable (a_id left, b_id right).
-        //   • Second pair (a_id, a_name) — same-side (both left) → must demote.
-        let first_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
-        let second_eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
-        let condition = bin(first_eq, BinOp::And, second_eq);
-
-        let join_mexpr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-
-        let rule = JoinToHashJoin;
-        let alternatives = rule
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-
-        assert_eq!(alternatives.len(), 1);
-
-        let alt = &alternatives[0];
-        let Operator::PhysicalHashJoin(phys) = &alt.op else {
-            panic!("expected PhysicalHashJoin, got {:?}", alt.op);
-        };
-
-        // ── eq_conditions: exactly one pair, (a_id, b_id) ──────────────────
-        assert_eq!(
-            phys.condition.keys().len(),
-            1,
-            "expected 1 eq pair in eq_conditions, got {:?}",
-            phys.condition.keys()
-        );
-        let eq = &phys.condition.keys()[0];
-        assert!(
-            !eq.null_safe,
-            "regular equality should not be marked null-safe"
-        );
-        let lhs = mat(&memo, eq.left);
-        let rhs = mat(&memo, eq.right);
-        assert_col_id(
-            &lhs,
-            test_col_id("a_id"),
-            "left side of eq_condition should be a_id",
-        );
-        assert_col_id(
-            &rhs,
-            test_col_id("b_id"),
-            "right side of eq_condition should be b_id",
-        );
-
-        // ── other_condition: the demoted (a_id = a_name) pair ───────────────
-        let other = phys
-            .condition
-            .residual()
-            .as_ref()
-            .expect("demoted same-side pair must appear in other_condition");
-        let other = mat(&memo, *other);
-        match &other.kind {
-            ExprKind::BinaryOp {
-                left, op, right, ..
-            } => {
-                assert!(
-                    matches!(op, BinOp::Eq),
-                    "demoted condition should be BinaryOp::Eq, got {:?}",
-                    op
-                );
-                match (&left.kind, &right.kind) {
-                    (
-                        ExprKind::ColumnRef { column_id: l, .. },
-                        ExprKind::ColumnRef { column_id: r, .. },
-                    ) => {
-                        let a_id = test_col_id("a_id");
-                        let a_name = test_col_id("a_name");
-                        assert!(
-                            (*l == a_id && *r == a_name) || (*l == a_name && *r == a_id),
-                            "expected (a_id, a_name) in demoted eq, got ({}, {})",
-                            l,
-                            r
-                        );
-                    }
-                    other => panic!(
-                        "expected two ColumnRef nodes inside demoted eq, got {:?}",
-                        other
-                    ),
-                }
-            }
-            other => panic!("expected BinaryOp::Eq in other_condition, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn null_safe_join_pair_stays_hash_join_key() {
-        let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_id"]);
-        let right_group = mk_scan_group(&mut memo, &["b_id"]);
-
-        let condition = bin(col("a_id"), BinOp::EqForNull, col("b_id"));
-        let join_mexpr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-
-        let rule = JoinToHashJoin;
-        let alternatives = rule
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert_eq!(alternatives.len(), 1);
-        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
-            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
-        };
-        assert_eq!(phys.condition.keys().len(), 1);
-        assert!(
-            phys.condition.keys()[0].null_safe,
-            "<=> hash join key must retain null-safe semantics"
-        );
-        assert!(
-            phys.condition.residual().is_none(),
-            "<=> should not be left as a residual-only predicate"
-        );
-    }
-
-    #[test]
-    fn mixed_integer_eq_pair_keeps_raw_hash_key_for_distribution() {
-        let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_id"]);
-        let right_group = mk_scan_group(&mut memo, &["b_id"]);
-
-        let condition = bin(
-            col_typed("a_id", DataType::Int64),
-            BinOp::Eq,
-            col_typed("b_id", DataType::Int32),
-        );
-        let join_mexpr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-
-        let alternatives = JoinToHashJoin
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert_eq!(
-            alternatives.len(),
-            1,
-            "mixed integer equality should remain hash-joinable"
-        );
-        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
-            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
-        };
-        assert_eq!(phys.condition.keys().len(), 1);
-        let left_key = mat(&memo, phys.condition.keys()[0].left);
-        let right_key = mat(&memo, phys.condition.keys()[0].right);
-        assert_eq!(left_key.value_type.data_type().clone(), DataType::Int64);
-        assert_eq!(right_key.value_type.data_type().clone(), DataType::Int32);
-        assert!(
-            matches!(left_key.kind, ExprKind::ColumnRef { .. }),
-            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
-        );
-        assert!(
-            matches!(right_key.kind, ExprKind::ColumnRef { .. }),
-            "optimizer hash key should keep raw column refs so distribution can enforce both sides"
-        );
-        assert!(
-            phys.condition.residual().is_none(),
-            "compatible scalar equality should not be demoted"
-        );
-    }
-
-    #[test]
-    fn cross_type_array_pair_has_no_hash_join_alternative() {
-        for comparison in [BinOp::Eq, BinOp::EqForNull] {
-            assert_cross_type_array_pair_has_no_hash_join_alternative(comparison);
-        }
-    }
-
-    fn assert_cross_type_array_pair_has_no_hash_join_alternative(comparison: BinOp) {
-        let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_arr"]);
-        let right_group = mk_scan_group(&mut memo, &["b_arr"]);
-        let condition = bin(
-            col_typed("a_arr", list_type(DataType::Utf8)),
-            comparison,
-            col_typed("b_arr", list_type(DataType::Int64)),
-        );
-        let join_mexpr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-
-        let hash_alternatives = JoinToHashJoin
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert!(
-            hash_alternatives.is_empty(),
-            "cross-type complex equality must not become a raw hash key"
-        );
-
-        let nested_alternatives = JoinToNestLoop
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert_eq!(
-            nested_alternatives.len(),
-            1,
-            "nested loop must remain available for complex-only equality"
-        );
-        assert!(matches!(
-            nested_alternatives[0].op,
-            Operator::PhysicalNestLoopJoin(_)
-        ));
-    }
-
-    #[test]
-    fn complex_pair_demotes_when_scalar_hash_key_remains() {
-        for comparison in [BinOp::Eq, BinOp::EqForNull] {
-            assert_complex_pair_demotes_when_scalar_hash_key_remains(comparison);
-        }
-    }
-
-    fn assert_complex_pair_demotes_when_scalar_hash_key_remains(comparison: BinOp) {
-        let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_id", "a_arr"]);
-        let right_group = mk_scan_group(&mut memo, &["b_id", "b_arr"]);
-        let scalar_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
-        let complex_eq = bin(
-            col_typed("a_arr", list_type(DataType::Utf8)),
-            comparison,
-            col_typed("b_arr", list_type(DataType::Utf8)),
-        );
-        let condition = bin(scalar_eq, BinOp::And, complex_eq);
-        let join_mexpr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-
-        let alternatives = JoinToHashJoin
-            .apply(
-                &join_mexpr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        assert_eq!(alternatives.len(), 1);
-        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
-            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
-        };
-        assert_eq!(
-            phys.condition.keys().len(),
-            1,
-            "only the scalar equality should remain as a hash key"
-        );
-        let left_key = mat(&memo, phys.condition.keys()[0].left);
-        assert_col_id(&left_key, test_col_id("a_id"), "scalar hash key on left");
-        assert!(
-            phys.condition.residual().is_some(),
-            "complex equality must survive as a residual predicate"
-        );
-    }
-
-    #[test]
-    fn join_to_hash_join_emits_one_property_driven_hash_join() {
-        let mut memo = Memo::new();
-        let left_group = mk_scan_group(&mut memo, &["a_id"]);
-        let right_group = mk_scan_group(&mut memo, &["b_id"]);
-        let condition = bin(col("a_id"), BinOp::Eq, col("b_id"));
-        let expr = logical_join_expr(
-            &mut memo,
-            JoinKind::Inner,
-            condition,
-            vec![left_group, right_group],
-        );
-        let rule = JoinToHashJoin;
-        let alternatives = rule
-            .apply(
-                &expr,
-                &mut memo,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-
-        assert_eq!(alternatives.len(), 1);
-        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
-            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
-        };
-        assert!(matches!(phys.distribution, JoinDistribution::Unknown));
-    }
-}
+mod join_demotion_tests;
 
 #[cfg(test)]
 mod window_split_tests {

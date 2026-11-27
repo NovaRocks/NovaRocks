@@ -50,8 +50,24 @@ use std::{
 /// Function bindings include complete identity, type and semantic metadata.
 /// Sharing keeps expression nodes compact while preserving one exact binding
 /// from analysis through optimization and physical lowering.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
+#[derive(Clone, Debug)]
+pub struct SqlFunctionBinding(
+    Arc<SqlFunctionCallFacts>,
+    Option<novarocks_functions::StaticScalarCallEffects>,
+);
+
+// Derived proof availability is independent of the bound expression's identity.
+impl PartialEq for SqlFunctionBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for SqlFunctionBinding {}
+impl std::hash::Hash for SqlFunctionBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0, state);
+    }
+}
 
 /// Positive evidence of the constructor that supplied an exact result target.
 /// It is not inferred from a function name, selected result or source absence.
@@ -100,8 +116,16 @@ pub(crate) enum PlanBindingAuthority {
 
 impl SqlFunctionBinding {
     pub(crate) fn from_analyzed(call: crate::analyzer::FinalizedAnalysisCall) -> Self {
-        let (resolved, policy, origin, target) = call.into_parts();
-        Self::with_constraint(resolved, policy, origin, target)
+        let (resolved, policy, origin, target, static_effects) = call.into_parts();
+        let mut binding = Self::with_constraint(resolved, policy, origin, target);
+        binding.1 = static_effects;
+        binding
+    }
+
+    pub(crate) fn static_scalar_effects(
+        &self,
+    ) -> Option<novarocks_functions::StaticScalarCallEffects> {
+        self.1
     }
 
     fn with_constraint(
@@ -110,15 +134,18 @@ impl SqlFunctionBinding {
         result_constraint_origin: SqlResultConstraintOrigin,
         result_constraint: Option<novarocks_functions::FunctionValueType>,
     ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
-            resolved,
-            decimal_overflow_policy,
-            result_constraint,
-            result_constraint_origin,
-            statement_start: None,
-            time_zone: None,
-            aggregate_state_source: None,
-        }))
+        Self(
+            Arc::new(SqlFunctionCallFacts {
+                resolved,
+                decimal_overflow_policy,
+                result_constraint,
+                result_constraint_origin,
+                statement_start: None,
+                time_zone: None,
+                aggregate_state_source: None,
+            }),
+            None,
+        )
     }
 
     pub(crate) fn from_plan(

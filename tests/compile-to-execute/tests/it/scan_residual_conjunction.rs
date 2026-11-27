@@ -261,3 +261,219 @@ fn unsafe_decimal_join_keeps_the_closed_provider_equality_and_original_join_pred
     assert_eq!(joins, 1);
     assert_eq!(exact_guarantees, 1);
 }
+
+#[derive(Default)]
+struct RecordedWaits(std::sync::Mutex<Vec<Duration>>);
+impl KernelEvaluationControl for RecordedWaits {
+    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+        assert!(units <= novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK);
+        Ok(())
+    }
+
+    fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
+        self.0.lock().unwrap().push(duration);
+        Ok(())
+    }
+}
+
+struct ScanAndFilter {
+    scan: (
+        Arc<novarocks_local_program::LocalProgram>,
+        novarocks_local_program::ProgramNodeId,
+    ),
+    filter: (
+        Arc<novarocks_local_program::LocalProgram>,
+        novarocks_local_program::ProgramNodeId,
+    ),
+}
+
+fn scan_and_filter(sql: &str) -> ScanAndFilter {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_sql_testkit::sql_source_with_declared_fields;
+
+    let source = sql_source_with_declared_fields(
+        sql,
+        &[
+            Field::new("id", DataType::Int8, false),
+            Field::new("d", DataType::Int64, false),
+            Field::new("first_delay", DataType::Int32, false),
+            Field::new("second_delay", DataType::Int16, false),
+            Field::new("enabled", DataType::Boolean, true),
+        ],
+    );
+    let functions = installed_builtin_owner_catalogue();
+    let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
+    let mut scan = None;
+    let mut filter = None;
+    for program in programs.values() {
+        for node in program.graph().nodes() {
+            match node.kind() {
+                ProgramNodeKind::Scan { residuals, .. } => {
+                    // Bare BOOLEAN is kept as an executable Scan residual by
+                    // the SQL/provider contract, including NULL as non-TRUE.
+                    assert_eq!(residuals.len(), 1);
+                    assert!(
+                        scan.replace((program.clone(), node.local_id().unwrap()))
+                            .is_none()
+                    );
+                }
+                ProgramNodeKind::Filter { .. } => {
+                    assert!(
+                        filter
+                            .replace((program.clone(), node.local_id().unwrap()))
+                            .is_none()
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    ScanAndFilter {
+        scan: scan.expect("actual compiled Scan"),
+        filter: filter.expect("actual compiled residual Filter"),
+    }
+}
+
+fn demand_batch(schema: &arrow::datatypes::SchemaRef) -> RecordBatch {
+    use arrow::array::{Int8Array, Int16Array, Int64Array};
+    use arrow::datatypes::DataType;
+
+    let arrays = schema
+        .fields()
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.data_type() {
+                DataType::Int8 => Arc::new(Int8Array::from(vec![1, 2, 3, 4])),
+                DataType::Int16 => Arc::new(Int16Array::from(vec![20, 21, 22, 23])),
+                DataType::Int32 => Arc::new(Int32Array::from(vec![10, 11, 12, 13])),
+                DataType::Int64 => Arc::new(Int64Array::from(vec![0, 0, 3, 0])),
+                DataType::Boolean => Arc::new(BooleanArray::from(vec![
+                    Some(false),
+                    None,
+                    Some(true),
+                    Some(true),
+                ])),
+                other => panic!("unexpected source field {other:?}"),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(schema.clone(), arrays).unwrap()
+}
+
+impl ScanAndFilter {
+    fn apply(
+        &self,
+        original_rows: &[usize],
+        control: &RecordedWaits,
+    ) -> Result<ArrayRef, novarocks_expression::ExprEvaluationFailure<std::convert::Infallible>>
+    {
+        let (scan, scan_node) = &self.scan;
+        let scan_batch = demand_batch(
+            scan.graph().nodes()[scan_node.index()]
+                .output_layout()
+                .schema(),
+        );
+        let selection = Selection::try_sparse(scan_batch.num_rows(), original_rows).unwrap();
+        let scan_result = CompiledFilterConjunctionInstance::try_new_with_allocator(
+            &predicate_units(scan, *scan_node),
+            control,
+            None,
+        )
+        .unwrap()
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &scan_batch,
+                source: None,
+            },
+            selection,
+            control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+        let kept = scan_result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let rows = original_rows
+            .iter()
+            .copied()
+            .zip(kept.iter())
+            .filter_map(|(row, truth)| (truth == Some(true)).then_some(row))
+            .collect::<Vec<_>>();
+
+        let (filter, filter_node) = &self.filter;
+        let ProgramNodeKind::Filter {
+            input, predicates, ..
+        } = filter.graph().nodes()[filter_node.index()].kind()
+        else {
+            panic!("actual residual Filter");
+        };
+        let filter_batch = demand_batch(
+            filter.graph().nodes()[input.index()]
+                .output_layout()
+                .schema(),
+        );
+        let sites = predicates
+            .iter()
+            .map(|site| (filter.unit(site.unit).unwrap().clone(), site.root))
+            .collect::<Vec<_>>();
+        CompiledFilterConjunctionInstance::try_new_with_allocator(&sites, control, None)
+            .unwrap()
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &filter_batch,
+                    source: None,
+                },
+                Selection::try_sparse(filter_batch.num_rows(), &rows).unwrap(),
+                control,
+                &mut PassThroughCallHost,
+            )
+    }
+}
+
+#[test]
+fn scan_necessary_term_cuts_wait_and_row_error_domain_with_original_wait_order() {
+    use novarocks_expression::ExprEvaluationFailure;
+
+    let source = scan_and_filter(
+        "SELECT id FROM fixture WHERE 12 / d > 3 AND sleep(CAST(first_delay AS BIGINT))          AND sleep(CAST(second_delay AS BIGINT)) AND enabled",
+    );
+    let control = RecordedWaits::default();
+    let output = source.apply(&[0, 1], &control).unwrap();
+    assert!(output.is_empty());
+    assert!(control.0.lock().unwrap().is_empty());
+
+    let output = source.apply(&[0, 1, 2], &control).unwrap();
+    assert_eq!(
+        output
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true)],
+    );
+    assert_eq!(
+        *control.0.lock().unwrap(),
+        vec![Duration::from_secs(12), Duration::from_secs(22)],
+    );
+
+    let control = RecordedWaits::default();
+    let Err(ExprEvaluationFailure::RequiredRow(error)) = source.apply(&[3], &control) else {
+        panic!("the surviving bad divisor still reports a row error");
+    };
+    assert_eq!(error.batch_row(), 3);
+    assert!(control.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn scan_does_not_advance_a_fallible_term_before_the_original_wait() {
+    use novarocks_expression::ExprEvaluationFailure;
+
+    let source = scan_and_filter(
+        "SELECT id FROM fixture WHERE sleep(CAST(first_delay AS BIGINT)) AND 12 / d > 3          AND enabled",
+    );
+    let control = RecordedWaits::default();
+    let Err(ExprEvaluationFailure::RequiredRow(error)) = source.apply(&[3], &control) else {
+        panic!("the original division still fails after the selected wait");
+    };
+    assert_eq!(error.batch_row(), 3);
+    assert_eq!(*control.0.lock().unwrap(), vec![Duration::from_secs(13)]);
+}

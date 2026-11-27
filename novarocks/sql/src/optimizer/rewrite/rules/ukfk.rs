@@ -454,7 +454,7 @@ fn selected_equality_columns(arena: &ScalarArena, expr: ScalarId) -> Option<(Sca
         != Some(binding.selected.overload.as_str())
         || binding.kind != FunctionKind::Scalar
         || binding.semantics.volatility != FunctionVolatility::Immutable
-        || scalar_expr::scalar_call_can_fail(binding)
+        || !arena.effects(expr).can_share()
         || left_type != arena.value_type(left)
         || right_type != arena.value_type(right)
         || left_type.data_type() != right_type.data_type()

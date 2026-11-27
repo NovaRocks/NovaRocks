@@ -982,7 +982,12 @@ fn provider_or_ready_step(
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         &common.session.optimizer_settings,
-    );
+        &crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: Some(common.functions.as_ref()),
+            allow_throw_exception: root_allow_throw_exception,
+            control,
+        },
+    )?;
     let offer_predicates = common
         .session
         .optimizer_settings

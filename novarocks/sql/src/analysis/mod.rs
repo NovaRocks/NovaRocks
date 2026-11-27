@@ -23,6 +23,7 @@
 pub(crate) mod cte;
 pub(crate) mod expr_display;
 pub(crate) mod expr_identity;
+pub(crate) mod scalar_effects;
 pub(crate) mod schema;
 pub(crate) use schema::{AnalyzedOutputField, AnalyzedProjectItem};
 

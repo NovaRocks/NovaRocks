@@ -34,7 +34,7 @@ use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::optimizer::rewrite::rules::predicate_pushdown::deriver::derive_inner_join_predicates;
 use crate::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
-    PredicateGroup, PredicateOrigin, predicate_key as canonical_predicate_key,
+    ElidablePredicates, PredicateGroup, PredicateOrigin,
 };
 use crate::optimizer::rewrite::rules::utils::{
     collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
@@ -71,14 +71,22 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
     ) -> Result<RewriteResult, SqlCompileError> {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
-        let throws = match &expr.op {
-            Operator::LogicalFilter(filter) => scalar_expr::can_fail(&arena, filter.predicate) || expr.children.first().is_some_and(|child| matches!(&child.op, Operator::LogicalJoin(join) if join.condition.is_some_and(|condition| scalar_expr::can_fail(&arena,condition)))),
-            Operator::LogicalJoin(join) => join.condition.is_some_and(|condition| scalar_expr::can_fail(&arena,condition)),
+        let can_move = |predicate| arena.effects(predicate).can_share();
+        let join_allows_move = |join: &LogicalJoinOp| join.condition.is_none_or(can_move);
+        let can_move_between_relations = match &expr.op {
+            Operator::LogicalFilter(filter) => {
+                can_move(filter.predicate)
+                    && expr.children.first().is_some_and(|child| {
+                        matches!(&child.op, Operator::LogicalJoin(join) if join_allows_move(join))
+                    })
+            }
+            Operator::LogicalJoin(join) => join_allows_move(join),
             _ => false,
         };
-        if throws {
-            // Moving a checked error below a join can evaluate unmatched rows;
-            // pushing a sibling filter can also suppress the existing error.
+        // Moving ON or WHERE expressions across a join changes the inputs and
+        // number of pairs at each use. Keep effectful conditions at their
+        // original position until a pair-domain proof is available.
+        if !can_move_between_relations {
             return Ok(RewriteResult::Unchanged);
         }
 
@@ -240,15 +248,7 @@ fn push_filter_predicates_opt(
                     }
                 }
 
-                if matches!(
-                    join.join_type,
-                    JoinKind::LeftMark { .. }
-                        | JoinKind::LeftOuter
-                        | JoinKind::LeftSemi
-                        | JoinKind::LeftAnti
-                        | JoinKind::RightOuter
-                        | JoinKind::FullOuter
-                ) {
+                if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
                     remaining.push(conj);
                 } else {
                     let (factored, or_remaining) =
@@ -487,15 +487,15 @@ fn append_new_derived_conjuncts_opt(
     right_ids: &HashSet<ColumnId>,
     arena: &ScalarArena,
 ) {
-    let mut seen: HashSet<String> = conjuncts
-        .iter()
-        .map(|expr| predicate_key_str(arena, *expr))
-        .collect();
+    let mut seen = ElidablePredicates::default();
+    for &expr in conjuncts.iter() {
+        seen.insert(arena, expr);
+    }
     for group in derived {
         if derived_exists_below_child_opt(group.expr, left, right, left_ids, right_ids, arena) {
             continue;
         }
-        if seen.insert(predicate_key_str(arena, group.expr)) {
+        if seen.insert(arena, group.expr) {
             conjuncts.push(group.expr);
         }
     }
@@ -525,49 +525,42 @@ fn derived_exists_below_child_opt(
 }
 
 fn subtree_has_predicate_opt(expr: &OptExpr, pred: ScalarId, arena: &ScalarArena) -> bool {
-    let key = predicate_key_str(arena, pred);
-    subtree_has_predicate_key_opt(expr, &key, arena)
-}
-
-fn subtree_has_predicate_key_opt(expr: &OptExpr, key: &str, arena: &ScalarArena) -> bool {
     match &expr.op {
         Operator::LogicalScan(scan) => scan
             .predicates
             .iter()
-            .any(|&pred_id| predicate_has_conjunct_key(arena, pred_id, key)),
+            .any(|&predicate| predicate_has_conjunct(arena, predicate, pred)),
         Operator::LogicalFilter(filter) => {
-            predicate_has_conjunct_key(arena, filter.predicate, key)
+            predicate_has_conjunct(arena, filter.predicate, pred)
                 || expr
                     .children
                     .iter()
-                    .any(|child| subtree_has_predicate_key_opt(child, key, arena))
+                    .any(|child| subtree_has_predicate_opt(child, pred, arena))
         }
-        Operator::LogicalJoin(join) => {
-            join.condition
-                .map(|cond_id| predicate_has_conjunct_key(arena, cond_id, key))
-                .unwrap_or(false)
-                || expr
-                    .children
-                    .iter()
-                    .any(|child| subtree_has_predicate_key_opt(child, key, arena))
-        }
-        _ => expr
+        Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => expr
             .children
             .iter()
-            .any(|child| subtree_has_predicate_key_opt(child, key, arena)),
+            .any(|child| subtree_has_predicate_opt(child, pred, arena)),
+        Operator::LogicalJoin(join)
+            if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
+        {
+            join.condition
+                .is_some_and(|condition| predicate_has_conjunct(arena, condition, pred))
+                || expr
+                    .children
+                    .iter()
+                    .any(|child| subtree_has_predicate_opt(child, pred, arena))
+        }
+        _ => false,
     }
 }
 
-fn predicate_has_conjunct_key(arena: &ScalarArena, expr: ScalarId, key: &str) -> bool {
+fn predicate_has_conjunct(arena: &ScalarArena, expr: ScalarId, candidate: ScalarId) -> bool {
     let mut conjuncts = Vec::new();
     scalar_expr::split_conjuncts(arena, expr, &mut conjuncts);
     conjuncts
         .into_iter()
-        .any(|conjunct| predicate_key_str(arena, conjunct) == key)
-}
-
-fn predicate_key_str(arena: &ScalarArena, expr: ScalarId) -> String {
-    canonical_predicate_key(arena, expr).as_str().to_string()
+        .any(|conjunct| super::predicate_group::same_elidable_predicate(arena, conjunct, candidate))
 }
 
 fn merge_join_conditions(
@@ -576,21 +569,20 @@ fn merge_join_conditions(
     new_preds: Vec<ScalarId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
-    let mut all = Vec::new();
-    let mut seen = HashSet::new();
-    if let Some(cond) = existing {
-        let mut conjuncts = Vec::new();
-        scalar_expr::split_conjuncts(arena, cond, &mut conjuncts);
-        for pred in conjuncts {
-            if seen.insert(predicate_key_str(arena, pred)) {
-                all.push(pred);
-            }
-        }
+    if new_preds.is_empty() {
+        return Ok(existing);
     }
-    for pred in new_preds {
-        if seen.insert(predicate_key_str(arena, pred)) {
-            all.push(pred);
-        }
+    let mut all = Vec::new();
+    if let Some(condition) = existing {
+        scalar_expr::split_conjuncts(arena, condition, &mut all);
+    }
+    all.extend(new_preds);
+    if all
+        .iter()
+        .all(|&predicate| arena.effects(predicate).can_share())
+    {
+        let mut seen = ElidablePredicates::default();
+        all.retain(|&predicate| seen.insert(arena, predicate));
     }
     scalar_expr::combine_conjuncts(arena, all, control)
 }
@@ -608,6 +600,9 @@ fn extract_implied_or_side_filters(
     right_ids: &HashSet<ColumnId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(Vec<ScalarId>, Vec<ScalarId>), SqlCompileError> {
+    if !arena.effects(expr).can_share() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
@@ -681,6 +676,9 @@ fn factor_common_eq_from_or(
     right_ids: &HashSet<ColumnId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(Vec<ScalarId>, Option<ScalarId>), SqlCompileError> {
+    if !arena.effects(expr).can_share() {
+        return Ok((Vec::new(), None));
+    }
     let mut branches = Vec::new();
     scalar_expr::split_disjuncts(arena, expr, &mut branches);
     if branches.len() < 2 {
@@ -704,7 +702,7 @@ fn factor_common_eq_from_or(
             }
             let in_all = branch_conjuncts[1..]
                 .iter()
-                .all(|conjs| conjs.iter().any(|c| expr_eq(*c, *candidate)));
+                .all(|conjs| conjs.iter().any(|c| *c == *candidate));
             if in_all {
                 common_eqs.push(*candidate);
             }
@@ -719,7 +717,7 @@ fn factor_common_eq_from_or(
     for branch in &branch_conjuncts {
         let remaining: Vec<ScalarId> = branch
             .iter()
-            .filter(|c| !common_eqs.iter().any(|eq| expr_eq(**c, *eq)))
+            .filter(|c| !common_eqs.iter().any(|eq| **c == *eq))
             .copied()
             .collect();
         if remaining.is_empty() {
@@ -773,10 +771,6 @@ fn is_cross_side_eq(
     } else {
         false
     }
-}
-
-fn expr_eq(a: ScalarId, b: ScalarId) -> bool {
-    a == b
 }
 
 #[cfg(test)]
@@ -1002,9 +996,10 @@ mod tests {
         assert!(right_pred.contains("Int(7)"));
     }
     #[test]
-    fn throwing_decimal_filter_stays_above_join_while_null_policy_can_push() {
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-        for policy in [OutputNull, ReportError] {
+    fn throwing_decimal_filter_stays_above_join_while_try_cast_can_push() {
+        use novarocks_type_contract::{DecimalOverflowPolicy::OutputNull, TrinoCastMode};
+        for (cast_mode, may_raise) in [(TrinoCastMode::Explicit, true), (TrinoCastMode::Try, false)]
+        {
             let mut arena = ScalarArena::new();
             let source = arena.intern(
                 ScalarNode::ColumnRef(col_id(1)),
@@ -1012,10 +1007,10 @@ mod tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    cast_mode: None,
+                    cast_mode: Some(cast_mode),
                     child: source,
                     target: DataType::Decimal128(9, 0),
-                    decimal_overflow_policy: policy,
+                    decimal_overflow_policy: OutputNull,
                 },
                 novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
             );
@@ -1046,10 +1041,7 @@ mod tests {
             let result = PushDownPredicateJoin
                 .apply(input, &mut make_ctx(arena))
                 .unwrap();
-            assert_eq!(
-                matches!(result, RewriteResult::Unchanged),
-                policy == ReportError
-            );
+            assert_eq!(matches!(result, RewriteResult::Unchanged), may_raise);
         }
     }
 }

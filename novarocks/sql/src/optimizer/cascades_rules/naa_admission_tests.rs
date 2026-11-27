@@ -154,7 +154,7 @@ fn nullable_scope_before_required_error_stays_in_value_demand_eligibility() {
     let c = comparison(&mut arena);
     let s = scope(&mut arena, true, false);
     let r = throwing(&mut arena);
-    assert!(scalar_expr::can_fail(&arena, r));
+    assert!(arena.effects(r).may_raise_data());
     let e = binary(&mut arena, s, BinOp::And, r, DataType::Boolean, true);
     let op = authored(&mut arena, c, Some(e));
     let condition = admit(&mut arena, &op).unwrap();

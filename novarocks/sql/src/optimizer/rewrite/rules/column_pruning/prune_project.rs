@@ -36,20 +36,6 @@ use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::optimizer::rewrite::rules::column_pruning::auto_fill_column_id;
 use crate::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
 
-/// Returns `true` when a project item's expression is an `assert_true(...)` call.
-///
-/// Such items must never be dropped by column pruning, even when their
-/// `output_column_id` is not referenced by any upstream operator.  This mirrors
-/// the StarRocks `PruneProjectColumnsRule` carve-out for `assert_true` items
-/// (used, e.g., for the per-group row-check emitted by `ScalarApplyToJoin`).
-fn is_assert_true_item(arena: &ScalarArena, item: &ScalarProjectItem) -> bool {
-    matches!(
-        arena.node(item.expr),
-        ScalarNode::FunctionCall { binding, .. }
-            if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
-    )
-}
-
 /// Intern `const 1` (Int64) into the arena and return its `ScalarId`.
 fn intern_const_one(
     arena: &mut ScalarArena,
@@ -123,8 +109,7 @@ impl LogicalRewriteRule for PruneProjectColumns {
             .filter(|item| {
                 item.output_column_id == ColumnId::UNSET
                     || needed.contains(&item.output_column_id)
-                    || is_assert_true_item(&arena, item)
-                    || crate::optimizer::scalar_expr::can_fail(&arena, item.expr)
+                    || crate::optimizer::scalar_expr::must_retain_projection(&arena, item.expr)
             })
             .collect();
         drop(arena);

@@ -105,17 +105,13 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         let (left_preds, right_preds) = {
             let arena = arena_rc.borrow();
             let keys = join_equi_keys_opt(&join, &left, &right, &arena);
-            if keys.is_empty() {
-                return Ok(RewriteResult::Unchanged);
-            }
-
             let left_preds = if derive_left {
-                eligible_not_null(&left, keys.iter().map(|k| k.left), &arena)
+                eligible_not_null(&left, keys.iter().map(|key| key.left), &arena)
             } else {
                 Vec::new()
             };
             let right_preds = if derive_right {
-                eligible_not_null(&right, keys.iter().map(|k| k.right), &arena)
+                eligible_not_null(&right, keys.iter().map(|key| key.right), &arena)
             } else {
                 Vec::new()
             };
@@ -163,8 +159,6 @@ fn eligible_not_null(
         if !arena.nullable(operand) {
             continue;
         }
-        // Keys from join_equi_keys_opt are always bare ColumnRef (Cast/Nested
-        // already peeled); this guard is defensive.
         let ScalarNode::ColumnRef(column_id) = arena.node(operand) else {
             continue;
         };

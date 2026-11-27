@@ -42,7 +42,7 @@
 use crate::optimizer::property::OrderingSpec;
 use crate::optimizer::property::{DistributionSpec, PhysicalPropertySet};
 use crate::optimizer::scalar::ScalarArena;
-use crate::optimizer::scalar_expr::{column_id, contains_non_replica_deterministic_function};
+use crate::optimizer::scalar_expr::column_id;
 
 /// Output of a passthrough operator equals its single child's output.
 pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
@@ -136,7 +136,11 @@ impl DeriveOutput for ProjectOp {
                 }),
             DistributionSpec::Broadcast
                 if self.items.iter().any(|item| {
-                    contains_non_replica_deterministic_function(scalars, item.expr)
+                    !scalars
+                        .effects(item.expr)
+                        .expression
+                        .value_stability
+                        .is_replica_deterministic()
                 }) =>
             {
                 DistributionSpec::Any

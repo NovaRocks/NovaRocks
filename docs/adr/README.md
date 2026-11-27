@@ -342,6 +342,7 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0278](ADR-0278-scalar-effects-and-relational-evaluation-demand-govern-sql-rewrites.md) — SQL 改写如何共同消费原静态效应和实际求值行域，保护 Join 及 runtime filter 的生效点（active）
 - [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
 - [ADR-0275](ADR-0275-approximate-distinct-freezes-precision-for-split.md) — 近似去重怎样从原参数取得固定精度，统一 HLL 状态并复核分阶段来源（active，部分替代 ADR-0259 的普通近似去重状态）
 - [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）

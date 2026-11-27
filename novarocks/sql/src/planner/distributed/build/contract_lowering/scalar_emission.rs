@@ -1333,11 +1333,9 @@ impl ScalarEmission<'_, '_> {
         let site = self.storage.source_site();
         let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
-            crate::planner::BINDING_AUTHORITY,
-            self.functions.as_ref(),
+            Some(self.functions.as_ref()),
             &source,
             target,
-            policy,
             cast_mode,
             self.control,
         )
@@ -1361,7 +1359,24 @@ impl ScalarEmission<'_, '_> {
         let (conversion, carrier) = match plan {
             PlannedConversion::Identity => return Ok(expression),
             PlannedConversion::Carrier(step) => (None, Some(step)),
-            PlannedConversion::ValueConversion { binding, tail } => (Some(binding), tail),
+            PlannedConversion::ValueConversion {
+                binding,
+                intermediate,
+                tail,
+            } => (
+                Some(
+                    crate::binding::SqlFunctionBinding::from_plan_with_constraint(
+                        crate::planner::BINDING_AUTHORITY,
+                        binding,
+                        policy,
+                        crate::binding::SqlResultConstraintOrigin::ValueDomainConversion {
+                            final_target: target.clone(),
+                        },
+                        Some(intermediate),
+                    ),
+                ),
+                tail,
+            ),
         };
         let expression = if let Some(binding) = conversion {
             let argument = novarocks_functions::FunctionArgument::Value {

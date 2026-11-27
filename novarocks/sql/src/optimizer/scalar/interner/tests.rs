@@ -77,7 +77,7 @@ fn publication(arena: &ScalarArena) -> (usize, usize, usize, Vec<(u64, Vec<Scala
     (
         arena.nodes.len(),
         arena.value_types.len(),
-        arena.function_volatility.len(),
+        arena.definition_effects.len(),
         buckets,
     )
 }
