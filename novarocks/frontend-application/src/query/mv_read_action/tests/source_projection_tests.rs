@@ -98,7 +98,7 @@ fn row_projection(
     fixture.interpretation.outputs[0].source_type = fixture_type("double");
     fixture.interpretation.aggregates.clear();
     fixture.interpretation.state_slots.clear();
-    fixture.interpretation.apply_key.kind = if self_join {
+    fixture.interpretation.apply_key.as_mut().unwrap().kind = if self_join {
         ApplyKeyKind::JoinRowKey
     } else {
         ApplyKeyKind::BaseRowId
@@ -299,7 +299,7 @@ impl SourceFixture {
                 source_observations: &observed.relations,
                 runtime_layout: &crate::mv::domain::iceberg_refresh::stateless_mv_runtime_layout(),
                 target_identity: &property.identity,
-                apply_key_column_name: contract.apply_key.column_name,
+                apply_key_column_name: Some(contract.apply_key.column_name),
                 branch_column_name: (!sql.union_branches().is_empty())
                     .then_some(novarocks_sql::planning::mv::MV_BRANCH_ID_COLUMN_NAME),
             },

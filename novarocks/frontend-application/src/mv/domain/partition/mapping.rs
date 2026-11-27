@@ -447,7 +447,7 @@ mod tests {
         fixture.interpretation.aggregates.clear();
         fixture.interpretation.state_slots.clear();
         fixture.interpretation.branches.clear();
-        fixture.interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        fixture.interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::BaseRowId;
         fixture.interpretation.target.fields.retain(|field| {
             matches!(
                 field.logical_identity,

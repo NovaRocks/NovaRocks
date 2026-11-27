@@ -37,6 +37,7 @@ use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
 
 pub(crate) struct PlannedChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
+    summary_author_inputs: BTreeMap<NodeId, Port>,
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
     pub sink_projection: Option<SinkProjectionChannels>,
@@ -58,6 +59,21 @@ pub(crate) struct PlannedChannels {
     /// pass-through reads are its one branch in `unions`.
     pub table_functions: BTreeMap<NodeId, crate::table_function::PlannedTableFunction>,
     pub series: BTreeMap<NodeId, crate::generate_series::PlannedGenerateSeries>,
+}
+
+impl PlannedChannels {
+    pub(crate) fn data_slot(
+        &self,
+        node: NodeId,
+        value: ValueId,
+    ) -> Result<SlotId, ChannelLoweringError> {
+        let (Some(channels), Some(port)) =
+            (self.nodes.get(&node), self.summary_author_inputs.get(&node))
+        else {
+            return Err(ChannelLoweringError::Invalid("missing data input channel"));
+        };
+        Ok(resolve_input(value, channels, port)?.slot)
+    }
 }
 
 pub(crate) struct SinkProjectionChannels {
@@ -671,7 +687,9 @@ fn resolve_core_with_creation<H>(
                 slots.extend(fresh_slots(1, &mut next_slot, work)?.iter().copied());
                 (Arc::from(slots), port)
             }
-            NodeKind::PositionShard(_) => fresh_relation(fragment, node, &mut next_slot, work)?,
+            NodeKind::PositionShard(_) | NodeKind::ContentApply(_) => {
+                fresh_relation(fragment, node, &mut next_slot, work)?
+            }
             NodeKind::ChangeEventExpand { .. } => {
                 single_child(&node.inputs)?;
                 let mut slots = Vec::new();
@@ -742,13 +760,7 @@ fn resolve_core_with_creation<H>(
             // A finish produces its root relation itself, and its statistics
             // their internal grouping and final channels.
             NodeKind::TableFinish(spec) => {
-                let expected = if spec.count_mode
-                    == novarocks_physical_plan::FinishCountMode::LogicalChanges
-                {
-                    2
-                } else {
-                    1
-                };
+                let expected = 1 + spec.inputs.summaries.iter().count();
                 if node.inputs.len() != expected {
                     return Err(
                         ChannelLoweringError::Invalid("finish input role arity differs").into(),
@@ -924,28 +936,23 @@ fn resolve_core_with_creation<H>(
     } else {
         None
     };
+    let mut summary_author_inputs = BTreeMap::new();
     let mut summary_slots = novarocks_local_program::PerKind::empty();
     for summary in fragment.summaries() {
-        let slots = match summary.author {
-            novarocks_physical_plan::SummaryAuthor::RouterSink => {
-                fresh_slots(summary.columns.values().len(), &mut next_slot, work)?
-            }
-            novarocks_physical_plan::SummaryAuthor::Node(author) => {
-                let owner = nodes.get(&author).ok_or(ChannelLoweringError::Invalid(
-                    "summary author channels are absent",
+        if let novarocks_physical_plan::SummaryAuthor::Node(author) = summary.author {
+            let node = fragment
+                .nodes()
+                .get(&author)
+                .ok_or(ChannelLoweringError::Invalid("summary author is absent"))?;
+            for input in &node.inputs {
+                let port = ports.remove(input).ok_or(ChannelLoweringError::Invalid(
+                    "missing summary author input channels",
                 ))?;
-                let port = ports.get(&author).ok_or(ChannelLoweringError::Invalid(
-                    "summary author port is absent",
-                ))?;
-                let mut slots = Vec::new();
-                reserve_vec(&mut slots, summary.columns.values().len(), work)?;
-                for value in summary.columns.values() {
-                    slots.push(resolve_input(*value, owner, port)?.slot);
-                    work.step()?;
-                }
-                Arc::from(slots)
+                summary_author_inputs.insert(*input, port);
+                work.step()?;
             }
-        };
+        }
+        let slots = fresh_slots(summary.columns.values().len(), &mut next_slot, work)?;
         if summary_slots.insert(summary.kind(), slots).is_some() {
             return Err(ChannelLoweringError::Invalid("duplicate summary channels").into());
         }
@@ -953,6 +960,7 @@ fn resolve_core_with_creation<H>(
     }
     Ok(PlannedChannels {
         nodes,
+        summary_author_inputs,
         unpivot_sources,
         assertion_keys,
         sink_projection,
@@ -1000,7 +1008,8 @@ fn fresh_relation(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Arc<[SlotId]>, Port), ChannelLoweringError> {
     let mut port = Port::new();
-    for (ordinal, value) in node.output.columns.iter().enumerate() {
+    let columns = node.data_output_columns();
+    for (ordinal, value) in columns.iter().enumerate() {
         if !fragment.values().contains_key(value) {
             return Err(ChannelLoweringError::Invalid(
                 "missing writer relation value",
@@ -1009,10 +1018,7 @@ fn fresh_relation(
         port.entry(*value).or_insert(ordinal);
         work.step()?;
     }
-    Ok((
-        fresh_slots(node.output.columns.len(), next_slot, work)?,
-        port,
-    ))
+    Ok((fresh_slots(columns.len(), next_slot, work)?, port))
 }
 
 /// A window's output is its whole input followed by one value per call.

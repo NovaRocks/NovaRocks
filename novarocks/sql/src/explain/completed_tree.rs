@@ -1616,6 +1616,13 @@ impl TreeContext<'_> {
             NodeKind::WriteLayoutKey { .. } => {
                 out.push(format_args!("{prefix}WRITE_LAYOUT_KEY{stats}"))?;
             }
+            NodeKind::ContentApply(spec) => {
+                out.push(format_args!(
+                    "{prefix}CONTENT_APPLY(content={}, route-keys={}){stats}",
+                    spec.weighted_content.len(),
+                    spec.route_keys.len(),
+                ))?;
+            }
             NodeKind::PositionShard(spec) => {
                 out.push(format_args!(
                     "{prefix}POSITION_SHARD_AGGREGATION(routes={}){stats}",

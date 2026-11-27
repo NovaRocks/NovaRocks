@@ -707,17 +707,12 @@ fn lower_with_creation<
             // The writer family, under its own admission below.
             NodeKind::TableWriter { .. } => node.inputs.len() == 1,
             NodeKind::TableFinish(spec) => {
-                node.inputs.len()
-                    == if spec.count_mode
-                        == novarocks_physical_plan::FinishCountMode::LogicalChanges
-                    {
-                        2
-                    } else {
-                        1
-                    }
+                node.inputs.len() == 1 + spec.inputs.summaries.iter().count()
             }
             // Both join families, under their own admission below.
-            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
+            NodeKind::HashJoin { .. }
+            | NodeKind::NestLoopJoin { .. }
+            | NodeKind::ContentApply(_) => node.inputs.len() == 2,
             // A table function, under its own admission: exactly one outer
             // input and an installed pure TableV1 kernel.
             NodeKind::TableFunction { .. } => {
@@ -1684,6 +1679,15 @@ fn lower_with_creation<
                 work,
                 creation,
             )?,
+            NodeKind::ContentApply(spec) => lower_content_apply(
+                physical,
+                node,
+                spec,
+                planned,
+                &channels_plan,
+                work,
+                creation,
+            )?,
             NodeKind::ChangeEventExpand { .. } => {
                 let child =
                     *local_ids
@@ -1964,8 +1968,8 @@ fn lower_with_creation<
                 .into());
             }
         }
-        if layout.slots().len() != planned.slots.len()
-            || layout.slots().len() != node.output.columns.len()
+        let data_output = node.data_output_columns();
+        if layout.slots().len() != planned.slots.len() || layout.slots().len() != data_output.len()
         {
             return Err((FragmentCompileError::Invalid("output occurrence width changed")).into());
         }
@@ -1984,7 +1988,7 @@ fn lower_with_creation<
                 scan_layouts.insert(id);
             }
         }
-        for (ordinal, value) in node.output.columns.iter().enumerate() {
+        for (ordinal, value) in data_output.iter().enumerate() {
             work.step()?;
             let ty: FunctionValueType = physical
                 .values()
@@ -2527,6 +2531,92 @@ fn lower_position_shard<H>(
             output_slots,
         },
         layout.finish_with_creation(&output_slots, work, creation)?,
+    ))
+}
+
+fn lower_content_apply<H>(
+    fragment: &novarocks_physical_plan::Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    spec: &novarocks_physical_plan::ContentApplySpec,
+    planned: &crate::channels::NodeChannels,
+    channels: &crate::channels::PlannedChannels,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
+    use novarocks_local_program::{ProgramContentApply, ProgramContentApplyTarget, SummaryKind};
+
+    let [weighted, target] = node.inputs.as_ref() else {
+        return Err(FragmentCompileError::Invalid("content application inputs differ").into());
+    };
+    let input_id = |id| {
+        channels
+            .nodes
+            .get(id)
+            .map(|input| input.local)
+            .ok_or(FragmentCompileError::Invalid(
+                "missing content application input channels",
+            ))
+    };
+    let content =
+        |input, values: &[novarocks_physical_plan::ValueId], work: &mut CompileCheckpoints<'_>| {
+            let mut slots = Vec::new();
+            crate::assert_rows::reserve_vec(&mut slots, values.len(), work)?;
+            for &value in values {
+                slots.push(channels.data_slot(input, value)?);
+                work.step()?;
+            }
+            Ok::<_, crate::FragmentCreationError<H>>(slots.into_boxed_slice())
+        };
+    let mut route_keys = Vec::new();
+    crate::assert_rows::reserve_vec(&mut route_keys, spec.route_keys.len(), work)?;
+    for &key in &spec.route_keys {
+        route_keys.push(key);
+        work.step()?;
+    }
+    let summary_slots = channels
+        .summary_slots
+        .get(SummaryKind::DeleteVerification)
+        .and_then(|slots| slots.as_ref().try_into().ok())
+        .ok_or(FragmentCompileError::Invalid(
+            "content application summary layout differs",
+        ))?;
+    let data = node.data_output_columns();
+    let mut layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(data.len(), work, creation)?;
+    for (ordinal, value) in data.iter().enumerate() {
+        let ty = &fragment
+            .values()
+            .get(value)
+            .ok_or(FragmentCompileError::Invalid(
+                "missing content application output value",
+            ))?
+            .ty;
+        let name = crate::typed_layout::local_name_with_creation(
+            "local",
+            planned.local.index(),
+            ordinal,
+            work,
+            creation,
+        )?;
+        layout.push_with_creation(ty, name, work, creation)?;
+    }
+    Ok((
+        ProgramNodeKind::ContentApply(ProgramContentApply {
+            weighted_input: input_id(weighted)?,
+            target_input: input_id(target)?,
+            weighted_content: content(*weighted, &spec.weighted_content, work)?,
+            target_content: content(*target, &spec.target_content, work)?,
+            route_keys: route_keys.into_boxed_slice(),
+            weight: channels.data_slot(*weighted, spec.weight)?,
+            target: ProgramContentApplyTarget {
+                file: channels.data_slot(*target, spec.target.file)?,
+                position: channels.data_slot(*target, spec.target.position)?,
+                spec_id: channels.data_slot(*target, spec.target.spec_id)?,
+                partition: channels.data_slot(*target, spec.target.partition)?,
+            },
+            summary_slots,
+        }),
+        layout.finish_with_creation(&planned.slots, work, creation)?,
     ))
 }
 

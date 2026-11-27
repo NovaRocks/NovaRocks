@@ -118,6 +118,7 @@ pub(crate) fn input_consumption(kind: &NodeKind, ordinal: usize) -> InputConsump
             InputConsumption::DrainedBeforeOutput
         }
         NodeKind::NestLoopJoin { .. } if ordinal == 1 => InputConsumption::DrainedBeforeOutput,
+        NodeKind::ContentApply(_) if ordinal == 0 => InputConsumption::DrainedBeforeOutput,
         // The installed aggregate route has no streaming preaggregation
         // (local-compiler/src/aggregate.rs), including partial grouping.
         NodeKind::Aggregate { .. }
@@ -284,6 +285,7 @@ impl WaitGraph {
                         )?;
                     }
                     NodeKind::NestLoopJoin { .. } => graph.add_input_gate(&plan, operator, 0, 1)?,
+                    NodeKind::ContentApply(_) => graph.add_input_gate(&plan, operator, 1, 0)?,
                     NodeKind::SetOp {
                         kind: SetOperationKind::Intersect | SetOperationKind::Except,
                         ..

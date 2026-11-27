@@ -274,6 +274,10 @@ pub struct IcebergTableHandle {
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
     mutation_partition_type_json: Option<Arc<str>>,
+    // Preparation-only policy. The resulting read columns carry their own
+    // frozen declarations; this flag never enters a worker recipe.
+    mv_content_target: bool,
+    mv_partition_selection: bool,
     rewritten_target: Option<crate::commit::conflict_scope::RewrittenTargetBinding>,
     prepared_manifest_list: Option<Arc<PreparedReadManifestList>>,
     delete_filter_proof: DeleteFilterProof,
@@ -417,10 +421,30 @@ impl IcebergTableHandle {
             storage_properties,
             pinned_data_files,
             mutation_partition_type_json: None,
+            mv_content_target: false,
+            mv_partition_selection: false,
             rewritten_target: None,
             prepared_manifest_list: None,
             delete_filter_proof: DeleteFilterProof::NotRequested,
         })
+    }
+
+    pub(crate) fn with_mv_content_target(mut self) -> Self {
+        self.mv_content_target = true;
+        self
+    }
+
+    pub(crate) const fn is_mv_content_target(&self) -> bool {
+        self.mv_content_target
+    }
+
+    pub(crate) fn with_mv_partition_selection(mut self) -> Self {
+        self.mv_partition_selection = true;
+        self
+    }
+
+    pub(crate) const fn has_mv_partition_selection(&self) -> bool {
+        self.mv_partition_selection
     }
 
     pub(crate) fn with_mutation_partition_type(

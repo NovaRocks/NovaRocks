@@ -639,7 +639,7 @@ pub(crate) fn build_create_documents_for_prepared_target(
             source_observations: &prepared.source_field_observations,
             prepared_target,
             target_identity: &prepared.property.identity,
-            apply_key_column_name: prepared.refresh_contract.apply_key.column_name,
+            apply_key_column_name: Some(prepared.refresh_contract.apply_key.column_name),
             branch_column_name: prepared.branch_id_column_name.as_deref(),
             configuration: create_configuration_document(&seed.refresh)?,
         },
@@ -690,7 +690,7 @@ fn validate_branch_union_contract(
             query_branch_count
         ));
     }
-    if interpretation.apply_key.kind != ApplyKeyKind::GroupRowId {
+    if interpretation.apply_key_kind() != Some(ApplyKeyKind::GroupRowId) {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} must use GroupRowId inner apply keys",
             target.catalog, target.namespace, target.table
@@ -728,7 +728,7 @@ fn validate_union_projection_schema_contract_for_base(
             branch_count
         ).into());
     }
-    if interpretation.apply_key.kind != ApplyKeyKind::BaseRowId {
+    if interpretation.apply_key_kind() != Some(ApplyKeyKind::BaseRowId) {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} must use BaseRowId inner apply keys",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table

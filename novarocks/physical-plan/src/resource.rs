@@ -1470,6 +1470,12 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
             usage.add_bytes(spec.group.to_bytes().len());
             usage.add_bytes(spec.inputs.len().saturating_mul(32));
         }
+        NodeKind::ContentApply(spec) => usage.add_item_counts([
+            spec.weighted_content.len(),
+            spec.target_content.len(),
+            spec.route_keys.len(),
+            5,
+        ]),
         NodeKind::ExchangeSource { imports, .. } => usage.add_items(imports.len()),
         NodeKind::TableWriter { target } => {
             usage.add_item_counts([

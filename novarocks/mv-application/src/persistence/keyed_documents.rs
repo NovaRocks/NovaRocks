@@ -7,8 +7,14 @@
 //! staged FE migration; this path never converts a keyed record into legacy P.
 
 use super::{
-    binding_envelope::inspect_binding, codec::keyed::*, codec::*, documents::MvDocumentError,
+    binding_envelope::inspect_binding,
+    codec::keyed::*,
+    codec::*,
+    documents::MvDocumentError,
     identity::DocumentRevision,
+    resolution::{
+        ApplicablePublication, current_publication_records, resolve_applicable_publication,
+    },
 };
 use crate::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
 use bytes::Bytes;
@@ -310,15 +316,12 @@ pub struct MvKeyedObservedCurrentDocuments {
     pub publication_revision: Option<DocumentRevision>,
     /// The snapshot carrying the current record, including maintenance/slot copies.
     pub publication_snapshot: Option<i64>,
+    applicable_publication: ApplicablePublication,
+    markers: Vec<(ConnectorMarkerKey, Marker)>,
 }
 impl MvKeyedObservedCurrentDocuments {
     pub fn decoded_markers(&self) -> Result<Vec<(ConnectorMarkerKey, Marker)>, MvDocumentError> {
-        self.view
-            .markers
-            .iter()
-            .filter(|(key, _)| key.owner == MV_DOCUMENT_OWNER)
-            .map(|(key, value)| Ok((key.clone(), Marker::decode(key, value)?)))
-            .collect()
+        decode_current_mv_markers(&self.view)
     }
 
     pub fn root_binding_revision(&self) -> DocumentRevision {
@@ -326,20 +329,41 @@ impl MvKeyedObservedCurrentDocuments {
     }
 
     pub fn is_never_published(&self) -> bool {
-        never_published(&self.view)
+        matches!(
+            self.applicable_publication,
+            ApplicablePublication::NeverPublished(_)
+        )
+    }
+
+    pub fn applicable_publication(&self) -> &ApplicablePublication {
+        &self.applicable_publication
+    }
+
+    pub fn markers(&self) -> &[(ConnectorMarkerKey, Marker)] {
+        &self.markers
+    }
+
+    pub fn eligibility(&self) -> MarkerEligibility<'_> {
+        marker_eligibility(self.applicable_publication.evidence(), self.markers())
+    }
+
+    pub fn servable_publication(&self) -> Option<&KeyedPublicationDocument> {
+        if self.eligibility().rewrite_serving {
+            self.publication.as_ref()
+        } else {
+            None
+        }
     }
 
     pub fn publication_evidence<'a>(
         &'a self,
         root: &'a DocumentRevision,
-    ) -> super::codec::PublicationEvidence<'a> {
-        use super::codec::PublicationEvidence;
-        match self.publication.as_ref() {
-            Some(publication) => PublicationEvidence::Current(&publication.publication_id),
-            None if self.is_never_published() && *root == self.root_binding_revision() => {
-                PublicationEvidence::Unpublished(root)
+    ) -> PublicationEvidence<'a> {
+        match self.applicable_publication.evidence() {
+            PublicationEvidence::Unpublished(binding) if binding != root => {
+                PublicationEvidence::Unknown
             }
-            None => PublicationEvidence::Unknown,
+            evidence => evidence,
         }
     }
     pub fn management_dependencies(
@@ -601,17 +625,9 @@ pub(crate) fn decode_keyed_drop_documents(
 /// Ordinary direct reads only need the known format gate over the original
 /// Current envelopes. They do not decode the definition or publication data.
 pub fn require_readable_keyed_format(view: &KeyedDocumentView) -> Result<(), MvDocumentError> {
-    let mut publications = view
-        .current_records
-        .iter()
-        .filter(|record| record.owner == MV_DOCUMENT_OWNER && record.name == "publication");
-    let binding = match publications.next() {
-        Some(record) => {
-            if publications.next().is_some() {
-                return contract("duplicate MV publication record");
-            }
-            record.binding
-        }
+    let records = current_publication_records(view)?;
+    let binding = match records.publication {
+        Some(record) => record.binding,
         None => view
             .roots
             .get(MV_DOCUMENT_OWNER)
@@ -622,7 +638,27 @@ pub fn require_readable_keyed_format(view: &KeyedDocumentView) -> Result<(), MvD
     inspect_binding(view, binding)?.require_current()
 }
 
+/// Transitional entry point for consumers which still require a publication
+/// or first-refresh witness. Use the layered observation for new callers.
 pub fn decode_current_keyed_documents(
+    view: KeyedDocumentView,
+    catalog: CatalogHandle,
+) -> Result<MvKeyedObservedCurrentDocuments, MvDocumentError> {
+    let observed = resolve_current_keyed_documents(view, catalog)?;
+    if matches!(
+        observed.applicable_publication(),
+        ApplicablePublication::RetiredPublication(_) | ApplicablePublication::Unattributed
+    ) {
+        return contract(
+            "current snapshot contains data but no MV publication record (external modification)",
+        );
+    }
+    Ok(observed)
+}
+
+/// Decodes exact management documents from the provider's storage observation.
+/// Whether the data publication can serve a rewrite is decided independently.
+pub fn resolve_current_keyed_documents(
     view: KeyedDocumentView,
     catalog: CatalogHandle,
 ) -> Result<MvKeyedObservedCurrentDocuments, MvDocumentError> {
@@ -651,20 +687,8 @@ pub fn decode_current_keyed_documents(
     }
     let configuration = decode_configuration(&c.value.content)?;
     let configuration_revision = DocumentRevision::from_canonical_bytes(&c.value.content);
-    let records = view
-        .current_records
-        .iter()
-        .filter(|r| r.owner == MV_DOCUMENT_OWNER && r.name == "publication")
-        .collect::<Vec<_>>();
-    if records.len() > 1 {
-        return contract("duplicate MV publication record");
-    }
-    let record = records.first().copied();
-    if record.is_none() && !never_published(&view) {
-        return contract(
-            "current snapshot contains data but no MV publication record (external modification)",
-        );
-    }
+    let records = current_publication_records(&view)?;
+    let record = records.publication;
     let binding_id = match record {
         Some(r) => r.binding.ok_or_else(|| {
             MvDocumentError::Contract("publication has no binding identity".into())
@@ -692,13 +716,15 @@ pub fn decode_current_keyed_documents(
         .transpose()?;
     let publication_revision =
         record.map(|r| DocumentRevision::from_canonical_bytes(&snapshot_record_frame(r)));
-    let publication_snapshot = record
-        .map(|_| {
-            view.current_snapshot.ok_or_else(|| {
-                MvDocumentError::Contract("publication record has no carrier snapshot".into())
-            })
-        })
-        .transpose()?;
+    let publication_snapshot = record.and(view.current_snapshot);
+    let markers = decode_current_mv_markers(&view)?;
+    let applicable_publication = resolve_applicable_publication(
+        &view,
+        publication.as_ref(),
+        records.retirement,
+        revision(versions.binding.identity()),
+        &markers,
+    )?;
     Ok(MvKeyedObservedCurrentDocuments {
         management_target,
         deployment_owner: owner,
@@ -712,8 +738,20 @@ pub fn decode_current_keyed_documents(
         publication,
         publication_revision,
         publication_snapshot,
+        applicable_publication,
+        markers,
     })
 }
+fn decode_current_mv_markers(
+    view: &KeyedDocumentView,
+) -> Result<Vec<(ConnectorMarkerKey, Marker)>, MvDocumentError> {
+    view.markers
+        .iter()
+        .filter(|(key, _)| key.owner == MV_DOCUMENT_OWNER)
+        .map(|(key, value)| Ok((key.clone(), Marker::decode(key, value)?)))
+        .collect()
+}
+
 pub fn observe_current_keyed_documents(
     lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
@@ -767,6 +805,8 @@ pub struct MvKeyedDocumentProjection {
     pub(crate) versions: MvKeyedVersions,
     pub(crate) publication: Option<KeyedPublicationDocument>,
     pub(crate) file_totals: SnapshotFileTotals,
+    /// None means a local projection written before this provider witness was retained.
+    pub(crate) never_published: Option<bool>,
 }
 impl MvKeyedDocumentProjection {
     pub fn try_from_current(observed: MvKeyedObservedCurrentDocuments) -> Result<Self, String> {
@@ -776,6 +816,7 @@ impl MvKeyedDocumentProjection {
         let output = observed.publication_snapshot.map(|_| {
             MvAcceleratorCommittedVersionRevision::from_committed(&observed.view.metadata_version)
         });
+        let never_published = observed.is_never_published();
         Ok(Self {
             source: MvAcceleratorSourceRevision {
                 target: observed.view.table,
@@ -798,6 +839,7 @@ impl MvKeyedDocumentProjection {
             versions: observed.versions,
             publication: observed.publication,
             file_totals: observed.view.current_snapshot_file_totals,
+            never_published: Some(never_published),
         })
     }
     pub fn source_revision(&self) -> &super::definition::MvAcceleratorSourceRevision {
@@ -846,8 +888,7 @@ impl MvKeyedDocumentProjection {
         self.source.management_dependencies(control)
     }
     pub fn never_published(&self) -> bool {
-        self.metadata_version.snapshot_id().is_none()
-            || (self.publication.is_none() && self.file_totals.is_empty())
+        self.never_published == Some(true)
     }
     /// A refresh rechecks the never-published witness at the current snapshot;
     /// an intervening empty slot-change snapshot is allowed.
@@ -859,14 +900,18 @@ impl MvKeyedDocumentProjection {
         {
             return contract("MV refresh target was replaced");
         }
-        if self.never_published() {
-            if !never_published(current) {
-                return contract("MV first-refresh witness no longer holds");
+        match self.never_published {
+            Some(true) if !never_published(current) => {
+                contract("MV first-refresh witness no longer holds")
             }
-        } else if current.current_snapshot != self.publication_snapshot() {
-            return contract("MV current publication carrier changed before refresh");
+            Some(false) if current.current_snapshot != self.metadata_version.snapshot_id() => {
+                contract("MV current carrier changed before refresh")
+            }
+            None if current.metadata_version != self.metadata_version => {
+                contract("MV cached current carrier requires a fresh observation")
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1080,55 +1125,6 @@ pub(crate) mod tests {
     pub(crate) use super::keyed_view_fixture as fixture;
     use super::*;
     #[test]
-    fn retirement_marker_and_record_block_reuse_even_with_an_empty_storage_snapshot() {
-        use crate::persistence::codec::{
-            Marker, PublicationEvidence, RetirementRecord, marker_eligibility,
-        };
-
-        let (catalog, mut view) = fixture(Some(17), true);
-        let previously_published = decode_current_keyed_documents(view.clone(), catalog.clone())
-            .unwrap()
-            .publication
-            .unwrap();
-        let retirement = RetirementRecord {
-            retired_publication: previously_published.publication_id,
-            operation: novarocks_spi::connector::ConnectorMutationOperationId::from_bytes([8; 16]),
-            requested: 4,
-            matched: 3,
-            insufficient_keys: 1,
-            content_fingerprint: None,
-        };
-        let invalid = Marker::Invalid {
-            publication: retirement.retired_publication.clone(),
-            retirement_record_revision: retirement.revision().unwrap(),
-        };
-        let (key, value) = invalid.encode().unwrap();
-        let decoded = Marker::decode(&key, &value).unwrap();
-        assert_eq!(decoded, invalid);
-        let markers = vec![(key.clone(), decoded)];
-        let eligibility = marker_eligibility(
-            PublicationEvidence::Retired(&retirement.retired_publication),
-            &markers,
-        );
-        assert!(eligibility.automatic_reuse_blocked);
-        assert_eq!(eligibility.active, vec![&invalid]);
-
-        let record = retirement.encode().unwrap();
-        assert_eq!(RetirementRecord::decode(&record).unwrap(), retirement);
-        view.current_records = vec![record];
-        view.markers.insert(key, value);
-        view.current_snapshot = Some(18);
-        view.metadata_version =
-            ConnectorCommittedVersion::try_new(Bytes::from_static(b"retired"), Some(18)).unwrap();
-        view.current_snapshot_file_totals = SnapshotFileTotals {
-            data_files: Some(0),
-            delete_files: Some(0),
-        };
-        assert!(!never_published(&view));
-        assert!(decode_current_keyed_documents(view, catalog).is_err());
-    }
-
-    #[test]
     fn pending_release_requires_the_original_refusal_and_exact_attempt_and_scope() {
         use crate::persistence::identity::{
             NativeDataVersion, ObjectIdentity, PublicationIdentity,
@@ -1184,7 +1180,7 @@ pub(crate) mod tests {
                 publication,
                 evidence: PendingEvidence {
                     attempt,
-                    refresh_identity: Bytes::from_static(b"original refresh"),
+                    refresh_identity: uuid::Uuid::now_v7(),
                     source_windows: vec![SourceVersionWindow {
                         occurrence: 0,
                         from: NativeDataVersion::try_new(vec![1]).unwrap(),
@@ -1193,7 +1189,10 @@ pub(crate) mod tests {
                     storage_uuid: *uuid.as_bytes(),
                     baseline_snapshot: 17,
                     mapping_revision: rev,
-                    verification_requirement: Bytes::from_static(b"verify"),
+                    verification_requirement: PendingVerificationRequirement::content_locate(
+                        10, 20,
+                    )
+                    .unwrap(),
                 },
             }
             .encode()
@@ -1265,30 +1264,6 @@ pub(crate) mod tests {
         assert!(current.view.markers.contains_key(&other_key));
     }
 
-    #[test]
-    fn no_publication_requires_absent_snapshot_or_known_empty_file_totals() {
-        let (catalog, mut view) = fixture(Some(17), false);
-        assert!(never_published(&view));
-        assert!(
-            decode_current_keyed_documents(view.clone(), catalog.clone())
-                .unwrap()
-                .is_never_published()
-        );
-        view.current_snapshot_file_totals.data_files = None;
-        assert!(!never_published(&view));
-        assert!(decode_current_keyed_documents(view.clone(), catalog.clone()).is_err());
-        view.current_snapshot_file_totals.data_files = Some(1);
-        assert!(decode_current_keyed_documents(view, catalog).is_err());
-    }
-
-    #[test]
-    fn an_empty_external_snapshot_does_not_prove_first_publication() {
-        let (catalog, mut view) = fixture(Some(17), false);
-        view.before_first_data_publication = false;
-        assert!(view.current_snapshot_file_totals.is_empty());
-        assert!(!never_published(&view));
-        assert!(decode_current_keyed_documents(view, catalog).is_err());
-    }
     #[test]
     fn copied_record_projects_its_current_carrier_and_c_revision_ignores_writer() {
         let (catalog, view) = fixture(Some(17), true);

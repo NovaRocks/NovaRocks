@@ -59,8 +59,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadStaticFacts,
     ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
     ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SystemTableUnitHint,
-    TupleDomain, ValueSet,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitPruningBasis,
+    SplitPruningLedger, SystemTableUnitHint, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
@@ -1854,6 +1854,36 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         }
                         Some(physical)
                     }
+                    K::FrozenMvContentTarget {
+                        table,
+                        original_source,
+                        object_id,
+                        snapshot_id,
+                    } => {
+                        let (physical, _) = self.prepare_original_write_target(
+                            name,
+                            table,
+                            original_source,
+                            OriginalTargetSnapshot::Signed(Some(*snapshot_id)),
+                        )?;
+                        let metadata = physical.table.metadata();
+                        validate_mv_target_pin(metadata, object_id, Some(*snapshot_id))?;
+                        if metadata.format_version() != FormatVersion::V3 {
+                            return Err(unsupported(
+                                "Iceberg MV content target requires format v3",
+                            ));
+                        }
+                        crate::read_snapshot::validate_mv_content_target_snapshot(
+                            &physical.table,
+                            *snapshot_id,
+                            self.request_context
+                                .as_ref()
+                                .map(|control| control as &dyn ConnectorOperationControl),
+                        )
+                        .await?;
+                        self.check_request_active()?;
+                        Some(physical)
+                    }
                     K::Metadata {
                         request: metadata_request,
                     } => {
@@ -2100,6 +2130,19 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     )?,
                 ))
             }
+            K::FrozenMvContentTarget {
+                object_id,
+                snapshot_id,
+                ..
+            } => {
+                let metadata = physical.table.metadata();
+                validate_mv_target_pin(metadata, object_id, Some(*snapshot_id))?;
+                let version = ConnectorReadRelationVersion::SnapshotId(*snapshot_id);
+                Some(crate::typed_read::IcebergRuntimeRelation::Table(
+                    table_handle_for_version(name, metadata, version, None)?
+                        .with_mv_content_target(),
+                ))
+            }
             K::MvTarget {
                 object_id,
                 snapshot_id,
@@ -2144,7 +2187,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         Some(selection.snapshot_id()),
                         schema,
                         selected,
-                    )?,
+                    )?
+                    .with_mv_partition_selection(),
                 ))
             }
             K::Delta { window } => {
@@ -2328,7 +2372,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 Some(selection.snapshot_id()),
                 schema,
                 selected,
-            )?,
+            )?
+            .with_mv_partition_selection(),
         )))
     }
 
@@ -2393,7 +2438,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     columns.push((name.to_string(), column, true));
                 }
                 if let Some(mutation) = handle.mutation_metadata()? {
-                    for field in [mutation.spec_field(), mutation.partition_field()] {
+                    let partition = mutation.read_field(
+                        crate::typed_read::schema_binding::mutation_partition::PARTITION_ID,
+                        handle.is_mv_content_target(),
+                    );
+                    for field in [mutation.spec_field().as_ref(), partition.as_ref()] {
                         columns.push((
                             field.name.clone(),
                             IcebergColumnHandle::base_column(field)?,
@@ -2633,7 +2682,10 @@ fn known_empty_prepared_table_source(
     let crate::typed_read::IcebergRuntimeRelation::Table(handle) = request.table.as_ref() else {
         return Ok(None);
     };
-    if handle.pinned_data_files().is_some() {
+    if request.enumeration_coverage
+        || handle.is_mv_content_target()
+        || handle.pinned_data_files().is_some()
+    {
         return Ok(None);
     }
     let predicate = handle.split_pruning_predicate(request.constraint.summary(), None);
@@ -2663,11 +2715,17 @@ fn known_empty_prepared_table_source(
     } else {
         std::time::Duration::from_secs(1)
     };
+    let mut pruning = SplitPruningLedger::default();
+    if handle.snapshot_id().is_some() {
+        pruning.mark_unenumerated_unsatisfiable();
+    }
     Ok(Some(Box::new(
-        IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
+        IcebergRuntimeSplitSource::new(IcebergSplitSource::with_pruning(
             &enumeration,
             Vec::new(),
             options,
+            pruning,
+            false,
         )?)
         .with_initial_dynamic_filter_wait(wait),
     )))
@@ -2690,15 +2748,23 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         if original_owner.is_some() {
             return Err(invalid("split opening owner is occupied"));
         }
+        if request.enumeration_coverage
+            && let crate::typed_read::IcebergRuntimeRelation::Table(handle) = request.table.as_ref()
+            && handle.limit().is_some()
+        {
+            return Err(unsupported(
+                "A pushed scan limit cannot prove complete MV enumeration",
+            ));
+        }
         let receipt = self.prepared_source_access(request.table.as_ref())?;
         let Some(receipt) = receipt else {
             return Ok(Box::pin(async move {
-                self.get_splits(
-                    &request.session,
+                self.open_runtime_splits(
                     &request.table,
                     &request.columns,
                     &request.dynamic_filter_columns,
                     &request.constraint,
+                    request.enumeration_coverage,
                 )
                 .await
             }));
@@ -2763,67 +2829,91 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         'a,
         Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
     > {
-        Box::pin(async move {
-            if self.prepared_source_access(table)?.is_some() {
-                return Err(invalid(
-                    "prepared source must open through its original closed split source",
-                ));
-            }
-            let result: Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> = match table
-            {
-                crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => Ok(Box::new(
-                    IcebergRuntimeSplitSource::new(self.change_window_split_source(handle).await?),
-                )),
-                crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) => {
-                    self.system_relation_runtime_split_source(scan).await
-                }
-                crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
-                    let enumeration_handle = if columns.is_empty() {
-                        handle.clone()
-                    } else {
-                        handle
-                            .apply_projection(&OrderedAssignments::try_new(columns.to_vec())?)?
-                            .into_handle()
-                    };
-                    let files = match handle.snapshot_id() {
-                        None => Vec::new(),
-                        Some(snapshot_id) => {
-                            self.planned_files_runtime(
-                                handle,
-                                snapshot_id,
-                                constraint,
-                                dynamic_filter_columns,
-                            )
-                            .await?
-                        }
-                    };
-                    let initial_dynamic_filter_wait = if !dynamic_filter_columns.is_empty() {
-                        std::time::Duration::from_secs(1)
-                    } else {
-                        std::time::Duration::default()
-                    };
-                    Ok(Box::new(
-                        IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
-                            &enumeration_handle,
-                            files,
-                            self.split_source_options,
-                        )?)
-                        .with_initial_dynamic_filter_wait(initial_dynamic_filter_wait),
-                    ))
-                }
-                crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
-                    "iceberg table-function split enumeration is not implemented",
-                )),
-                crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => Err(unsupported(
-                    "iceberg merge split enumeration is not implemented",
-                )),
-            };
-            result
-        })
+        Box::pin(self.open_runtime_splits(
+            table,
+            columns,
+            dynamic_filter_columns,
+            constraint,
+            false,
+        ))
     }
 }
 
+#[derive(Default)]
+struct PlannedReadFileSet {
+    files: Vec<IcebergPlannedDataFile>,
+    pruning: SplitPruningLedger,
+}
+
 impl IcebergTypedBoundary {
+    async fn open_runtime_splits(
+        &self,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[Assignment<IcebergColumnHandle>],
+        dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
+        constraint: &Constraint<IcebergColumnHandle>,
+        enumeration_coverage: bool,
+    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+        if self.prepared_source_access(table)?.is_some() {
+            return Err(invalid(
+                "prepared source must open through its original closed split source",
+            ));
+        }
+        let result: Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> = match table {
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => Ok(Box::new(
+                IcebergRuntimeSplitSource::new(self.change_window_split_source(handle).await?),
+            )),
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(scan) => {
+                self.system_relation_runtime_split_source(scan).await
+            }
+            crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+                let enumeration_coverage = enumeration_coverage || handle.is_mv_content_target();
+                let enumeration_handle = if columns.is_empty() {
+                    handle.clone()
+                } else {
+                    handle
+                        .apply_projection(&OrderedAssignments::try_new(columns.to_vec())?)?
+                        .into_handle()
+                };
+                let planned = match handle.snapshot_id() {
+                    None => PlannedReadFileSet::default(),
+                    Some(snapshot_id) => {
+                        self.planned_files_runtime(
+                            handle,
+                            snapshot_id,
+                            constraint,
+                            dynamic_filter_columns,
+                            enumeration_coverage,
+                        )
+                        .await?
+                    }
+                };
+                let initial_dynamic_filter_wait = if !dynamic_filter_columns.is_empty() {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::default()
+                };
+                Ok(Box::new(
+                    IcebergRuntimeSplitSource::new(IcebergSplitSource::with_pruning(
+                        &enumeration_handle,
+                        planned.files,
+                        self.split_source_options,
+                        planned.pruning,
+                        enumeration_coverage,
+                    )?)
+                    .with_initial_dynamic_filter_wait(initial_dynamic_filter_wait),
+                ))
+            }
+            crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
+                "iceberg table-function split enumeration is not implemented",
+            )),
+            crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => Err(unsupported(
+                "iceberg merge split enumeration is not implemented",
+            )),
+        };
+        result
+    }
+
     pub(crate) fn plan_prepared_source_endpoint(
         &self,
         request: &novarocks_spi::connector::read_stack::adapter::ProviderReadSplitOpenRequest<Self>,
@@ -2835,11 +2925,14 @@ impl IcebergTypedBoundary {
             _retention_guard: retention_guard,
             ..
         } = snapshot;
-        let files = match request.table.as_ref() {
+        let planned = match request.table.as_ref() {
             crate::typed_read::IcebergRuntimeRelation::ChangeWindow(_) => {
                 let frozen = self.pinned_table_for_attempt(request.table.schema_table_name())?;
-                ChangeWindowEndpointProjection::new(frozen.table.metadata(), domain)?
-                    .plan(files, self.request_context.as_ref())?
+                PlannedReadFileSet {
+                    files: ChangeWindowEndpointProjection::new(frozen.table.metadata(), domain)?
+                        .plan(files, self.request_context.as_ref())?,
+                    pruning: SplitPruningLedger::default(),
+                }
             }
             crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                 if handle.read_domain() != Some(domain) {
@@ -2858,7 +2951,9 @@ impl IcebergTypedBoundary {
             _ => return Err(invalid("prepared source has an unsupported relation kind")),
         };
         Ok(crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint {
-            files, retention: retention_guard,
+            files: planned.files,
+            pruning: planned.pruning,
+            retention: retention_guard,
         })
     }
 
@@ -2870,12 +2965,17 @@ impl IcebergTypedBoundary {
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
         use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint;
         self.check_request_active()?;
-        let PreparedSplitEndpoint { files, retention } = selected;
+        let PreparedSplitEndpoint {
+            files,
+            pruning,
+            retention,
+        } = selected;
         match request.table.as_ref() {
             crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
                 let PreparedSplitEndpoint {
                     files: from_files,
                     retention: from_retention,
+                    pruning: _,
                 } = from.ok_or_else(|| invalid("prepared Delta has no original From endpoint"))?;
                 let plan = plan_change_window_splits(
                     handle,
@@ -2908,10 +3008,12 @@ impl IcebergTypedBoundary {
                     std::time::Duration::from_secs(1)
                 };
                 Ok(Box::new(
-                    IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
+                    IcebergRuntimeSplitSource::new(IcebergSplitSource::with_pruning(
                         &enumeration_handle,
                         files,
                         self.split_source_options,
+                        pruning,
+                        request.enumeration_coverage || handle.is_mv_content_target(),
                     )?)
                     .with_initial_dynamic_filter_wait(wait)
                     .with_source_retention([None, Some(retention)]),
@@ -2927,16 +3029,20 @@ impl IcebergTypedBoundary {
         snapshot_id: i64,
         constraint: &Constraint<IcebergColumnHandle>,
         dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
-    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        enumeration_coverage: bool,
+    ) -> Result<PlannedReadFileSet, ConnectorError> {
         // Keep the original schema validation before predicate pruning and I/O.
         let schema = handle.parse_table_schema()?;
 
-        if handle.pinned_data_files().is_none()
+        if !enumeration_coverage
+            && handle.pinned_data_files().is_none()
             && handle
                 .split_pruning_predicate(constraint.summary(), Some(&schema))?
                 .is_none()
         {
-            return Ok(Vec::new());
+            let mut planned = PlannedReadFileSet::default();
+            planned.pruning.mark_unenumerated_unsatisfiable();
+            return Ok(planned);
         }
         let physical = self
             .load_pinned_relation_async(handle.schema_table_name())
@@ -2973,7 +3079,9 @@ impl IcebergTypedBoundary {
         read_files: Vec<IcebergReadFile>,
         constraint: &Constraint<IcebergColumnHandle>,
         dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
-    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+    ) -> Result<PlannedReadFileSet, ConnectorError> {
+        use crate::typed_read::split_source::record_pruned_data_file;
+        let mut pruning = SplitPruningLedger::default();
         let schema = handle.parse_table_schema()?;
         let pinned = handle.pinned_data_files();
         let predicates = if pinned.is_some() {
@@ -2981,7 +3089,18 @@ impl IcebergTypedBoundary {
         } else {
             let predicate = handle.split_pruning_predicate(constraint.summary(), Some(&schema))?;
             if predicate.is_none() {
-                return Ok(Vec::new());
+                for read_file in &read_files {
+                    self.check_request_active()?;
+                    record_pruned_data_file(
+                        &mut pruning,
+                        SplitPruningBasis::UnsatisfiablePredicate,
+                        read_file,
+                    )?;
+                }
+                return Ok(PlannedReadFileSet {
+                    files: Vec::new(),
+                    pruning,
+                });
             }
             physical_predicates(&predicate, &schema)
         };
@@ -2991,6 +3110,13 @@ impl IcebergTypedBoundary {
             self.check_request_active()?;
             if let Some(pinned) = pinned {
                 if !pinned.contains(&read_file.path) {
+                    if handle.has_mv_partition_selection() {
+                        record_pruned_data_file(
+                            &mut pruning,
+                            SplitPruningBasis::PartitionSelection,
+                            &read_file,
+                        )?;
+                    }
                     continue;
                 }
                 pinned_seen += 1;
@@ -3015,6 +3141,11 @@ impl IcebergTypedBoundary {
                     &predicates,
                 )
             {
+                record_pruned_data_file(
+                    &mut pruning,
+                    SplitPruningBasis::StaticPredicate,
+                    &read_file,
+                )?;
                 continue;
             }
             planned.push(planned_data_file(
@@ -3034,7 +3165,10 @@ impl IcebergTypedBoundary {
                 pinned.len(),
             )));
         }
-        Ok(planned)
+        Ok(PlannedReadFileSet {
+            files: planned,
+            pruning,
+        })
     }
 }
 
@@ -3094,18 +3228,11 @@ where
         dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
     ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
         if self.closed {
-            return Ok(ConnectorSplitBatch::finished());
+            return Ok(ConnectorSplitBatch::closed());
         }
-        let batch = self.inner.next_batch(max_size, dynamic_filter)?;
-        let no_more_splits = batch.no_more_splits();
-        Ok(ConnectorSplitBatch::new(
-            batch
-                .into_splits()
-                .into_iter()
-                .map(IntoIcebergRuntimeSplit::into_runtime_split)
-                .collect(),
-            no_more_splits,
-        ))
+        self.inner
+            .next_batch(max_size, dynamic_filter)
+            .map(|batch| batch.map_splits(IntoIcebergRuntimeSplit::into_runtime_split))
     }
 
     fn is_finished(&self) -> bool {
@@ -3142,6 +3269,7 @@ impl IntoIcebergRuntimeSplit for SystemManifestSplit {
 
 struct RuntimeSystemRelationSource {
     split: Option<SystemRelationSplit>,
+    closed: bool,
 }
 
 impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeSystemRelationSource {
@@ -3152,6 +3280,9 @@ impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeSystemRelationSour
     ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
         if max_size == 0 {
             return Err(invalid("connector split batch size must be positive"));
+        }
+        if self.closed {
+            return Ok(ConnectorSplitBatch::closed());
         }
         if dynamic_filter.current_predicate().is_none() {
             self.split = None;
@@ -3171,6 +3302,7 @@ impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeSystemRelationSour
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
+        self.closed = true;
         self.split = None;
         Ok(())
     }
@@ -3184,11 +3316,15 @@ impl IcebergTypedBoundary {
         let reference = scan.reference();
         if reference.system_table_type().unit_hint() == SystemTableUnitHint::SingleUnit {
             return Ok(Box::new(RuntimeSystemRelationSource {
+                closed: false,
                 split: Some(SystemRelationSplit::try_new(reference.clone())?),
             }));
         }
         if reference.snapshot_id().is_none() {
-            return Ok(Box::new(RuntimeSystemRelationSource { split: None }));
+            return Ok(Box::new(RuntimeSystemRelationSource {
+                split: None,
+                closed: false,
+            }));
         }
         let manifests = self.pinned_snapshot_manifests(reference).await?;
         let source = SystemManifestSplitSource::try_new(scan, manifests)?;
@@ -4782,6 +4918,58 @@ mod mv_target_selection_tests {
     }
 
     #[test]
+    fn planning_attributes_partition_selection_and_static_empty_to_their_exact_inventory() {
+        let (_executor, _warehouse, boundary, _) =
+            super::prepared_source_relation_tests::inventory_fixture();
+        let (metadata, selection, snapshot) = fixture();
+        let name = SchemaTableName::try_new("db", "target").unwrap();
+        let schema = projection_schema_for_pinned_snapshot(&metadata, 41).unwrap();
+        let pinned = select_mv_target_files(&metadata, &snapshot, &selection).unwrap();
+        let partitioned = pinned_table_handle_with_schema(
+            &name,
+            &metadata,
+            Some(41),
+            schema.clone(),
+            Some(pinned),
+        )
+        .unwrap()
+        .with_mv_partition_selection();
+        let planned = boundary
+            .planned_files_from_observation(
+                &partitioned,
+                41,
+                snapshot.files.clone(),
+                &Constraint::of_summary(TupleDomain::all()),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(planned.files.len(), 1);
+        assert_eq!(planned.files[0].read_file.path, "file:///emea.parquet");
+        let (basis, files) = planned.pruning.entries().next().unwrap();
+        assert_eq!(basis, SplitPruningBasis::PartitionSelection);
+        assert_eq!(files.file_count, 1);
+        assert_ne!(files.identity_digest, [0; 32]);
+
+        let full =
+            pinned_table_handle_with_schema(&name, &metadata, Some(41), schema, None).unwrap();
+        let planned = boundary
+            .planned_files_from_observation(
+                &full,
+                41,
+                snapshot.files,
+                &Constraint::of_summary(TupleDomain::none()),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert!(planned.files.is_empty());
+        assert!(planned.pruning.complete_file_inventory());
+        let (basis, files) = planned.pruning.entries().next().unwrap();
+        assert_eq!(basis, SplitPruningBasis::UnsatisfiablePredicate);
+        assert_eq!(files.file_count, 2);
+        assert_ne!(files.identity_digest, [0; 32]);
+    }
+
+    #[test]
     fn frozen_target_requires_exact_object_snapshot_and_empty_state() {
         let (metadata, selection, _) = fixture();
         assert_eq!(metadata.current_snapshot_id(), None);
@@ -6101,6 +6289,7 @@ mod system_work_unit_tests {
         for kind in [Kind::Snapshots, Kind::History, Kind::Refs, Kind::Manifests] {
             let reference = reference(kind);
             let mut source = RuntimeSystemRelationSource {
+                closed: false,
                 split: Some(SystemRelationSplit::try_new(reference.clone()).unwrap()),
             };
             assert!(!source.is_finished());
@@ -6130,6 +6319,7 @@ mod system_work_unit_tests {
     fn closed_singleton_and_empty_manifest_sources_emit_no_units() {
         let filter = DynamicFilterSnapshot::all_complete();
         let mut source = RuntimeSystemRelationSource {
+            closed: false,
             split: Some(
                 SystemRelationSplit::try_new(reference(
                     crate::typed_read::IcebergSystemTableType::Snapshots,
@@ -6145,7 +6335,10 @@ mod system_work_unit_tests {
                 .into_splits()
                 .is_empty()
         );
-        let mut empty = RuntimeSystemRelationSource { split: None };
+        let mut empty = RuntimeSystemRelationSource {
+            split: None,
+            closed: false,
+        };
         assert!(empty.is_finished());
         assert!(
             empty
@@ -6692,6 +6885,7 @@ mod prepared_source_relation_tests {
             // Synchronous refusal cannot yield a foreign F or install/take Source.
             let result = Arc::clone(&boundary).begin_get_splits(
                 ProviderReadSplitOpenRequest {
+                    enumeration_coverage: false,
                     session: ConnectorSession::try_new(
                         "q",
                         "u",
@@ -6886,6 +7080,7 @@ mod prepared_source_relation_tests {
         let mut owner = None;
         let result = Arc::clone(&boundary).begin_get_splits(
             ProviderReadSplitOpenRequest {
+                enumeration_coverage: false,
                 session: ConnectorSession::try_new(
                     "q",
                     "u",
@@ -6934,6 +7129,7 @@ mod known_empty_prepared_source_tests {
         summary: TupleDomain<IcebergColumnHandle>,
     ) -> ProviderReadSplitOpenRequest<IcebergTypedBoundary> {
         ProviderReadSplitOpenRequest {
+            enumeration_coverage: false,
             session: ConnectorSession::try_new(
                 "q",
                 "u",
@@ -6973,6 +7169,36 @@ mod known_empty_prepared_source_tests {
             .is_none()
         );
     }
+    #[test]
+    fn complete_cover_does_not_authorize_the_unenumerated_empty_fast_path() {
+        use novarocks_spi::connector::read_stack::SplitEnumeration;
+
+        let mut request = request(TupleDomain::none());
+        let mut source =
+            known_empty_prepared_table_source(&request, IcebergSplitSourceOptions::default())
+                .unwrap()
+                .expect("ordinary exact None keeps its short path");
+        let (_, enumeration) = source
+            .next_batch(1, &DynamicFilterSnapshot::all_complete())
+            .unwrap()
+            .into_parts();
+        let SplitEnumeration::NaturalEnd(pruning) = enumeration else {
+            panic!("predicate proof should finish the ordinary source");
+        };
+        assert!(!pruning.complete_file_inventory());
+        assert_eq!(
+            pruning.entries().next().unwrap().0,
+            SplitPruningBasis::UnsatisfiablePredicate
+        );
+        request.enumeration_coverage = true;
+        assert!(
+            known_empty_prepared_table_source(&request, IcebergSplitSourceOptions::default())
+                .unwrap()
+                .is_none(),
+            "the complete-cover request keeps its original file inventory"
+        );
+    }
+
     #[test]
     fn known_empty_does_not_hide_the_original_projection_refusal() {
         let mut request = request(TupleDomain::none());

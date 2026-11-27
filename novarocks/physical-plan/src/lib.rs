@@ -129,7 +129,8 @@ pub fn grouped_state_topn_key_supported(
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
 /// Revision 47 retires package and call-request constant quota fields.
-pub const PLAN_CONTRACT_REVISION: u32 = 47;
+/// Revision 48 installs content application and its demand filter placement.
+pub const PLAN_CONTRACT_REVISION: u32 = 48;
 
 #[cfg(test)]
 mod tests;

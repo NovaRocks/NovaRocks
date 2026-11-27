@@ -198,6 +198,37 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     build_read_snapshot_in_domain(table, domain, control).await
 }
 
+/// Validate all live delete content before an MV target's predicate,
+/// partition selection or dynamic feedback can narrow the scan.
+pub(crate) async fn validate_mv_content_target_snapshot(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<(), ConnectorError> {
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| read_snapshot_error("Frozen MV content target snapshot is absent"))?;
+    let schema = snapshot.schema(metadata).map_err(|error| {
+        read_snapshot_error(format!("Resolve MV content target schema: {error}"))
+    })?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)?;
+    observe_read_files_original::<DataFile>(
+        table,
+        domain,
+        control,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ReadPurpose::MvContentTarget,
+    )
+    .await
+    .map_err(ReadFailure::into_connector)?;
+    Ok(())
+}
+
 /// The selected snapshot's authorized list, retained for the coordinator's
 /// exact read only. The worker receives the predicate, never this inventory.
 pub(crate) struct PreparedReadManifestList {
@@ -403,7 +434,15 @@ pub(crate) async fn build_read_snapshot_with_prepared_list(
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
     let snapshot_id = domain.endpoint().snapshot_id();
     let files = observe_read_files_original::<DataFile>(
-        table, domain, control, None, None, None, None, prepared,
+        table,
+        domain,
+        control,
+        None,
+        None,
+        None,
+        None,
+        prepared,
+        ReadPurpose::Ordinary,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -437,6 +476,7 @@ pub(crate) async fn build_rewrite_read_snapshot_at(
         None,
         Some(&mut entries),
         None,
+        ReadPurpose::Ordinary,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -527,6 +567,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 referenced_specs.as_mut(),
                 None,
                 None,
+                ReadPurpose::Ordinary,
             )
             .await?
         }
@@ -540,6 +581,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 None,
                 rewrite_entries.as_mut(),
                 None,
+                ReadPurpose::Ordinary,
             )
             .await?
         }
@@ -563,7 +605,18 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     capture: Option<&CaptureScope<'_>>,
 ) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_original::<P>(table, domain, control, capture, None, None, None, None).await
+    observe_read_files_original::<P>(
+        table,
+        domain,
+        control,
+        capture,
+        None,
+        None,
+        None,
+        None,
+        ReadPurpose::Ordinary,
+    )
+    .await
 }
 
 /// Index by physical path, but retain the original descriptor as a borrowed
@@ -584,6 +637,12 @@ impl std::hash::Hash for ManifestReferenceKey<'_> {
 const CONFLICTING_MANIFEST_REFERENCE: &str =
     "Iceberg snapshot repeats one manifest path with conflicting descriptors";
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadPurpose {
+    Ordinary,
+    MvContentTarget,
+}
+
 async fn observe_read_files_original<P: ObservedDataFileProjection>(
     table: &Table,
     domain: Arc<ReadDomain>,
@@ -593,6 +652,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
     mut rewrite_entries: Option<&mut rewrite_entries::RewriteEntries>,
     prepared: Option<&PreparedReadManifestList>,
+    purpose: ReadPurpose,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_scoped_active(capture)?;
@@ -743,6 +803,12 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 continue;
             }
             let df = entry.raw.data_file();
+            if purpose == ReadPurpose::MvContentTarget && df.content_type() == DataContentType::Data
+            {
+                // This preflight validates live delete content. The ordinary
+                // split-opening path still authors all data file facts.
+                continue;
+            }
             let typed_partition = if let Some(capture) = capture {
                 TypedPartition::bind_type_checked(
                     spec,
@@ -787,16 +853,25 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                     ));
                 }
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    delete_entries.push((
-                        Some(entry.ordinal),
-                        observed_raw_delete_entry(
-                            &entry,
-                            manifest.metadata().format_version,
-                            &schema,
-                            typed_partition,
-                            metrics,
-                        )?,
-                    ));
+                    let delete = observed_raw_delete_entry(
+                        &entry,
+                        manifest.metadata().format_version,
+                        &schema,
+                        typed_partition,
+                        metrics,
+                    )?;
+                    if purpose == ReadPurpose::MvContentTarget
+                        && !matches!(delete.file.kind, DeleteKind::DeletionVector { .. })
+                    {
+                        return Err(ReadFailure::Original(
+                            ConnectorError::new(
+                                ConnectorErrorKind::CorruptData,
+                                "Iceberg MV content target has a live equality or position delete file",
+                            )
+                            .into(),
+                        ));
+                    }
+                    delete_entries.push((Some(entry.ordinal), delete));
                 }
             }
         }
@@ -2693,6 +2768,48 @@ mod tests {
         .await;
         let snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
         assert_eq!(snapshot.files[0].logical_delete_set().member_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn mv_content_target_validates_live_delete_content_without_narrowing_the_scan() {
+        let target = table(
+            vec![
+                vec![(data("a"), 5)],
+                vec![(dv("target.puffin", "a", 4, 2), 5)],
+            ],
+            Some(1),
+            false,
+        )
+        .await;
+        validate_mv_content_target_snapshot(&target, 77, None)
+            .await
+            .unwrap();
+
+        // Legacy deletes lie outside this data file's sequence horizon.
+        // They still describe live storage-side writes and cannot enter the
+        // content target, even if a normal read never applies them.
+        for legacy in [
+            equality("legacy-equality.parquet"),
+            position("legacy-position.parquet", "a"),
+        ] {
+            let target = table(
+                vec![vec![(data("a"), 5)], vec![(legacy, 4)]],
+                Some(1),
+                false,
+            )
+            .await;
+            assert_eq!(
+                build_read_snapshot_at(&target, 77).await.unwrap().files[0]
+                    .logical_delete_set()
+                    .member_count(),
+                0,
+            );
+            let error = validate_mv_content_target_snapshot(&target, 77, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+            assert!(error.message().contains("live equality or position delete"));
+        }
     }
 
     #[tokio::test]

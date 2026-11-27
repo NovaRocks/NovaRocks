@@ -494,9 +494,10 @@ impl MvKeyedReadinessExecution {
                 observed,
             )
             .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
-        let unchanged = expected
-            .as_ref()
-            .is_some_and(|old| old.projection.facts.source_revision() == facts.source_revision());
+        let unchanged = expected.as_ref().is_some_and(|old| {
+            old.projection.facts.source_revision() == facts.source_revision()
+                && old.projection.facts.never_published == facts.never_published
+        });
         if expected.is_none()
             && let Some(existing) = self
                 .repository
@@ -1095,9 +1096,10 @@ impl MvKeyedReadinessExecution {
                 "keyed read-only observation target changed",
             ));
         }
-        let unchanged = expected
-            .as_ref()
-            .is_some_and(|v| v.projection.facts.source_revision() == facts.source_revision());
+        let unchanged = expected.as_ref().is_some_and(|old| {
+            old.projection.facts.source_revision() == facts.source_revision()
+                && old.projection.facts.never_published == facts.never_published
+        });
         if expected.is_none()
             && let Some(existing) = self
                 .repository

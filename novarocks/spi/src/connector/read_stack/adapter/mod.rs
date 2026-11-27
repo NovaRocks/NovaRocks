@@ -456,6 +456,7 @@ pub struct ProviderReadSplitOpenRequest<P: ProviderReadRuntime> {
     pub dynamic_filter_columns: BTreeSet<P::Column>,
     pub constraint: Constraint<P::Column>,
     pub preparation: Option<super::runtime::ConnectorReadSplitPreparation>,
+    pub enumeration_coverage: bool,
 }
 
 /// Driver returned after the original split-open source has been installed.
@@ -478,6 +479,12 @@ pub trait ProviderReadSplitManager: ProviderReadRuntime {
             return Err(ConnectorError::new(
                 crate::connector::ConnectorErrorKind::InvalidRequest,
                 "split opening owner is occupied",
+            ));
+        }
+        if request.enumeration_coverage {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "Provider has no complete split enumeration author",
             ));
         }
         Ok(Box::pin(async move {
@@ -1319,8 +1326,15 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
                     "split opening owner is occupied",
                 ));
             }
-            let (session, table, columns, dynamic_filter_columns, constraint, preparation) =
-                request.into_parts();
+            let (
+                session,
+                table,
+                columns,
+                dynamic_filter_columns,
+                constraint,
+                preparation,
+                enumeration_coverage,
+            ) = request.into_parts();
             adapter.table(&table)?;
             let table =
                 super::runtime::shared_table_value::<P::Table>(&table).ok_or_else(type_error)?;
@@ -1331,6 +1345,7 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
                 dynamic_filter_columns: adapter.typed_columns(&dynamic_filter_columns)?,
                 constraint: adapter.typed_constraint(&constraint)?,
                 preparation,
+                enumeration_coverage,
             };
             Arc::clone(&adapter.provider).begin_get_splits(request, original_owner)
         })();
@@ -1361,23 +1376,17 @@ impl<P: ProviderReadRuntime> ConnectorReadSplitSource for AdapterSplitSource<P> 
         max_size: usize,
         dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
     ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
-        let domain = map_tuple_domain(dynamic_filter.current_predicate(), |column| {
-            self.adapter.column(column).cloned()
-        })?;
-        let dynamic_filter = DynamicFilterSnapshot::new(domain, dynamic_filter.is_complete());
+        let dynamic_filter = if dynamic_filter.is_empty_content_demand() {
+            DynamicFilterSnapshot::empty_content_demand()
+        } else {
+            let domain = map_tuple_domain(dynamic_filter.current_predicate(), |column| {
+                self.adapter.column(column).cloned()
+            })?;
+            DynamicFilterSnapshot::new(domain, dynamic_filter.is_complete())
+        };
         self.source
             .next_batch(max_size, &dynamic_filter)
-            .map(|batch| {
-                let no_more_splits = batch.no_more_splits();
-                ConnectorSplitBatch::new(
-                    batch
-                        .into_splits()
-                        .into_iter()
-                        .map(|split| self.adapter.wrap_split(split))
-                        .collect(),
-                    no_more_splits,
-                )
-            })
+            .map(|batch| batch.map_splits(|split| self.adapter.wrap_split(split)))
     }
 
     fn is_finished(&self) -> bool {
@@ -1992,10 +2001,13 @@ mod tests {
                         .map(|v| v.map(|v| (v, None))),
                     K::RowMutationCurrent(_)
                     | K::RowMutationMatch { .. }
-                    | K::FrozenMvTarget { .. } => Err(crate::connector::ConnectorError::new(
-                        crate::connector::ConnectorErrorKind::Unsupported,
-                        "fixture has no original write-target observation",
-                    )),
+                    | K::FrozenMvTarget { .. }
+                    | K::FrozenMvContentTarget { .. } => {
+                        Err(crate::connector::ConnectorError::new(
+                            crate::connector::ConnectorErrorKind::Unsupported,
+                            "fixture has no original write-target observation",
+                        ))
+                    }
                     K::MvTarget {
                         object_id,
                         snapshot_id,

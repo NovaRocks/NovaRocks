@@ -45,7 +45,7 @@ fn projection() -> StoredKeyedMvProjection {
     }
 }
 
-// Obtain the canonical schema-four DTO, then mutate one field for negative
+// Obtain the canonical projection DTO, then mutate one field for negative
 // tests. This uses no retired model conversion or legacy document encoder.
 fn projection_dto(expected: &StoredKeyedMvProjection) -> super::StoredMvProjectionAvro {
     let key = projection_by_id_key(expected.mv_id).unwrap();
@@ -195,7 +195,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         assert_eq!(
             catalog.latest(subject).unwrap().id(),
             if subject == "mv.accelerator_projection" {
-                5
+                6
             } else {
                 3
             }
@@ -205,7 +205,7 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
         catalog.entry("mv.accelerator_projection", 3).unwrap().id(),
         3
     );
-    for version in [3, 4, 5] {
+    for version in [3, 4, 5, 6] {
         let entry = catalog.entry("mv.accelerator_projection", version).unwrap();
         let json: serde_json::Value = serde_json::from_str(entry.raw_schema()).unwrap();
         let fields = json["fields"].as_array().unwrap();
@@ -326,4 +326,68 @@ fn keyed_projection_requires_binding_and_preserves_file_total_semantics() {
     altered_source.source_revision.metadata_version.digest = "00".repeat(32);
     let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &altered_source).unwrap();
     assert!(decode_keyed_projection(&key, &value).is_err());
+}
+
+#[test]
+fn projection_preserves_its_witness_without_inventing_one_for_v5() {
+    use crate::persistence::keyed_documents::{
+        MvKeyedDocumentProjection, keyed_view_fixture, resolve_current_keyed_documents,
+    };
+    let (catalog, view) = keyed_view_fixture(Some(17), false);
+    let mut original = StoredKeyedMvProjection {
+        mv_id: 7,
+        facts: MvKeyedDocumentProjection::try_from_current(
+            resolve_current_keyed_documents(view.clone(), catalog.clone()).unwrap(),
+        )
+        .unwrap(),
+    };
+    let key = projection_by_id_key(original.mv_id).unwrap();
+    let new = encode_keyed_projection(Uuid::now_v7(), &original).unwrap();
+    assert_eq!(
+        decode_keyed_projection(&key, &new)
+            .unwrap()
+            .value
+            .facts
+            .never_published,
+        Some(true)
+    );
+
+    let schema = schema_catalog()
+        .unwrap()
+        .entry("mv.accelerator_projection", 5)
+        .unwrap();
+    let datum = apache_avro::to_value(projection_dto(&original)).unwrap();
+    let apache_avro::types::Value::Record(mut fields) = datum else {
+        unreachable!()
+    };
+    fields.retain(|(name, _)| name != "never_published");
+    let payload =
+        apache_avro::to_avro_datum(schema.schema(), apache_avro::types::Value::Record(fields))
+            .unwrap();
+    let fingerprint = schema.fingerprint().as_bytes();
+    let mut envelope = new.as_bytes()[..6].to_vec();
+    envelope.extend_from_slice(&schema.id().to_be_bytes());
+    envelope.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
+    envelope.extend_from_slice(fingerprint);
+    envelope.extend_from_slice(Uuid::now_v7().as_bytes());
+    envelope.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    envelope.extend_from_slice(&payload);
+    let legacy = Value::try_from(Bytes::from(envelope)).unwrap();
+    let cached = decode_keyed_projection(&key, &legacy).unwrap().value;
+    assert_eq!(
+        cached.facts.source_revision(),
+        original.facts.source_revision()
+    );
+    assert_eq!(cached.facts.never_published, None);
+
+    let mut same_zero_totals = view;
+    same_zero_totals.before_first_data_publication = false;
+    original.facts = MvKeyedDocumentProjection::try_from_current(
+        resolve_current_keyed_documents(same_zero_totals, catalog).unwrap(),
+    )
+    .unwrap();
+    let unattributed = encode_keyed_projection(Uuid::now_v7(), &original).unwrap();
+    let decoded = decode_keyed_projection(&key, &unattributed).unwrap().value;
+    assert_eq!(decoded.facts.never_published, Some(false));
+    assert!(decoded.facts.publication().is_none());
 }

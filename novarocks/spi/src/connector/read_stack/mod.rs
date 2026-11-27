@@ -106,7 +106,10 @@ pub use session::{
     ConnectorCatalogSession, ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue,
 };
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
-pub use split_source::{ConnectorSplitBatch, ConnectorSplitSource, SplitSourceProfile};
+pub use split_source::{
+    ConnectorSplitBatch, ConnectorSplitSource, PrunedSplitFiles, SplitEnumeration,
+    SplitPruningBasis, SplitPruningLedger, SplitSourceProfile,
+};
 pub use static_facts::{
     ConnectorReadArtifactCoverage, ConnectorReadBucketLayout, ConnectorReadDistribution,
     ConnectorReadInputVersion, ConnectorReadMetadataKind, ConnectorReadMetadataRequest,

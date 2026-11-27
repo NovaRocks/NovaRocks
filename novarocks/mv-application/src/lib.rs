@@ -47,6 +47,7 @@ pub mod process_runtime;
 pub mod product;
 pub mod publication;
 pub mod readiness;
+pub mod refresh_failure;
 pub mod repository;
 mod repository_metrics;
 pub mod scheduler;

@@ -133,7 +133,7 @@ impl FragmentBuilder {
                 .map(|id| {
                     self.nodes
                         .get(id)
-                        .map(|n| n.output.columns.to_vec())
+                        .map(|n| n.data_output_columns().to_vec())
                         .ok_or(BuildError::UndefinedInput { node, input: *id })
                 })
                 .collect::<Result<_, _>>()?,

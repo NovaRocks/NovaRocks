@@ -53,6 +53,10 @@ enum Action {
         directory: PathBuf,
         token: String,
     },
+    ContentTargetEnumerationClose {
+        target: Target,
+        token: String,
+    },
     KnownCommitted {
         target: Target,
         directory: PathBuf,
@@ -266,6 +270,23 @@ impl DocumentExpiryClaim {
     }
 }
 
+/// An original one-shot FE grant carried to the selected source operation.
+pub(crate) struct ContentTargetEnumerationClose {
+    claim: ActionClaim,
+    token: String,
+}
+
+impl ContentTargetEnumerationClose {
+    pub(crate) fn is_active(&self) -> bool {
+        self.claim.cancellation().is_active()
+    }
+
+    pub(crate) fn record_hit(mut self) -> std::io::Result<String> {
+        self.claim.record_hit()?;
+        Ok(self.token)
+    }
+}
+
 pub struct MvTestControls {
     process: ProcessBinding,
     actions: Vec<AuthorizedAction>,
@@ -447,6 +468,30 @@ impl MvTestControls {
             "MV test action has no active unclaimed authorization for this FE launch and target"
                 .into(),
         )
+    }
+
+    #[expect(
+        dead_code,
+        reason = "RWM-10c moves the original MV control to the admitted content target."
+    )]
+    pub(crate) fn claim_content_target_enumeration_close(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+    ) -> Option<ContentTargetEnumerationClose> {
+        self.actions.iter().find_map(|authorized| {
+            let Action::ContentTargetEnumerationClose { target, token } = &authorized.action else {
+                return None;
+            };
+            if !target.matches(catalog, namespace, mv) {
+                return None;
+            }
+            Some(ContentTargetEnumerationClose {
+                claim: authorized.grant.claim_once(self.process).ok()?,
+                token: token.clone(),
+            })
+        })
     }
 
     pub(crate) fn claim_document_expiry(
@@ -979,7 +1024,11 @@ fn same_selection(left: &Action, right: &Action) -> bool {
                 ..
             },
         ) => a == b && x == y,
-        (Action::KnownCommitted { target: a, .. }, Action::KnownCommitted { target: b, .. })
+        (
+            Action::ContentTargetEnumerationClose { target: a, .. },
+            Action::ContentTargetEnumerationClose { target: b, .. },
+        )
+        | (Action::KnownCommitted { target: a, .. }, Action::KnownCommitted { target: b, .. })
         | (Action::Scheduler { target: a, .. }, Action::Scheduler { target: b, .. })
         | (
             Action::TransientPreparation { target: a, .. },
@@ -1031,6 +1080,7 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
         "accelerator-wipe" => &["action", "family"],
         "document-observation" => &["action", "catalog", "namespace", "mv", "level"],
         "document-expiry" => &["action", "catalog", "namespace", "mv", "token", "directory"],
+        "mv-content-target-enumeration-close" => &["action", "catalog", "namespace", "mv", "token"],
         "recovery-hold" => &[
             "action",
             "catalog",
@@ -1087,6 +1137,16 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
         mv: text("mv")?.into(),
     };
     Ok(match action {
+        "mv-content-target-enumeration-close" => {
+            let token = text("token")?;
+            if token.contains(['\n', '\r']) {
+                return Err("MV content target enumeration token contains a line break".into());
+            }
+            Action::ContentTargetEnumerationClose {
+                target,
+                token: token.into(),
+            }
+        }
         "document-expiry" => {
             let token = text("token")?;
             if token.contains(['\n', '\r']) {

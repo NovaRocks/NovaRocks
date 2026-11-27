@@ -162,6 +162,14 @@ impl RoundSplitAssignment {
         }
     }
 
+    pub(crate) fn with_enumeration_receipts(
+        mut self,
+        receipts: Arc<super::SplitEnumerationReceipts>,
+    ) -> Self {
+        self.driver.install_enumeration_receipts(receipts);
+        self
+    }
+
     /// A handle that closes this round's assignment from another thread.
     ///
     /// Cancellation reaches the coordinator on the statement thread while the
@@ -369,8 +377,8 @@ impl RoundSplitAssignment {
         batch: ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>,
     ) -> Result<bool, SplitAssignmentDriverError> {
         let no_more_splits = batch.no_more_splits();
-        let splits = batch
-            .into_splits()
+        let (splits, enumeration) = batch.into_parts();
+        let splits = splits
             .into_iter()
             .map(super::super::connector_domain::Split::new)
             .collect::<Vec<_>>();
@@ -379,8 +387,7 @@ impl RoundSplitAssignment {
             return Ok(false);
         }
         let placement = self.driver.distribute(scan, splits)?;
-        self.driver
-            .start_delivery(scan, placement, no_more_splits)?;
+        self.driver.start_delivery(scan, placement, enumeration)?;
         Ok(true)
     }
 

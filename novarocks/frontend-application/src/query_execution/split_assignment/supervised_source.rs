@@ -32,6 +32,15 @@ use std::sync::{
 
 pub(crate) struct SupervisedSplitSource {
     cell: Option<Arc<SourceCell>>,
+    #[cfg(novarocks_dev_controls)]
+    early_close: Option<ContentTargetEarlyClose>,
+}
+
+#[cfg(novarocks_dev_controls)]
+pub(crate) struct ContentTargetEarlyClose {
+    pub(crate) execution: novarocks_proto_codec::lifecycle::QueryExecutionId,
+    pub(crate) scan: super::ScanNodeKey,
+    pub(crate) fault: crate::mv::test_controls::ContentTargetEnumerationClose,
 }
 struct SourceCell {
     source: Mutex<Option<Box<dyn ConnectorReadSplitSource>>>,
@@ -103,6 +112,8 @@ impl SupervisedSplitSource {
         responsibility: ConnectorBlockingIoResponsibility,
     ) -> Self {
         Self {
+            #[cfg(novarocks_dev_controls)]
+            early_close: None,
             cell: Some(Arc::new(SourceCell {
                 source: Mutex::new(Some(source)),
                 closed: AtomicBool::new(false),
@@ -117,6 +128,8 @@ impl SupervisedSplitSource {
     #[cfg(test)]
     pub(crate) fn fixture(source: Box<dyn ConnectorReadSplitSource>) -> Self {
         Self {
+            #[cfg(novarocks_dev_controls)]
+            early_close: None,
             cell: Some(Arc::new(SourceCell {
                 source: Mutex::new(Some(source)),
                 closed: AtomicBool::new(false),
@@ -128,6 +141,15 @@ impl SupervisedSplitSource {
             })),
         }
     }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_content_target_early_close(
+        mut self,
+        early_close: Option<ContentTargetEarlyClose>,
+    ) -> Self {
+        self.early_close = early_close;
+        self
+    }
+
     fn cell(&self) -> &Arc<SourceCell> {
         self.cell.as_ref().expect("original source cell retained")
     }
@@ -198,7 +220,27 @@ impl ConnectorReadSplitSource for SupervisedSplitSource {
         if self.cell().closed.load(Ordering::Acquire)
             || self.cell().requested.load(Ordering::Acquire)
         {
-            return Ok(ConnectorSplitBatch::finished());
+            return Ok(ConnectorSplitBatch::closed());
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(early_close) = self.early_close.take()
+            && early_close.fault.is_active()
+        {
+            self.close()?;
+            let token = early_close.fault.record_hit().map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("Record original MV content target close injection: {error}"),
+                )
+            })?;
+            tracing::info!(
+                marker = novarocks_failpoint::observation_marker::MV_CONTENT_TARGET_ENUMERATION_CLOSED,
+                execution_id = ?early_close.execution,
+                scan = %early_close.scan,
+                token = %token,
+                "MV content target enumeration closed before its first batch"
+            );
+            return Ok(ConnectorSplitBatch::closed());
         }
         self.cell()
             .borrow()?

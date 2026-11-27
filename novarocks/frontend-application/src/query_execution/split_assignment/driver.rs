@@ -25,9 +25,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::{Condvar, Mutex};
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::query_execution::artifact::FragmentId;
@@ -35,7 +36,10 @@ use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use novarocks_spi::connector::ConnectorReadWireEncoder;
+use novarocks_spi::connector::{
+    ConnectorReadWireEncoder,
+    read_stack::{SplitEnumeration, SplitPruningLedger},
+};
 
 use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
 use super::transport::{
@@ -275,6 +279,93 @@ impl SplitSourceState {
     }
 }
 
+/// The serial split driver is the only author. A provider's terminal batch
+/// alone says nothing about the receiving tasks.
+#[derive(Debug)]
+pub(crate) struct EnumerationReceipt {
+    execution: QueryExecutionId,
+    scan: ScanNodeKey,
+    pruning: Box<SplitPruningLedger>,
+}
+
+impl EnumerationReceipt {
+    #[expect(
+        dead_code,
+        reason = "RWM-10c publication reads and reports the scan's original coverage."
+    )]
+    pub(crate) fn scan(&self) -> ScanNodeKey {
+        self.scan
+    }
+
+    #[expect(
+        dead_code,
+        reason = "RWM-10c publication reads and reports the scan's original pruning."
+    )]
+    pub(crate) fn pruning(&self) -> &SplitPruningLedger {
+        &self.pruning
+    }
+}
+
+pub(crate) struct SplitEnumerationReceipts {
+    execution: QueryExecutionId,
+    scans: Mutex<BTreeMap<ScanNodeKey, Option<Arc<EnumerationReceipt>>>>,
+}
+
+impl SplitEnumerationReceipts {
+    pub(crate) fn new(
+        execution: QueryExecutionId,
+        scans: impl Iterator<Item = ScanNodeKey>,
+    ) -> Self {
+        Self {
+            execution,
+            scans: Mutex::new(scans.map(|scan| (scan, None)).collect()),
+        }
+    }
+
+    fn record(&self, receipt: EnumerationReceipt) {
+        assert_eq!(
+            self.execution, receipt.execution,
+            "receipt belongs to the original attempt"
+        );
+        let mut scans = self
+            .scans
+            .lock()
+            .expect("original split enumeration coverage");
+        let slot = scans
+            .get_mut(&receipt.scan)
+            .expect("receipt scan was frozen");
+        assert!(slot.is_none(), "one enumeration receipt per scan");
+        *slot = Some(Arc::new(receipt));
+    }
+
+    /// Capture all original receipts only for this exact execution.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "RWM-10c publication consumes the original split coverage."
+        )
+    )]
+    pub(crate) fn complete(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Option<Vec<Arc<EnumerationReceipt>>> {
+        if self.execution != execution {
+            return None;
+        }
+        self.scans
+            .lock()
+            .expect("original split enumeration coverage")
+            .values()
+            .map(|receipt| {
+                receipt
+                    .clone()
+                    .filter(|receipt| receipt.pruning.complete_file_inventory())
+            })
+            .collect()
+    }
+}
+
 /// Per-task send state.
 #[derive(Debug, Default)]
 struct TaskState {
@@ -306,6 +397,8 @@ struct PendingTaskUpdate {
 struct PendingBatchDelivery {
     scan: ScanNodeKey,
     no_more_splits: bool,
+    natural_end: Option<Box<SplitPruningLedger>>,
+    all_recipients_accepted: bool,
     recipients: VecDeque<(AssignmentTarget, Vec<Split>)>,
     current: Option<PendingTaskUpdate>,
 }
@@ -327,6 +420,7 @@ pub(crate) struct SplitAssignmentDriver {
     retry_policy: TaskUpdateRetryPolicy,
     stop: SplitAssignmentStop,
     delivery: Option<PendingBatchDelivery>,
+    receipts: Option<Arc<SplitEnumerationReceipts>>,
 }
 
 impl SplitAssignmentDriver {
@@ -369,7 +463,17 @@ impl SplitAssignmentDriver {
             retry_policy,
             stop,
             delivery: None,
+            receipts: None,
         }
+    }
+
+    pub(crate) fn install_enumeration_receipts(&mut self, receipts: Arc<SplitEnumerationReceipts>) {
+        assert_eq!(
+            self.execution_id, receipts.execution,
+            "receipt collector belongs to the original attempt"
+        );
+        assert!(self.receipts.is_none(), "one receipt collector per attempt");
+        self.receipts = Some(receipts);
     }
 
     pub(crate) const fn delivery_in_progress(&self) -> bool {
@@ -478,7 +582,7 @@ impl SplitAssignmentDriver {
         &mut self,
         scan: ScanNodeKey,
         placement: BTreeMap<AssignmentTarget, Vec<Split>>,
-        no_more_splits: bool,
+        enumeration: SplitEnumeration,
     ) -> Result<(), SplitAssignmentDriverError> {
         if self.closed {
             return Err(SplitAssignmentDriverError::Closed);
@@ -486,6 +590,11 @@ impl SplitAssignmentDriver {
         if self.delivery.is_some() {
             return Err(SplitAssignmentDriverError::DeliveryInProgress);
         }
+        let no_more_splits = !matches!(enumeration, SplitEnumeration::More);
+        let natural_end = match enumeration {
+            SplitEnumeration::NaturalEnd(pruning) => Some(pruning),
+            SplitEnumeration::Closed | SplitEnumeration::More => None,
+        };
         // A task that received nothing still has to hear the terminal marker,
         // otherwise its scan would block forever waiting for work that will
         // never arrive.
@@ -499,6 +608,8 @@ impl SplitAssignmentDriver {
         self.delivery = Some(PendingBatchDelivery {
             scan,
             no_more_splits,
+            natural_end,
+            all_recipients_accepted: true,
             recipients: recipients.into_iter().collect(),
             current: None,
         });
@@ -608,6 +719,7 @@ impl SplitAssignmentDriver {
                     let state = self.task_state.entry(current.target).or_default();
                     state.in_flight = false;
                     state.finished = true;
+                    delivery.all_recipients_accepted = false;
                 }
                 Err(error) if error.kind() == TaskUpdateTransportErrorKind::RetryableNetwork => {
                     let now = Instant::now();
@@ -674,6 +786,7 @@ impl SplitAssignmentDriver {
                 .get(&target)
                 .is_some_and(|state| state.finished)
             {
+                delivery.all_recipients_accepted = false;
                 continue;
             }
             // Sequences are allocated once and the resulting immutable request
@@ -726,6 +839,16 @@ impl SplitAssignmentDriver {
                 .find(|source| source.scan == delivery.scan)
         {
             source.finished = true;
+            if delivery.all_recipients_accepted
+                && let Some(pruning) = delivery.natural_end
+                && let Some(receipts) = &self.receipts
+            {
+                receipts.record(EnumerationReceipt {
+                    execution: self.execution_id,
+                    scan: delivery.scan,
+                    pruning,
+                });
+            }
         }
         Ok(true)
     }

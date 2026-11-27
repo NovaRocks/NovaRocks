@@ -88,6 +88,18 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
     Ok(())
 }
 
+pub(super) fn validate_new_interpretation(
+    document: &InterpretationDocument,
+) -> Result<(), ValidationError> {
+    if !document.is_aggregate() && document.apply_key.is_some() {
+        return Err(ValidationError::new(
+            "interpretation.apply_key",
+            "new non-aggregate interpretations cannot declare an apply key",
+        ));
+    }
+    validate_interpretation(document)
+}
+
 pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), ValidationError> {
     if document.outputs.is_empty() {
         return Err(ValidationError::new(
@@ -114,16 +126,33 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             ));
         }
     }
-    match document.apply_key.kind {
-        ApplyKeyKind::BaseRowId | ApplyKeyKind::JoinRowKey | ApplyKeyKind::GroupRowId => {}
-    }
-    if document.apply_key.kind == ApplyKeyKind::GroupRowId && document.aggregates.is_empty() {
+    if document.is_aggregate() != (document.apply_key_kind() == Some(ApplyKeyKind::GroupRowId)) {
         return Err(ValidationError::new(
             "interpretation.apply_key.kind",
-            "GROUP_ROW_ID requires aggregate interpretation",
+            "GROUP_ROW_ID is required exactly for aggregate interpretations",
         ));
     }
-    if document.apply_key.components.is_empty() {
+    // Historical non-aggregate layouts still decode for rebuild classification.
+    // A content layout has no identity columns or branch interpretation.
+    if document.apply_key.is_none()
+        && (!document.branches.is_empty()
+            || document.target.fields.iter().any(|field| {
+                matches!(
+                    field.logical_identity,
+                    PhysicalFieldLogicalIdentity::Branch(_)
+                )
+            }))
+    {
+        return Err(ValidationError::new(
+            "interpretation.branches",
+            "content interpretation cannot declare branch identities",
+        ));
+    }
+    let apply_components = document
+        .apply_key
+        .as_ref()
+        .map_or(&[][..], |apply_key| apply_key.components.as_slice());
+    if document.apply_key.is_some() && apply_components.is_empty() {
         return Err(ValidationError::new(
             "interpretation.apply_key.components",
             "at least one apply-key field is required",
@@ -131,7 +160,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
     }
     let mut apply_logical_ids = BTreeSet::new();
     let mut apply_target_ids = BTreeSet::new();
-    for component in &document.apply_key.components {
+    for component in apply_components {
         if !apply_logical_ids.insert(&component.logical_id) {
             return Err(ValidationError::new(
                 "interpretation.apply_key.components",
@@ -360,7 +389,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
                 ));
             }
             PhysicalFieldLogicalIdentity::ApplyKey(logical_id)
-                if !document.apply_key.components.iter().any(|component| {
+                if !apply_components.iter().any(|component| {
                     &component.logical_id == logical_id
                         && component.target_field_id == field.target_field_id
                 }) =>
@@ -424,7 +453,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             slot.nullable,
         )?;
     }
-    for component in &document.apply_key.components {
+    for component in apply_components {
         if !document.target.fields.iter().any(|field| {
             field.logical_identity
                 == PhysicalFieldLogicalIdentity::ApplyKey(component.logical_id.clone())

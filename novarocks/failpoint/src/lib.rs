@@ -74,6 +74,10 @@ pub enum QueryLifecycleFaultKind {
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
+    /// Close the original MV content-target source before its natural end.
+    MvContentTargetEnumerationClose,
+    /// Drop one positive output row produced by the MV content author.
+    MvContentApplyDropInsert,
     /// Drops the acknowledgement of one `EstablishParticipation` after the
     /// backend has installed the context. The context exists and the frontend
     /// does not know it, which is the unknown-outcome case the protocol's
@@ -204,7 +208,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -212,6 +216,8 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
+        Self::MvContentTargetEnumerationClose,
+        Self::MvContentApplyDropInsert,
         Self::EstablishParticipationAckDrop,
         Self::CreateTaskAckDrop,
         Self::CreateTaskBeforeWorkerHold,
@@ -252,6 +258,8 @@ impl QueryLifecycleFaultKind {
             }
             Self::RuntimeFilterFeedbackUnavailable => "runtime-filter-feedback-unavailable",
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
+            Self::MvContentTargetEnumerationClose => "mv-content-target-enumeration-close",
+            Self::MvContentApplyDropInsert => "mv-content-apply-drop-insert",
             Self::EstablishParticipationAckDrop => "establish-participation-ack-drop",
             Self::CreateTaskAckDrop => "create-task-ack-drop",
             Self::CreateTaskBeforeWorkerHold => "create-task-before-worker-hold",
@@ -304,12 +312,13 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 29] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 30] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
     QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+    QueryLifecycleFaultKind::MvContentApplyDropInsert,
     // The task protocol's four core-operation faults. Each drops an
     // acknowledgement the backend already earned; none of them skips the
     // operation, because a fault that never applied anything would exercise

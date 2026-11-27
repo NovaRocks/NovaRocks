@@ -3314,6 +3314,13 @@ condition,
             format_value_ids(key_inputs),
             output_key.get(),
         )),
+        NodeKind::ContentApply(spec) => lines.push(format_args!(
+            "{pad}  weighted-content=[{}], target-content=[{}], route-keys={:?}, weight=v{}",
+            format_value_ids(&spec.weighted_content),
+            format_value_ids(&spec.target_content),
+            spec.route_keys,
+            spec.weight.get(),
+        )),
         NodeKind::PositionShard(spec) => lines.push(format_args!(
             "{pad}  target={}, contribution-routes={}",
             spec.target.get(),
@@ -3899,6 +3906,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
             NodeKind::AssertOneRow(_) => formatter.write_str("ASSERT ONE ROW")?,
             NodeKind::ChangeEventExpand { .. } => formatter.write_str("CHANGE EVENT EXPAND")?,
             NodeKind::WriteLayoutKey { .. } => formatter.write_str("WRITE LAYOUT KEY")?,
+            NodeKind::ContentApply(_) => formatter.write_str("CONTENT APPLY")?,
             NodeKind::PositionShard(_) => formatter.write_str("POSITION SHARD AGGREGATION")?,
             NodeKind::ExchangeSource { edge, .. } => {
                 let label = context.plan.edges().get(edge).map_or("EXCHANGE", |edge| {

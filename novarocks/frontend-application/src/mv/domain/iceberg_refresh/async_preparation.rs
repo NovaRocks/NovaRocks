@@ -231,7 +231,7 @@ pub(crate) async fn prepare_refresh_binding_candidate(
             source_observations: &observed.relations,
             runtime_layout: &runtime_layout,
             target_identity: &property.identity,
-            apply_key_column_name: refresh_contract.apply_key.column_name,
+            apply_key_column_name: Some(refresh_contract.apply_key.column_name),
             branch_column_name: identity_needs_branch_id_column(&property.identity)
                 .then_some(BRANCH_ID_COLUMN_NAME),
         },

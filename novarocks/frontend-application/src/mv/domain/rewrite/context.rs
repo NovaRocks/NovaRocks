@@ -665,7 +665,10 @@ fn sql_schema_facts(
             })
             .collect::<Result<_, _>>()?,
         apply_key.name.clone(),
-        match interpretation.apply_key.kind {
+        match interpretation
+            .apply_key_kind()
+            .ok_or("keyed rewrite requires an apply key")?
+        {
             ApplyKeyKind::BaseRowId => SqlImvApplyKeySourceFacts::BaseRowId,
             ApplyKeyKind::JoinRowKey => SqlImvApplyKeySourceFacts::JoinRowKey,
             ApplyKeyKind::GroupRowId => SqlImvApplyKeySourceFacts::GroupRowId,

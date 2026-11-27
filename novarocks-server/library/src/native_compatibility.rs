@@ -232,6 +232,29 @@ mod tests {
     }
 
     #[test]
+    fn peer_without_content_application_cannot_share_the_plan_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = super::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            47,
+            COMPILED,
+        )
+        .unwrap();
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(current.carriers(), prior.carriers());
+        assert_eq!(
+            current.function_catalog_digest(),
+            prior.function_catalog_digest()
+        );
+    }
+
+    #[test]
     fn peer_on_revision_42_cannot_share_the_multicast_binding_island() {
         let manifest = server_manifest();
         let current =
@@ -302,7 +325,7 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 17), ("paimon", 1)]
+            vec![("iceberg", 18), ("paimon", 1)]
         );
         assert!(
             declarations

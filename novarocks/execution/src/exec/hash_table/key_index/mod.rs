@@ -59,10 +59,6 @@ pub(crate) use bulk_build::AssignmentChunk;
     reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
 )]
 pub(crate) use bulk_build::Assignments;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
 pub(crate) use bulk_build::BulkReady;
 #[expect(
     unused_imports,

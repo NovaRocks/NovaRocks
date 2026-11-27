@@ -686,7 +686,18 @@ message PhysicalNode {
     SystemRelationNode system_relation = 27;
     PositionShardNode position_shard = 28;
     WriteLayoutKeyNode write_layout_key = 29;
+    ContentApplyNode content_apply = 31;
   }
+}
+message ContentApplyNode {
+  repeated uint32 weighted_content_value_ids = 1;
+  repeated uint32 target_content_value_ids = 2;
+  repeated uint32 route_key_ordinals = 3;
+  optional uint32 weight_value_id = 4;
+  optional uint32 file_value_id = 5;
+  optional uint32 position_value_id = 6;
+  optional uint32 spec_id_value_id = 7;
+  optional uint32 partition_value_id = 8;
 }
 message OutputPort {
   optional uint32 node_id = 1;

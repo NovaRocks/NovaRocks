@@ -1294,6 +1294,10 @@ fn build_node(
             ));
             Ok(build)
         }
+        ProgramNodeKind::ContentApply(_) => Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "content apply requires its phased execution factory",
+        )),
         ProgramNodeKind::PositionShard {
             inputs,
             output_slots,

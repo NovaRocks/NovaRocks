@@ -50,11 +50,14 @@ pub(super) fn projection(payload: &[u8], schema: i32) -> Result<(), String> {
     } else {
         None
     };
-    let mapping = if schema == 5 {
+    let mapping = if schema >= 5 {
         input.optional(Datum::bytes)?
     } else {
         None
     };
+    if schema == 6 {
+        input.optional(Datum::boolean)?;
+    }
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());
     }
@@ -120,6 +123,18 @@ impl<'a> Datum<'a> {
             }
         }
         Err("MV Accelerator Avro integer overflows".into())
+    }
+
+    fn boolean(&mut self) -> Result<(), String> {
+        let (&value, rest) = self
+            .remaining
+            .split_first()
+            .ok_or("MV Accelerator Avro boolean is truncated")?;
+        if value > 1 {
+            return Err("MV Accelerator Avro boolean must be 0 or 1".into());
+        }
+        self.remaining = rest;
+        Ok(())
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], String> {

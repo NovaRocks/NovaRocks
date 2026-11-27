@@ -27,10 +27,13 @@ mod round;
 mod supervised_source;
 mod transport;
 
+#[cfg(novarocks_dev_controls)]
+pub(crate) use supervised_source::ContentTargetEarlyClose;
 pub(crate) use supervised_source::SupervisedSplitSource;
 
 pub(crate) use driver::{
     AssignmentTarget, ScanNodeKey, SplitAssignmentDriverError, SplitAssignmentStop,
+    SplitEnumerationReceipts,
 };
 pub(crate) use round::{
     RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,

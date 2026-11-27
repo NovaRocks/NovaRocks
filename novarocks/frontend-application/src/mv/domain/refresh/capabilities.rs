@@ -95,14 +95,17 @@ impl RefreshCapabilities {
             BaseSnapshotPolicy::SingleBase
         };
 
-        let kind_identity = apply_key_kind_to_refresh_identity(interpretation.apply_key.kind);
+        let apply_key_kind = interpretation
+            .apply_key_kind()
+            .ok_or("keyed refresh requires an apply key")?;
+        let kind_identity = apply_key_kind_to_refresh_identity(apply_key_kind);
         let identity = if has_branch {
             RefreshIdentity::BranchScoped(Box::new(kind_identity))
         } else {
             kind_identity
         };
 
-        let apply_key_value_type = match (interpretation.apply_key.kind, has_branch) {
+        let apply_key_value_type = match (apply_key_kind, has_branch) {
             (ApplyKeyKind::BaseRowId, false) => ApplyKeyValueType::Int64,
             (ApplyKeyKind::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
             (ApplyKeyKind::JoinRowKey, _) => ApplyKeyValueType::Utf8,
@@ -175,7 +178,7 @@ mod tests {
     #[test]
     fn single_relation_projection_keeps_one_base_and_its_physical_apply_key() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::BaseRowId;
         interpretation.aggregates.clear();
         interpretation.branches.clear();
 
@@ -198,7 +201,7 @@ mod tests {
     #[test]
     fn a_join_pair_and_a_fan_in_of_the_same_arity_choose_different_policies() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::JoinRowKey;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::JoinRowKey;
         interpretation.aggregates.clear();
         interpretation.branches.clear();
 
@@ -233,7 +236,10 @@ mod tests {
     #[test]
     fn branch_union_aggregate_scopes_its_identity_and_requires_every_base() {
         let interpretation = interpretation();
-        assert_eq!(interpretation.apply_key.kind, ApplyKeyKind::GroupRowId);
+        assert_eq!(
+            interpretation.apply_key_kind(),
+            Some(ApplyKeyKind::GroupRowId)
+        );
         assert!(!interpretation.aggregates.is_empty());
         assert!(!interpretation.branches.is_empty());
 
@@ -263,7 +269,7 @@ mod tests {
     #[test]
     fn join_over_branches_without_aggregate_state_is_rejected() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::BaseRowId;
         interpretation.aggregates.clear();
 
         let error = RefreshCapabilities::from_canonical_facts(

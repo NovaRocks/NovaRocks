@@ -160,6 +160,7 @@ pub fn observed_current_keyed(
     view.object_id = source.target_object_id.clone();
     view.metadata_version = facts.metadata_version().clone();
     view.current_snapshot_file_totals = facts.file_totals;
+    view.before_first_data_publication = facts.never_published();
     view.versions = facts
         .versions()
         .versions()
@@ -188,5 +189,5 @@ pub fn observed_current_keyed(
                 .records
         })
         .unwrap_or_default();
-    decode_current_keyed_documents(view, catalog).expect("typed keyed Current fixture")
+    resolve_current_keyed_documents(view, catalog).expect("typed keyed Current fixture")
 }
