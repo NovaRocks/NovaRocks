@@ -783,8 +783,13 @@ pub(super) fn for_module(
             "tests/system-test-runner/fixtures/trino_query_probe.py".into(),
         ]);
     }
-    use super::native_creation::constant_capacity::{DEFAULT_FOLD, DEFAULT_STATIC, LARGE_STATIC};
-    if matches!(name, DEFAULT_STATIC | DEFAULT_FOLD | LARGE_STATIC) {
+    use super::native_creation::constant_capacity::{
+        DEFAULT_FOLD, DEFAULT_STATIC, LARGE_STATIC, OVERSIZE,
+    };
+    if matches!(
+        name,
+        DEFAULT_STATIC | DEFAULT_FOLD | LARGE_STATIC | OVERSIZE
+    ) {
         declaration.impact.paths.extend([
             "novarocks/constant-contract/**".into(),
             "novarocks/arrow-batch-codec/**".into(),
@@ -804,10 +809,13 @@ pub(super) fn for_module(
                 "Fresh managed 1FE+3BE at default query and Client window limits. Generates the 990,000-unit ASCII and alternating 8,193-row SQL inputs, checks typed row bags, exact statement and Task evidence, and original resource/role cleanup."
             }
             DEFAULT_FOLD => {
-                "Independent managed 1FE+3BE at the same defaults. Generates a one-row rpad workload with a 9 MiB result before short projection, checks the typed Trino row, original Native Task exit, and resource/role cleanup."
+                "Independent managed 1FE+3BE at the same defaults. Generates a one-row rpad workload with a 9 MiB result before short projection, checks the typed Trino row and the function_translate step-four row, original Native Task exit, and resource/role cleanup."
             }
             LARGE_STATIC => {
-                "Fresh managed 1FE+3BE generates a 9 MiB literal and six 3 MiB literals. Uses only its own FE query and Client window overlay, verifies typed Trino rows and linked IPC/Values evidence on an exact released Task, and checks resource/role cleanup."
+                "Fresh managed 1FE+3BE generates a 9 MiB literal and six 3 MiB literals. Raises only the FE SQL text length and uses the default Client window, verifies typed Trino rows and linked IPC/Values evidence on an exact released Task, and checks resource/role cleanup."
+            }
+            OVERSIZE => {
+                "Fresh managed 1FE+3BE uses an 8 MiB ordinary Native request limit on every role. The 9 MiB optional fold must freeze, fail in FE before CreateTask is sent, and surface one typed resource rejection on attempt 1. Observes actual Task, resource and role cleanup."
             }
             _ => unreachable!(),
         });
@@ -916,7 +924,7 @@ pub(super) fn for_module(
         let (reason, detail) = if name == LARGE_STATIC {
             (
                 "cost",
-                "Generates and transports two large static VALUES inputs with an isolated FE capacity overlay.",
+                "Generates and transports two large static VALUES inputs with an isolated FE SQL text length overlay.",
             )
         } else if compatibility {
             (

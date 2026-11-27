@@ -26,8 +26,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_failpoint::observation_marker::{
-    ObservationAction, TASK_CONSTANT_IPC_RECORD, TASK_TERMINAL_RETAINED, TASK_VALUES_BACKING,
-    TASK_VALUES_SOURCE,
+    ObservationAction, PARTICIPATION_TERMINATION_COMPLETED, TASK_CONSTANT_IPC_RECORD,
+    TASK_CREATE_APPLIED, TASK_TERMINAL_RETAINED, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
 };
 use serde::Serialize;
 
@@ -42,6 +42,7 @@ pub(super) struct TaskEvidence {
     backend_process: String,
     stage: u32,
     task: u32,
+    created: bool,
     terminal: Option<String>,
     records: Vec<PoolRecord>,
     values: Vec<ValuesBacking>,
@@ -84,7 +85,7 @@ impl TaskEvidence {
         }
         // The preserved expression and the materialized optional-fold product
         // are both eligible. Their placement decision is independently probed.
-        if !require_layout || matches!(case, Case::Fold) {
+        if !require_layout || matches!(case, Case::Fold | Case::Translate) {
             return Ok(true);
         }
         let dimensions = case.dimensions();
@@ -117,7 +118,9 @@ impl TaskEvidence {
                                 && (1..8 * MIB).contains(&record.body_bytes)
                         })
                 }
-                Case::Fold => unreachable!("optional-fold structure is observed separately"),
+                Case::Fold | Case::Translate => {
+                    unreachable!("only Task exit is required for fold controls")
+                }
             };
             if matched {
                 return Ok(true);
@@ -216,6 +219,73 @@ pub(super) fn await_exact_tasks(
     }
 }
 
+pub(super) fn await_refused_attempt_tasks(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    execution: &str,
+) -> Result<Vec<TaskEvidence>> {
+    use crate::scenarios::task_evidence::{
+        PARTICIPATION_ESTABLISH_APPLIED, RELEASE_APPLIED, backends_with_marker,
+    };
+
+    let action = ObservationAction::TaskProtocol.as_str();
+    loop {
+        let established =
+            backends_with_marker(context, PARTICIPATION_ESTABLISH_APPLIED, execution)?;
+        let released = backends_with_marker(context, RELEASE_APPLIED, execution)?;
+        let terminated =
+            backends_with_marker(context, PARTICIPATION_TERMINATION_COMPLETED, execution)?;
+        let mut tasks = Vec::new();
+        for index in 0..context.handle().be_count() {
+            ensure!(
+                context
+                    .handle()
+                    .selected_native_observation_binding(index, action, &selected.token, Some(2),)?
+                    .is_none(),
+                "the oversized fragment started a replacement execution on BE {index}"
+            );
+            let binding = context.handle().selected_native_observation_binding(
+                index,
+                action,
+                &selected.token,
+                Some(1),
+            )?;
+            let Some(binding) = binding else { continue };
+            ensure!(
+                binding.backend_index == index
+                    && binding.statement_run_token == selected.token
+                    && format!(
+                        "{}:{}:{}",
+                        binding.query_id_hi, binding.query_id_lo, binding.attempt_id
+                    ) == execution,
+                "Native observation belongs to another execution"
+            );
+            let log = context.handle().be_log_contents(index)?;
+            tasks.extend(read_tasks(
+                &log,
+                index,
+                &binding.backend_process_id,
+                execution,
+            )?);
+        }
+        if tasks.iter().all(|task| {
+            task.created
+                && task.terminal.is_some()
+                && (released.contains(&task.backend_index)
+                    || terminated.contains(&task.backend_index))
+        }) && established
+            .iter()
+            .all(|index| released.contains(index) || terminated.contains(index))
+        {
+            return Ok(tasks);
+        }
+        let remaining = context.remaining(&format!(
+            "observe terminal Tasks and actual participation exits for {execution}; established={established:?}, released={released:?}, terminated={terminated:?}, tasks={tasks:?}",
+        ))?;
+        thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
 fn read_tasks(
     log: &str,
     index: usize,
@@ -228,7 +298,8 @@ fn read_tasks(
         let Some(marker) = words.find(|word| {
             matches!(
                 *word,
-                TASK_TERMINAL_RETAINED
+                TASK_CREATE_APPLIED
+                    | TASK_TERMINAL_RETAINED
                     | TASK_CONSTANT_IPC_RECORD
                     | TASK_VALUES_BACKING
                     | TASK_VALUES_SOURCE
@@ -264,6 +335,7 @@ fn read_tasks(
             ..Default::default()
         });
         match marker {
+            TASK_CREATE_APPLIED => evidence.created = true,
             TASK_TERMINAL_RETAINED => {
                 let state = fields.get("state")?;
                 ensure!(

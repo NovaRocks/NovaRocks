@@ -21,7 +21,8 @@ use std::{collections::BTreeSet, fs, path::Path, time::Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::{
-    LaunchProfile, TestClusterOwner, test_sessions::ClusterTestSessionPlan,
+    LaunchProfile, QueryLifecycleFailureSite, QueryLifecycleStatementObservation, TestClusterOwner,
+    test_sessions::ClusterTestSessionPlan,
 };
 use novarocks_failpoint::observation_marker::ObservationAction;
 use novarocks_test_trino_client::{StatementFailure, StatementResult, TrinoValue};
@@ -47,6 +48,7 @@ mod task_markers;
 pub(in crate::scenarios) const DEFAULT_STATIC: &str = "native-creation/default-static-values";
 pub(in crate::scenarios) const DEFAULT_FOLD: &str = "native-creation/default-optional-fold";
 pub(in crate::scenarios) const LARGE_STATIC: &str = "native-creation/large-static-values";
+pub(in crate::scenarios) const OVERSIZE: &str = "native-creation/oversize-fragment-refusal";
 
 // The independent comparison uses the exact original P00 artifact source.
 const BASELINE_SOURCE: &str = "2cc1ed48f62e6e825f8305e5d68b01363b5c441d";
@@ -54,21 +56,31 @@ const MIB: usize = 1024 * 1024;
 const DEFAULT_QUERY_LENGTH: usize = 1_000_000;
 const DEFAULT_RESULT_BYTES: usize = 8 * MIB;
 const LARGE_QUERY_LENGTH: usize = 32 * MIB;
-const LARGE_RESULT_BYTES: usize = 256 * MIB;
+const OVERSIZE_REQUEST_LIMIT: usize = 8 * MIB;
+const DEFAULT_REQUEST_LIMIT: usize = 64 * MIB;
+const TRANSLATE_STEP_FOUR: &str =
+    "SELECT length(translated) AS codepoints, length(to_utf8(translated)) AS utf8_bytes,
+       crc32(to_utf8(translated)) AS fingerprint
+FROM (SELECT translate(rpad('', 1024 * 1024, 'a'), 'a', '膨') AS translated) AS t";
 const SMOKE_LENGTH: usize = 494_958;
 const GROUPED_ROWS: usize = 8_193;
 const SINGLE_BYTES: usize = 9 * MIB;
 const GRID_CELL_BYTES: usize = 3 * MIB;
 
 pub(super) fn scenarios() -> impl Iterator<Item = Box<dyn Scenario>> {
-    [Group::DefaultStatic, Group::DefaultFold, Group::LargeStatic]
-        .into_iter()
-        .map(|group| {
-            Box::new(Witness {
-                group,
-                intent: SqlIntentOwner::default(),
-            }) as Box<dyn Scenario>
-        })
+    [
+        Group::DefaultStatic,
+        Group::DefaultFold,
+        Group::LargeStatic,
+        Group::Oversize,
+    ]
+    .into_iter()
+    .map(|group| {
+        Box::new(Witness {
+            group,
+            intent: SqlIntentOwner::default(),
+        }) as Box<dyn Scenario>
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -76,21 +88,30 @@ enum Group {
     DefaultStatic,
     DefaultFold,
     LargeStatic,
+    Oversize,
 }
 
 impl Group {
     fn cases(self) -> &'static [Case] {
         match self {
             Self::DefaultStatic => &[Case::Smoke, Case::Grouped],
-            Self::DefaultFold => &[Case::Fold],
+            Self::DefaultFold => &[Case::Fold, Case::Translate],
+            Self::Oversize => &[Case::Fold],
             Self::LargeStatic => &[Case::Single, Case::Grid],
         }
     }
 
-    fn configuration(self) -> (usize, usize) {
+    fn query_limit(self) -> usize {
         match self {
-            Self::LargeStatic => (LARGE_QUERY_LENGTH, LARGE_RESULT_BYTES),
-            Self::DefaultStatic | Self::DefaultFold => (DEFAULT_QUERY_LENGTH, DEFAULT_RESULT_BYTES),
+            Self::LargeStatic => LARGE_QUERY_LENGTH,
+            _ => DEFAULT_QUERY_LENGTH,
+        }
+    }
+
+    fn request_limit(self) -> usize {
+        match self {
+            Self::Oversize => OVERSIZE_REQUEST_LIMIT,
+            _ => DEFAULT_REQUEST_LIMIT,
         }
     }
 }
@@ -106,6 +127,7 @@ impl Scenario for Witness {
             Group::DefaultStatic => DEFAULT_STATIC,
             Group::DefaultFold => DEFAULT_FOLD,
             Group::LargeStatic => LARGE_STATIC,
+            Group::Oversize => OVERSIZE,
         }
     }
 
@@ -132,12 +154,20 @@ impl Scenario for Witness {
 
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
-        if self.is_explicit_stage() {
-            let (query_length, result_bytes) = self.group.configuration();
-            launch.config_overlay.fe = Some(format!(
-                "[standalone_server]\ntrino_query_max_length = {query_length}\n\
-                 [runtime.frontend_workload]\nclient_result_all_objects_bytes = {result_bytes}\n"
-            ));
+        match self.group {
+            Group::LargeStatic => {
+                launch.config_overlay.fe = Some(format!(
+                    "[standalone_server]\ntrino_query_max_length = {LARGE_QUERY_LENGTH}\n"
+                ));
+            }
+            Group::Oversize => {
+                let overlay = format!(
+                    "[runtime.native_ingress]\nordinary_request_max_bytes = {OVERSIZE_REQUEST_LIMIT}\n"
+                );
+                launch.config_overlay.fe = Some(overlay.clone());
+                launch.config_overlay.be = Some(overlay);
+            }
+            Group::DefaultStatic | Group::DefaultFold => {}
         }
         Ok(launch)
     }
@@ -158,7 +188,16 @@ impl Scenario for Witness {
                 sql: case.sql(),
                 faults: vec![],
                 observations: (0..cluster_size)
-                    .map(|index| (index, ObservationAction::TaskProtocol.as_str(), None))
+                    .flat_map(|index| {
+                        let attempts: &[_] = if matches!(self.group, Group::Oversize) {
+                            &[Some(1), Some(2)]
+                        } else {
+                            &[None]
+                        };
+                        attempts.iter().map(move |&attempt| {
+                            (index, ObservationAction::TaskProtocol.as_str(), attempt)
+                        })
+                    })
                     .collect(),
             })
             .collect();
@@ -184,8 +223,8 @@ impl Scenario for Witness {
         );
         let baseline_build = is_baseline(context)?;
         ensure!(
-            !baseline_build || !self.is_explicit_stage(),
-            "large-static-values requires the current capacity contract"
+            !baseline_build || matches!(self.group, Group::DefaultStatic | Group::DefaultFold),
+            "this scenario requires the current capacity contract"
         );
         record_config(context, self.group, baseline_build)?;
         let idle = query_lifecycle::resource_snapshot(context)?;
@@ -194,7 +233,17 @@ impl Scenario for Witness {
         let primary = (|| -> Result<()> {
             for (ordinal, &case) in self.group.cases().iter().enumerate() {
                 let selected = self.intent.take(ordinal)?;
-                run_statement(context, &mut session, &selected, case, baseline_build)?;
+                if baseline_build && matches!(case, Case::Translate) {
+                    continue;
+                }
+                run_statement(
+                    context,
+                    &mut session,
+                    &selected,
+                    case,
+                    baseline_build,
+                    matches!(self.group, Group::Oversize),
+                )?;
                 if baseline_build {
                     capture_baseline_contract(context, &mut session, &selected.sql, case)?;
                 }
@@ -213,6 +262,7 @@ enum Case {
     Smoke,
     Grouped,
     Fold,
+    Translate,
     Single,
     Grid,
 }
@@ -223,6 +273,7 @@ impl Case {
             Self::Smoke => "smoke-990000",
             Self::Grouped => "alternating-8193",
             Self::Fold => "optional-fold-9mib",
+            Self::Translate => "function-translate-step-four",
             Self::Single => "single-9mib",
             Self::Grid => "grid-2-by-3",
         }
@@ -243,6 +294,7 @@ impl Case {
                 sql
             }
             Self::Fold => "SELECT length(v), substr(v, 1, 1), substr(v, -1, 1) FROM (VALUES (rpad('', BIGINT '9437184', 'x'))) AS t(v)".into(),
+            Self::Translate => TRANSLATE_STEP_FOUR.into(),
             Self::Single => values_sql(&["v"], &[&[('A', 'x', 'Z')]], SINGLE_BYTES),
             Self::Grid => values_sql(
                 &["a", "b", "c"],
@@ -275,6 +327,11 @@ impl Case {
                 vec![Cell::Integer(1), Cell::Integer(4096)],
             ],
             Self::Fold => vec![projected(SINGLE_BYTES, &[('x', 'x')])],
+            Self::Translate => vec![vec![
+                Cell::Integer(1_048_576),
+                Cell::Integer(3_145_728),
+                Cell::Integer(3_347_635_901),
+            ]],
             Self::Single => vec![projected(SINGLE_BYTES, &[('A', 'Z')])],
             Self::Grid => vec![
                 projected(GRID_CELL_BYTES, &[('A', 'A'), ('B', 'B'), ('C', 'C')]),
@@ -287,7 +344,7 @@ impl Case {
         match self {
             Self::Smoke => (2, 1),
             Self::Grouped => (GROUPED_ROWS, 1),
-            Self::Fold | Self::Single => (1, 1),
+            Self::Fold | Self::Translate | Self::Single => (1, 1),
             Self::Grid => (2, 3),
         }
     }
@@ -295,6 +352,7 @@ impl Case {
     fn result_types(self) -> Vec<&'static str> {
         match self {
             Self::Grouped => vec!["integer", "bigint"],
+            Self::Translate => vec!["bigint"; 3],
             _ => ["bigint", "varchar", "varchar"].repeat(self.dimensions().1),
         }
     }
@@ -393,7 +451,11 @@ fn run_statement(
     selected: &SelectedStatement,
     case: Case,
     baseline_build: bool,
+    expect_oversize: bool,
 ) -> Result<()> {
+    let before_freeze = expect_oversize
+        .then(|| super::completed_statement_freeze_bytes(context))
+        .transpose()?;
     let root = context.scenario_root().to_owned();
     let client_record = root.join(format!("{}.client.json", case.label()));
     let digest = format!("{:x}", Sha256::digest(selected.sql.as_bytes()));
@@ -446,6 +508,20 @@ fn run_statement(
     let cancel_needed =
         matches!(&result, Err(error) if !matches!(error, StatementFailure::Trino(_)));
     let primary = (|| -> Result<()> {
+        if let Some(before_freeze) = before_freeze {
+            ensure!(
+                initial_continuation,
+                "oversize rejection requires the original terminal GET"
+            );
+            return check_oversize_refusal(
+                context,
+                selected,
+                &observation,
+                &query_id,
+                result,
+                before_freeze,
+            );
+        }
         let output = result.with_context(|| format!("drain {} Trino statement", case.label()))?;
         ensure!(
             initial_continuation && output.query_id == query_id && output.pages >= 2,
@@ -504,6 +580,93 @@ fn run_statement(
     )
 }
 
+fn check_oversize_refusal(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    observation: &QueryLifecycleStatementObservation,
+    query_id: &str,
+    result: Result<StatementResult, StatementFailure>,
+    before_freeze: (i64, i64),
+) -> Result<()> {
+    use novarocks_execution_contract::failure::{FailureClass, ResourceDimension, ResourceScope};
+
+    let after_freeze = super::completed_statement_freeze_bytes(context)?;
+    let frozen_bytes = after_freeze.1 - before_freeze.1;
+    write_record(
+        &context.scenario_root().join("oversize-freeze.json"),
+        &json!({
+            "query_id": query_id, "before": before_freeze, "after": after_freeze,
+            "frozen_bytes": frozen_bytes, "request_limit": OVERSIZE_REQUEST_LIMIT
+        }),
+    )?;
+    let Err(StatementFailure::Trino(error)) = result else {
+        bail!("oversize fragment did not return a terminal Trino error: {result:?}");
+    };
+    ensure!(
+        error.error_code == 131072
+            && error.error_name == "GENERIC_INSUFFICIENT_RESOURCES"
+            && error.error_type == "INSUFFICIENT_RESOURCES"
+            && error
+                .message
+                .starts_with("[query.execution.resource_exhausted] "),
+        "oversize fragment changed typed Trino identity: {error:?}"
+    );
+    let deadline = context.deadline();
+    let terminal = context
+        .handle()
+        .await_query_lifecycle_statement_observation(observation, false, deadline)?;
+    write_record(
+        &context.scenario_root().join("oversize-terminal.json"),
+        &json!({"query_id": query_id, "terminal": format!("{terminal:#?}")}),
+    )?;
+    ensure!(
+        after_freeze.0 == before_freeze.0 + 1 && frozen_bytes > OVERSIZE_REQUEST_LIMIT as i64,
+        "the statement did not complete an oversized freeze: {before_freeze:?} -> {after_freeze:?}"
+    );
+    let failure = terminal
+        .failure_fact
+        .context("oversize attempt lacks its original failure")?;
+    ensure!(
+        failure.class() == FailureClass::Resource
+            && matches!(
+                terminal.failure_site,
+                Some(QueryLifecycleFailureSite::Coordinator)
+            )
+            && failure.resource().is_some_and(|resource| {
+                resource.dimension == ResourceDimension::Bytes
+                    && resource.constraint_scope == Some(ResourceScope::Request)
+                    && resource.limit == Some(OVERSIZE_REQUEST_LIMIT as u64)
+                    && resource
+                        .requested
+                        .is_some_and(|bytes| bytes > OVERSIZE_REQUEST_LIMIT as u64)
+            }),
+        "oversize fragment was not refused at FE request-byte preflight: {terminal:?}"
+    );
+    let execution = terminal
+        .execution_id
+        .as_deref()
+        .context("terminal attempt lacks identity")?;
+    ensure!(
+        terminal.attempt_id == 1
+            && execution
+                == format!(
+                    "{}:{}:1",
+                    terminal.process_namespace as i64, terminal.local_sequence
+                )
+            && terminal.worker_participations_converged,
+        "oversize attempt was replaced or did not converge: {terminal:?}"
+    );
+    let tasks = task_markers::await_refused_attempt_tasks(context, selected, execution)?;
+    write_record(
+        &context.scenario_root().join("oversize-tasks.json"),
+        &json!({"query_id": query_id, "execution_id": execution, "attempt": 1, "tasks": tasks}),
+    )?;
+    context.action(
+        "oversized frozen fragment was refused before send and the original attempt exited",
+    );
+    Ok(())
+}
+
 fn write_record(path: &Path, body: &Value) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(body)?)
         .with_context(|| format!("write constant capacity evidence {}", path.display()))
@@ -558,13 +721,31 @@ fn record_config(context: &ScenarioContext, group: Group, baseline_build: bool) 
     };
     let query = configured(query, "trino_query_max_length")?;
     let result = configured(result, "client_result_all_objects_bytes")?;
-    let actual = (
-        query.unwrap_or(DEFAULT_QUERY_LENGTH),
-        result.unwrap_or(DEFAULT_RESULT_BYTES),
-    );
+    let query_limit = query.unwrap_or(DEFAULT_QUERY_LENGTH);
+    let result_limit = result.unwrap_or(DEFAULT_RESULT_BYTES);
     ensure!(
-        actual == group.configuration(),
-        "unexpected effective constant capacity configuration: {actual:?}"
+        query_limit == group.query_limit() && result_limit == DEFAULT_RESULT_BYTES,
+        "unexpected effective query limit {query_limit} or Client window {result_limit}"
+    );
+    let request_limits =
+        roles
+            .iter()
+            .map(|role| {
+                let entry = &role["effective_config"]["value"]["runtime"]["value"]["native_ingress"]
+                    ["value"]["ordinary_request_max_bytes"];
+                let configured = configured(entry, "ordinary_request_max_bytes")?;
+                let limit = configured.unwrap_or(DEFAULT_REQUEST_LIMIT);
+                ensure!(
+                    limit == group.request_limit(),
+                    "unexpected Native request limit {limit} for {}",
+                    role["role"]
+                );
+                Ok(json!({"role": role["role"], "configured": configured, "effective": limit}))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        request_limits.len() == REQUIRED_BACKENDS + 1,
+        "missing exact role configuration"
     );
     write_record(
         &context
@@ -573,8 +754,9 @@ fn record_config(context: &ScenarioContext, group: Group, baseline_build: bool) 
         &json!({
             "comparison": if baseline_build { "p00-baseline" } else { "target" },
             "effective_launch_config_sha256": config.artifact_sha256(),
-            "trino_query_max_length": {"configured": query, "effective": actual.0},
-            "client_result_all_objects_bytes": {"configured": result, "effective": actual.1}
+            "trino_query_max_length": {"configured": query, "effective": query_limit},
+            "client_result_all_objects_bytes": {"configured": result, "effective": result_limit},
+            "ordinary_request_max_bytes": request_limits
         }),
     )
 }
@@ -767,15 +949,21 @@ mod tests {
                     config["standalone_server"]["trino_query_max_length"].as_integer(),
                     Some(LARGE_QUERY_LENGTH as i64)
                 );
+                assert!(config.get("runtime").is_none());
+                assert!(launch.config_overlay.be.is_none());
+            } else if scenario.name() == OVERSIZE {
+                let fe = launch.config_overlay.fe.unwrap();
+                assert_eq!(launch.config_overlay.be.as_deref(), Some(fe.as_str()));
+                let config: toml::Value = fe.parse().unwrap();
                 assert_eq!(
-                    config["runtime"]["frontend_workload"]["client_result_all_objects_bytes"]
-                        .as_integer(),
-                    Some(LARGE_RESULT_BYTES as i64)
+                    config["runtime"]["native_ingress"]["ordinary_request_max_bytes"].as_integer(),
+                    Some(OVERSIZE_REQUEST_LIMIT as i64)
                 );
+                assert!(config["runtime"].get("frontend_workload").is_none());
             } else {
                 assert!(launch.config_overlay.fe.is_none());
+                assert!(launch.config_overlay.be.is_none());
             }
-            assert!(launch.config_overlay.be.is_none());
         }
     }
 }

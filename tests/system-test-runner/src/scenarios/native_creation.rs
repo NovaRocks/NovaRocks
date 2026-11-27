@@ -1512,17 +1512,7 @@ struct FrontendCreationGauges {
 
 impl FrontendCreationGauges {
     fn scrape(context: &mut ScenarioContext) -> Result<Self> {
-        let port = context.handle().runtime().fe_http_port;
-        let body = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?
-            .get(format!("http://127.0.0.1:{port}/metrics"))
-            .send()
-            .context("scrape FE /metrics")?
-            .error_for_status()
-            .context("FE /metrics status")?
-            .text()
-            .context("read FE /metrics")?;
+        let body = scrape_frontend_metrics(context)?;
         Ok(Self {
             static_fragments_frozen: metric(&body, STATIC_FRAGMENTS_FROZEN)?,
             static_fragments_retained: metric(&body, STATIC_FRAGMENTS_RETAINED)?,
@@ -1531,6 +1521,31 @@ impl FrontendCreationGauges {
             create_payloads_retained: metric(&body, CREATE_PAYLOADS_RETAINED)?,
         })
     }
+}
+
+fn completed_statement_freeze_bytes(context: &mut ScenarioContext) -> Result<(i64, i64)> {
+    let body = scrape_frontend_metrics(context)?;
+    Ok((
+        metric(
+            &body,
+            "novarocks_task_statement_static_fragment_bytes_count",
+        )?,
+        metric(&body, "novarocks_task_statement_static_fragment_bytes_sum")?,
+    ))
+}
+
+fn scrape_frontend_metrics(context: &mut ScenarioContext) -> Result<String> {
+    let port = context.handle().runtime().fe_http_port;
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .context("scrape FE /metrics")?
+        .error_for_status()
+        .context("FE /metrics status")?
+        .text()
+        .context("read FE /metrics")
 }
 
 /// The one unlabelled sample of `name` in a Prometheus text body.
