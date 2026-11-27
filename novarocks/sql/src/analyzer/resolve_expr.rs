@@ -4494,6 +4494,9 @@ pub(super) fn resolve_aggregate_function_call_with_order(
         if matches!(
             error,
             novarocks_functions::FunctionBindingError::UnavailableImplementation(_)
+                | novarocks_functions::FunctionBindingError::ValueType(
+                    novarocks_type_contract::ValueTypeError::TooDeep
+                )
         ) {
             return AnalyzeError::function_binding(error).at_type_mismatch(span);
         }

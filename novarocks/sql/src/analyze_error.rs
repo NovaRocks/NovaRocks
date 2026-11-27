@@ -756,6 +756,12 @@ impl AnalyzeError {
         }
     }
 
+    pub(crate) fn unsupported_type_depth() -> Self {
+        let mut error = Self::domain_source(novarocks_type_contract::ValueTypeError::TooDeep);
+        error.kind = AnalyzeErrorKind::UnsupportedExpression;
+        error
+    }
+
     pub fn unsupported_query_shape(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::UnsupportedQueryShape, message, span)
     }
@@ -817,6 +823,9 @@ impl AnalyzeError {
                     view_cause: None,
                 }
             }
+            novarocks_functions::FunctionBindingError::ValueType(
+                novarocks_type_contract::ValueTypeError::TooDeep,
+            ) => Self::unsupported_type_depth(),
             novarocks_functions::FunctionBindingError::ValueType(
                 source @ novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. },
             ) => {

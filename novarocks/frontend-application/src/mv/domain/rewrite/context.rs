@@ -965,7 +965,7 @@ fn provider_type_node(
         IcebergSourcePrimitive as Primitive, IcebergSourceTypeNode as Node,
     };
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err("MV source type exceeds the SQL value depth".into());
+        return Err(novarocks_type_contract::ValueTypeError::TooDeep.to_string());
     }
     let error = || "MV source type has an invalid provider node".to_string();
     Ok(match nodes.next().ok_or_else(error)? {

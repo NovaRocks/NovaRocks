@@ -2845,7 +2845,7 @@ fn table_writer_rejects_a_relabelled_fixed_relation_field() {
 }
 
 #[test]
-fn table_writer_provider_name_is_complete_and_bounded() {
+fn table_writer_provider_name_accepts_wide_nonempty_names() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     invalid_table_writer_fragment(TableWriterFixture::ProviderName(1), &mut fixture_constants)
         .unwrap();
@@ -2858,12 +2858,11 @@ fn table_writer_provider_name_is_complete_and_bounded() {
         invalid_table_writer_fragment(TableWriterFixture::ProviderName(0), &mut fixture_constants)
             .unwrap_err();
     assert!(empty.to_string().contains("empty provider name"));
-    let oversized = invalid_table_writer_fragment(
-        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES + 1),
+    invalid_table_writer_fragment(
+        TableWriterFixture::ProviderName(1025),
         &mut fixture_constants,
     )
-    .unwrap_err();
-    assert!(oversized.to_string().contains("field-name byte limit"));
+    .unwrap();
 }
 
 #[derive(Clone, Copy)]

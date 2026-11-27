@@ -969,3 +969,95 @@ fn map_concat_selects_full_common_map_type_before_ordered_control() {
         .unwrap_err();
     assert_eq!(error.kind(), AnalyzeErrorKind::InvalidFunctionArgument);
 }
+
+#[test]
+fn result_types_admit_depth_d_and_reject_an_extra_logical_level() {
+    use crate::analyze_error::AnalyzeErrorKind;
+    use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let scope = ctx.new_scope();
+    let nested_type = |depth| {
+        let mut name = "BIGINT".to_owned();
+        for _ in 1..depth {
+            name = format!("ARRAY({name})");
+        }
+        name
+    };
+    let supported = nested_type(MAX_VALUE_TYPE_DEPTH - 1);
+    let at_limit = nested_type(MAX_VALUE_TYPE_DEPTH);
+    let too_deep = nested_type(MAX_VALUE_TYPE_DEPTH + 1);
+    for (at_depth_d, at_depth_d_plus_one) in [
+        (
+            format!("CAST(NULL AS {at_limit})"),
+            format!("CAST(NULL AS {too_deep})"),
+        ),
+        (
+            format!("ARRAY[CAST(NULL AS {supported})]"),
+            format!("ARRAY[CAST(NULL AS {at_limit})]"),
+        ),
+        (
+            format!("ROW(CAST(NULL AS {supported}))"),
+            format!("ROW(CAST(NULL AS {at_limit}))"),
+        ),
+        (
+            format!("array_agg(CAST(NULL AS {supported}))"),
+            format!("array_agg(CAST(NULL AS {at_limit}))"),
+        ),
+        (
+            format!("map_agg('k', CAST(NULL AS {supported}))"),
+            format!("map_agg('k', CAST(NULL AS {at_limit}))"),
+        ),
+    ] {
+        let valid = query(&format!("SELECT {at_depth_d}"));
+        let plan = ctx
+            .analyze_expr(projection(&valid), &scope)
+            .unwrap_or_else(|error| panic!("{at_depth_d}: {error}"));
+        assert_eq!(plan.value_type.value_type().depth(), MAX_VALUE_TYPE_DEPTH);
+        let sql = format!("SELECT {at_depth_d_plus_one}");
+        let invalid = query(&sql);
+        let error = ctx
+            .analyze_expr(projection(&invalid), &scope)
+            .expect_err("the result type would add a logical level");
+        assert_eq!(
+            error.kind(),
+            AnalyzeErrorKind::UnsupportedExpression,
+            "{sql}: {error:?}"
+        );
+        assert_eq!(
+            error.to_user_error(Some(&sql)).code().as_str(),
+            "sql.analyze.unsupported_expression"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_VALUE_TYPE_DEPTH.to_string())
+        );
+    }
+}
+
+#[test]
+fn row_declaration_counts_depth_independently_of_width() {
+    let control = SqlCompileControl::unbounded();
+    let ctx = context(&control);
+    let leaf_count = 64;
+    let leaves = (0..leaf_count)
+        .map(|i| format!("v{i} BIGINT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let nested = (0..leaf_count)
+        .map(|i| format!("r{i} ROW({leaves})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT CAST(NULL AS ROW({nested}))");
+    let parsed = query(&sql);
+    let result = ctx
+        .analyze_expr(projection(&parsed), &ctx.new_scope())
+        .unwrap();
+    assert_eq!(result.value_type.value_type().depth(), 3);
+    assert_eq!(
+        result.value_type.value_type().expanded_nodes(),
+        1 + leaf_count * (1 + leaf_count)
+    );
+}

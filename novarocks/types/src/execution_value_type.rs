@@ -25,8 +25,8 @@ use std::fmt;
 
 use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
-    ExecutionValueTypeError, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, TypedValueBinding,
-    ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    ExecutionValueTypeError, MAX_VALUE_TYPE_DEPTH, TypedValueBinding, ValueField, ValueKind,
+    ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
 };
 
 use crate::schema::SqlType;
@@ -101,7 +101,7 @@ pub fn execution_value_type_from_declaration(
 
 /// Validate a borrowed declaration before any semantic or layout construction.
 ///
-/// A declaration may be deeper or wider than an unrelated carrier. Its own
+/// A declaration may be deeper than an unrelated carrier. Its own
 /// bounded traversal therefore precedes carrier preflight. The caller observes
 /// each actual declaration node and can stop the walk without a new receipt or
 /// an inferred resource grant. This walk does not copy declarations or names.
@@ -115,7 +115,6 @@ where
     fn visit<E: From<ExecutionColumnTypeError>>(
         declaration: &SqlType,
         depth: usize,
-        nodes: &mut usize,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
         observe()?;
@@ -124,32 +123,22 @@ where
                 ExecutionValueTypeError::Depth,
             )));
         }
-        *nodes = nodes.checked_add(1).ok_or_else(|| {
-            E::from(ExecutionColumnTypeError::Type(
-                ExecutionValueTypeError::Nodes,
-            ))
-        })?;
-        if *nodes > MAX_VALUE_TYPE_NODES {
-            return Err(E::from(ExecutionColumnTypeError::Type(
-                ExecutionValueTypeError::Nodes,
-            )));
-        }
         match declaration {
-            SqlType::Array(item) => visit(item, depth + 1, nodes, observe),
+            SqlType::Array(item) => visit(item, depth + 1, observe),
             SqlType::Map(key, value) => {
-                visit(key, depth + 1, nodes, observe)?;
-                visit(value, depth + 1, nodes, observe)
+                visit(key, depth + 1, observe)?;
+                visit(value, depth + 1, observe)
             }
             SqlType::Struct(fields) => {
                 for (_, child) in fields {
-                    visit(child, depth + 1, nodes, observe)?;
+                    visit(child, depth + 1, observe)?;
                 }
                 Ok(())
             }
             _ => Ok(()),
         }
     }
-    visit(declaration, 1, &mut 0, &mut observe)
+    visit(declaration, 1, &mut observe)
 }
 
 /// Project a bound semantic tree back to its explicit SQL declaration.
@@ -863,21 +852,19 @@ mod tests {
             .unwrap_err(),
             ExecutionColumnTypeError::Type(ExecutionValueTypeError::Depth)
         );
+        let leaves = 4_096;
         let wide = SqlType::Struct(
-            (0..MAX_VALUE_TYPE_NODES)
+            (0..leaves)
                 .map(|index| (format!("f{index}"), SqlType::Int))
                 .collect(),
         );
-        assert_eq!(
-            execution_value_type_from_declaration(
-                &wide,
-                &DataType::Int32,
-                false,
-                ValueTypeStorageLifetime::pure()
-            )
-            .unwrap_err(),
-            ExecutionColumnTypeError::Type(ExecutionValueTypeError::Nodes)
-        );
+        let mut visits = 0;
+        validate_execution_declaration_observed::<ExecutionColumnTypeError>(&wide, || {
+            visits += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visits, leaves + 1);
 
         #[derive(Debug, Eq, PartialEq)]
         enum ObservedError {
