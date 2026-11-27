@@ -238,6 +238,31 @@ pub fn validate_arrow_layout_structure_with_profile_observed<'a, E: From<ValueTy
     visit_type(root, &mut slots, profile, false, false, observe)
 }
 
+/// Observe carrier nodes, Fields, and child edges with the associated depth.
+/// Observations precede admission of each node so a caller can stop the walk.
+pub fn visit_arrow_layout_events_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut(ValueTypeVisit<'a>, crate::ArrowTypeDepth) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut slots = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
+    visit_type_with_depth(root, &mut slots, profile, false, false, observe)
+}
+
+/// Visit Arrow carrier nodes in declaration order with their logical and physical coordinates.
+pub fn visit_arrow_layout_nodes_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    mut observe: impl FnMut(&'a DataType, crate::ArrowTypeDepth) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_arrow_layout_events_observed(root, profile, |visit, depth| {
+        if let ValueTypeVisit::TypeNode(data_type) = visit {
+            observe(data_type, depth)?;
+        }
+        Ok(())
+    })
+}
+
 pub fn validate_value_type_structure_with_scratch_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
     scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
@@ -374,19 +399,37 @@ fn visit_type<'a, E: From<ValueTypeError>>(
     validate_annotations: bool,
     mut observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
+    visit_type_with_depth(
+        root,
+        slots,
+        profile,
+        original_owned_clone,
+        validate_annotations,
+        |visit, _| observe(visit),
+    )
+}
+
+fn visit_type_with_depth<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    slots: &mut [Option<crate::TypeTraversalFrame<'a>>],
+    profile: crate::ArrowTypeProfile,
+    original_owned_clone: bool,
+    validate_annotations: bool,
+    mut observe: impl FnMut(ValueTypeVisit<'a>, crate::ArrowTypeDepth) -> Result<(), E>,
+) -> Result<(), E> {
     let root_frame = crate::TypeTraversalFrame::root(root);
     let mut enter =
         |frame: crate::TypeTraversalFrame<'a>, edge: Option<TypeChild<'a>>| -> Result<(), E> {
             if let Some(edge) = edge {
                 if let Some(field) = edge.field {
-                    observe(ValueTypeVisit::Field(field))?;
+                    observe(ValueTypeVisit::Field(field), frame.depth)?;
                     if validate_annotations {
                         field_logical_type(field)?;
                     }
                 }
-                observe(ValueTypeVisit::ChildEdge(edge.data_type))?;
+                observe(ValueTypeVisit::ChildEdge(edge.data_type), frame.depth)?;
             }
-            observe(ValueTypeVisit::TypeNode(frame.data_type))?;
+            observe(ValueTypeVisit::TypeNode(frame.data_type), frame.depth)?;
             frame.depth.check(profile)?;
             crate::carrier_parameters::validate_arrow_node_shape(frame.data_type)
                 .map_err(ValueTypeError::InvalidType)?;

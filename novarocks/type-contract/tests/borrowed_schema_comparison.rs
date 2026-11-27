@@ -191,13 +191,10 @@ fn borrowed_nested_comparisons_allocate_no_requested_backing() {
     });
     assert_eq!(types, Ok(true));
     assert_eq!(requests, Requests::default());
-    // The unchanged bucketed port provides a positive allocator witness with
-    // the identical, precreated fixture and the same nonallocating observer.
-    let (bucketed, requests) =
+    let (observed, requests) =
         capture(|| arrow_fields_exact_observed::<Failure>(&left, &right, || Ok(())));
-    assert_eq!(bucketed, Ok(true));
-    assert!(requests.allocations > 0);
-    assert!(requests.bytes > 0);
+    assert_eq!(observed, Ok(true));
+    assert_eq!(requests, Requests::default());
 }
 
 #[test]
@@ -362,5 +359,25 @@ fn borrowed_type_bounds_and_wide_metadata_keep_zero_allocation() {
     });
     assert_eq!(result, Ok(true));
     assert!(calls.get() > 256);
+    assert_eq!(requests, Requests::default());
+
+    let field_with_metadata = || {
+        Field::new("metadata", DataType::Int64, true).with_metadata(
+            (0..512)
+                .map(|i| (format!("key-{i}"), format!("value-{i}")))
+                .collect::<arrow_schema::Metadata>(),
+        )
+    };
+    let left = field_with_metadata();
+    let right = field_with_metadata();
+    calls.set(0);
+    let (result, requests) = capture(|| {
+        arrow_fields_exact_borrowed_observed::<Failure>(&left, &right, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+    });
+    assert_eq!(result, Ok(true));
+    assert!(calls.get() < 4 * 512);
     assert_eq!(requests, Requests::default());
 }

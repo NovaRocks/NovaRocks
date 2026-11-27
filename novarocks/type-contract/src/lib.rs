@@ -157,8 +157,8 @@ pub use logical::{
     validate_nested_logical_types_observed, validate_value_type_structure_observed,
     validate_value_type_structure_with_profile_and_scratch_observed,
     validate_value_type_structure_with_profile_observed,
-    validate_value_type_structure_with_scratch_observed,
-    visit_original_data_type_clone_with_scratch_observed,
+    validate_value_type_structure_with_scratch_observed, visit_arrow_layout_events_observed,
+    visit_arrow_layout_nodes_observed, visit_original_data_type_clone_with_scratch_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,

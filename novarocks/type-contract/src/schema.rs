@@ -15,8 +15,6 @@
 // limitations under the License.
 
 use arrow_schema::{DataType, Field, Schema};
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::Hasher;
 
 /// Real comparison work before a closed operation or byte inspection.
 /// This reports no storage facts and grants no capacity. The existing unit
@@ -123,14 +121,7 @@ pub fn arrow_data_types_exact_with_profile_observed<E: From<crate::ValueTypeErro
     profile: crate::ArrowTypeProfile,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_with_profile(
-        left,
-        right,
-        profile,
-        FieldMode::Exact,
-        MetadataMode::Bucketed,
-        observe,
-    )
+    compare_types_with_profile(left, right, profile, FieldMode::Exact, observe)
 }
 /// Exact expected-first comparison for an already prepared runtime port.
 /// Permissive permits only an expected required Field to have an actual nullable
@@ -153,7 +144,7 @@ pub fn arrow_data_types_exact_with_profile_and_nullability_observed<
             validate_comparison_nodes(depth, profile, left, right)
         },
         mode: FieldMode::Exact,
-        metadata_mode: MetadataMode::Bucketed,
+
         nullability,
         ignore_field_nullability: false,
         allow_fixed_bytes: false,
@@ -174,7 +165,7 @@ pub fn arrow_fields_exact_with_nullability_observed<E>(
         observe: &mut weighted,
         validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
-        metadata_mode: MetadataMode::Bucketed,
+
         nullability,
         ignore_field_nullability: false,
         allow_fixed_bytes: false,
@@ -188,14 +179,7 @@ pub fn arrow_data_types_equal_with_profile_observed<E: From<crate::ValueTypeErro
     profile: crate::ArrowTypeProfile,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_with_profile(
-        left,
-        right,
-        profile,
-        FieldMode::Compatibility,
-        MetadataMode::Bucketed,
-        observe,
-    )
+    compare_types_with_profile(left, right, profile, FieldMode::Compatibility, observe)
 }
 pub fn arrow_data_types_exact_borrowed_with_profile_observed<E: From<crate::ValueTypeError>>(
     left: &DataType,
@@ -203,14 +187,7 @@ pub fn arrow_data_types_exact_borrowed_with_profile_observed<E: From<crate::Valu
     profile: crate::ArrowTypeProfile,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_with_profile(
-        left,
-        right,
-        profile,
-        FieldMode::Exact,
-        MetadataMode::BorrowedLinear,
-        observe,
-    )
+    compare_types_with_profile(left, right, profile, FieldMode::Exact, observe)
 }
 pub fn arrow_data_types_equal_borrowed_with_profile_observed<E: From<crate::ValueTypeError>>(
     left: &DataType,
@@ -218,21 +195,14 @@ pub fn arrow_data_types_equal_borrowed_with_profile_observed<E: From<crate::Valu
     profile: crate::ArrowTypeProfile,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_with_profile(
-        left,
-        right,
-        profile,
-        FieldMode::Compatibility,
-        MetadataMode::BorrowedLinear,
-        observe,
-    )
+    compare_types_with_profile(left, right, profile, FieldMode::Compatibility, observe)
 }
 fn compare_types_with_profile<E: From<crate::ValueTypeError>>(
     left: &DataType,
     right: &DataType,
     profile: crate::ArrowTypeProfile,
     mode: FieldMode,
-    metadata_mode: MetadataMode,
+
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
     let mut weighted = |_: TypeComparisonStep| observe();
@@ -242,7 +212,7 @@ fn compare_types_with_profile<E: From<crate::ValueTypeError>>(
             validate_comparison_nodes(depth, profile, left, right)
         },
         mode,
-        metadata_mode,
+
         nullability: crate::CarrierNullabilityPolicy::Exact,
         ignore_field_nullability: false,
         allow_fixed_bytes: false,
@@ -280,51 +250,26 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
     )
 }
 
-/// Compare exact types with the same traversal and bounds as the observed
-/// exact port, borrowing metadata instead of allocating fingerprint buckets.
-/// Callers must admit quadratic metadata candidate work and retained map
-/// iteration capacity. Long names, keys, and values retain chunk observation;
-/// this port introduces no additional metadata admission limit.
+/// Compare exact types with the shared depth and carrier checks. Metadata
+/// comparisons borrow the original sorted entries and observe bytes in chunks.
 pub fn arrow_data_types_exact_borrowed_observed<E: From<crate::ValueTypeError>>(
     left: &DataType,
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_borrowed(left, right, FieldMode::Exact, observe)
+    arrow_data_types_exact_observed(left, right, observe)
 }
 
 /// Observe Arrow's original PartialEq rule using the sole traversal and
 /// borrowed metadata. Dictionary Field ids/order remain compatibility facts;
 /// child NULL, names, metadata and all carrier structure are still compared.
-/// As with the exact borrowed port, callers admit retained map iteration and
-/// quadratic metadata candidate work without a new metadata limit.
+/// Metadata uses the same borrowed lookup as the exact port.
 pub fn arrow_data_types_equal_borrowed_observed<E: From<crate::ValueTypeError>>(
     left: &DataType,
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_borrowed(left, right, FieldMode::Compatibility, observe)
-}
-
-fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
-    left: &DataType,
-    right: &DataType,
-    mode: FieldMode,
-    mut observe: impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    let mut weighted = |_: TypeComparisonStep| observe();
-    Walk {
-        observe: &mut weighted,
-        validate: &mut |depth, left: &DataType, right: &DataType| {
-            validate_comparison_nodes(depth, crate::ArrowTypeProfile::Physical, left, right)
-        },
-        mode,
-        metadata_mode: MetadataMode::BorrowedLinear,
-        nullability: crate::CarrierNullabilityPolicy::Exact,
-        ignore_field_nullability: false,
-        allow_fixed_bytes: false,
-    }
-    .ty(left, right, crate::ArrowTypeDepth::ROOT)
+    arrow_data_types_equal_observed(left, right, observe)
 }
 
 /// Exact Field comparison using borrowed metadata and the sole type traversal.
@@ -333,19 +278,9 @@ fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
 pub fn arrow_fields_exact_borrowed_observed<E>(
     left: &Field,
     right: &Field,
-    mut observe: impl FnMut() -> Result<(), E>,
+    observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    let mut weighted = |_: TypeComparisonStep| observe();
-    Walk {
-        observe: &mut weighted,
-        validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
-        mode: FieldMode::Exact,
-        metadata_mode: MetadataMode::BorrowedLinear,
-        nullability: crate::CarrierNullabilityPolicy::Exact,
-        ignore_field_nullability: false,
-        allow_fixed_bytes: false,
-    }
-    .field(left, right, crate::ArrowTypeDepth::ROOT)
+    arrow_fields_exact_observed(left, right, observe)
 }
 
 /// Observe Arrow schema compatibility equality. Unlike the frozen exact
@@ -382,7 +317,7 @@ pub fn arrow_fields_exact_observed<E>(
         observe: &mut weighted,
         validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
-        metadata_mode: MetadataMode::Bucketed,
+
         nullability: crate::CarrierNullabilityPolicy::Exact,
         ignore_field_nullability: false,
         allow_fixed_bytes: false,
@@ -426,7 +361,7 @@ fn compare_types_weighted<E>(
         observe: &mut observe,
         validate: &mut validate,
         mode,
-        metadata_mode: MetadataMode::Bucketed,
+
         nullability: crate::CarrierNullabilityPolicy::Exact,
         ignore_field_nullability,
         allow_fixed_bytes: false,
@@ -476,18 +411,12 @@ pub(crate) fn arrow_validated_write_projection_observed<E>(
         observe: &mut weighted,
         validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
-        metadata_mode: MetadataMode::Bucketed,
+
         nullability: crate::CarrierNullabilityPolicy::Exact,
         ignore_field_nullability,
         allow_fixed_bytes: true,
     }
     .ty(left, right, crate::ArrowTypeDepth::ROOT)
-}
-
-#[derive(Clone, Copy)]
-enum MetadataMode {
-    Bucketed,
-    BorrowedLinear,
 }
 
 #[derive(Clone, Copy)]
@@ -500,7 +429,7 @@ struct Walk<'a, F, B> {
     observe: &'a mut F,
     validate: &'a mut B,
     mode: FieldMode,
-    metadata_mode: MetadataMode,
+
     nullability: crate::CarrierNullabilityPolicy,
     ignore_field_nullability: bool,
     allow_fixed_bytes: bool,
@@ -525,90 +454,19 @@ impl<
         }
         Ok(true)
     }
-    fn key_hash(&mut self, key: &[u8]) -> Result<u64, E> {
-        (self.observe)(TypeComparisonStep::Header)?;
-        let mut hash = DefaultHasher::new();
-        hash.write_usize(key.len());
-        for chunk in key.chunks(1024) {
-            (self.observe)(TypeComparisonStep::Bytes {
-                inspected_bytes: chunk.len(),
-            })?;
-            hash.write(chunk);
-        }
-        Ok(hash.finish())
-    }
     fn metadata(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
-        match self.metadata_mode {
-            MetadataMode::Bucketed => self.metadata_with_key_hash(left, right, Self::key_hash),
-            MetadataMode::BorrowedLinear => self.metadata_borrowed(left, right),
-        }
-    }
-    fn metadata_borrowed(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
         if left.metadata().len() != right.metadata().len() {
             return Ok(false);
         }
-        // Borrow the original maps and compare candidate bytes cooperatively.
-        // No hash computation, bucket table, or copied key is required. A caller
-        // must admit the K right-map scans and K^2 candidates, including opaque
-        // iteration over retained hash-table capacity, before entering here.
-        for (key, value) in left.metadata() {
+        // Arrow Metadata iterates in key order. The original maps provide
+        // exact, incremental comparison without a second index or key copies.
+        for ((key, value), (other_key, other_value)) in
+            left.metadata().iter().zip(right.metadata().iter())
+        {
             (self.observe)(TypeComparisonStep::Header)?;
-            let mut matched = false;
-            for (other_key, other_value) in right.metadata() {
-                (self.observe)(TypeComparisonStep::Header)?;
-                if self.bytes(key.as_bytes(), other_key.as_bytes())? {
-                    if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
-                        return Ok(false);
-                    }
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-    fn metadata_with_key_hash(
-        &mut self,
-        left: &Field,
-        right: &Field,
-        mut key_hash: impl FnMut(&mut Self, &[u8]) -> Result<u64, E>,
-    ) -> Result<bool, E> {
-        if left.metadata().len() != right.metadata().len() {
-            return Ok(false);
-        }
-        if left.metadata().is_empty() {
-            return Ok(true);
-        }
-        // Fixed-size fingerprints only select borrowed candidates. Exact
-        // chunk comparisons retain unordered metadata equality even on a
-        // collision. Scratch bucket allocations still need host admission;
-        // neither key strings nor recursive field/type facts are copied.
-        let mut buckets: HashMap<u64, Vec<(&str, &str)>> = HashMap::new();
-        for (key, value) in right.metadata() {
-            let fingerprint = key_hash(self, key.as_bytes())?;
-            buckets.entry(fingerprint).or_default().push((key, value));
-        }
-        for (key, value) in left.metadata() {
-            let fingerprint = key_hash(self, key.as_bytes())?;
-            (self.observe)(TypeComparisonStep::Header)?;
-            let Some(candidates) = buckets.get(&fingerprint) else {
-                return Ok(false);
-            };
-            let mut matched = false;
-            for (other_key, other_value) in candidates {
-                (self.observe)(TypeComparisonStep::Header)?;
-                if self.bytes(key.as_bytes(), other_key.as_bytes())? {
-                    if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
-                        return Ok(false);
-                    }
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
+            if !self.bytes(key.as_bytes(), other_key.as_bytes())?
+                || !self.bytes(value.as_bytes(), other_value.as_bytes())?
+            {
                 return Ok(false);
             }
         }
@@ -926,12 +784,13 @@ mod tests {
         }
     }
     #[test]
-    fn actual_long_metadata_key_hashing_preserves_control_at_first_quantum() {
+    fn actual_long_metadata_key_comparison_preserves_control_at_first_quantum() {
         let key = "k".repeat(320 * 1024);
-        let left = Field::new("x", DataType::Int64, false)
-            .with_metadata(HashMap::from([(key.clone(), "v".to_owned())]));
+        let left = Field::new("x", DataType::Int64, false).with_metadata(
+            std::collections::HashMap::from([(key.clone(), "v".to_owned())]),
+        );
         let right = Field::new("x", DataType::Int64, false)
-            .with_metadata(HashMap::from([(key, "v".to_owned())]));
+            .with_metadata(std::collections::HashMap::from([(key, "v".to_owned())]));
         for failure in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
@@ -955,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_metadata_buckets_preserve_unordered_exact_equality() {
+    fn borrowed_metadata_preserves_unordered_exact_equality() {
         let field = |entries: &[(&str, &str)]| {
             Field::new("x", DataType::Int64, false).with_metadata(
                 entries
@@ -985,7 +844,7 @@ mod tests {
                 observe: &mut observe,
                 validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
                 mode: FieldMode::Exact,
-                metadata_mode: MetadataMode::Bucketed,
+
                 nullability: crate::CarrierNullabilityPolicy::Exact,
                 ignore_field_nullability: false,
                 allow_fixed_bytes: false,
@@ -993,48 +852,7 @@ mod tests {
             .metadata(&empty, &empty),
             Ok(true)
         );
-        assert_eq!(observed, 0, "empty metadata needs no bucket or key work");
-    }
-
-    #[test]
-    fn forced_metadata_fingerprint_collision_requires_exact_key_and_value() {
-        let field = |entries: &[(&str, &str)]| {
-            Field::new("x", DataType::Int64, false).with_metadata(
-                entries
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect::<std::collections::HashMap<String, String>>(),
-            )
-        };
-        let left = field(&[("same-prefix-a", "first"), ("same-prefix-b", "second")]);
-        let equal = field(&[("same-prefix-b", "second"), ("same-prefix-a", "first")]);
-        let missing = field(&[("same-prefix-c", "first"), ("same-prefix-b", "second")]);
-        let swapped = field(&[("same-prefix-a", "second"), ("same-prefix-b", "first")]);
-        for (right, expected) in [(&equal, true), (&missing, false), (&swapped, false)] {
-            let mut observed = 0;
-            let mut observe = |_: TypeComparisonStep| {
-                observed += 1;
-                Ok::<_, std::convert::Infallible>(())
-            };
-            let result = Walk {
-                observe: &mut observe,
-                validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
-                mode: FieldMode::Exact,
-                metadata_mode: MetadataMode::Bucketed,
-                nullability: crate::CarrierNullabilityPolicy::Exact,
-                ignore_field_nullability: false,
-                allow_fixed_bytes: false,
-            }
-            .metadata_with_key_hash(&left, right, |walk, _| {
-                (walk.observe)(TypeComparisonStep::Header)?;
-                Ok(0)
-            });
-            assert_eq!(result, Ok(expected));
-            assert!(
-                observed > 4,
-                "collisions still inspect actual key/value bytes"
-            );
-        }
+        assert_eq!(observed, 0, "empty metadata needs no key work");
     }
 
     #[test]
