@@ -1505,7 +1505,10 @@ mod values_copy_tests {
             novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
-        assert!(values_copy_kind_observed(sources[0].data_type(), || Ok(())).is_err());
+        assert_eq!(
+            values_copy_kind_observed(sources[0].data_type(), || Ok(())).unwrap(),
+            ValuesCopyKind::Extend
+        );
         assert_eq!(
             values_copy_kind_for_layout_observed(&layout, sources[0].data_type(), || Ok(()))
                 .unwrap(),

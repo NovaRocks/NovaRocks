@@ -1098,23 +1098,12 @@ fn tracked_window(
         };
         order.len()
     ];
-    let receipt = novarocks_type_contract::AggregateStateInterpretation {
-        distinct,
-        order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
-            keys.iter()
-                .map(|key| novarocks_type_contract::AggregateStateOrderKey {
-                    ascending: key.ascending,
-                    nulls_first: key.nulls_first,
-                })
-                .collect(),
-        ),
-    };
     let options = AggregatePreparationOptions {
         distinct,
         phase: AggregateKernelPhase::Single,
         order_keys: keys.into(),
         state_input_type: None,
-        state_interpretation: Some(Arc::new(receipt)),
+        state_interpretation: None,
     };
     let context = context();
     let prepared = catalog

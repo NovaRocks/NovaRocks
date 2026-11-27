@@ -196,6 +196,12 @@ fn wire_whitelist_accepts_exactly_the_decodable_literal_types() {
         DataType::Decimal128(38, 9),
         DataType::Decimal256(76, 10),
         DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+        DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))),
+        DataType::Struct(arrow::datatypes::Fields::empty()),
     ] {
         assert!(
             is_wire_encodable_literal_type(&FunctionValueType::new(accepted.clone(), true)),
@@ -209,12 +215,6 @@ fn wire_whitelist_accepts_exactly_the_decodable_literal_types() {
         DataType::FixedSizeBinary(14),
         DataType::Date64,
         DataType::Null,
-        DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        ))),
-        DataType::Struct(arrow::datatypes::Fields::empty()),
     ] {
         assert!(
             !is_wire_encodable_literal_type(&FunctionValueType::new(rejected.clone(), true)),

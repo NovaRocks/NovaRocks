@@ -279,16 +279,15 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
             intermediate_value_type_id: Some(2),
         }];
         let aggregate =
-            encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control)
-                .unwrap();
-        (
+            encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control)?;
+        Ok::<_, BindingCodecError>((
             types.as_wire().clone(),
             functions.as_wire().to_vec(),
             aggregate.as_wire().to_vec(),
-        )
+        ))
     };
-    let expected = project(&left);
-    let compare = |right: &AggregateBinding| project(right) == expected;
+    let expected = project(&left).unwrap();
+    let compare = |right: &AggregateBinding| project(right).is_ok_and(|actual| actual == expected);
     let mut right = left.clone();
     // Legacy occurrence projections are deliberately outside the definition signature.
     right.function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
@@ -303,7 +302,7 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     assert!(!compare(&right));
     right = left.clone();
     right.logical_argument_count = 0;
-    assert!(!compare(&right));
+    assert!(project(&right).is_err());
     right = left.clone();
     right.merge_state.as_mut().unwrap().state_format =
         AggregateStateFormatId::try_new("test/other-v1").unwrap();

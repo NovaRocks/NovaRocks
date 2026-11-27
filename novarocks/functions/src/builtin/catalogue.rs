@@ -4815,24 +4815,29 @@ mod tests {
             Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
 
-        let resolved = resolve_bound_aggregate(
-            &catalog,
-            "array_agg",
-            &[DataType::Utf8],
-            &[DataType::Utf8, DataType::Int64],
-            false,
-            crate::binding_test_control(),
-        )
-        .expect("selected array_agg overload accepts one physical ORDER BY channel");
+        let arguments =
+            [DataType::Utf8, DataType::Int64].map(|data_type| FunctionArgument::Value {
+                value_type: FunctionValueType::new(data_type, true),
+                constant: None,
+            });
+        let resolved = catalog
+            .resolve_bound_user(
+                "array_agg",
+                FunctionKind::Aggregate,
+                FunctionBindingRequest {
+                    logical_argument_count: 1,
+                    arguments: &arguments,
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .expect("selected array_agg overload accepts one physical ORDER BY channel");
         assert_eq!(
-            resolved.overload.as_str(),
+            resolved.selected.overload.as_str(),
             "builtin.aggregate/array_agg/derived-v1"
         );
-        assert_eq!(resolved.argument_types, [DataType::Utf8, DataType::Int64]);
-        let DataType::Struct(fields) = resolved.intermediate_type else {
-            panic!("ordered array_agg must expose a Struct intermediate");
-        };
-        assert_eq!(fields.len(), 2);
+        assert_eq!(resolved.selected.argument_types.len(), 2);
+        assert!(resolved.selected.aggregate.is_none());
 
         assert!(matches!(
             resolve_bound_aggregate(

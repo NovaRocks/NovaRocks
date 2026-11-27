@@ -122,14 +122,16 @@ impl Fixture {
                         .collect::<Box<[_]>>(),
                 ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
-                aggregate: (kind == FunctionKind::Aggregate).then(|| AggregateBindingSelection {
-                    state_argument_contract:
-                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-                    intermediate_type: i64_type(false),
-                    state_format: AggregateStateFormatIdentity::try_new(
-                        "fixture/window-contract/state-v1",
-                    )
-                    .unwrap(),
+                aggregate: (kind == FunctionKind::Aggregate && order.is_empty()).then(|| {
+                    AggregateBindingSelection {
+                        state_argument_contract:
+                            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                        intermediate_type: i64_type(false),
+                        state_format: AggregateStateFormatIdentity::try_new(
+                            "fixture/window-contract/state-v1",
+                        )
+                        .unwrap(),
+                    }
                 }),
             }),
             argument_uses: (0..arguments.len())
@@ -388,17 +390,13 @@ fn window_and_single_aggregate_sources_are_distinct_and_function_order_stays_sep
         &[],
         &RuntimeControl::default(),
     ));
+    let mergeable = Fixture::new(&[i64_type(true)], &[], FunctionKind::Aggregate);
     for phase in [
         AggregateKernelPhase::Partial,
         AggregateKernelPhase::Intermediate,
         AggregateKernelPhase::Final,
     ] {
-        let phase_keys = if phase.consumes_logical_arguments() {
-            keys.clone()
-        } else {
-            Arc::from([])
-        };
-        let non_single = aggregate_contract(&fixture, phase, false, phase_keys);
+        let non_single = aggregate_contract(&mergeable, phase, false, Arc::from([]));
         assert_invalid(WindowCallContract::try_aggregate(
             non_single,
             options(),

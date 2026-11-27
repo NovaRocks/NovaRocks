@@ -84,7 +84,7 @@ impl Fixture {
                         .collect::<Box<[_]>>(),
                 ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
-                aggregate: Some(AggregateBindingSelection {
+                aggregate: order.is_empty().then(|| AggregateBindingSelection {
                     state_argument_contract:
                         novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: state,
@@ -258,7 +258,7 @@ fn selected<'a>(selection: Selection<'a>, values: ArrayRef) -> SelectedValues<'a
 
 #[test]
 fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
-    let fixture = ordered_fixture();
+    let fixture = Fixture::new(&[i64_type(true)], &[], i64_type(false));
     let call = fixture.call();
     for phase in [
         AggregateKernelPhase::Single,
@@ -282,7 +282,7 @@ fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
         );
         assert_eq!(
             contract.order_argument_types().cloned().collect::<Vec<_>>(),
-            [FunctionValueType::new(DataType::Int32, true)]
+            []
         );
         assert_eq!(contract.intermediate_type(), &i64_type(false));
         assert_eq!(contract.final_type(), &i64_type(false));
@@ -290,10 +290,7 @@ fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
             contract.state_format(),
             &fixture.selected.aggregate.as_ref().unwrap().state_format
         );
-        assert_eq!(
-            contract.order_keys().len(),
-            usize::from(phase.consumes_logical_arguments())
-        );
+        assert!(contract.order_keys().is_empty());
         assert_eq!(
             contract.state_input_type().is_some(),
             !phase.consumes_logical_arguments()
@@ -346,7 +343,7 @@ fn zero_argument_count_shape_needs_only_selection_for_update() {
 #[test]
 fn logical_and_order_carriers_share_exact_selection_but_stay_independent() {
     let call = ordered_fixture().call();
-    let contract = aggregate(call, AggregateKernelPhase::Partial);
+    let contract = aggregate(call, AggregateKernelPhase::Single);
     let rows = [1, 4];
     let other_rows = [0, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
@@ -615,7 +612,15 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
 #[test]
 fn phase_contract_rejects_repeated_distinct_order_and_wrong_state_channels() {
     let call = ordered_fixture().call();
-    for phase in [AggregateKernelPhase::Single, AggregateKernelPhase::Partial] {
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        AggregateKernelPhase::Partial,
+        true,
+        keys(1),
+        None,
+        &CompileControl(None),
+    ));
+    for phase in [AggregateKernelPhase::Single] {
         let legal = AggregateCallContract::try_new(
             call.clone(),
             phase,
@@ -644,6 +649,7 @@ fn phase_contract_rejects_repeated_distinct_order_and_wrong_state_channels() {
             &CompileControl(None),
         ));
     }
+    let call = Fixture::new(&[i64_type(true)], &[], i64_type(false)).call();
     for phase in [
         AggregateKernelPhase::Intermediate,
         AggregateKernelPhase::Final,

@@ -896,6 +896,7 @@ fn topn_grouped_states_preserve_complete_independent_wire_and_owned_payloads() {
 #[test]
 fn topn_owned_signatures_keep_lambda_nominal_metadata_and_original_aliases() {
     let mut n = node();
+    calls(&mut n)[0].binding.logical_argument_count = 2;
     calls(&mut n)[0].binding.function.argument_types =
         novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
             FunctionArgumentType::Value(dictionary()),

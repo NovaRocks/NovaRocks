@@ -470,11 +470,13 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 function: function.clone(),
                 phase: AggregatePhase::Single,
                 logical_argument_count: u32::try_from(call.args.len()).unwrap(),
-                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
-                    state_interpretation: None,
-                    state_argument_contract: aggregate.state_argument_contract,
-                    intermediate_type: aggregate.intermediate_type.clone(),
-                    state_format: aggregate.state_format.clone(),
+                merge_state: (!call.function_order).then(|| {
+                    novarocks_physical_plan::AggregateMergeBinding {
+                        state_interpretation: None,
+                        state_argument_contract: aggregate.state_argument_contract,
+                        intermediate_type: aggregate.intermediate_type.clone(),
+                        state_format: aggregate.state_format.clone(),
+                    }
                 }),
             })
         });
@@ -620,22 +622,14 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     .into_boxed_slice(),
             ),
             result_type: FunctionResultType::Scalar(function.result_type.clone()),
-            aggregate: aggregate_binding.as_deref().map(|binding| {
-                novarocks_functions::AggregateBindingSelection {
-                    state_argument_contract: binding
-                        .merge_state
-                        .as_ref()
-                        .unwrap()
-                        .state_argument_contract,
-                    intermediate_type: binding
-                        .merge_state
-                        .as_ref()
-                        .unwrap()
-                        .intermediate_type
-                        .clone(),
-                    state_format: binding.merge_state.as_ref().unwrap().state_format.clone(),
-                }
-            }),
+            aggregate: aggregate_binding
+                .as_deref()
+                .and_then(|binding| binding.merge_state.as_ref())
+                .map(|state| novarocks_functions::AggregateBindingSelection {
+                    state_argument_contract: state.state_argument_contract,
+                    intermediate_type: state.intermediate_type.clone(),
+                    state_format: state.state_format.clone(),
+                }),
         });
         let argument_uses = args
             .iter()
@@ -650,7 +644,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 )
             })
             .collect::<Vec<_>>();
-        if call.uninstalled {
+        if call.uninstalled || call.function_order {
             frozen.push(FrozenPhysicalCall {
                 materialized_writer_input: None,
                 site,

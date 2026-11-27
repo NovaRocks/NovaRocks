@@ -160,7 +160,7 @@ impl Owner {
                     DataType::Int32,
                     false,
                 )),
-                aggregate: Some(AggregateBindingSelection {
+                aggregate: (!ordered).then(|| AggregateBindingSelection {
                     state_argument_contract:
                         novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: FunctionValueType::new(DataType::Int64, false),
@@ -583,13 +583,10 @@ fn failures() -> Vec<KernelFailure> {
 fn value_array() -> ArrayRef {
     Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]))
 }
-fn order_array() -> ArrayRef {
-    Arc::new(Int32Array::from(vec![5, 4, 3, 2, 1]))
-}
 
 #[test]
 fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels() {
-    let owner = Owner::new(1, true);
+    let owner = Owner::new(1, false);
     for phase in [
         AggregateKernelPhase::Single,
         AggregateKernelPhase::Partial,
@@ -639,11 +636,8 @@ fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels
                 prepared.prepared().contract.logical_argument_types().len(),
                 1
             );
-            assert_eq!(prepared.prepared().contract.order_argument_types().len(), 1);
-            assert_eq!(
-                prepared.prepared().contract.order_keys().len(),
-                usize::from(phase.consumes_logical_arguments())
-            );
+            assert_eq!(prepared.prepared().contract.order_argument_types().len(), 0);
+            assert!(prepared.prepared().contract.order_keys().is_empty());
             assert!(
                 prepared
                     .effects()
@@ -656,9 +650,8 @@ fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels
 }
 #[test]
 fn four_phases_emit_actual_intermediate_or_final_values_with_sparse_repeated_group_borrows() {
-    let owner = Owner::new(1, true);
+    let owner = Owner::new(1, false);
     let values = value_array();
-    let orders = order_array();
     let rows = [1, 3];
     let selection = Selection::try_sparse(5, &rows).unwrap();
     let runtime = RuntimeControl::default();
@@ -672,12 +665,11 @@ fn four_phases_emit_actual_intermediate_or_final_values_with_sparse_repeated_gro
         let mut state = create_aggregate_state(kernel.as_ref(), &runtime).unwrap();
         if phase.consumes_logical_arguments() {
             let logical = [EvaluatedArgument::Column(&values)];
-            let order = [EvaluatedArgument::Column(&orders)];
             let input = SelectedAggregateUpdateInput::try_new(
                 &kernel.contract,
                 selection,
                 &logical,
-                &order,
+                &[],
                 &runtime,
             )
             .unwrap();
@@ -686,11 +678,9 @@ fn four_phases_emit_actual_intermediate_or_final_values_with_sparse_repeated_gro
             assert_eq!(invocation.next_batch_row(), Some(1));
             invocation.update_next(&mut state, &runtime).unwrap();
             assert_eq!(state.sum, 20);
-            assert_eq!(state.last_order, Some(4));
             assert_eq!(invocation.next_selected_ordinal(), Some(1));
             assert_eq!(invocation.next_batch_row(), Some(3));
             invocation.update_next(&mut state, &runtime).unwrap();
-            assert_eq!(state.last_order, Some(2));
             assert_eq!(invocation.next_selected_ordinal(), None);
         } else {
             let input = SelectedAggregateMergeInput::try_new(
@@ -1428,7 +1418,7 @@ fn prepared_batches_read_compact_ordinals_and_explicit_scalar_broadcast() {
     let logical = [EvaluatedArgument::SelectedColumn(&selected)];
     let orders = [EvaluatedArgument::Scalar(&order)];
     let kernel = owner
-        .specialize(AggregateKernelPhase::Partial)
+        .specialize(AggregateKernelPhase::Single)
         .into_prepared();
     let mut state = create_aggregate_state(kernel.as_ref(), &runtime).unwrap();
     let input = SelectedAggregateUpdateInput::try_new(
@@ -1445,7 +1435,8 @@ fn prepared_batches_read_compact_ordinals_and_explicit_scalar_broadcast() {
     assert_eq!(state.sum, 600);
     assert_eq!(state.last_row, Some(3));
     assert_eq!(state.last_order, Some(7));
-    let merge_kernel = owner
+    let merge_owner = Owner::new(1, false);
+    let merge_kernel = merge_owner
         .specialize(AggregateKernelPhase::Final)
         .into_prepared();
     let mut merged = create_aggregate_state(merge_kernel.as_ref(), &runtime).unwrap();

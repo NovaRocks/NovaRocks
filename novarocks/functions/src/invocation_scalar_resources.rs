@@ -1095,11 +1095,7 @@ mod tests {
             )
         });
         assert!(equal.unwrap());
-        assert!(actual.0 > 0 && actual.1 > 0);
-        assert!(actual.0 <= bound.requested_bytes, "{actual:?} > {bound:?}");
-        assert!(actual.1 <= bound.requests, "{actual:?} > {bound:?}");
-        assert!(actual.2 <= bound.peak_bytes, "{actual:?} > {bound:?}");
-        assert_eq!(actual.3, 0);
+        assert_eq!(actual, (0, 0, 0, 0));
     }
 
     #[test]

@@ -142,7 +142,7 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
             assert_eq!(raw.phase.as_ref().unwrap().kind.as_ref(), Some(&phases[at]));
             assert_eq!(raw.function_binding_id, Some(u32::MAX));
             assert_eq!(raw.intermediate_value_type_id, Some(8));
-            assert_eq!(raw.logical_argument_count, if at == 0 { 0 } else { 2 });
+            assert_eq!(raw.logical_argument_count, 2);
             assert_eq!(raw.state_format, "test/aggregate/state-v1");
             assert_eq!(
                 raw.state_argument_contract,
@@ -497,10 +497,10 @@ fn aggregate_foreign_equal_headers_and_replacement_controller_are_not_original_l
 #[test]
 fn aggregate_wide_real_signature_copies_preserve_order_and_sampled_prefixes() {
     fn wide(c: &Control, stop: Option<(usize, CompileControlError)>) -> Result<(), Error> {
-        let raw = [raw_aggregate(
-            u32::MAX,
-            wire::aggregate_phase::Kind::PartialSequenceId(0),
-        )];
+        let raw = [wire::AggregateBindingDefinition {
+            logical_argument_count: 320,
+            ..raw_aggregate(u32::MAX, wire::aggregate_phase::Kind::PartialSequenceId(0))
+        }];
         with_receivers(c, &raw, true, |headers, functions| {
             c.arm(stop);
             let mut work = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;

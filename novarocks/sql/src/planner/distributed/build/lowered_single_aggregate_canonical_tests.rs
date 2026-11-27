@@ -553,17 +553,7 @@ fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy(
             nulls_first: true,
         }]
     );
-    assert_eq!(
-        entry
-            .source()
-            .binding
-            .merge_state
-            .as_ref()
-            .unwrap()
-            .state_interpretation
-            .as_ref(),
-        Some(state_source)
-    );
+    assert!(entry.source().binding.merge_state.is_none());
     let canonical = entry.canonical().unwrap();
     assert_eq!(canonical.request().logical_argument_count, 1);
     assert_eq!(canonical.request().arguments.len(), 2);

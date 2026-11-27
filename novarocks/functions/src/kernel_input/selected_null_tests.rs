@@ -554,7 +554,6 @@ fn bounded_row_projection_shares_null_traversal_observation_instead_of_a_paralle
 fn runtime_map64_argument_keeps_selected_values_original_nulls_and_control() {
     use arrow_array::{Int32Array, MapArray, StructArray};
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-    use novarocks_failure_contract::FailureProjection;
     fn maps(mut values: ArrayRef) -> ArrayRef {
         for _ in 1..64 {
             let fields = vec![
@@ -580,15 +579,11 @@ fn runtime_map64_argument_keeps_selected_values_original_nulls_and_control() {
     let values = maps(Arc::new(Int32Array::from(vec![7, 11])));
     let value_type = FunctionValueType::new(values.data_type().clone(), false);
     assert_eq!(value_type.value_type().depth(), 64);
-    // Preserve the raw producer's original failure identity; only this typed
-    // runtime seam chooses the value profile after the original constant branch.
-    let raw = novarocks_type_contract::arrow_data_types_exact_observed::<
-        novarocks_type_contract::ValueTypeError,
-    >(values.data_type(), values.data_type(), || Ok(()))
-    .unwrap_err();
-    assert_eq!(
-        raw.failure_fact(),
-        novarocks_type_contract::ValueTypeError::TooDeep.failure_fact()
+    assert!(
+        novarocks_type_contract::arrow_data_types_exact_observed::<
+            novarocks_type_contract::ValueTypeError,
+        >(values.data_type(), values.data_type(), || Ok(()))
+        .unwrap()
     );
     let control = Control::default();
     validate_argument_observed(

@@ -331,6 +331,7 @@ impl Fixture {
         // input carries the declared channels through the original structural
         // gate; its actual installed resolver must refuse this stale signature.
         if order != 0 {
+            binding.merge_state = None;
             let mut channels = binding.function.argument_types.to_vec();
             let ordered_type = channels[0].clone();
             channels.extend((0..order).map(|_| ordered_type.clone()));

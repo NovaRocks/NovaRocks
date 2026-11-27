@@ -324,34 +324,17 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
             panic!("window scalar result");
         };
         assert_eq!(&function.result_type, selected_result);
-        let (Some(state), Some(aggregate)) = (&selected.aggregate, &source.aggregate_binding)
-        else {
-            panic!("same canonical aggregate state");
+        let Some(aggregate) = &source.aggregate_binding else {
+            panic!("same canonical aggregate");
         };
+        assert!(selected.aggregate.is_none());
+        assert!(aggregate.merge_state.is_none());
         assert_eq!(aggregate.phase, AggregatePhase::Single);
         assert_eq!(aggregate.function, *function);
         assert_eq!(
             aggregate.logical_argument_count as usize,
             receipt.captured().request().logical_argument_count
         );
-        assert_eq!(
-            aggregate.merge_state.as_ref().unwrap().intermediate_type,
-            state.intermediate_type
-        );
-        assert_eq!(
-            aggregate.merge_state.as_ref().unwrap().state_format,
-            state.state_format
-        );
-        assert_eq!(
-            aggregate
-                .merge_state
-                .as_ref()
-                .unwrap()
-                .state_interpretation
-                .as_ref(),
-            receipt.captured().binding().aggregate_state_source(),
-        );
-
         let output = receipt.builder().value(source.output).unwrap();
         assert_eq!(&output.ty, selected_result);
         assert!(

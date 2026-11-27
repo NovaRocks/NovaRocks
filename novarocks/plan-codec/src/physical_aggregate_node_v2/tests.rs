@@ -745,6 +745,7 @@ fn aggregate_all_phases_grouping_and_intentional_source_aliases_preserve_identit
         calls(&mut n)[0].binding.phase = phase;
         if phase == p::AggregatePhase::Single {
             for call in calls(&mut n).iter_mut() {
+                call.binding.logical_argument_count = 2;
                 call.binding.function.argument_types =
                     novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                         FunctionArgumentType::Value(dictionary()),
@@ -1047,6 +1048,7 @@ fn numeric_prefix(c: &Control, action: impl Fn() -> Result<(), Error>) {
 fn aggregate_real_signature_and_lambda_collections_obey_tighter_parent_before_walk() {
     for lambda in [false, true] {
         let mut n = node();
+        calls(&mut n)[0].binding.logical_argument_count = if lambda { 2 } else { 320 };
         calls(&mut n)[0].binding.function.argument_types = if lambda {
             novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                 FunctionArgumentType::Value(dictionary()),
@@ -1887,6 +1889,7 @@ fn aggregate_caller_parent_seven_axes_known_refusal_precedes_late_control() {
 fn aggregate_caller_owned_actual320_signatures_and_lambda_copy_preserve_source_profiles() {
     for lambda in [false, true] {
         let mut n = node();
+        calls(&mut n)[0].binding.logical_argument_count = if lambda { 2 } else { 320 };
         calls(&mut n)[0].binding.function.argument_types = if lambda {
             novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                 FunctionArgumentType::Value(dictionary()),

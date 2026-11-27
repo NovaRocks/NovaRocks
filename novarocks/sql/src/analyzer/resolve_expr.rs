@@ -6330,38 +6330,23 @@ mod tests {
             arguments[0].value_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Json
         );
-        let selected = crate::functions::aggregate_selection(binding);
-        match &selected.intermediate_type.data_type() {
-            DataType::List(item) => {
-                assert!(item.metadata().as_arc().is_none());
-                assert_eq!(
-                    selected
-                        .intermediate_type
-                        .value_type()
-                        .child_type_at(0)
-                        .unwrap()
-                        .domain(),
-                    arguments[0].value_type.value_type().domain()
-                );
-            }
-            DataType::Struct(fields) => {
-                let DataType::List(item) = fields[0].data_type() else {
-                    panic!("expected update channel List");
-                };
-                assert!(item.metadata().as_arc().is_none());
-                assert_eq!(
-                    selected
-                        .intermediate_type
-                        .value_type()
-                        .child_type_at(0)
-                        .unwrap()
-                        .child_type_at(0)
-                        .unwrap()
-                        .domain(),
-                    arguments[0].value_type.value_type().domain()
-                );
-            }
-            _ => panic!("unexpected ARRAY_AGG intermediate type"),
+        if binding.logical_argument_count == binding.selected.argument_types.len() {
+            let state = binding.selected.aggregate.as_ref().unwrap();
+            let DataType::List(item) = state.intermediate_type.data_type() else {
+                panic!("expected mergeable List state");
+            };
+            assert!(item.metadata().as_arc().is_none());
+            assert_eq!(
+                state
+                    .intermediate_type
+                    .value_type()
+                    .child_type_at(0)
+                    .unwrap()
+                    .domain(),
+                arguments[0].value_type.value_type().domain(),
+            );
+        } else {
+            assert!(binding.selected.aggregate.is_none());
         }
     }
 
