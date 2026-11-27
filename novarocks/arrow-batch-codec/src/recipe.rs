@@ -108,7 +108,7 @@ impl BatchRecipe {
                 ),
             )
             .map_err(CodecError::Observer)?;
-        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         observer.checkpoint().map_err(CodecError::Observer)?;
         for input in fields {
             observer.checkpoint().map_err(CodecError::Observer)?;
@@ -584,7 +584,7 @@ impl BatchRecipe {
                 ),
             )
             .map_err(CodecError::Observer)?;
-        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         observer.checkpoint().map_err(CodecError::Observer)?;
         for (ordinal, ((array, field), policy)) in batch
             .columns()

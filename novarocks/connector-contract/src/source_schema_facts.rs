@@ -24,8 +24,8 @@
 use crate::{ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_RECIPE_COLUMNS};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
-    FunctionValueType, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, ValueTypeStorageLifetime,
-    ValueTypeVisit, validate_arrow_layout_structure_with_scratch_observed,
+    FunctionValueType, MAX_VALUE_TYPE_DEPTH, ValueTypeStorageLifetime, ValueTypeVisit,
+    validate_arrow_layout_structure_with_scratch_observed,
 };
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
@@ -565,7 +565,7 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
     }
     // Admit the exact fixed stack initialization before visiting any source.
     work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound())?;
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     for field in schema.fields() {
         work(1)?;
         if !field.metadata().is_empty() {

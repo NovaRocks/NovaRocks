@@ -225,9 +225,6 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
             .nodes
             .checked_add(1)
             .ok_or_else(|| E::from(ValueTypeError::TooManyNodes))?;
-        if self.nodes > crate::MAX_VALUE_TYPE_NODES {
-            return Err(ValueTypeError::TooManyNodes.into());
-        }
         crate::validate_arrow_carrier_parameters_observed::<ParameterFailure<E>>(actual, || {
             (self.observe)(1).map_err(ParameterFailure::Caller)
         })
@@ -649,11 +646,7 @@ mod tests {
         let run = |ends: DataType, nullable| {
             DataType::RunEndEncoded(
                 Arc::new(Field::new("provider_ends", ends, nullable)),
-                Arc::new(Field::new(
-                    "provider_values",
-                    dictionary(DataType::Utf8),
-                    true,
-                )),
+                Arc::new(Field::new("provider_values", DataType::Utf8, true)),
             )
         };
         assert_eq!(

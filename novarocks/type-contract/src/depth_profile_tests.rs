@@ -62,8 +62,8 @@ fn map_scaffolding_has_physical_visits_without_spending_logical_depth() {
     // n Maps plus a scalar is semantic depth n+1 and physical depth 2n+1.
     for (maps, physical_pass, value_pass) in [
         (31, true, true),
-        (32, false, true),
-        (63, false, true),
+        (32, true, true),
+        (63, true, true),
         (64, false, false),
     ] {
         let ty = map_layers(DataType::Int64, maps);
@@ -135,7 +135,7 @@ fn complete_function_value_and_layout_match_accept_semantic_map64() {
     );
     assert!(matches!(
         arrow_data_types_exact_observed::<ValueTypeError>(&plain, &plain, || Ok(())),
-        Err(ValueTypeError::TooDeep)
+        Ok(true)
     ));
     assert!(
         arrow_data_types_exact_borrowed_with_profile_observed::<ValueTypeError>(
@@ -146,119 +146,101 @@ fn complete_function_value_and_layout_match_accept_semantic_map64() {
         )
         .unwrap()
     );
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
     value
         .validate_with_scratch_observed::<ValueTypeError>(&mut scratch, |_| Ok(()))
         .unwrap();
 }
 
+fn run_end(value: DataType) -> DataType {
+    DataType::RunEndEncoded(
+        Arc::new(Field::new("run_ends", DataType::Int32, false)),
+        Arc::new(Field::new("values", value, false)),
+    )
+}
+
 #[test]
-fn value_profile_accepts_more_than_63_wrappers_within_the_existing_type_contract() {
-    assert_eq!(ArrowTypeProfile::Physical.physical_depth_limit(), Some(64));
-    assert_eq!(ArrowTypeProfile::Value.physical_depth_limit(), None);
-    assert_eq!(
-        ArrowTypeProfile::CanonicalValue.physical_depth_limit(),
-        None
-    );
-    let maps = map_layers(DataType::Int64, 63);
-    for wrappers in [64, 96] {
-        let encoded = dictionaries(maps.clone(), wrappers);
-        // 96 wrappers plus this Map chain has physical depth 223. Those
-        // coordinates are observed facts, not independent rejection limits.
-        assert!(profile(&encoded, ArrowTypeProfile::Value).is_ok());
-        assert!(matches!(
-            profile(&encoded, ArrowTypeProfile::Physical),
-            Err(ValueTypeError::TooDeep)
-        ));
-        let layout = ValueLayout::try_new(&encoded, ValueTypeStorageLifetime::pure()).unwrap();
-        assert_eq!(layout.data_type(), &maps);
-        let semantic = ValueTypeRef::try_from_declared_arrow(
-            &encoded,
-            false,
-            ValueLogicalType::Physical,
-            ValueTypeStorageLifetime::pure(),
-        )
-        .unwrap();
-        assert_eq!(semantic.depth(), MAX_VALUE_TYPE_DEPTH);
-        let complete = FunctionValueType::new(encoded, false);
-        assert_eq!(complete.value_type().depth(), MAX_VALUE_TYPE_DEPTH);
-        assert_eq!(complete.data_type(), &maps);
-    }
-    // Canonical is a representation constraint, regardless of depth.
-    assert!(matches!(
-        profile(
-            &dictionaries(DataType::Int64, 1),
-            ArrowTypeProfile::CanonicalValue
+fn rejects_each_pair_of_consecutive_encodings() {
+    let dict = |value| dictionaries(value, 1);
+    for (outer, inner) in [
+        (
+            dict as fn(DataType) -> DataType,
+            dict as fn(DataType) -> DataType,
         ),
+        (dict, run_end),
+        (run_end, dict),
+        (run_end, run_end),
+    ] {
+        let ty = outer(inner(DataType::Int64));
+        assert!(matches!(
+            profile(&ty, ArrowTypeProfile::Value),
+            Err(ValueTypeError::InvalidType(_))
+        ));
+        assert!(ValueLayout::try_new(&ty, ValueTypeStorageLifetime::pure()).is_err());
+        assert!(
+            ValueTypeRef::try_from_declared_arrow(
+                &ty,
+                false,
+                ValueLogicalType::Physical,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn encoding_at_distinct_logical_nodes_fits_the_derived_path() {
+    let wrapped_map_path = |levels: usize| {
+        let mut value = run_end(DataType::Int64);
+        for _ in 1..levels {
+            value = run_end(map_layers(value, 1));
+        }
+        value
+    };
+    assert_eq!(
+        profile(
+            &wrapped_map_path(MAX_VALUE_TYPE_DEPTH),
+            ArrowTypeProfile::Value
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        profile(
+            &wrapped_map_path(MAX_VALUE_TYPE_DEPTH + 1),
+            ArrowTypeProfile::Value
+        ),
+        Err(ValueTypeError::TooDeep)
+    );
+    let dict_leaf = dictionaries(DataType::Int64, 1);
+    let dict_struct = dictionaries(
+        DataType::Struct(vec![Arc::new(Field::new("child", dict_leaf, true))].into()),
+        1,
+    );
+    assert_eq!(profile(&dict_struct, ArrowTypeProfile::Value), Ok(()));
+    assert!(matches!(
+        profile(&dict_struct, ArrowTypeProfile::CanonicalValue),
         Err(ValueTypeError::InvalidType(_))
     ));
-    assert!(ArrowTypeProfile::Value.check_physical_depth(223).is_ok());
-    assert!(
-        ArrowTypeProfile::CanonicalValue
-            .check_physical_depth(128)
-            .is_ok()
-    );
 }
 
 #[test]
-fn run_end_and_dictionary_wrappers_keep_observed_coordinates_without_a_new_quota() {
-    let mut encoded = DataType::Int64;
-    let mut coordinate = ArrowTypeDepth::ROOT;
-    for index in 0..96 {
-        coordinate = coordinate.encoding_child().unwrap();
-        encoded = if index % 2 == 0 {
-            dictionaries(encoded, 1)
-        } else {
-            DataType::RunEndEncoded(
-                Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                Arc::new(Field::new("values", encoded, false)),
-            )
-        };
-    }
-    assert_eq!(coordinate.logical(), 1);
-    assert_eq!(coordinate.physical(), 97);
-    assert_eq!(coordinate.encoding_wrappers(), 96);
-    coordinate.check(ArrowTypeProfile::Value).unwrap();
-    assert!(profile(&encoded, ArrowTypeProfile::Value).is_ok());
-    assert_eq!(
-        ValueLayout::try_new(&encoded, ValueTypeStorageLifetime::pure())
-            .unwrap()
-            .data_type(),
-        &DataType::Int64
-    );
-    let extra = dictionaries(encoded, 1);
-    assert!(profile(&extra, ArrowTypeProfile::Value).is_ok());
-    assert!(ValueLayout::try_new(&extra, ValueTypeStorageLifetime::pure()).is_ok());
-}
-
-#[test]
-fn encoding_occurrences_still_spend_the_inherited_expanded_node_budget() {
-    let field = Arc::new(Field::new(
-        "encoded",
-        dictionaries(DataType::Int64, 96),
-        false,
-    ));
-    let within = DataType::Struct(vec![field.clone(); 20].into());
-    assert!(profile(&within, ArrowTypeProfile::Value).is_ok());
-    let over = DataType::Struct(vec![field; 24].into());
-    assert_eq!(
-        profile(&over, ArrowTypeProfile::Value),
-        Err(ValueTypeError::TooManyNodes)
-    );
-}
-
-#[test]
-fn all_map_entry_nodes_still_count_against_the_original_physical_node_budget() {
-    for (maps, pass) in [(1023, true), (1024, false)] {
-        let field = Arc::new(Field::new("value", map_layers(DataType::Int32, 1), false));
-        let ty = DataType::Struct(vec![field; maps].into());
-        let result = profile(&ty, ArrowTypeProfile::Value);
-        if pass {
-            assert!(result.is_ok());
-        } else {
-            assert_eq!(result, Err(ValueTypeError::TooManyNodes));
-        }
-    }
+fn wide_siblings_visit_every_map_scaffold() {
+    let field = Arc::new(Field::new("value", map_layers(DataType::Int32, 1), false));
+    let ty = DataType::Struct(vec![field; 1025].into());
+    let mut nodes = 0;
+    validate_arrow_layout_structure_with_profile_observed::<ValueTypeError>(
+        &ty,
+        ArrowTypeProfile::Value,
+        |visit| {
+            if matches!(visit, ValueTypeVisit::TypeNode(_)) {
+                nodes += 1;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(nodes, 1 + 4 * 1025);
 }
 
 #[test]
@@ -284,7 +266,7 @@ fn scratch_and_heap_keep_identical_physical_events_for_each_explicit_profile() {
                     Ok(())
                 },
             );
-            let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+            let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
             let mut second = Vec::new();
             let b = validate_arrow_layout_structure_with_profile_and_scratch_observed::<
                 ValueTypeError,
@@ -384,7 +366,7 @@ fn explicit_schema_profile_reuses_one_comparison_without_pending_preflights() {
         ),
         Err(ValueTypeError::TooDeep)
     ));
-    let wrapped = dictionaries(ty, 96);
+    let wrapped = dictionaries(ty, 1);
     assert!(
         arrow_data_types_exact_borrowed_with_profile_observed::<ValueTypeError>(
             &wrapped,
@@ -395,15 +377,15 @@ fn explicit_schema_profile_reuses_one_comparison_without_pending_preflights() {
         .unwrap()
     );
     let over = dictionaries(wrapped, 1);
-    assert!(
+    assert!(matches!(
         arrow_data_types_exact_borrowed_with_profile_observed::<ValueTypeError>(
             &over,
             &over,
             ArrowTypeProfile::Value,
             || Ok(())
-        )
-        .unwrap()
-    );
+        ),
+        Err(ValueTypeError::InvalidType(_))
+    ));
 }
 
 #[test]
@@ -421,14 +403,14 @@ fn immutable_complete_map64_exact_comparison_keeps_layout_and_observer_identity(
             .exactly_equals_observed::<ValueTypeError>(&different_layout, || Ok(()))
             .unwrap()
     );
-    // Raw Arrow callers retain their original explicit physical policy.
+    // Both comparison ports preserve the same logical depth.
     assert!(matches!(
         arrow_data_types_exact_observed::<ValueTypeError>(
             left.data_type(),
             equal.data_type(),
             || Ok(())
         ),
-        Err(ValueTypeError::TooDeep)
+        Ok(true)
     ));
     let mut observed = 0;
     assert!(

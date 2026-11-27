@@ -101,7 +101,7 @@ pub(crate) fn exact_requested_write_fields_from_declaration(
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let arrow_schema =
         crate::scalar_integer_domain::sql_schema_from_document(iceberg_schema, document)?;
-    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     requested
         .iter()
         .map(|request| {
@@ -169,7 +169,7 @@ pub(crate) fn canonical_data_write_fields_from_declaration(
     creation
         .work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound())
         .map_err(crate::metadata::metadata_creation_error)?;
-    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut fields = creation
         .reserve(schema.as_struct().fields().len())
         .map_err(crate::metadata::metadata_creation_error)?;
@@ -573,7 +573,7 @@ mod tests {
         );
         let result = (|| {
             creation.work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()).map_err(crate::metadata::metadata_creation_error)?;
-            let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+            let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
             let output = if changed {
                 project_write_field(
                     &source,

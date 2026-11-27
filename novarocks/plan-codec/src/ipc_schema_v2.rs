@@ -66,8 +66,7 @@ fn checked_field_source(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(usize, usize), TypeCodecError> {
     use novarocks_type_contract::{
-        MAX_VALUE_TYPE_NODES, owned_resources::arrow_metadata,
-        validate_arrow_layout_structure_with_scratch_observed,
+        owned_resources::arrow_metadata, validate_arrow_layout_structure_with_scratch_observed,
     };
     let mut bytes = 0usize;
     let mut type_nodes = 0usize;
@@ -86,7 +85,7 @@ fn checked_field_source(
     };
     add_field(field, work)?;
     work.flush()?;
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     work.flush()?;
     validate_arrow_layout_structure_with_scratch_observed(
         field.data_type(),

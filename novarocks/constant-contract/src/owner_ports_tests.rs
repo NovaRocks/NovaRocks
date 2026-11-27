@@ -227,7 +227,7 @@ fn parent_pool_keeps_original_field_buffer_ordinal_float_bits_and_typed_null() {
         ConstantPool::type_validation_scratch_layout(),
         Layout::new::<
             [Option<novarocks_type_contract::TypeTraversalFrame<'_>>;
-                novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+                novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
         >()
     );
     assert_eq!(

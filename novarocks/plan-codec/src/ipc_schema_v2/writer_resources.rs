@@ -34,7 +34,7 @@ use crate::{
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use novarocks_type_contract::{
-    CompileCheckpoints, MAX_VALUE_TYPE_NODES, ValueTypeVisit,
+    CompileCheckpoints, MAX_ARROW_TYPE_PATH_DEPTH, ValueTypeVisit,
     validate_arrow_layout_structure_with_scratch_observed,
 };
 use std::alloc::Layout;
@@ -262,7 +262,7 @@ fn schema_writer_prefix_core<H>(
             // Inline borrowed scratch is not a heap allocation request. Its
             // finite initialization is opaque and bracketed, not internally
             // cooperative or a claim of formal stack memory admission.
-            let bytes = Layout::array::<Option<WalkerEntry<'_>>>(MAX_VALUE_TYPE_NODES)
+            let bytes = Layout::array::<Option<WalkerEntry<'_>>>(MAX_ARROW_TYPE_PATH_DEPTH)
                 .map_err(|_| invalid())?
                 .size();
             scratch_work = mul(4, bytes)?;
@@ -285,7 +285,7 @@ fn schema_writer_prefix_core<H>(
             work.step()?;
             admit_prefix_work(initial, max_preflight_library_work)?;
             work.flush()?;
-            let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+            let mut scratch = [None; MAX_ARROW_TYPE_PATH_DEPTH];
             work.flush()?;
             validate_arrow_layout_structure_with_scratch_observed(
                 field.data_type(),
@@ -466,7 +466,7 @@ pub(super) fn prefix_initial(
     } else {
         mul(
             4,
-            Layout::array::<Option<WalkerEntry<'_>>>(MAX_VALUE_TYPE_NODES)
+            Layout::array::<Option<WalkerEntry<'_>>>(MAX_ARROW_TYPE_PATH_DEPTH)
                 .map_err(|_| invalid())?
                 .size(),
         )?
@@ -520,7 +520,7 @@ pub(super) fn reader_facts(
     // bound before this original structural Vec walk. Its geometric request
     // model and single-walk ownership remain unchanged.
     walkers(&mut requests, prefix.walker_node_bound, 1, None)?;
-    let scratch = Layout::new::<[Option<WalkerEntry<'_>>; MAX_VALUE_TYPE_NODES]>().size();
+    let scratch = Layout::new::<[Option<WalkerEntry<'_>>; MAX_ARROW_TYPE_PATH_DEPTH]>().size();
     let associations = mul(
         mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
         add(schema.string_bytes, 1)?,

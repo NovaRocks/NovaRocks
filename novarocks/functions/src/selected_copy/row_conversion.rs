@@ -287,7 +287,7 @@ impl<H> Model<'_, '_, '_, '_, H> {
         // envelope; no dummy array/to_data packet/second decoder is constructed.
         // This is conservative temporary wrapper/table geometry, not payload.
         let mut nodes = 0usize;
-        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         // Stack initialization is real caller work, not an allocation invoice.
         for _ in 0..scratch.len() {
             self.step()?;

@@ -1859,7 +1859,7 @@ pub(crate) fn validate_type_with_scratch_host_observed<'source, H>(
         novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
     >();
     admit_scratch(layout)?;
-    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed(
         ty,
         &mut scratch,

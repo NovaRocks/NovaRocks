@@ -26,8 +26,8 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY,
-    ValueTypeVisit, validate_value_type_structure_with_scratch_observed,
+    CompileCheckpoints, CompileControlError, NR_LOGICAL_TYPE_KEY, ValueTypeVisit,
+    validate_value_type_structure_with_scratch_observed,
 };
 use std::{mem, sync::Arc};
 
@@ -252,7 +252,7 @@ fn preflight_core(
     work.step()?;
     admitted?;
     work.flush()?;
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     work.flush()?;
     let mut metrics = Metrics::default();
     validate_value_type_structure_with_scratch_observed::<TypeCodecError>(

@@ -71,7 +71,7 @@ fn compare(root: &DataType) {
         vector.push(event(visit));
         Ok(())
     });
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
     let second =
         validate_value_type_structure_with_scratch_observed::<Error>(root, &mut scratch, |visit| {
             borrowed.push(event(visit));
@@ -139,7 +139,7 @@ fn borrowed_scratch_every_control_prefix_matches_the_original_walk() {
     );
     let run = |control: &Control, scratch_backend: bool| -> Result<(), Error> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-        let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+        let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
         let observe = |_: ValueTypeVisit<'_>| work.step().map_err(Error::from);
         let result = if scratch_backend {
             validate_value_type_structure_with_scratch_observed(&root, &mut scratch, observe)
@@ -183,7 +183,7 @@ fn layout_scratch_observes_unknown_annotations_without_authoring_semantics() {
         )])),
     );
     let root = DataType::List(Arc::clone(&field));
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut trace = Vec::new();
     let mut attributes = 0;
     validate_arrow_layout_structure_with_scratch_observed::<Error>(&root, &mut scratch, |visit| {
@@ -207,7 +207,7 @@ fn layout_scratch_observes_unknown_annotations_without_authoring_semantics() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+            let mut scratch = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
             let mut prefix = Vec::new();
             let result = validate_arrow_layout_structure_with_scratch_observed::<Error>(
                 &root,

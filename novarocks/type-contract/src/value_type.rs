@@ -25,7 +25,7 @@ use std::{
 
 use arrow_schema::{DataType, Field};
 
-use crate::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, ValueLogicalType};
+use crate::{MAX_VALUE_TYPE_DEPTH, ValueLogicalType};
 
 /// A caller's already-acquired storage lifetime, with no authorization API.
 ///
@@ -660,9 +660,6 @@ impl ValueTypeRef {
         if depth > MAX_VALUE_TYPE_DEPTH {
             return Err(ExecutionValueTypeError::Depth.into());
         }
-        if nodes > MAX_VALUE_TYPE_NODES {
-            return Err(ExecutionValueTypeError::Nodes.into());
-        }
         crate::value_construction::ValueConstruction::new(observer)
             .exact(Self::storage_allocation_layout)?;
         Ok(Self(Arc::new(ValueType {
@@ -904,9 +901,6 @@ fn from_declared_arrow<E>(
     *visited = visited
         .checked_add(1)
         .ok_or(ExecutionValueTypeError::Nodes)?;
-    if *visited > MAX_VALUE_TYPE_NODES {
-        return Err(ExecutionValueTypeError::Nodes.into());
-    }
     crate::validate_arrow_carrier_parameters_observed::<crate::CarrierParameterError>(
         ty,
         || Ok(()),

@@ -58,7 +58,9 @@ pub use call_context::*;
 mod function;
 mod largeint;
 mod logical;
-pub use depth_profile::{ArrowTypeDepth, ArrowTypeProfile, TypeTraversalFrame};
+pub use depth_profile::{
+    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_TYPE_PATH_DEPTH, TypeTraversalFrame,
+};
 mod canonical_fact;
 pub mod owned_resources;
 mod partition;

@@ -164,7 +164,7 @@ impl GeometryWork for GeometryObserver<'_> {
             },
         )?;
         let mut scratch: novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_> =
-            [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+            [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         observe_work(self.0)?;
         novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(
             field.data_type(),

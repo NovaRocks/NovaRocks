@@ -348,7 +348,7 @@ fn validate_nested_observed<O: OwnedCopy>(
         context.add(context.mul(MAX_VALUE_TYPE_NODES, 128)?, 128)?,
     )?)?;
     context.flush()?;
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     context.step()?;
     context.flush()?;
     let mut nodes = 0usize;

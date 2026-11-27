@@ -1483,7 +1483,7 @@ fn validate_type_profile_owned<E: PoolFailure>(
         work.flush()?;
         // Fixed stack initialization is opaque; its actual layout and full
         // work were admitted before the first source-validation callback.
-        let scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        let scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         observer.step(work)?;
         work.flush()?;
         Some(scratch)

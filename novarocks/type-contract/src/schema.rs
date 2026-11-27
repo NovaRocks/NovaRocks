@@ -109,7 +109,7 @@ pub fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
         right,
         FieldMode::Exact,
         || Ok(()),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
     .unwrap_or(false)
 }
@@ -149,15 +149,9 @@ pub fn arrow_data_types_exact_with_profile_and_nullability_observed<
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
-            depth.check(profile)?;
-            if nodes > crate::MAX_VALUE_TYPE_NODES {
-                Err(crate::ValueTypeError::TooManyNodes.into())
-            } else {
-                Ok(())
-            }
+        validate: &mut |depth, left: &DataType, right: &DataType| {
+            validate_comparison_nodes(depth, profile, left, right)
         },
-        nodes: 0,
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability,
@@ -178,8 +172,7 @@ pub fn arrow_fields_exact_with_nullability_observed<E>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |_, _| Ok(()),
-        nodes: 0,
+        validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability,
@@ -245,15 +238,9 @@ fn compare_types_with_profile<E: From<crate::ValueTypeError>>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
-            depth.check(profile)?;
-            if nodes > crate::MAX_VALUE_TYPE_NODES {
-                Err(crate::ValueTypeError::TooManyNodes.into())
-            } else {
-                Ok(())
-            }
+        validate: &mut |depth, left: &DataType, right: &DataType| {
+            validate_comparison_nodes(depth, profile, left, right)
         },
-        nodes: 0,
         mode,
         metadata_mode,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -271,10 +258,10 @@ pub(crate) fn arrow_validated_data_types_exact_observed<E>(
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types(left, right, FieldMode::Exact, observe, |_, _| Ok(()))
+    compare_types(left, right, FieldMode::Exact, observe, |_, _, _| Ok(()))
 }
 
-/// The same exact comparison with bounded depth/node traversal and an observer
+/// The same exact comparison with bounded depth and an observer
 /// at every visited type and field. Frozen metadata bounds are validated by
 /// the type owner; this comparison does not allocate a recursive schema copy.
 pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
@@ -282,15 +269,15 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
     right: &DataType,
     observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types(left, right, FieldMode::Exact, observe, |depth, nodes| {
-        if depth > crate::MAX_VALUE_TYPE_DEPTH {
-            Err(crate::ValueTypeError::TooDeep.into())
-        } else if nodes > crate::MAX_VALUE_TYPE_NODES {
-            Err(crate::ValueTypeError::TooManyNodes.into())
-        } else {
-            Ok(())
-        }
-    })
+    compare_types(
+        left,
+        right,
+        FieldMode::Exact,
+        observe,
+        |depth, left, right| {
+            validate_comparison_nodes(depth, crate::ArrowTypeProfile::Physical, left, right)
+        },
+    )
 }
 
 /// Compare exact types with the same traversal and bounds as the observed
@@ -328,16 +315,9 @@ fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
-            if depth.physical() > crate::MAX_VALUE_TYPE_DEPTH {
-                Err(crate::ValueTypeError::TooDeep.into())
-            } else if nodes > crate::MAX_VALUE_TYPE_NODES {
-                Err(crate::ValueTypeError::TooManyNodes.into())
-            } else {
-                Ok(())
-            }
+        validate: &mut |depth, left: &DataType, right: &DataType| {
+            validate_comparison_nodes(depth, crate::ArrowTypeProfile::Physical, left, right)
         },
-        nodes: 0,
         mode,
         metadata_mode: MetadataMode::BorrowedLinear,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -358,8 +338,7 @@ pub fn arrow_fields_exact_borrowed_observed<E>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |_, _| Ok(()),
-        nodes: 0,
+        validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::BorrowedLinear,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -383,14 +362,8 @@ pub fn arrow_data_types_equal_observed<E: From<crate::ValueTypeError>>(
         right,
         FieldMode::Compatibility,
         observe,
-        |depth, nodes| {
-            if depth > crate::MAX_VALUE_TYPE_DEPTH {
-                Err(crate::ValueTypeError::TooDeep.into())
-            } else if nodes > crate::MAX_VALUE_TYPE_NODES {
-                Err(crate::ValueTypeError::TooManyNodes.into())
-            } else {
-                Ok(())
-            }
+        |depth, left, right| {
+            validate_comparison_nodes(depth, crate::ArrowTypeProfile::Physical, left, right)
         },
     )
 }
@@ -407,8 +380,7 @@ pub fn arrow_fields_exact_observed<E>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |_, _| Ok(()),
-        nodes: 0,
+        validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -418,12 +390,26 @@ pub fn arrow_fields_exact_observed<E>(
     .field(left, right, crate::ArrowTypeDepth::ROOT)
 }
 
+fn validate_comparison_nodes<E: From<crate::ValueTypeError>>(
+    depth: crate::ArrowTypeDepth,
+    profile: crate::ArrowTypeProfile,
+    left: &DataType,
+    right: &DataType,
+) -> Result<(), E> {
+    depth.check(profile)?;
+    crate::carrier_parameters::validate_arrow_node_shape(left)
+        .map_err(crate::ValueTypeError::InvalidType)?;
+    crate::carrier_parameters::validate_arrow_node_shape(right)
+        .map_err(crate::ValueTypeError::InvalidType)?;
+    Ok(())
+}
+
 fn compare_types<E>(
     left: &DataType,
     right: &DataType,
     mode: FieldMode,
     mut observe: impl FnMut() -> Result<(), E>,
-    validate: impl FnMut(usize, usize) -> Result<(), E>,
+    validate: impl FnMut(crate::ArrowTypeDepth, &DataType, &DataType) -> Result<(), E>,
 ) -> Result<bool, E> {
     compare_types_weighted(left, right, mode, false, |_| observe(), validate)
 }
@@ -434,12 +420,11 @@ fn compare_types_weighted<E>(
     mode: FieldMode,
     ignore_field_nullability: bool,
     mut observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
-    mut validate: impl FnMut(usize, usize) -> Result<(), E>,
+    mut validate: impl FnMut(crate::ArrowTypeDepth, &DataType, &DataType) -> Result<(), E>,
 ) -> Result<bool, E> {
     Walk {
         observe: &mut observe,
-        validate: &mut |depth: crate::ArrowTypeDepth, nodes| validate(depth.physical(), nodes),
-        nodes: 0,
+        validate: &mut validate,
         mode,
         metadata_mode: MetadataMode::Bucketed,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -454,7 +439,9 @@ pub(crate) fn arrow_validated_data_types_exact_weighted_observed<E>(
     right: &DataType,
     observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_weighted(left, right, FieldMode::Exact, false, observe, |_, _| Ok(()))
+    compare_types_weighted(left, right, FieldMode::Exact, false, observe, |_, _, _| {
+        Ok(())
+    })
 }
 
 /// Compare already validated plain layouts while ignoring only Field NULL
@@ -471,7 +458,7 @@ pub(crate) fn arrow_validated_data_types_ignoring_nullability_observed<E>(
         FieldMode::Exact,
         true,
         |_| observe(),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
 }
 
@@ -487,8 +474,7 @@ pub(crate) fn arrow_validated_write_projection_observed<E>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |_, _| Ok(()),
-        nodes: 0,
+        validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -513,7 +499,6 @@ enum FieldMode {
 struct Walk<'a, F, B> {
     observe: &'a mut F,
     validate: &'a mut B,
-    nodes: usize,
     mode: FieldMode,
     metadata_mode: MetadataMode,
     nullability: crate::CarrierNullabilityPolicy,
@@ -523,7 +508,7 @@ struct Walk<'a, F, B> {
 impl<
     E,
     F: FnMut(TypeComparisonStep) -> Result<(), E>,
-    B: FnMut(crate::ArrowTypeDepth, usize) -> Result<(), E>,
+    B: FnMut(crate::ArrowTypeDepth, &DataType, &DataType) -> Result<(), E>,
 > Walk<'_, F, B>
 {
     fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
@@ -666,8 +651,7 @@ impl<
         // Keep the original comparison occurrence count, including the
         // entries Struct reached through a Map edge. Profile selection only
         // changes depth coordinates, never this inherited node policy.
-        self.nodes += 1;
-        (self.validate)(depth, self.nodes)?;
+        (self.validate)(depth, left, right)?;
         match (left, right) {
             (DataType::FixedSizeBinary(_), DataType::Binary) if self.allow_fixed_bytes => Ok(true),
             (DataType::List(left), DataType::List(right))
@@ -845,7 +829,7 @@ mod tests {
         let over = DataType::Struct(fields.into());
         assert_eq!(
             arrow_data_types_exact_observed::<ValueTypeError>(&over, &over, || Ok(())),
-            Err(ValueTypeError::TooManyNodes)
+            Ok(true)
         );
         assert!(arrow_data_types_exact(&over, &over));
     }
@@ -907,7 +891,7 @@ mod tests {
                 field.data_type(),
                 || Ok(())
             ),
-            Err(ValueTypeError::TooManyNodes)
+            Ok(true)
         );
     }
 
@@ -999,8 +983,7 @@ mod tests {
         assert_eq!(
             Walk {
                 observe: &mut observe,
-                validate: &mut |_, _| Ok(()),
-                nodes: 0,
+                validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
                 nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -1035,8 +1018,7 @@ mod tests {
             };
             let result = Walk {
                 observe: &mut observe,
-                validate: &mut |_, _| Ok(()),
-                nodes: 0,
+                validate: &mut |_, _: &DataType, _: &DataType| Ok(()),
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
                 nullability: crate::CarrierNullabilityPolicy::Exact,
@@ -1103,7 +1085,10 @@ mod tests {
                     Box::new(DataType::Int16),
                     Box::new(DataType::List(f.clone())),
                 ),
-                DataType::RunEndEncoded(Arc::new(Field::new("ends", DataType::Int32, false)), f),
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::List(f), true)),
+                ),
             ]
         };
         let left = field(0, false);
@@ -1194,7 +1179,7 @@ mod physical_nullability_exact_tests {
     use super::*;
     use crate::{ArrowTypeProfile, CarrierNullabilityPolicy, ValueTypeError};
     use std::sync::Arc;
-    fn compare(expected: &DataType, actual: &DataType) -> bool {
+    fn comparison(expected: &DataType, actual: &DataType) -> Result<bool, ValueTypeError> {
         arrow_data_types_exact_with_profile_and_nullability_observed::<ValueTypeError>(
             expected,
             actual,
@@ -1202,7 +1187,9 @@ mod physical_nullability_exact_tests {
             CarrierNullabilityPolicy::Permissive,
             || Ok(()),
         )
-        .unwrap()
+    }
+    fn compare(expected: &DataType, actual: &DataType) -> bool {
+        comparison(expected, actual).unwrap()
     }
     fn structure(field: Field) -> DataType {
         DataType::Struct(vec![Arc::new(field)].into())
@@ -1270,7 +1257,10 @@ mod physical_nullability_exact_tests {
         };
         let expected = map(false, false, false);
         assert!(compare(&expected, &map(false, false, true)));
-        assert!(!compare(&expected, &map(true, false, true)));
+        assert!(matches!(
+            comparison(&expected, &map(true, false, true)),
+            Err(ValueTypeError::InvalidType(_))
+        ));
         assert!(!compare(&expected, &map(false, true, true)));
         let invalid = map(true, true, true);
         assert!(
@@ -1285,7 +1275,10 @@ mod physical_nullability_exact_tests {
             Arc::new(Field::new("run_ends", DataType::Int32, true)),
             Arc::new(Field::new("values", DataType::Int64, true)),
         );
-        assert!(!compare(&expected, &actual));
+        assert!(matches!(
+            comparison(&expected, &actual),
+            Err(ValueTypeError::InvalidType(_))
+        ));
     }
     #[test]
     fn permissive_exact_fields_keep_dictionary_id_and_order() {

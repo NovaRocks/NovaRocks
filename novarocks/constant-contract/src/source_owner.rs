@@ -504,7 +504,7 @@ fn source_fields_in<
     // Original borrowed grammar uses fixed stack scratch. Initialization is
     // opaque, with control on both sides; it reports no completed visits.
     work.flush()?;
-    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     work.flush()?;
     visit(field, work)?;
     novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed::<E>(

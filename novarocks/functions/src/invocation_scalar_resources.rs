@@ -191,11 +191,11 @@ pub(crate) fn argument_metadata_geometry(
     control: &dyn KernelEvaluationControl,
 ) -> Result<AllocationGeometry, InvocationPreparationFailure> {
     use novarocks_type_contract::{
-        MAX_VALUE_TYPE_NODES, ValueTypeVisit,
+        ValueTypeVisit,
         owned_resources::{hashmap, vec},
         validate_value_type_structure_with_scratch_observed,
     };
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut work = crate::kernel_input::EvaluationCheckpoints::new(control);
     let mut geometry = AllocationGeometry::default();
     validate_value_type_structure_with_scratch_observed(ty, &mut scratch, |event| {

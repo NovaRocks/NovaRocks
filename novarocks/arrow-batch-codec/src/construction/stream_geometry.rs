@@ -184,7 +184,7 @@ fn declaration_counts<H, W: ConstructionWork + ?Sized>(
         // completed field visit loop. The sole type-contract grammar owns the
         // validated carrier walk; this model does not interpret annotations.
         work.flush().map_err(IpcConstructionError::Control)?;
-        let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+        let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
         work.flush().map_err(IpcConstructionError::Control)?;
         validate_arrow_layout_structure_with_profile_and_scratch_observed::<
             IpcConstructionError<H, W::Error>,
