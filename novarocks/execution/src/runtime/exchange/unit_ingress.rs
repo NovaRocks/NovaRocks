@@ -182,6 +182,40 @@ impl Receiver {
             .slots
             .retire_with(&closes, clear_queue)
             .map_err(ExchangeFailure::from)?;
+
+        #[cfg(novarocks_dev_controls)]
+        {
+            let observer = self
+                .mu
+                .lock()
+                .expect("exchange receiver lock")
+                .test_observer
+                .clone();
+            for (stream, disposition) in &closes {
+                if let ExchangeCloseDisposition::Consumed { final_sequence } = disposition {
+                    let source = stream.source().task();
+                    let destination = stream.destination();
+                    let execution = destination.query_execution_id();
+                    emit_exchange_snapshot_marker(observer.as_deref(), || {
+                        format!(
+                            "event=receiver_consumed execution_id={}:{}:{} source={} source_stage={} source_task={} destination={} destination_stage={} destination_task={} node_id={} sender_ordinal={} sequence={}",
+                            execution.query_id().high(),
+                            execution.query_id().low(),
+                            execution.attempt_id().get(),
+                            source.backend_process_id(),
+                            source.stage_id().get(),
+                            source.task_id().get(),
+                            destination.backend_process_id(),
+                            destination.stage_id().get(),
+                            destination.task_id().get(),
+                            stream.destination_node().get(),
+                            stream.source().sender_ordinal(),
+                            final_sequence.get(),
+                        )
+                    });
+                }
+            }
+        }
         self.observable.defer_notify().arm();
         Ok(())
     }

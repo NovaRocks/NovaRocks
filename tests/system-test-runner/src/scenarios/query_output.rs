@@ -26,8 +26,8 @@ use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{LaunchProfile, TestClusterOwner};
 use novarocks_failpoint::observation_marker::{
-    EXCHANGE_GRANT_ONLY_PROBE, ObservationAction, TASK_CONSTANT_IPC_RECORD, TASK_TERMINAL_RETAINED,
-    TASK_VALUES_CAST_SOURCE, TASK_VALUES_SOURCE,
+    EXCHANGE_GRANT_ONLY_PROBE, EXCHANGE_SNAPSHOT, ObservationAction, TASK_CONSTANT_IPC_RECORD,
+    TASK_TERMINAL_RETAINED, TASK_VALUES_CAST_SOURCE, TASK_VALUES_SOURCE,
 };
 use novarocks_result_contract::RootProfileV1;
 use serde_json::{Value, json};
@@ -673,7 +673,8 @@ fn verify_deep_type_observations(
     let deadline = context.deadline();
     loop {
         let mut accepted_values = BTreeSet::new();
-        let mut accepted_route = false;
+        let mut data_routes = BTreeSet::new();
+        let mut consumed_routes = BTreeSet::new();
         for index in 0..context.handle().be_count() {
             let handle = context.handle();
             let binding = handle.selected_native_observation_binding(
@@ -736,20 +737,45 @@ fn verify_deep_type_observations(
                 }
             }
 
-            accepted_route |= scoped.iter().copied().any(|line| {
-                line.contains(EXCHANGE_GRANT_ONLY_PROBE)
+            for line in &scoped {
+                if marker_field(line, "source_stage") != Some(sender_stage)
+                    || marker_field(line, "destination_stage") != Some(root_stage)
+                    || marker_field(line, "node_id") != Some(destination_node)
+                    || marker_field(line, "source") == marker_field(line, "destination")
+                {
+                    continue;
+                }
+                let route = [
+                    "execution_id",
+                    "source",
+                    "source_task",
+                    "destination",
+                    "destination_task",
+                    "sender_ordinal",
+                ]
+                .map(|name| marker_field(line, name).map(str::to_owned));
+                if route.iter().any(Option::is_none) {
+                    continue;
+                }
+                if line.contains(EXCHANGE_GRANT_ONLY_PROBE)
                     && marker_field(line, "event") == Some("data_custody_received")
-                    && marker_field(line, "source_stage") == Some(sender_stage)
-                    && marker_field(line, "destination_stage") == Some(root_stage)
-                    && marker_field(line, "node_id") == Some(destination_node)
                     && marker_field(line, "source") == Some(binding.backend_process_id.as_str())
-                    && marker_field(line, "source") != marker_field(line, "destination")
-            });
+                {
+                    data_routes.insert(route);
+                } else if line.contains(EXCHANGE_SNAPSHOT)
+                    && marker_field(line, "event") == Some("receiver_consumed")
+                    && marker_field(line, "destination")
+                        == Some(binding.backend_process_id.as_str())
+                {
+                    consumed_routes.insert(route);
+                }
+            }
             std::fs::write(
                 artifact_root.join(format!("be-{index}-native-observation.log")),
                 scoped.join("\n"),
             )?;
         }
+        let accepted_route = !data_routes.is_disjoint(&consumed_routes);
         if &accepted_values == pool_references && accepted_route {
             return Ok(());
         }

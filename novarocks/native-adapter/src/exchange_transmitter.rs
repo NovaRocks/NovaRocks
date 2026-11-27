@@ -65,12 +65,12 @@ fn observe_grant_only(
     let destination = stream.destination();
     let execution = source.query_execution_id();
     observer.observe(&format!(
-        "{} event={event} execution_id={}:{}:{} source={} source_stage={} source_task={} destination={} destination_stage={} destination_task={} node_id={}",
+        "{} event={event} execution_id={}:{}:{} source={} source_stage={} source_task={} destination={} destination_stage={} destination_task={} node_id={} sender_ordinal={}",
         novarocks_failpoint::observation_marker::EXCHANGE_GRANT_ONLY_PROBE,
         execution.query_id().high(), execution.query_id().low(), execution.attempt_id().get(),
         source.backend_process_id(), source.stage_id().get(), source.task_id().get(),
         destination.backend_process_id(), destination.stage_id().get(), destination.task_id().get(),
-        stream.destination_node().get(),
+        stream.destination_node().get(), stream.source().sender_ordinal(),
     ));
 }
 
