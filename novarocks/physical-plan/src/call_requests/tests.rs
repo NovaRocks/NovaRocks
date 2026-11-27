@@ -711,13 +711,7 @@ fn ordered_window_fragment() -> Fragment {
         function: binding.clone(),
         phase: AggregatePhase::Single,
         logical_argument_count: 1,
-        merge_state: Some(crate::AggregateMergeBinding {
-            intermediate_type: ty,
-            state_format: AggregateStateFormatId::try_new("fixture/window/state").unwrap(),
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-            state_interpretation: None,
-        }),
+        merge_state: None,
     };
     let properties = builder.node_output_properties(input).unwrap().clone();
     builder
