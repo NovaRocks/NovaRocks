@@ -7,6 +7,7 @@ use super::mv_uea7::{ManagedMvRestFixture, property, status, wait_for_status_pha
 use super::mv_uea7::{
     mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup, mv_rows, mv_text_lines,
 };
+use super::mv_uea7_documents::load_metadata;
 use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{
     Scenario, ScenarioBinary, ScenarioBinaryLayout, ScenarioContext, ScenarioLaunchConfig,
@@ -2799,7 +2800,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        use super::mv_uea7_documents::{load_metadata, wire::Graph};
+        use super::mv_uea7_documents::wire::Graph;
 
         require_three_backends(context)?;
         let catalog = "system_mv_legacy_interpretation";

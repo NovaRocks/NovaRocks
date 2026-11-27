@@ -208,10 +208,7 @@ pub(crate) async fn build_statistics_read_snapshot_at(
     .await
 }
 
-fn read_domain_at(
-    table: &Table,
-    snapshot_id: i64,
-) -> Result<Arc<ReadDomain>, ConnectorError> {
+fn read_domain_at(table: &Table, snapshot_id: i64) -> Result<Arc<ReadDomain>, ConnectorError> {
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
