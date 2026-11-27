@@ -58,6 +58,7 @@ pub(super) struct SourceFixture {
     initial_observations: AtomicUsize,
     preparations: AtomicUsize,
     requests: Mutex<Vec<ConnectorReadSourcePreparationRequest>>,
+    historical_requests: Mutex<Vec<ConnectorReadSourcePreparationRequest>>,
     schema_projections: AtomicUsize,
     revision_selectors: Mutex<Vec<ConnectorReadSelector>>,
     captured_context: Mutex<Option<ConnectorRequestContext>>,
@@ -141,6 +142,7 @@ impl SourceFixture {
             initial_observations: AtomicUsize::new(0),
             preparations: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
+            historical_requests: Mutex::new(Vec::new()),
             schema_projections: AtomicUsize::new(0),
             revision_selectors: Mutex::new(Vec::new()),
             captured_context: Mutex::new(None),
@@ -411,12 +413,21 @@ impl SourceFixture {
         source: bool,
         creation: &mut ConnectorReadSchemaCreation<'_>,
     ) -> CompileResult<ConnectorTableMetadata> {
-        self.metadata_for_projection(source, true, creation)
+        self.metadata_for_projection(
+            source,
+            true,
+            if source { self.snapshot } else { 11 },
+            creation,
+        )
+    }
+    fn statistics_version(snapshot: i64) -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(Bytes::copy_from_slice(&snapshot.to_be_bytes())).unwrap()
     }
     fn metadata_for_projection(
         &self,
         source: bool,
         initial: bool,
+        snapshot: i64,
         creation: &mut ConnectorReadSchemaCreation<'_>,
     ) -> CompileResult<ConnectorTableMetadata> {
         let identity = if source {
@@ -520,15 +531,15 @@ impl SourceFixture {
                 } else {
                     self.projection.facts.metadata_version().payload().clone()
                 }),
-                statistics_data_version: None,
+                statistics_data_version: Some(Self::statistics_version(snapshot)),
                 table: novarocks_spi::connector::ConnectorTableHandle::try_new(
                     self.descriptor.instance_id.clone(),
-                    Bytes::from_static(if source && initial {
-                        b"original-source-18"
-                    } else if source {
-                        b"prepared-source-to-18"
-                    } else {
-                        b"original-target-11"
+                    Bytes::from_static(match (source, initial, snapshot) {
+                        (true, true, 18) => b"original-source-18",
+                        (true, false, 18) => b"prepared-source-to-18",
+                        (true, false, 17) => b"prepared-source-from-17",
+                        (false, _, 11) => b"original-target-11",
+                        _ => panic!("unexpected original projection snapshot {snapshot}"),
                     }),
                 )
                 .unwrap(),
@@ -537,30 +548,29 @@ impl SourceFixture {
             types,
             creation,
         )?;
-        Ok(if source {
+        Ok(
             result.with_source_read_facts(ConnectorProcessLocalPayload::new(
                 ConnectorProviderBindingKey {
                     instance_id: self.descriptor.instance_id.clone(),
                     incarnation: self.epoch,
                 },
-                Arc::new(self.snapshot),
-            ))
-        } else {
-            result
-        })
+                Arc::new(snapshot),
+            )),
+        )
     }
     fn control_host(self: &Arc<Self>) -> Arc<novarocks_catalog_application::ConnectorControlHost> {
         let template = novarocks_catalog_application::test_support::test_control_binding_for(
             self.descriptor.instance_id.clone(),
             self.epoch.to_bytes()[0],
         );
-        let control = ConnectorControlBinding::try_new(
+        let control = ConnectorControlBinding::try_new_with_statistics(
             self.descriptor.clone(),
             self.epoch,
             self.clone(),
             template.planning().clone(),
             template.execution_distribution().clone(),
             None,
+            Some(self.clone()),
         )
         .unwrap()
         .with_catalog_properties(
@@ -757,7 +767,7 @@ impl ConnectorMetadata for SourceFixture {
         selector: ConnectorReadSelector,
     ) -> Result<ConnectorExactSemanticRevision, ConnectorError> {
         let source = match table.payload().as_ref() {
-            b"original-source-18" | b"prepared-source-to-18" => true,
+            b"original-source-18" | b"prepared-source-to-18" | b"prepared-source-from-17" => true,
             b"original-target-11" => false,
             _ => panic!("unknown original table revision request"),
         };
@@ -765,13 +775,11 @@ impl ConnectorMetadata for SourceFixture {
             self.revision_selectors.lock().unwrap().push(selector);
         }
         let snapshot = match selector {
-            ConnectorReadSelector::Current => {
-                if source {
-                    self.snapshot
-                } else {
-                    11
-                }
-            }
+            ConnectorReadSelector::Current => match table.payload().as_ref() {
+                b"prepared-source-from-17" => 17,
+                _ if source => self.snapshot,
+                _ => 11,
+            },
             ConnectorReadSelector::SnapshotId(id) => id,
             _ => panic!("no other selector"),
         };
@@ -805,7 +813,7 @@ impl ConnectorMetadata for SourceFixture {
         revision: &ConnectorExactSemanticRevision,
     ) -> Result<ConnectorReadSelector, ConnectorError> {
         let source = match table.payload().as_ref() {
-            b"original-source-18" | b"prepared-source-to-18" => true,
+            b"original-source-18" | b"prepared-source-to-18" | b"prepared-source-from-17" => true,
             b"original-target-11" => false,
             _ => panic!("unknown original table revision selector request"),
         };
@@ -887,8 +895,27 @@ impl ProviderReadMetadata for SourceFixture {
                 request.observed_table().payload().as_ref(),
                 b"original-source-18"
             );
-            assert!(
-                matches!(request.selection(),ConnectorReadSourceSelection::ChangeWindow(w) if w==ConnectorReadChangeWindow::new(17,18))
+            if request.selection() == ConnectorReadSourceSelection::Snapshot(17) {
+                assert!(request.from_revision().is_none());
+                assert_eq!(
+                    request.to_revision().canonical_read_point(),
+                    Some(ConnectorCanonicalReadPoint::Snapshot(Some(17)))
+                );
+                self.historical_requests
+                    .lock()
+                    .unwrap()
+                    .push(request.clone());
+                let context = crate::connector::test_request_context();
+                let metadata =
+                    crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+                        self.metadata_for_projection(true, false, 17, creation)
+                    })
+                    .map_err(crate::connector::schema_creation::connector_schema_error)?;
+                return Ok(ProviderPreparedSourceRead::snapshot((), Arc::new(metadata)));
+            }
+            assert_eq!(
+                request.selection(),
+                ConnectorReadSourceSelection::ChangeWindow(ConnectorReadChangeWindow::new(17, 18))
             );
             assert_eq!(
                 request.from_revision().unwrap().canonical_read_point(),
@@ -903,7 +930,7 @@ impl ProviderReadMetadata for SourceFixture {
             let context = crate::connector::test_request_context();
             let metadata =
                 crate::connector::schema_creation::with_schema_creation(&context, |creation| {
-                    self.metadata_for_projection(true, false, creation)
+                    self.metadata_for_projection(true, false, 18, creation)
                 })
                 .map_err(crate::connector::schema_creation::connector_schema_error)?;
             Ok(ProviderPreparedSourceRead::change_window(
@@ -1167,10 +1194,11 @@ impl MvStorageObservationPort for SourceFixture {
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvSourceSchemaObservation, ConnectorError> {
-        let initial = match metadata.table.payload().as_ref() {
-            b"original-source-18" => true,
-            b"prepared-source-to-18" => false,
-            _ => panic!("source schema must project the original pin or its prepared To"),
+        let (initial, snapshot) = match metadata.table.payload().as_ref() {
+            b"original-source-18" => (true, 18),
+            b"prepared-source-to-18" => (false, 18),
+            b"prepared-source-from-17" => (false, 17),
+            _ => panic!("source schema must project the original pin or a retained snapshot"),
         };
         self.schema_projections.fetch_add(1, Ordering::SeqCst);
         novarocks_spi::connector::MvSourceSchemaObservation::try_new(
@@ -1182,7 +1210,7 @@ impl MvStorageObservationPort for SourceFixture {
             },
             metadata.version.clone().unwrap(),
             novarocks_spi::connector::MvSourceFormatVersion::V3,
-            Some(1),
+            Some(snapshot),
             true,
             self.observed_source_fields(initial),
             &context,
@@ -1266,6 +1294,84 @@ impl MvStorageObservationPort for SourceFixture {
         panic!("no maintenance during EXPLAIN")
     }
 }
+impl StatisticsReader for SourceFixture {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ProviderBindingEpoch {
+        self.epoch
+    }
+
+    fn read_statistics(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> Result<StatisticsEvidence, ConnectorError> {
+        assert!(request.row_mutation_current.is_none() && request.narrowed_read.is_none());
+        let retention = request
+            .observed_source
+            .as_ref()
+            .expect("original statistics pin");
+        retention.validate_owner(&ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.epoch,
+        })?;
+        let snapshot = **retention.value::<i64>(self.descriptor.instance_id.as_str())?;
+        let (rows, bytes) = match (snapshot, request.table.payload().as_ref()) {
+            (17, b"prepared-source-from-17") => (1, 128),
+            (18, b"prepared-source-to-18" | b"original-source-18") => (2, 256),
+            (11, b"original-target-11") => (
+                self.current
+                    .publication
+                    .as_ref()
+                    .and_then(|publication| publication.logical_result_rows)
+                    .expect("fixture target row count"),
+                128,
+            ),
+            _ => panic!("statistics do not describe the retained snapshot {snapshot}"),
+        };
+        let data_version = Self::statistics_version(snapshot);
+        assert_eq!(request.data_version, data_version);
+        let metrics = request
+            .metrics
+            .metrics()
+            .iter()
+            .map(|metric| {
+                let count = match metric {
+                    StatisticsMetric::RowCount => rows,
+                    StatisticsMetric::DataFileBytes => bytes,
+                    _ => panic!("unexpected manifest volume metric {metric:?}"),
+                };
+                (
+                    metric.clone(),
+                    StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                        StatisticsMetricValue::U64(count),
+                        data_version.clone(),
+                        StatisticsMetricSource::CurrentManifest,
+                        StatisticsNumericNature::Exact,
+                        StatisticsBasisRelation::Identical,
+                    )),
+                )
+            })
+            .collect();
+        StatisticsEvidence::try_new(
+            data_version.clone(),
+            StatisticsEvidenceRevision::try_new(data_version.as_bytes().clone())?,
+            StatisticsRowCoverage::AllVisibleRows,
+            metrics,
+        )
+    }
+
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> futures::future::BoxFuture<'_, Result<StatisticsEvidence, ConnectorError>> {
+        Box::pin(async move { self.read_statistics(request) })
+    }
+}
+
+impl ConnectorStatistics for SourceFixture {}
+
 impl ConnectorDocumentStorageObservation for SourceFixture {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
@@ -1441,10 +1547,11 @@ async fn explain_counted_with_initial_schema(
     let state = fixture.state.as_ref().unwrap();
     assert!(state.local_health().is_none());
     let explain = state.explain.as_ref().unwrap();
-    assert!(matches!(
-        explain.result,
-        Some(Ok(MvRefreshPreparationOutput::Explain(_)))
-    ));
+    match explain.result.as_ref() {
+        Some(Ok(MvRefreshPreparationOutput::Explain(_))) => {}
+        Some(Err(error)) => panic!("original EXPLAIN preparation failed: {error}"),
+        _ => panic!("original EXPLAIN did not return its rendered plan"),
+    }
     let Ok(StatementActionValue::Local(rows)) = &result else {
         panic!("original EXPLAIN must transfer its rendered Local result")
     };
@@ -1538,6 +1645,17 @@ async fn explain_counted_with_initial_schema(
         "A may only project B's original completed receipt"
     );
     drop(context);
+    {
+        let history = source.historical_requests.lock().unwrap();
+        let [read] = history.as_slice() else {
+            panic!(
+                "cost comparison must obtain one exact historical snapshot for the repeated table"
+            );
+        };
+        assert_eq!(read.selection(), ConnectorReadSourceSelection::Snapshot(17));
+        assert_eq!(read.to_revision(), &from);
+        assert_eq!(read.object_id(), &source.object());
+    }
     {
         let requests = source.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
