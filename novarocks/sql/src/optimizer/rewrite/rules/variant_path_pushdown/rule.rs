@@ -277,6 +277,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
     let value_type = arena.value_type(expr).clone();
     let node = arena.node(expr).clone();
     match node {
+        ScalarNode::Let { .. } => Ok(None),
         ScalarNode::BinaryOp {
             op,
             left,
@@ -302,15 +303,6 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                 })
                 .transpose()
         }
-        ScalarNode::UnaryOp { op, child } => rewrite_unary_child(
-            arena,
-            child,
-            bindings,
-            factory,
-            value_type,
-            |child| ScalarNode::UnaryOp { op, child },
-            control,
-        ),
         ScalarNode::FunctionCall {
             name,
             args,
@@ -407,80 +399,6 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             |child| ScalarNode::IsNull { child, negated },
             control,
         ),
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let new_child =
-                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
-            let (list, list_changed) =
-                rewrite_scalar_vec(arena, &list, bindings, factory, control)?;
-            let changed = new_child.is_some() || list_changed;
-            changed
-                .then(|| {
-                    arena.intern_observed(
-                        ScalarNode::InList {
-                            child: new_child.unwrap_or(child),
-                            list,
-                            negated,
-                        },
-                        value_type,
-                        control,
-                    )
-                })
-                .transpose()
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => {
-            let new_child =
-                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
-            let new_low = rewrite_variant_request_scalar(arena, low, bindings, factory, control)?;
-            let new_high = rewrite_variant_request_scalar(arena, high, bindings, factory, control)?;
-            let changed = new_child.is_some() || new_low.is_some() || new_high.is_some();
-            changed
-                .then(|| {
-                    arena.intern_observed(
-                        ScalarNode::Between {
-                            child: new_child.unwrap_or(child),
-                            low: new_low.unwrap_or(low),
-                            high: new_high.unwrap_or(high),
-                            negated,
-                        },
-                        value_type,
-                        control,
-                    )
-                })
-                .transpose()
-        }
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => {
-            let new_child =
-                rewrite_variant_request_scalar(arena, child, bindings, factory, control)?;
-            let new_pattern =
-                rewrite_variant_request_scalar(arena, pattern, bindings, factory, control)?;
-            let changed = new_child.is_some() || new_pattern.is_some();
-            changed
-                .then(|| {
-                    arena.intern_observed(
-                        ScalarNode::Like {
-                            child: new_child.unwrap_or(child),
-                            pattern: new_pattern.unwrap_or(pattern),
-                            negated,
-                        },
-                        value_type,
-                        control,
-                    )
-                })
-                .transpose()
-        }
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -509,23 +427,6 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                 })
                 .transpose()
         }
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => rewrite_unary_child(
-            arena,
-            child,
-            bindings,
-            factory,
-            value_type,
-            |child| ScalarNode::IsTruthValue {
-                child,
-                value,
-                negated,
-            },
-            control,
-        ),
         ScalarNode::Nested(child) => rewrite_unary_child(
             arena,
             child,
@@ -588,6 +489,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             control,
         ),
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => Ok(None),
@@ -955,13 +857,14 @@ fn expr_contains_variant_request_scalar(
     // Preserve the original child order and first-true short circuit. Each
     // selected Constant reader keeps the same originating request control.
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, right, .. } => {
-            any_variant_request_scalar(arena, [*left, *right], request, control)
-        }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => any_variant_request_scalar(arena, [*left, *right], request, control),
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => {
             expr_contains_variant_request_scalar(arena, *child, request, control)
         }
@@ -993,18 +896,6 @@ fn expr_contains_variant_request_scalar(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             expr_contains_variant_request_scalar(arena, *body, request, control)
         }
-        ScalarNode::InList { child, list, .. } => any_variant_request_scalar(
-            arena,
-            std::iter::once(*child).chain(list.iter().copied()),
-            request,
-            control,
-        ),
-        ScalarNode::Between {
-            child, low, high, ..
-        } => any_variant_request_scalar(arena, [*child, *low, *high], request, control),
-        ScalarNode::Like { child, pattern, .. } => {
-            any_variant_request_scalar(arena, [*child, *pattern], request, control)
-        }
         ScalarNode::Case {
             operand,
             when_then,
@@ -1021,6 +912,7 @@ fn expr_contains_variant_request_scalar(
             control,
         ),
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => Ok(false),
@@ -1169,14 +1061,17 @@ fn contains_variant_get_candidate_scalar(arena: &ScalarArena, expr: ScalarId) ->
     }
 
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             contains_variant_get_candidate_scalar(arena, *left)
                 || contains_variant_get_candidate_scalar(arena, *right)
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => contains_variant_get_candidate_scalar(arena, *child),
         ScalarNode::FunctionCall { args, .. } => args
             .iter()
@@ -1206,23 +1101,6 @@ fn contains_variant_get_candidate_scalar(arena: &ScalarArena, expr: ScalarId) ->
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             contains_variant_get_candidate_scalar(arena, *body)
         }
-        ScalarNode::InList { child, list, .. } => {
-            contains_variant_get_candidate_scalar(arena, *child)
-                || list
-                    .iter()
-                    .any(|item| contains_variant_get_candidate_scalar(arena, *item))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            contains_variant_get_candidate_scalar(arena, *child)
-                || contains_variant_get_candidate_scalar(arena, *low)
-                || contains_variant_get_candidate_scalar(arena, *high)
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            contains_variant_get_candidate_scalar(arena, *child)
-                || contains_variant_get_candidate_scalar(arena, *pattern)
-        }
         ScalarNode::Case {
             operand,
             when_then,
@@ -1237,6 +1115,7 @@ fn contains_variant_get_candidate_scalar(arena: &ScalarArena, expr: ScalarId) ->
                 || else_expr.is_some_and(|expr| contains_variant_get_candidate_scalar(arena, expr))
         }
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => false,

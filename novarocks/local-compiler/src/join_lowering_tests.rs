@@ -319,11 +319,11 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
     let key = match case.family {
         Family::Hash { null_safe, .. } => {
             let left_definition = builder
-                .fixture_definition(JOIN, key_ty.clone(), ExprKind::Value(left[0]))
+                .fixture_definition(JOIN, key_ty.clone(), ExprKind::input(left[0]))
                 .unwrap();
             key_left_definition = Some(left_definition);
             let right_definition = builder
-                .fixture_definition(JOIN, key_ty.clone(), ExprKind::Value(right[0]))
+                .fixture_definition(JOIN, key_ty.clone(), ExprKind::input(right[0]))
                 .unwrap();
             Some(JoinKey {
                 left: builder
@@ -355,11 +355,11 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
                 key_left_definition.expect("a shared key definition")
             } else {
                 builder
-                    .fixture_definition(JOIN, int64(), ExprKind::Value(left[1]))
+                    .fixture_definition(JOIN, int64(), ExprKind::input(left[1]))
                     .unwrap()
             };
             let rhs = builder
-                .fixture_definition(JOIN, int64(), ExprKind::Value(right[1]))
+                .fixture_definition(JOIN, int64(), ExprKind::input(right[1]))
                 .unwrap();
             let definition = builder
                 .fixture_definition(

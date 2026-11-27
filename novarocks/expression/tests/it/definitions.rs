@@ -58,7 +58,7 @@ fn slot() -> StaticExprNode {
 #[test]
 fn rejects_forward_references_and_cycles_before_freeze() {
     let nodes = vec![StaticExprNode::new_value_typed(
-        StaticExprKind::Not(CompiledExprId::new(0)),
+        StaticExprKind::IsNull(CompiledExprId::new(0)),
         boolean(),
     )];
     assert!(matches!(
@@ -112,7 +112,7 @@ fn compile_reference_loop_observes_real_quantum_and_all_tails() {
 #[test]
 fn compile_ordinary_error_tail_preserves_original_control_and_expression_error() {
     let nodes = vec![StaticExprNode::new_value_typed(
-        StaticExprKind::Not(CompiledExprId::new(0)),
+        StaticExprKind::IsNull(CompiledExprId::new(0)),
         boolean(),
     )];
     let baseline = TestControl::new(None);

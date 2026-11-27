@@ -124,7 +124,7 @@ fn request_fragment(
     builder
         .add_values(NodeId::new(99), Box::default(), Box::from([source_value]))
         .unwrap();
-    let argument_kind = ExprKind::Value(source_value);
+    let argument_kind = ExprKind::input(source_value);
     let input = builder.define(owner, ty.clone(), argument_kind).unwrap();
     let result = FunctionValueType::new(DataType::Int64, true);
     let function = crate::BoundFunction {

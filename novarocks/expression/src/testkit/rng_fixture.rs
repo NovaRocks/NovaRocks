@@ -203,7 +203,7 @@ pub fn rng_unit(mode: BoundMode, twin: bool, dictionary: bool) -> Arc<CompiledEx
     let bound_type = mode.bound_type();
     let argument = match &constant {
         Some(value) => ExprKind::Constant(register_constant(&mut constants, value)),
-        None => ExprKind::Value(bound),
+        None => ExprKind::input(bound),
     };
     let owner = ClaimAuthor::with_legacy_binding(
         &functions,
@@ -227,9 +227,9 @@ pub fn rng_unit(mode: BoundMode, twin: bool, dictionary: bool) -> Arc<CompiledEx
         .root(call, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let identity_a = draft
-        .add(None, bound_type.clone(), ExprKind::Value(bound))
+        .add(None, bound_type.clone(), ExprKind::input(bound))
         .unwrap();
-    let identity_b = draft.add(None, bound_type, ExprKind::Value(bound)).unwrap();
+    let identity_b = draft.add(None, bound_type, ExprKind::input(bound)).unwrap();
     if twin {
         draft
             .root(call, EvaluationDemand::Value, RootScope::Port(0))

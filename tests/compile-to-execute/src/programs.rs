@@ -467,6 +467,32 @@ pub fn compiled_roots(
         })
 }
 
+/// A positive IN call can stand alone or be the exact operand of the selected NOT.
+pub fn membership_use(
+    unit: &novarocks_expression::CompiledExprSet,
+    root: novarocks_type_contract::ExpressionUseId,
+) -> Option<novarocks_type_contract::ExpressionUseId> {
+    use novarocks_functions::PreparedPureKernel;
+    use novarocks_type_contract::OperatorFunction;
+    let call = unit.calls().get(&root)?;
+    if matches!(call.prepared(), PreparedPureKernel::Membership(_)) {
+        return Some(root);
+    }
+    if call.call_contract().function_id().as_str()
+        != OperatorFunction::BooleanNot.function_id_text()
+    {
+        return None;
+    }
+    let [operand] = unit.control_flow().uses()[&root].arguments.as_ref() else {
+        return None;
+    };
+    matches!(
+        unit.calls().get(operand)?.prepared(),
+        PreparedPureKernel::Membership(_)
+    )
+    .then_some(*operand)
+}
+
 /// Find the original signed membership root in the checked compiler output.
 pub fn compiled_signed_inlist_root(
     source: &SqlAuthoredPhysicalPlan,
@@ -476,11 +502,7 @@ pub fn compiled_signed_inlist_root(
     let mut found = None;
     for program in programs.values() {
         for (site, unit, root) in compiled_roots(program) {
-            let definition = unit.definitions().node(root.definition).unwrap();
-            if matches!(
-                definition.kind(),
-                novarocks_expression::StaticExprKind::PreparedInList { .. }
-            ) {
+            if membership_use(unit, root.use_id).is_some() {
                 assert!(found.is_none(), "one actual IN root");
                 found = Some((program.clone(), site));
             }

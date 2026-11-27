@@ -31,7 +31,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, LargeBinaryArray};
 use arrow_schema::DataType;
 use novarocks_constant_contract::{ConstantBackingIdentity, ConstantValue};
 use novarocks_type_contract::{ExpressionEffects, KeyRelation, arrow_data_types_exact_observed};
-use std::{convert::Infallible, sync::Arc};
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug)]
 pub enum InObservation {
     Step,
@@ -48,41 +48,35 @@ fn observe<E>(
 ) -> Result<(), InError<E>> {
     observer(event).map_err(InError::Host)
 }
-fn raw<T>(
-    f: impl FnOnce(
-        &mut dyn FnMut(InObservation) -> Result<(), Infallible>,
-    ) -> Result<T, InError<Infallible>>,
-) -> Result<T, KernelFailure> {
-    match f(&mut |_| Ok(())) {
-        Ok(value) => Ok(value),
-        Err(InError::Operation(message)) => Err(message),
-        Err(InError::Host(never)) => match never {},
-    }
-}
 /// One original invocation's root NULL/match/null-candidate continuation.
 pub struct InRows {
     len: usize,
     has_null: Vec<bool>,
     matched: Vec<bool>,
+    _host_hold: Option<OpaqueReservation>,
 }
 impl InRows {
-    pub fn begin_required(input: &ArrayRef) -> Result<Self, KernelFailure> {
-        raw(|observe| Self::begin_observed(input, observe))
-    }
-    pub fn begin_observed<E>(
-        input: &ArrayRef,
+    pub fn begin_in_observed<E>(
+        len: usize,
+        host: Option<&Arc<dyn AggregateStateAllocator>>,
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<Self, InError<E>> {
-        let len = input.len();
         if len == 0 {
             return Ok(Self {
                 len,
                 has_null: Vec::new(),
                 matched: Vec::new(),
+                _host_hold: None,
             });
         }
         observe(observer, InObservation::OpaqueBoundary)?;
-        // Original two independent std allocations; no new memory wallet.
+        let bytes = len
+            .checked_mul(2 * size_of::<bool>())
+            .ok_or(InError::Operation(KernelFailure::ResourceExhausted))?;
+        let host_hold = host
+            .map(|host| OpaqueRetainedCharge::try_new(Arc::clone(host))?.reserve_operation(bytes))
+            .transpose()
+            .map_err(InError::Operation)?;
         let mut has_null = Vec::new();
         has_null.try_reserve_exact(len).map_err(|source| {
             InError::Operation(KernelFailure::from_domain(
@@ -102,147 +96,63 @@ impl InRows {
             len,
             has_null,
             matched,
+            _host_hold: host_hold,
         })
     }
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn needs_comparison(&self, parent: usize) -> Result<bool, KernelFailure> {
+        self.matched
+            .get(parent)
+            .map(|matched| !matched)
+            .ok_or_else(|| contract("IN comparison row is outside the original probe"))
     }
-    pub fn candidate_nulls_required(&mut self, candidate: &ArrayRef) -> Result<(), KernelFailure> {
-        raw(|observe| self.candidate_nulls_observed(candidate, observe))
-    }
-    pub fn candidate_nulls_observed<E>(
+
+    pub fn record_equality(
         &mut self,
-        candidate: &ArrayRef,
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<(), InError<E>> {
-        self.candidate_nulls_projection_observed(candidate, self.len, |row| row, observer)
-    }
-    /// Parent ordinals were established by the host's checked selected domain.
-    pub fn candidate_nulls_selected_observed<E>(
-        &mut self,
-        candidate: &ArrayRef,
-        parents: &[usize],
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<(), InError<E>> {
-        self.candidate_nulls_projection_observed(
-            candidate,
-            parents.len(),
-            |row| parents[row],
-            observer,
-        )
-    }
-    fn candidate_nulls_projection_observed<E>(
-        &mut self,
-        candidate: &ArrayRef,
-        len: usize,
-        parent: impl Fn(usize) -> usize,
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<(), InError<E>> {
-        if candidate.len() != 1 && candidate.len() != len {
-            return Err(InError::Operation(contract(format_args!(
-                "IN predicate value length mismatch: input has {}, value has {}",
-                len,
-                candidate.len()
-            ))));
-        }
-        for row in 0..len {
-            observe(observer, InObservation::Step)?;
-            if parent(row) >= self.len {
-                return Err(InError::Operation(contract(
-                    "IN parent ordinal is outside its state",
-                )));
-            }
-            if candidate.is_null(row_index(row, candidate.len())) {
-                self.has_null[parent(row)] = true;
-            }
+        parent: usize,
+        result: Option<bool>,
+    ) -> Result<(), KernelFailure> {
+        let Some(matched) = self.matched.get_mut(parent) else {
+            return Err(contract("IN equality row is outside the original probe"));
+        };
+        match result {
+            Some(true) => *matched = true,
+            Some(false) => {}
+            None => self.has_null[parent] = true,
         }
         Ok(())
     }
-    pub fn equalities_required(&mut self, equalities: &BooleanArray) -> Result<(), KernelFailure> {
-        raw(|observe| self.equalities_observed(equalities, observe))
-    }
-    pub fn equalities_observed<E>(
-        &mut self,
-        equalities: &BooleanArray,
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<(), InError<E>> {
-        self.equalities_projection_observed(equalities, self.len, |row| row, observer)
-    }
-    pub fn equalities_selected_observed<E>(
+    fn record_selected_equalities<E>(
         &mut self,
         equalities: &BooleanArray,
         parents: &[usize],
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<(), InError<E>> {
-        self.equalities_projection_observed(equalities, parents.len(), |row| parents[row], observer)
-    }
-    fn equalities_projection_observed<E>(
-        &mut self,
-        equalities: &BooleanArray,
-        len: usize,
-        parent: impl Fn(usize) -> usize,
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<(), InError<E>> {
-        if equalities.len() != len {
+        if equalities.len() != parents.len() {
             return Err(InError::Operation(contract(
                 "IN equality length differs from its selected rows",
             )));
         }
-        for row in 0..len {
+        for (parent, result) in parents.iter().copied().zip(equalities.iter()) {
             observe(observer, InObservation::Step)?;
-            let parent = parent(row);
-            if parent >= self.len {
-                return Err(InError::Operation(contract(
-                    "IN equality parent is outside its state",
-                )));
-            }
-            if equalities.is_null(row) {
-                self.has_null[parent] = true;
-            } else if equalities.value(row) {
-                self.matched[parent] = true;
-            }
+            self.record_equality(parent, result)
+                .map_err(InError::Operation)?;
         }
         Ok(())
     }
-    pub fn finish_required(
+
+    /// The grouped call records SQL-NULL probes before demanding candidates.
+    /// Finishing uses that original row state and needs no second probe view.
+    pub fn finish_group_observed<E>(
         self,
-        input: &ArrayRef,
-        negated: bool,
-    ) -> Result<BooleanArray, KernelFailure> {
-        raw(|observe| self.finish_observed(input, negated, observe))
-    }
-    pub fn finish_observed<E>(
-        self,
-        input: &ArrayRef,
-        negated: bool,
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<BooleanArray, InError<E>> {
-        self.finish_projection_observed(input, negated, false, &[], observer)
-    }
-    pub fn finish_selected_observed<E>(
-        self,
-        input: &ArrayRef,
-        negated: bool,
         truth_only: bool,
         failed_rows: &[usize],
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<BooleanArray, InError<E>> {
-        self.finish_projection_observed(input, negated, truth_only, failed_rows, observer)
-    }
-    fn finish_projection_observed<E>(
-        self,
-        input: &ArrayRef,
-        negated: bool,
-        truth_only: bool,
-        failed_rows: &[usize],
-        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-    ) -> Result<BooleanArray, InError<E>> {
-        if input.len() != self.len
-            || failed_rows.iter().any(|row| *row >= self.len)
+        if failed_rows.iter().any(|row| *row >= self.len)
             || failed_rows.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(InError::Operation(contract(
-                "IN finish input or failure ordinals differ from its state",
+                "IN failure ordinals differ from the original probe",
             )));
         }
         if self.len == 0 {
@@ -259,16 +169,8 @@ impl InRows {
                 builder.append_null();
                 continue;
             }
-            if input.is_null(row) || matches!(input.data_type(), DataType::Null) {
-                if truth_only {
-                    builder.append_value(false);
-                } else {
-                    builder.append_null();
-                }
-                continue;
-            }
             if *matched_row {
-                builder.append_value(!negated);
+                builder.append_value(true);
                 continue;
             }
             if self.has_null[row] {
@@ -279,7 +181,7 @@ impl InRows {
                 }
                 continue;
             }
-            builder.append_value(negated);
+            builder.append_value(false);
         }
         observe(observer, InObservation::OpaqueBoundary)?;
         let result = builder.finish();
@@ -316,7 +218,7 @@ impl MembershipEqualities {
         parents: &[usize],
         observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
     ) -> Result<(), InError<E>> {
-        state.equalities_selected_observed(&self.array, parents, observer)
+        state.record_selected_equalities(&self.array, parents, observer)
     }
 }
 
@@ -460,7 +362,81 @@ enum MembershipEquality {
     Json,
 }
 
+/// Flat comparisons selected for a real membership overload do not defer
+/// equality to the fallible comparison phase. The caller still has to prove
+/// the original argument occurrences independently.
+pub fn selection_has_streaming_equality(selected: &crate::FunctionBindingSelection) -> bool {
+    use novarocks_type_contract::{FunctionArgumentType, OperatorFunction};
+
+    let [
+        FunctionArgumentType::Value(probe),
+        FunctionArgumentType::CandidateGroup { .. },
+    ] = selected.argument_types.as_ref()
+    else {
+        return false;
+    };
+    selected.overload.as_str() == OperatorFunction::IN_LIST_OVERLOAD
+        && !is_json(probe)
+        && !PreparedCompositeComparisonRecipe::is_composite(probe)
+}
+
+fn is_json(source: &novarocks_type_contract::FunctionValueType) -> bool {
+    source.logical_type() == novarocks_type_contract::ValueLogicalType::Json
+        && source.data_type() == &DataType::LargeBinary
+}
+
 impl MembershipEquality {
+    fn prepare_group(
+        probe: &novarocks_type_contract::FunctionValueType,
+        element: &novarocks_type_contract::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, crate::ComparisonPrepareError> {
+        if probe.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && matches!(probe.data_type(), DataType::Float32 | DataType::Float64)
+        {
+            return PreparedComparisonRecipe::try_new_ieee_float_equality(probe, element, control)
+                .map(Self::Comparison);
+        }
+        Self::prepare(probe, element, control)
+    }
+
+    fn prepare(
+        source: &novarocks_type_contract::FunctionValueType,
+        candidate: &novarocks_type_contract::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, crate::ComparisonPrepareError> {
+        if is_json(source) {
+            return Ok(Self::Json);
+        }
+        if PreparedCompositeComparisonRecipe::is_composite(source) {
+            return PreparedCompositeComparisonRecipe::try_new(
+                KeyRelation::Equal,
+                source,
+                candidate,
+                control,
+            )
+            .map(Self::Composite);
+        }
+        PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, source, candidate, control)
+            .map(Self::Comparison)
+    }
+
+    fn nullable_result(&self) -> bool {
+        match self {
+            Self::Composite(recipe) => recipe.nullable_result(),
+            Self::Comparison(recipe) => recipe.nullable_result(),
+            Self::Json => false,
+        }
+    }
+
+    fn group_result_nullable(
+        &self,
+        probe: &novarocks_type_contract::FunctionValueType,
+        element: &novarocks_type_contract::FunctionValueType,
+    ) -> bool {
+        probe.nullable() || element.nullable() || self.nullable_result()
+    }
+
     fn effects(&self) -> ExpressionEffects {
         let mut effects = ExpressionEffects::PURE_VALUE;
         match self {
@@ -476,310 +452,124 @@ impl MembershipEquality {
     }
 }
 
-/// Common exact typed domain and membership equality for an IN expression.
+pub(crate) fn candidate_group_profile(
+    probe: &novarocks_type_contract::FunctionValueType,
+    element: &novarocks_type_contract::FunctionValueType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(bool, ExpressionEffects), crate::ComparisonPrepareError> {
+    let comparison = MembershipComparison::try_new(probe, element, control)?;
+    Ok((comparison.result_nullable(element), comparison.effects()))
+}
+
+/// Equality for the common domain of a selected probe and candidate group.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedNativeInListRecipe {
-    negated: bool,
+pub struct MembershipComparison {
     source: novarocks_type_contract::FunctionValueType,
-    candidates: novarocks_type_contract::FunctionParameterTypes,
-    result: novarocks_type_contract::FunctionValueType,
     equality: MembershipEquality,
 }
-/// Original comparison refusal and actual construction cause stay distinct.
-#[derive(Debug)]
-pub enum NativeInListCreationFailure<H> {
-    Control(novarocks_type_contract::CompileControlError),
-    Creator(H),
-    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-    Owner(crate::ComparisonPrepareError),
+
+/// Exact installed membership invocation. The original request and control
+/// graph own each source occurrence. The kernel keeps only the common domain
+/// and its equality preparation, never a second table of all candidates.
+#[derive(Clone, Debug)]
+pub struct PreparedMembership {
+    call: Arc<crate::FunctionCallContract>,
+    comparison: MembershipComparison,
 }
-impl<H: std::fmt::Display> std::fmt::Display for NativeInListCreationFailure<H> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Control(e) => e.fmt(f),
-            Self::Creator(e) => e.fmt(f),
-            Self::Resource(e) => write!(f, "IN recipe construction resource: {e:?}"),
-            Self::Owner(e) => e.fmt(f),
+
+impl PreparedMembership {
+    pub(crate) fn from_call(
+        call: Arc<crate::FunctionCallContract>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, crate::FunctionSpecializationFailure> {
+        use novarocks_type_contract::{
+            ArgumentControl, FunctionArgumentType, OperatorFunction, ValueLogicalType,
+        };
+        let [
+            FunctionArgumentType::Value(probe),
+            FunctionArgumentType::CandidateGroup { element_type },
+        ] = call.selected().argument_types.as_ref()
+        else {
+            return Err(contract("IN requires the selected probe and candidate group").into());
+        };
+        let crate::FunctionResultType::Scalar(result) = &call.selected().result_type else {
+            return Err(contract("IN requires its exact Boolean result").into());
+        };
+        if call.function_id().as_str() != OperatorFunction::InList.function_id_text()
+            || call.effects().argument_control != ArgumentControl::CandidateGroup
+            || call.logical_argument_count() != 2
+        {
+            return Err(contract("IN preparation has a foreign call contract").into());
         }
-    }
-}
-impl<H: std::error::Error + 'static> std::error::Error for NativeInListCreationFailure<H> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Control(e) => Some(e),
-            Self::Creator(e) => Some(e),
-            Self::Resource(_) => None,
-            Self::Owner(e) => Some(e),
+        let comparison = MembershipComparison::try_new(probe, element_type, control).map_err(
+            |error| match error.control_error() {
+                Some(error) => crate::FunctionSpecializationFailure::Control(error),
+                None => contract("IN has no selected equality implementation").into(),
+            },
+        )?;
+        if result.logical_type() != ValueLogicalType::Physical
+            || result.data_type() != &DataType::Boolean
+            || result.nullable() != comparison.result_nullable(element_type)
+        {
+            return Err(contract("IN preparation has a foreign Boolean result").into());
         }
+        Ok(Self { call, comparison })
     }
-}
-impl<H> From<crate::ComparisonPrepareError> for NativeInListCreationFailure<H> {
-    fn from(e: crate::ComparisonPrepareError) -> Self {
-        match e.control_error() {
-            Some(cause) => Self::Control(cause),
-            None => Self::Owner(e),
-        }
+
+    pub fn call(&self) -> &crate::FunctionCallContract {
+        &self.call
     }
-}
-impl<H> From<novarocks_type_contract::CompileControlError> for NativeInListCreationFailure<H> {
-    fn from(e: novarocks_type_contract::CompileControlError) -> Self {
-        Self::Control(e)
+
+    pub fn comparison(&self) -> &MembershipComparison {
+        &self.comparison
     }
-}
-impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
-    for NativeInListCreationFailure<H>
-{
-    fn from(e: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Resource(e)
-    }
-}
-fn inlist_request<H>(
-    creation: &mut Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-    layout: std::alloc::Layout,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<(), NativeInListCreationFailure<H>> {
-    if let Some(creation) = creation.as_mut() {
-        work.flush()?;
-        creation
-            .request_layout(layout)
-            .map_err(NativeInListCreationFailure::Creator)?;
-    }
-    Ok(())
-}
-fn inlist_pure_failure(
-    error: NativeInListCreationFailure<std::convert::Infallible>,
-) -> crate::ComparisonPrepareError {
-    match error {
-        NativeInListCreationFailure::Control(error) => {
-            crate::ComparisonPrepareError::Control(error)
-        }
-        NativeInListCreationFailure::Owner(error) => error,
-        NativeInListCreationFailure::Resource(_) => crate::ComparisonPrepareError::Control(
-            novarocks_type_contract::CompileControlError::ResourceExhausted,
-        ),
-        NativeInListCreationFailure::Creator(never) => match never {},
+
+    pub fn comparison_effects(&self) -> ExpressionEffects {
+        self.comparison.effects()
     }
 }
 
-impl PreparedNativeInListRecipe {
+impl MembershipComparison {
     pub fn try_new(
-        negated: bool,
-        source: &novarocks_type_contract::FunctionValueType,
-        candidates: &[&novarocks_type_contract::FunctionValueType],
-        result: &novarocks_type_contract::FunctionValueType,
+        probe: &novarocks_type_contract::FunctionValueType,
+        element: &novarocks_type_contract::FunctionValueType,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, crate::ComparisonPrepareError> {
-        Self::try_new_core::<true, std::convert::Infallible, _>(
-            negated,
-            source,
-            candidates.iter().copied(),
-            result,
-            None,
-            control,
-        )
-        .map(|(recipe, _)| recipe.expect("recipe publication requested"))
-        .map_err(inlist_pure_failure)
-    }
-    pub fn try_new_with_creator_in<H>(
-        negated: bool,
-        source: &novarocks_type_contract::FunctionValueType,
-        candidates: &[&novarocks_type_contract::FunctionValueType],
-        result: &novarocks_type_contract::FunctionValueType,
-        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Self, NativeInListCreationFailure<H>> {
-        Self::try_new_core::<true, H, _>(
-            negated,
-            source,
-            candidates.iter().copied(),
-            result,
-            Some(creation),
-            control,
-        )
-        .map(|(recipe, _)| recipe.expect("recipe publication requested"))
-    }
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 
-    /// Validate a static complete profile before any invocation exists.
-    /// This borrows the original types and does not publish a candidate owner
-    /// or invent an expression occurrence solely to obtain an effects value.
-    pub fn validate_borrowed_profile<'a>(
-        source: &novarocks_type_contract::FunctionValueType,
-        candidates: impl ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
-        result: &novarocks_type_contract::FunctionValueType,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), crate::ComparisonPrepareError> {
-        Self::try_new_core::<false, std::convert::Infallible, _>(
-            false, source, candidates, result, None, control,
-        )
-        .map(|_| ())
-        .map_err(inlist_pure_failure)
-    }
-
-    /// Validate the same original complete source/candidate/result profile
-    /// without publishing a recipe or its otherwise discarded candidate owner.
-    /// Actual prepared instances still consume the original owning constructor.
-    pub fn refine_borrowed_profile<'a>(
-        source: &novarocks_type_contract::FunctionValueType,
-        candidates: impl ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
-        result: &novarocks_type_contract::FunctionValueType,
-        context: novarocks_type_contract::ExpressionEffectContext,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<crate::ScopedExpressionEffects, crate::ComparisonPrepareError> {
-        Self::try_new_core::<false, std::convert::Infallible, _>(
-            false, source, candidates, result, None, control,
-        )
-        .map(|(_, effects)| crate::ScopedExpressionEffects::primitive(context, effects))
-        .map_err(inlist_pure_failure)
-    }
-
-    fn try_new_core<'a, const PUBLISH: bool, H, I>(
-        negated: bool,
-        source: &novarocks_type_contract::FunctionValueType,
-        candidates: I,
-        result: &novarocks_type_contract::FunctionValueType,
-        mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(Option<Self>, ExpressionEffects), NativeInListCreationFailure<H>>
-    where
-        I: ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
-    {
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let outcome = (|| -> Result<_, NativeInListCreationFailure<H>> {
-            crate::kernel_input::validate_type_observed(source, &mut work)
-                .map_err(crate::ComparisonPrepareError::Kernel)?;
-            crate::kernel_input::validate_type_observed(result, &mut work)
-                .map_err(crate::ComparisonPrepareError::Kernel)?;
-            let composite = PreparedCompositeComparisonRecipe::is_composite(source);
-            let mut comparison_right = source;
-            let mut nullable = source.nullable() || source.data_type() == &DataType::Null;
-            if candidates.len() != 0 {
-                let layout = std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(
-                    candidates.len(),
-                ).map_err(|_| NativeInListCreationFailure::Resource(
-                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
-                if PUBLISH {
-                    inlist_request(&mut creation, layout, &mut work)?;
-                }
-            }
-            let mut types = if PUBLISH {
-                Some(Vec::with_capacity(candidates.len()))
-            } else {
-                None
-            };
-            for candidate in candidates {
-                crate::kernel_input::validate_type_observed(candidate, &mut work)
-                    .map_err(crate::ComparisonPrepareError::Kernel)?;
-                let same_domain = if composite {
-                    source.same_physical_binding_ignoring_root_nullability_observed::<
-                        crate::ComparisonPrepareError,
-                    >(candidate, || work.step().map_err(Into::into))?
-                } else {
-                    candidate.logical_type() == source.logical_type()
-                        && arrow_data_types_exact_observed::<crate::ComparisonPrepareError>(
-                            source.data_type(),
-                            candidate.data_type(),
-                            || work.step().map_err(Into::into),
-                        )?
-                };
-                if !same_domain {
-                    return Err(crate::ComparisonPrepareError::TypeMismatch.into());
-                }
-                // All candidates have the same domain. Use an existing nullable
-                // declaration on the right if any candidate can produce SQL NULL.
-                if candidate.nullable() && !comparison_right.nullable() {
-                    comparison_right = candidate;
-                }
-                nullable |= candidate.nullable();
-                work.flush()?;
-                if let Some(types) = types.as_mut() {
-                    types.push(candidate.clone());
-                }
-                work.step()?;
-            }
-            if result.logical_type() != ValueLogicalType::Physical
-                || result.data_type() != &DataType::Boolean
-                || (nullable && !result.nullable())
-            {
-                return Err(crate::ComparisonPrepareError::TypeMismatch.into());
-            }
-            work.flush()?;
-            let equality = if source.logical_type() == ValueLogicalType::Json
-                && source.data_type() == &DataType::LargeBinary
-            {
-                MembershipEquality::Json
-            } else if composite {
-                let recipe = PreparedCompositeComparisonRecipe::try_new(
-                    KeyRelation::Equal,
-                    source,
-                    comparison_right,
-                    control,
-                )?;
-                if recipe.nullable_result() && !result.nullable() {
-                    return Err(crate::ComparisonPrepareError::TypeMismatch.into());
-                }
-                MembershipEquality::Composite(recipe)
-            } else {
-                MembershipEquality::Comparison(PreparedComparisonRecipe::try_new(
-                    ComparisonOperator::Eq,
-                    source,
-                    comparison_right,
-                    control,
-                )?)
-            };
-            let effects = equality.effects();
-            let Some(types) = types else {
-                return Ok((None, effects));
-            };
-            let facts = novarocks_type_contract::owned_resources::vec::box_facts(&types)
-                .map_err(|e| match e {
-                    novarocks_type_contract::ControlResourceError::Control(e) =>
-                        NativeInListCreationFailure::Control(e),
-                    novarocks_type_contract::ControlResourceError::SourceModel(_) =>
-                        NativeInListCreationFailure::Resource(
-                            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
-                })?;
-            if let Some(layout) = facts.requested_backing {
-                inlist_request(&mut creation, layout, &mut work)?;
-            }
-            let items = types.into_boxed_slice();
-            let candidates = if let Some(creation) = creation.as_mut() {
-                let storage = creation.storage_lifetime();
-                novarocks_type_contract::FunctionParameterTypes::try_from_boxed_observed(
-                    items,
-                    storage,
-                    |layout| {
-                        work.flush()?;
-                        creation
-                            .request_layout(layout)
-                            .map_err(NativeInListCreationFailure::Creator)
-                    },
-                )?
-            } else {
-                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(items)
-            };
-            Ok((
-                Some(Self {
-                    negated,
-                    source: source.clone(),
-                    candidates,
-                    result: result.clone(),
-                    equality,
-                }),
-                effects,
-            ))
-        })();
-        if matches!(
-            outcome,
-            Err(NativeInListCreationFailure::Control(_)
-                | NativeInListCreationFailure::Creator(_)
-                | NativeInListCreationFailure::Resource(_))
-        ) {
-            return outcome;
-        }
+        let same_domain = probe.same_physical_binding_ignoring_root_nullability_observed::<
+            crate::ComparisonPrepareError,
+        >(element, || work.step().map_err(Into::into))?;
         work.finish()?;
-        outcome
+        if !same_domain {
+            return Err(crate::ComparisonPrepareError::TypeMismatch);
+        }
+        let equality = MembershipEquality::prepare_group(probe, element, control)?;
+        Ok(Self {
+            source: probe.clone(),
+            equality,
+        })
     }
+
+    fn result_nullable(&self, element: &novarocks_type_contract::FunctionValueType) -> bool {
+        self.equality.group_result_nullable(&self.source, element)
+    }
+
+    fn effects(&self) -> ExpressionEffects {
+        self.equality.effects()
+    }
+
+    /// These equality kernels borrow their actual values and allocate nothing.
+    /// Composite comparison and JSON key preparation require all candidates to
+    /// produce values for the same row before comparison starts.
+    pub fn streaming_equality(&self) -> Option<&PreparedComparisonRecipe> {
+        match &self.equality {
+            MembershipEquality::Comparison(recipe) => Some(recipe),
+            MembershipEquality::Composite(_) | MembershipEquality::Json => None,
+        }
+    }
+
     /// Compare one materialized operand pair over the same compact row domain.
     /// A candidate with one physical row may be broadcast across the input.
     pub fn membership_equalities_observed<E>(
@@ -804,7 +594,7 @@ impl PreparedNativeInListRecipe {
             .map_err(InError::Operation)?
             {
                 return Err(InError::Operation(contract(
-                    "IN comparison operand differs from the recipe carrier",
+                    "IN comparison operand differs from its selected carrier",
                 )));
             }
         }
@@ -970,7 +760,7 @@ impl PreparedNativeInListRecipe {
     ) -> Result<MembershipEqualities, InError<E>> {
         if !self.uses_json_keys() || (candidate.len() != parents.len() && candidate.len() != 1) {
             return Err(InError::Operation(contract(
-                "IN JSON candidate differs from its exact membership recipe",
+                "IN JSON candidate differs from its selected membership comparison",
             )));
         }
         let candidate = json_array(candidate).map_err(InError::Operation)?;
@@ -1044,23 +834,8 @@ impl PreparedNativeInListRecipe {
         }
     }
 
-    pub fn negated(&self) -> bool {
-        self.negated
-    }
     pub fn source_type(&self) -> &novarocks_type_contract::FunctionValueType {
         &self.source
-    }
-    pub fn candidate_types(&self) -> &[novarocks_type_contract::FunctionValueType] {
-        &self.candidates
-    }
-    pub fn result_type(&self) -> &novarocks_type_contract::FunctionValueType {
-        &self.result
-    }
-    pub fn own_effects(
-        &self,
-        context: novarocks_type_contract::ExpressionEffectContext,
-    ) -> crate::ScopedExpressionEffects {
-        crate::ScopedExpressionEffects::primitive(context, self.equality.effects())
     }
 }
 

@@ -122,6 +122,16 @@ fn rewrite_children(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
     let rewritten = match node {
+        ScalarNode::LocalValue(_) => return Ok(Some(original)),
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => ScalarNode::Let {
+            binding,
+            initializer: mapped!(rewrite(arena, initializer)),
+            body: mapped!(rewrite(arena, body)),
+        },
         ScalarNode::BinaryOp {
             op,
             left,
@@ -132,10 +142,6 @@ fn rewrite_children(
             left: mapped!(rewrite(arena, left)),
             right: mapped!(rewrite(arena, right)),
             decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
-            op,
-            child: mapped!(rewrite(arena, child)),
         },
         ScalarNode::FunctionCall {
             name,
@@ -209,41 +215,6 @@ fn rewrite_children(
             child: mapped!(rewrite(arena, child)),
             negated,
         },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: mapped!(rewrite(arena, child)),
-            list: mapped!(
-                list.into_iter()
-                    .map(|item| rewrite(arena, item))
-                    .map(Result::transpose)
-                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
-                    .transpose()
-            ),
-            negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: mapped!(rewrite(arena, child)),
-            low: mapped!(rewrite(arena, low)),
-            high: mapped!(rewrite(arena, high)),
-            negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: mapped!(rewrite(arena, child)),
-            pattern: mapped!(rewrite(arena, pattern)),
-            negated,
-        },
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -277,8 +248,7 @@ fn rewrite_children(
         | ScalarNode::Constant(_)
         | ScalarNode::WindowCall { .. }
         | ScalarNode::LambdaFunction { .. }
-        | ScalarNode::Lambda { .. }
-        | ScalarNode::IsTruthValue { .. } => return Ok(None),
+        | ScalarNode::Lambda { .. } => return Ok(None),
     };
     Ok(Some(arena.intern_observed(
         rewritten,
@@ -648,13 +618,10 @@ mod tests {
                     input.value_type.clone(),
                 );
                 let source = if positive_only {
-                    arena.intern(
-                        ScalarNode::InList {
-                            child: leaf,
-                            list: vec![leaf; 320],
-                            negated: false,
-                        },
-                        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+                    crate::common::binary_operator::intern_test_predicate(
+                        &mut arena,
+                        novarocks_type_contract::OperatorFunction::InList,
+                        vec![leaf; 321],
                     )
                 } else {
                     leaf

@@ -68,8 +68,7 @@ mod common_tests {
     use super::column_id::ColumnId;
     use super::common::{
         ApplyKind, BinOp, CteId, ImvVersionRef, ImvVersionRole, JoinKind, LambdaParam,
-        LiteralValue, OutputColumn, ScanVariantColumn, UnOp, WindowBound, WindowFrame,
-        WindowFrameType,
+        LiteralValue, OutputColumn, ScanVariantColumn, WindowBound, WindowFrame, WindowFrameType,
     };
 
     #[test]
@@ -103,7 +102,6 @@ mod common_tests {
         assert_eq!(frame.frame_type, WindowFrameType::Rows);
         assert_eq!(LiteralValue::LargeInt(123), LiteralValue::LargeInt(123));
         assert_eq!(BinOp::EqForNull, BinOp::EqForNull);
-        assert_eq!(UnOp::Not, UnOp::Not);
 
         assert_eq!(
             ApplyKind::In { negated: true },

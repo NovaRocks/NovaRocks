@@ -407,8 +407,7 @@ fn collection_lambda_preserves_each_lexical_scope_across_typing_entries() {
             && expr.lambda_scope == Some(inner.id)
     }));
     assert!(unit.definitions().iter().any(|expr| {
-        matches!(expr.kind, ExprKind::Value(value) if value == columns[1].value)
-            && expr.lambda_scope == Some(inner.id)
+        expr.kind.input_value() == Some(columns[1].value) && expr.lambda_scope == Some(inner.id)
     }));
 }
 
@@ -436,10 +435,7 @@ fn migrated_calls_share_the_declared_port_and_preserve_source_occurrences() {
         text.unit()
             .definitions()
             .iter()
-            .filter_map(|definition| match definition.kind {
-                ExprKind::Value(id) => Some(id),
-                _ => None,
-            })
+            .filter_map(|definition| definition.kind.input_value())
             .collect::<Vec<_>>(),
         [
             columns[2].value,

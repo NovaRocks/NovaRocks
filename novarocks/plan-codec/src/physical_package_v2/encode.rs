@@ -55,7 +55,7 @@ use crate::physical_read_scan_v2::{
     ReadScanCodecError, ReadScanEncodeContext, encode_read_scans_observed,
 };
 use crate::physical_relation_v2::{RelationCodecError, encode_relations_in};
-use crate::physical_result_v2::prepare_result_encode_in;
+use crate::physical_result_v2::{prepare_result_encode_in, result_source_backing};
 use crate::physical_schema_v2::{SchemaCodecError, prepare_schemas_encode_observed_in};
 use crate::physical_semantics_v2::{
     SemanticsCodecError, encode_frozen_calls_observed, encode_frozen_pruning_observed,
@@ -314,9 +314,12 @@ fn encode_fragment_package_structural_in<'s>(
     }
     // Every later component's source invoice includes the collection buffers
     // that stay live through encoding.
-    let mut source = budget
-        .facts()
-        .coexisting_source_and_request_bytes_upper_bound;
+    let mut source = add(
+        budget
+            .facts()
+            .coexisting_source_and_request_bytes_upper_bound,
+        result_source_backing(package.result(), work)?,
+    )?;
 
     // Original component encoders in hard dependency order. A completed
     // namespace stays live for later components, so its requested-backing
@@ -628,6 +631,21 @@ fn encode_fragment_package_structural_in<'s>(
                 });
                 work.step()?;
             }
+            let expansions = unit.control_expansions().records();
+            let mut control_expansions = Vec::new();
+            control_expansions
+                .try_reserve_exact(expansions.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for expansion in expansions {
+                control_expansions.push(wire::SourceControlExpansion {
+                    root_expr_id: Some(expansion.root.get()),
+                    positive_expr_id: Some(expansion.positive.get()),
+                    conjunction_expr_id: Some(expansion.conjunction.get()),
+                    first_branch_expr_id: Some(expansion.branches[0].get()),
+                    second_branch_expr_id: Some(expansion.branches[1].get()),
+                });
+                work.step()?;
+            }
             let (control, _) = encode_expression_control_observed(
                 unit.control_flow(),
                 source,
@@ -679,6 +697,7 @@ fn encode_fragment_package_structural_in<'s>(
                 ports,
                 definitions: expressions.into_wire(),
                 roots,
+                control_expansions,
                 control: Some(control),
                 claims: Some(claims),
                 requests,

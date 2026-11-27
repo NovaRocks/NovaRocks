@@ -89,6 +89,14 @@ impl FunctionCallContract {
             for argument in &input.selected.argument_types {
                 match argument {
                     FunctionArgumentType::Value(value) => validate_type_observed(value, &mut work)?,
+                    FunctionArgumentType::CandidateGroup { element_type } => {
+                        if receipt.facts().argument_control
+                            != novarocks_type_contract::ArgumentControl::CandidateGroup
+                        {
+                            return Err(invalid("candidate group requires its exact control ABI"));
+                        }
+                        validate_type_observed(element_type, &mut work)?;
+                    }
                     FunctionArgumentType::Lambda {
                         parameter_types,
                         result_type,

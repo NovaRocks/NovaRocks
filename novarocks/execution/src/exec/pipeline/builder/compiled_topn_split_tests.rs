@@ -229,7 +229,7 @@ fn sort_exprs(
                 .add(
                     None,
                     int64(key.column == 0),
-                    ExprKind::Value(columns[key.column]),
+                    ExprKind::input(columns[key.column]),
                 )
                 .and_then(|definition| {
                     builder.unit(node).unwrap().root(

@@ -80,11 +80,10 @@ pub enum BinOp {
     EqForNull,
     And,
     Or,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnOp {
-    Not,
+    /// AND produced by expanding a single source predicate.
+    ExpandedConjunction,
+    /// The same expansion with its enclosing NOT in the source position.
+    ExpandedNegatedConjunction,
 }
 
 impl JoinKind {

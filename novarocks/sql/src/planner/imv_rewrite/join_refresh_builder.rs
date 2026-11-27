@@ -2360,7 +2360,12 @@ mod tests {
     fn expr_contains_string_literal(expr: &crate::analysis::TypedExpr, needle: &str) -> bool {
         match &expr.kind {
             ExprKind::Literal(LiteralValue::String(value)) => value == needle,
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 expr_contains_string_literal(left, needle)
                     || expr_contains_string_literal(right, needle)
             }
@@ -2369,7 +2374,6 @@ mod tests {
                 .any(|arg| expr_contains_string_literal(arg, needle)),
             ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::UnaryOp { expr, .. }
             | ExprKind::Nested(expr) => expr_contains_string_literal(expr, needle),
             ExprKind::Case {
                 operand,
@@ -2581,7 +2585,12 @@ mod tests {
                     refs.insert(*column_id);
                 }
             }
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 collect_column_refs(left, refs);
                 collect_column_refs(right, refs);
             }
@@ -2597,7 +2606,6 @@ mod tests {
             }
             ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::UnaryOp { expr, .. }
             | ExprKind::Nested(expr) => collect_column_refs(expr, refs),
             ExprKind::Case {
                 operand,
@@ -2615,23 +2623,6 @@ mod tests {
                 if let Some(else_expr) = else_expr {
                     collect_column_refs(else_expr, refs);
                 }
-            }
-            ExprKind::InList { expr, list, .. } => {
-                collect_column_refs(expr, refs);
-                for item in list {
-                    collect_column_refs(item, refs);
-                }
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                collect_column_refs(expr, refs);
-                collect_column_refs(low, refs);
-                collect_column_refs(high, refs);
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                collect_column_refs(expr, refs);
-                collect_column_refs(pattern, refs);
             }
             ExprKind::WindowCall {
                 args,
@@ -2652,8 +2643,8 @@ mod tests {
             ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
                 collect_column_refs(body, refs);
             }
-            ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
-            ExprKind::LambdaParamRef { .. }
+            ExprKind::LocalValue(_)
+            | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}

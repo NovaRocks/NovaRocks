@@ -294,7 +294,7 @@ impl Fixture {
                 id: ExprId::new(1),
                 lambda_scope: None,
                 ty: value_type.clone(),
-                kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+                kind: novarocks_expression_contract::ExprKind::input(p::ValueId::new(0)),
             },
             novarocks_expression_contract::ExprNode {
                 id: ExprId::new(2),

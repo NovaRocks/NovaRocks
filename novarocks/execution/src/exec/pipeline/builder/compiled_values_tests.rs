@@ -256,7 +256,7 @@ fn values_program_with_sources(
         let expr = builder
             .unit(PROJECT)
             .unwrap()
-            .add(None, ty.clone(), ExprKind::Value(input))
+            .add(None, ty.clone(), ExprKind::input(input))
             .unwrap();
         let expr = builder
             .unit(PROJECT)

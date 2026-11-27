@@ -186,7 +186,7 @@ pub(super) fn build_typed(
                 .add_root(
                     project,
                     ty.clone(),
-                    ExprKind::Value(input),
+                    ExprKind::input(input),
                     RootScope::Port(0),
                     EvaluationDemand::Value,
                 )

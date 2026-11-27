@@ -79,7 +79,7 @@ fn nullable_port(fields: &[(&str, DataType)]) -> (ExprPort, Arc<Schema>) {
 
 fn input(builder: &mut BoundExprSetBuilder, column: &(ValueId, FunctionValueType)) -> ExprId {
     builder
-        .add(None, column.1.clone(), ExprKind::Value(column.0))
+        .add(None, column.1.clone(), ExprKind::input(column.0))
         .unwrap()
 }
 

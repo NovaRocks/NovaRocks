@@ -62,9 +62,11 @@ pub fn resolved_aggregate_signature_from_binding(
         .into_iter()
         .map(|argument| match argument {
             FunctionArgumentType::Value(value) => Ok(value.data_type().clone()),
-            FunctionArgumentType::Lambda { .. } => Err(FunctionResolutionError::BadSignature(
-                "aggregate update channel cannot be a lambda".into(),
-            )),
+            FunctionArgumentType::Lambda { .. } | FunctionArgumentType::CandidateGroup { .. } => {
+                Err(FunctionResolutionError::BadSignature(
+                    "aggregate update channel requires a value".into(),
+                ))
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ResolvedAggregateSignature {
@@ -977,7 +979,7 @@ fn scalar_result_nullable(
     let value_nullable = |index: usize| match request.arguments.get(index) {
         Some(FunctionArgument::Value { value_type, .. }) => value_type.nullable(),
         Some(FunctionArgument::Lambda { result_type, .. }) => result_type.nullable(),
-        None => false,
+        Some(FunctionArgument::CandidateGroup { .. }) | None => false,
     };
     let first_value = match request.arguments.first() {
         Some(FunctionArgument::Value { value_type, .. }) => Some(value_type),
@@ -1018,7 +1020,7 @@ fn scalar_result_nullable_from_types(
             child_nullable
                 || nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
-        crate::native_like::ESCAPE_FUNCTION_NAME => {
+        super::like_escape_owner::BOOLEAN_NOT | super::like_escape_owner::LIKE => {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
@@ -1953,6 +1955,9 @@ fn dynamic_argument_data_types_with_creation<H>(
         types.push(match argument {
             FunctionArgument::Value { value_type, .. } => value_type.data_type().clone(),
             FunctionArgument::Lambda { result_type, .. } => result_type.data_type().clone(),
+            FunctionArgument::CandidateGroup { .. } => {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
+            }
         });
     }
     Ok(types)
@@ -3269,7 +3274,9 @@ fn scalar_overload_effects(
             Some(super::parse_json_owner::effects(operation))
         }
         "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
-        crate::native_like::ESCAPE_FUNCTION_NAME => Some(super::like_escape_owner::effects()),
+        super::like_escape_owner::BOOLEAN_NOT | super::like_escape_owner::LIKE => {
+            Some(super::like_escape_owner::effects(name, signature))
+        }
         "chr" | "codepoint" => Some(super::string_measure_owner::codepoint_effects()),
         name if super::string_measure_owner::operation(name).is_some() => {
             Some(super::string_measure_owner::effects())
@@ -3627,6 +3634,7 @@ pub fn contribute_builtin_functions(
         }
     }
     builder.register(super::binary_operator_owner::modulus_definition()?)?;
+    builder.register(super::in_list_owner::definition()?)?;
     super::collection_lambda::register(builder, Some(super::collection_lambda::prepare_kernel))?;
     builder.register(super::array_generation_owner::sequence_definition()?)?;
     for name in DYNAMIC_SCALAR_FUNCTIONS {
@@ -3775,8 +3783,8 @@ pub fn contribute_builtin_functions(
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
             }
-            crate::native_like::ESCAPE_FUNCTION_NAME => {
-                super::like_escape_owner::definition(declaration, resolver)?
+            name @ (super::like_escape_owner::BOOLEAN_NOT | super::like_escape_owner::LIKE) => {
+                super::like_escape_owner::definition(name, declaration, resolver)?
             }
             name if super::string_measure_owner::operation(name).is_some() => {
                 super::string_measure_owner::definition(name, declaration, resolver)?

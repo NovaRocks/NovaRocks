@@ -81,8 +81,8 @@ pub mod physical_package_v2 {
     // Expansion aliases; the shared generated vocabulary is the sole owner.
     pub use super::call_request::{
         CallRequestDefinition, ConstantReference, FragmentCallRequests, IpcCompression,
-        IpcConstantPool, LambdaArgumentType, OriginalCallRequest, OriginalFunctionArgument,
-        OriginalValueArgument, UnitCallRequest, call_request_definition,
+        IpcConstantPool, LambdaArgumentType, OriginalCallRequest, OriginalCandidateGroup,
+        OriginalFunctionArgument, OriginalValueArgument, UnitCallRequest, call_request_definition,
         original_function_argument,
     };
     include!(concat!(

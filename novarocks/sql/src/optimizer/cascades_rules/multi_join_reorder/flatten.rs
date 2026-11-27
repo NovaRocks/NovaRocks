@@ -281,16 +281,21 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
                 out.insert(*id);
             }
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::LocalValue(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::Like { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => collect_scalar_column_ids(arena, *child, out),
         ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
             for arg in args {
@@ -304,19 +309,6 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_scalar_column_ids(arena, *body, out);
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_scalar_column_ids(arena, *child, out);
-            for item in list {
-                collect_scalar_column_ids(arena, *item, out);
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_scalar_column_ids(arena, *child, out);
-            collect_scalar_column_ids(arena, *low, out);
-            collect_scalar_column_ids(arena, *high, out);
         }
         ScalarNode::Case {
             operand,

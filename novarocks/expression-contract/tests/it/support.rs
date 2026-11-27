@@ -148,6 +148,9 @@ pub fn request(function: &BoundFunction) -> PhysicalCallRequest {
         .argument_types
         .iter()
         .map(|ty| match ty {
+            FunctionArgumentType::CandidateGroup { .. } => {
+                panic!("candidate groups require specific source occurrences")
+            }
             FunctionArgumentType::Value(ty) => FunctionArgument::Value {
                 value_type: ty.clone(),
                 constant: None,

@@ -35,19 +35,20 @@ message EvaluationRegion {
 }
 message RegionGuard {
   optional uint32 owner_use_id = 1;
+  reserved 7, 8;
+  reserved "between_after_source_ordinal", "membership_after_source_ordinal";
   oneof kind {
     SimpleGuard simple = 2;
     uint32 coalesce_after_null_ordinal = 3;
     uint32 case_when_arm = 4;
     uint32 case_then_arm = 5;
     uint32 temporal_after_source_ordinal = 6;
-    uint32 between_after_source_ordinal = 7;
-    uint32 membership_after_source_ordinal = 8;
     // Zero-based preceding argument in the ordered regexp call.
     uint32 ordered_regexp_after_argument_ordinal = 9;
     // Zero-based preceding argument in an ordered scalar call. Its selected
     // declaration determines whether a successful NULL enters the next use.
     uint32 ordered_null_after_argument_ordinal = 10;
+    uint32 candidate_after_source_ordinal = 11;
   }
 }
 enum SimpleGuard {
@@ -59,6 +60,7 @@ enum SimpleGuard {
   SIMPLE_GUARD_TEMPORAL_INVOCATION_NULL = 5;
   SIMPLE_GUARD_TRY_BODY = 6;
   SIMPLE_GUARD_NULL_IF_AFTER_LEFT = 7;
+  SIMPLE_GUARD_LET_BODY = 8;
 }
 enum EvaluationDemand {
   EVALUATION_DEMAND_UNSPECIFIED = 0;
@@ -75,13 +77,13 @@ message ExpressionUse {
   repeated uint32 argument_use_ids = 6;
 }
 message ControlShape {
+  reserved 5, 6;
+  reserved "between_negated", "membership_negated";
   oneof kind {
     SimpleControl simple = 1;
     CaseControl case_control = 2;
     HigherOrderControl higher_order = 3;
     TemporalSourceShape temporal_source = 4;
-    bool between_negated = 5;
-    bool membership_negated = 6;
     NullIfControl null_if = 7;
   }
 }
@@ -99,6 +101,8 @@ enum SimpleControl {
   // Source is argument 0 and the pattern conversion occurs at argument 1.
   SIMPLE_CONTROL_ORDERED_REGEXP = 10;
   SIMPLE_CONTROL_ORDERED_NULL = 11;
+  SIMPLE_CONTROL_LET = 12;
+  SIMPLE_CONTROL_CANDIDATE_GROUP = 13;
 }
 // Argument 0 is the retained value. Argument 1 belongs to its non-NULL region;
 // the comparison consumes the exact catalogue equality identity.

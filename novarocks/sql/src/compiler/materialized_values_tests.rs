@@ -506,21 +506,17 @@ fn actual_in_predicate_preserves_nonzero_constant_sources_on_both_sides() {
         select.projection[0].expr.value_type,
         FunctionValueType::new(arrow::datatypes::DataType::Boolean, false)
     );
-    let crate::analysis::ExprKind::InList {
-        expr,
-        list,
-        negated,
-    } = &select.projection[0].expr.kind
+    let Some((expr, list)) =
+        crate::common::binary_operator::typed_in_list(&select.projection[0].expr)
     else {
         panic!("original IN typed owner")
     };
-    assert!(!negated);
     assert_eq!(list.len(), 2);
     assert!(matches!(
         list[0].kind,
         crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
     ));
-    for original in [expr.as_ref(), &list[1]] {
+    for original in [expr, &list[1]] {
         assert_eq!(original.value_type, ty);
         let crate::analysis::ExprKind::Constant(value) = &original.kind else {
             panic!("original source constant")

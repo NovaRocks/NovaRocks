@@ -576,7 +576,9 @@ fn validate_ordinary_inputs(
         .iter()
         .filter_map(|argument| match argument {
             FunctionArgumentType::Value(value) => Some(value),
-            FunctionArgumentType::Lambda { .. } => None,
+            FunctionArgumentType::Lambda { .. } | FunctionArgumentType::CandidateGroup { .. } => {
+                None
+            }
         });
     for (argument, ty) in arguments.iter().zip(expected) {
         validate_argument_observed(*argument, selection, ty, control)?;

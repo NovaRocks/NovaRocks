@@ -272,10 +272,13 @@ fn ordered_children_and_display_and_frame_facts_participate_in_exact_interning()
     let mut arena = ScalarArena::new();
     let a = ScalarId(0);
     let b = ScalarId(1);
-    let list = |list| ScalarNode::InList {
-        child: a,
-        list,
-        negated: false,
+    let binding = structural_call_binding(&arena);
+    let list = |args| ScalarNode::FunctionCall {
+        name: "ordered_fixture".into(),
+        binding: binding.clone(),
+        args,
+        distinct: false,
+        volatility: super::super::FunctionVolatility::Immutable,
     };
     let first = forced(&mut arena, list(vec![a, b]), ty(), &control).unwrap();
     assert_ne!(
@@ -568,6 +571,7 @@ fn entry_and_tail_refusal_publish_no_node_or_index_for_all_control_categories() 
 
 #[test]
 fn actual_long_bytes_and_child_fanout_observe_256_and_keep_primary_control() {
+    let binding = structural_call_binding(&ScalarArena::new());
     for error in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
@@ -575,10 +579,12 @@ fn actual_long_bytes_and_child_fanout_observe_256_and_keep_primary_control() {
     ] {
         for node in [
             text(&"x".repeat(600_000)),
-            ScalarNode::InList {
-                child: ScalarId(0),
-                list: vec![ScalarId(0); 600],
-                negated: false,
+            ScalarNode::FunctionCall {
+                name: "ordered_fixture".into(),
+                binding: binding.clone(),
+                args: vec![ScalarId(0); 601],
+                distinct: false,
+                volatility: super::super::FunctionVolatility::Immutable,
             },
         ] {
             let mut arena = ScalarArena::new();
@@ -596,6 +602,17 @@ fn actual_long_bytes_and_child_fanout_observe_256_and_keep_primary_control() {
             );
         }
     }
+}
+
+fn structural_call_binding(arena: &ScalarArena) -> crate::binding::SqlFunctionBinding {
+    super::super::test_function_binding(
+        arena,
+        "ordered_fixture",
+        &[],
+        DataType::Int64,
+        false,
+        super::super::FunctionVolatility::Immutable,
+    )
 }
 
 fn map64_carrier(mut leaf: DataType) -> DataType {

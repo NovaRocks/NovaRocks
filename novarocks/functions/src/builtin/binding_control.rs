@@ -90,6 +90,16 @@ pub(super) fn request_types(
         work.step()?;
         match argument {
             FunctionArgument::Value { value_type: ty, .. } => value_type(ty, work)?,
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => {
+                value_type(element_type, work)?;
+                for member in members {
+                    work.step()?;
+                    value_type(&member.value_type, work)?;
+                }
+            }
             FunctionArgument::Lambda {
                 parameter_types,
                 result_type,
@@ -192,7 +202,7 @@ pub(super) fn scalar_types<'a>(
         work.step()?;
         match argument {
             FunctionArgument::Value { .. } => {}
-            FunctionArgument::Lambda { .. } => {
+            FunctionArgument::Lambda { .. } | FunctionArgument::CandidateGroup { .. } => {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
         }
@@ -249,6 +259,10 @@ fn exact_argument(
     work.step()?;
     match (left, right) {
         (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => exact_type(a, b, work),
+        (
+            FunctionArgumentType::CandidateGroup { element_type: a },
+            FunctionArgumentType::CandidateGroup { element_type: b },
+        ) => exact_type(a, b, work),
         (
             FunctionArgumentType::Lambda {
                 parameter_types: a,

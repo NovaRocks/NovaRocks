@@ -359,7 +359,7 @@ fn read(
     demand: EvaluationDemand,
 ) -> RootOrdinal {
     let unit = builder.unit(node).unwrap();
-    let definition = unit.add(None, boolean(), ExprKind::Value(value)).unwrap();
+    let definition = unit.add(None, boolean(), ExprKind::input(value)).unwrap();
     unit.root(definition, demand, RootScope::Port(0)).unwrap()
 }
 

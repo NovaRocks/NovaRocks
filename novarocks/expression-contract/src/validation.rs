@@ -19,7 +19,8 @@
 use crate::unit_creation::{UnitMessage, UnitValidationCreation, ValidationFailure};
 use crate::validation_types::{self, ExpressionParentReference, TypeChecks};
 use crate::{
-    ExprId, ExprKind, ExprNode, ExprPort, ExprRoot, RootOrdinal, RootScope, UnitError, UnitLimits,
+    ControlExpansions, ExprId, ExprKind, ExprNode, ExprPort, ExprRoot, RootOrdinal, RootScope,
+    UnitError, UnitLimits, ValueAddress,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, EvaluationDemand, MAX_CONTROL_DEFINITIONS,
@@ -53,6 +54,7 @@ pub(crate) fn validate_core<'a, H>(
     ports: &'a [ExprPort],
     definitions: &'a [ExprNode],
     roots: &'a [ExprRoot],
+    expansions: &ControlExpansions,
     limits: UnitLimits,
     creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
@@ -60,6 +62,7 @@ pub(crate) fn validate_core<'a, H>(
     if definitions.len() > MAX_CONTROL_DEFINITIONS {
         return Err(novarocks_type_contract::ExpressionControlFlowError::TooManyItems.into());
     }
+    let mut has_local_values = false;
     for (ordinal, expression) in definitions.iter().enumerate() {
         work.step()?;
         if expression.id.get() as usize != ordinal {
@@ -78,7 +81,9 @@ pub(crate) fn validate_core<'a, H>(
                 "lexical scope is not a lambda definition",
             ));
         }
+        has_local_values |= matches!(expression.kind, ExprKind::Value(ValueAddress::Local(_)));
     }
+    expansions.validate_definitions(definitions, work)?;
     for port in ports {
         let mut seen = BTreeSet::new();
         for (id, _) in &port.values {
@@ -196,19 +201,54 @@ pub(crate) fn validate_core<'a, H>(
         }
         work.step()?;
     }
+    // Each definition summarizes addresses that would be unbound if it
+    // were entered directly. Removing a binder only at its body edge
+    // preserves obligations from every other incoming path to a shared
+    // definition, including its use as that same Let initializer.
+    let mut local_needs = if has_local_values {
+        Some(filled(definitions.len(), BTreeSet::new, creation, work)?)
+    } else {
+        None
+    };
     let mut processed = 0usize;
     while let Some(id) = ready.pop() {
         processed += 1;
-        let depth = depths[id.get() as usize];
+        let index = id.get() as usize;
+        let depth = depths[index];
         work.step()?;
         if depth > limits.expression_semantic_depth {
             return Err(
                 UnitError::Resource("expression semantic depth exceeds the caller limit").into(),
             );
         }
-        for &user in &dependents[id.get() as usize] {
+        if let Some(needs) = &mut local_needs
+            && let ExprKind::Value(ValueAddress::Local(binding)) = definitions[index].kind
+        {
+            creation.set_insert(&mut needs[index], binding, work)?;
+        }
+        for &user in &dependents[index] {
             let ordinal = user.get() as usize;
-            depths[ordinal] = depths[ordinal].max(depth.saturating_add(1));
+            if let Some(needs) = &mut local_needs {
+                let (through_user, from_value) = if ordinal < index {
+                    let (before, after) = needs.split_at_mut(index);
+                    (&mut before[ordinal], &after[0])
+                } else {
+                    let (before, after) = needs.split_at_mut(ordinal);
+                    (&mut after[0], &before[index])
+                };
+                let body_edge_only = matches!(
+                    definitions[ordinal].kind,
+                    ExprKind::Let { value, body } if id == body && id != value
+                );
+                for &binding in from_value {
+                    if !(body_edge_only && binding == user) {
+                        creation.set_insert(through_user, binding, work)?;
+                    }
+                    work.step()?;
+                }
+            }
+            let advance = usize::from(!expansions.shares_source_position(user, id));
+            depths[ordinal] = depths[ordinal].max(depth.saturating_add(advance));
             remaining[ordinal] -= 1;
             if remaining[ordinal] == 0 {
                 ready.push(user);
@@ -236,6 +276,26 @@ pub(crate) fn validate_core<'a, H>(
         );
         let expression = node(definitions, root.definition)?;
         work.step()?;
+        if expansions
+            .source_position(root.definition)
+            .is_some_and(|source| source != root.definition)
+        {
+            return Err(ValidationFailure::invalid(
+                Some(root.definition),
+                Some(root_id),
+                "root enters an expanded control position through an internal definition",
+            ));
+        }
+        if local_needs
+            .as_ref()
+            .is_some_and(|needs| !needs[root.definition.get() as usize].is_empty())
+        {
+            return Err(ValidationFailure::invalid(
+                Some(root.definition),
+                Some(root_id),
+                "local value is outside its Let body",
+            ));
+        }
         if expression.lambda_scope.is_some() {
             return Err(ValidationFailure::invalid(
                 Some(root.definition),
@@ -309,7 +369,7 @@ pub(crate) fn validate_core<'a, H>(
             work.step()?;
             work.flush()?;
             let expression = node(definitions, id)?;
-            if let ExprKind::Value(value) = expression.kind {
+            if let Some(value) = expression.kind.input_value() {
                 let ty = visible.get(&value).ok_or_else(|| {
                     ValidationFailure::invalid(
                         Some(id),
@@ -374,10 +434,19 @@ pub(crate) fn validate(
     ports: &[ExprPort],
     definitions: &[ExprNode],
     roots: &[ExprRoot],
+    expansions: &ControlExpansions,
     limits: UnitLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), UnitError> {
     let mut creation = UnitValidationCreation::<std::convert::Infallible>::pure();
-    validate_core(ports, definitions, roots, limits, &mut creation, work)
-        .map_err(|error| crate::unit_creation::pure_error(creation.finish_error(error, work)))
+    validate_core(
+        ports,
+        definitions,
+        roots,
+        expansions,
+        limits,
+        &mut creation,
+        work,
+    )
+    .map_err(|error| crate::unit_creation::pure_error(creation.finish_error(error, work)))
 }

@@ -106,7 +106,10 @@ fn reserve<T>(
     }
     Ok(())
 }
-struct UnitDefinitions<'a>(&'a [ExprNode]);
+struct UnitDefinitions<'a>(
+    &'a [ExprNode],
+    Option<&'a novarocks_expression_contract::ControlExpansions>,
+);
 impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for UnitDefinitions<'_> {
     fn definition_count(&self) -> usize {
         self.0.len()
@@ -115,6 +118,15 @@ impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for UnitDef
         self.0
             .get(id.get() as usize)
             .is_some_and(|node| node.id == id)
+    }
+    fn control_source_position(&self, id: ExprId) -> Option<u32> {
+        self.1
+            .and_then(|expansions| expansions.source_position(id))
+            .map(ExprId::get)
+    }
+    fn has_control_expansions(&self) -> bool {
+        self.1
+            .is_some_and(|expansions| !expansions.records().is_empty())
     }
 }
 
@@ -150,12 +162,12 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
         ControlShape::Try => Some(wire::SimpleControl::Try),
         ControlShape::OrderedRegexp => Some(wire::SimpleControl::OrderedRegexp),
         ControlShape::OrderedNull => Some(wire::SimpleControl::OrderedNull),
+        ControlShape::Let => Some(wire::SimpleControl::Let),
+        ControlShape::CandidateGroup => Some(wire::SimpleControl::CandidateGroup),
         ControlShape::NullIf
         | ControlShape::Case { .. }
         | ControlShape::HigherOrder { .. }
-        | ControlShape::TemporalSource(_)
-        | ControlShape::Between { .. }
-        | ControlShape::Membership { .. } => None,
+        | ControlShape::TemporalSource(_) => None,
     };
     let kind = match (simple, shape) {
         (Some(simple), _) => Kind::Simple(simple as i32),
@@ -181,8 +193,6 @@ fn encode_shape(shape: ControlShape) -> wire::ControlShape {
             body_ordinal,
             body_demand: encode_demand(body_demand),
         }),
-        (None, ControlShape::Between { negated }) => Kind::BetweenNegated(negated),
-        (None, ControlShape::Membership { negated }) => Kind::MembershipNegated(negated),
         (None, ControlShape::NullIf) => Kind::NullIf(wire::NullIfControl {
             equality_function: novarocks_type_contract::OperatorFunction::Equal
                 .function_id_text()
@@ -214,12 +224,12 @@ fn decode_shape(shape: &wire::ControlShape) -> Result<ControlShape, ControlCodec
             Ok(wire::SimpleControl::Try) => Ok(ControlShape::Try),
             Ok(wire::SimpleControl::OrderedRegexp) => Ok(ControlShape::OrderedRegexp),
             Ok(wire::SimpleControl::OrderedNull) => Ok(ControlShape::OrderedNull),
+            Ok(wire::SimpleControl::Let) => Ok(ControlShape::Let),
+            Ok(wire::SimpleControl::CandidateGroup) => Ok(ControlShape::CandidateGroup),
             _ => Err(ControlCodecError::InvalidShape(
                 "unknown or unspecified control shape",
             )),
         },
-        Kind::BetweenNegated(negated) => Ok(ControlShape::Between { negated: *negated }),
-        Kind::MembershipNegated(negated) => Ok(ControlShape::Membership { negated: *negated }),
         Kind::NullIf(plan) => {
             if plan.equality_function
                 != novarocks_type_contract::OperatorFunction::Equal.function_id_text()
@@ -252,12 +262,12 @@ fn encode_guard(guard: RegionGuard) -> wire::RegionGuard {
         GuardKind::CaseElse => Kind::Simple(wire::SimpleGuard::CaseElse as i32),
         GuardKind::TryBody => Kind::Simple(wire::SimpleGuard::TryBody as i32),
         GuardKind::NullIfAfterLeft => Kind::Simple(wire::SimpleGuard::NullIfAfterLeft as i32),
+        GuardKind::LetBody => Kind::Simple(wire::SimpleGuard::LetBody as i32),
         GuardKind::LambdaInvocation => Kind::Simple(wire::SimpleGuard::LambdaInvocation as i32),
         GuardKind::CoalesceAfterNull { ordinal } => Kind::CoalesceAfterNullOrdinal(ordinal),
         GuardKind::CaseWhen { arm } => Kind::CaseWhenArm(arm),
         GuardKind::CaseThen { arm } => Kind::CaseThenArm(arm),
-        GuardKind::BetweenAfterSource { ordinal } => Kind::BetweenAfterSourceOrdinal(ordinal),
-        GuardKind::MembershipAfterSource { ordinal } => Kind::MembershipAfterSourceOrdinal(ordinal),
+        GuardKind::CandidateAfterSource { ordinal } => Kind::CandidateAfterSourceOrdinal(ordinal),
         GuardKind::OrderedRegexpAfterArgument { ordinal } => {
             Kind::OrderedRegexpAfterArgumentOrdinal(ordinal)
         }
@@ -287,6 +297,7 @@ fn decode_guard(guard: &wire::RegionGuard) -> Result<RegionGuard, ControlCodecEr
             Ok(wire::SimpleGuard::IfElse) => GuardKind::IfElse,
             Ok(wire::SimpleGuard::CaseElse) => GuardKind::CaseElse,
             Ok(wire::SimpleGuard::TryBody) => GuardKind::TryBody,
+            Ok(wire::SimpleGuard::LetBody) => GuardKind::LetBody,
             Ok(wire::SimpleGuard::NullIfAfterLeft) => GuardKind::NullIfAfterLeft,
             Ok(wire::SimpleGuard::LambdaInvocation) => GuardKind::LambdaInvocation,
             Ok(wire::SimpleGuard::TemporalInvocationNull) => GuardKind::TemporalInvocationNull,
@@ -301,11 +312,8 @@ fn decode_guard(guard: &wire::RegionGuard) -> Result<RegionGuard, ControlCodecEr
         }
         Kind::CaseWhenArm(arm) => GuardKind::CaseWhen { arm: *arm },
         Kind::CaseThenArm(arm) => GuardKind::CaseThen { arm: *arm },
-        Kind::BetweenAfterSourceOrdinal(ordinal) => {
-            GuardKind::BetweenAfterSource { ordinal: *ordinal }
-        }
-        Kind::MembershipAfterSourceOrdinal(ordinal) => {
-            GuardKind::MembershipAfterSource { ordinal: *ordinal }
+        Kind::CandidateAfterSourceOrdinal(ordinal) => {
+            GuardKind::CandidateAfterSource { ordinal: *ordinal }
         }
         Kind::OrderedRegexpAfterArgumentOrdinal(ordinal) => {
             GuardKind::OrderedRegexpAfterArgument { ordinal: *ordinal }
@@ -496,9 +504,16 @@ pub fn decode_expression_control(
     control: &dyn PureCompileControl,
 ) -> Result<ExpressionControlFlow<ExprId>, ControlCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result =
-        decode_expression_control_core(definitions, input, None, None, &mut |_| Ok(()), &mut work)
-            .map(|(flow, _)| flow);
+    let result = decode_expression_control_core(
+        definitions,
+        None,
+        input,
+        None,
+        None,
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .map(|(flow, _)| flow);
     if matches!(result, Err(ControlCodecError::Control(_))) {
         return result;
     }
@@ -570,6 +585,7 @@ pub fn decode_expression_control_observed(
 ) -> Result<(ExpressionControlFlow<ExprId>, ControlProjectionFacts), ControlCodecError> {
     decode_expression_control_core(
         definitions,
+        None,
         input,
         Some(source_retained_bytes),
         limits.into(),
@@ -577,8 +593,26 @@ pub fn decode_expression_control_observed(
         work,
     )
 }
+pub(crate) fn decode_expanded_expression_control_observed(
+    definitions: &[ExprNode],
+    expansions: &novarocks_expression_contract::ControlExpansions,
+    input: &wire::ExpressionControl,
+    source: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(ExpressionControlFlow<ExprId>, ControlProjectionFacts), ControlCodecError> {
+    decode_expression_control_core(
+        definitions,
+        Some(expansions),
+        input,
+        Some(source),
+        None,
+        &mut |_| Ok(()),
+        work,
+    )
+}
 fn decode_expression_control_core(
     definitions: &[ExprNode],
+    expansions: Option<&novarocks_expression_contract::ControlExpansions>,
     input: &wire::ExpressionControl,
     source: Option<usize>,
     limits: Option<ControlProjectionLimits>,
@@ -607,7 +641,7 @@ fn decode_expression_control_core(
     let flow = ExpressionControlFlow::try_new_in(
         regions,
         uses,
-        &UnitDefinitions(definitions),
+        &UnitDefinitions(definitions, expansions),
         &mut |facts| {
             child = *facts;
             match model.gate_with(*facts, admit) {
@@ -651,6 +685,7 @@ pub(crate) fn decode_expression_control_with_creator_observed_in<
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
 >(
     definitions: &[ExprNode],
+    expansions: &novarocks_expression_contract::ControlExpansions,
     input: &wire::ExpressionControl,
     source: usize,
     limits: impl Into<Option<ControlProjectionLimits>>,
@@ -711,7 +746,7 @@ pub(crate) fn decode_expression_control_with_creator_observed_in<
         ExpressionControlFlow::try_new_with_creator_in(
             regions,
             uses,
-            &UnitDefinitions(definitions),
+            &UnitDefinitions(definitions, Some(expansions)),
             &mut temporary,
             &mut retained,
             work,
@@ -724,7 +759,7 @@ pub(crate) fn decode_expression_control_with_creator_observed_in<
         ExpressionControlFlow::try_new_with_single_creator_in(
             regions,
             uses,
-            &UnitDefinitions(definitions),
+            &UnitDefinitions(definitions, Some(expansions)),
             creation,
             work,
         )

@@ -91,14 +91,14 @@ fn finish_join(
         .define(
             join,
             ty(DataType::Int64, false),
-            ExprKind::Value(left_value),
+            ExprKind::input(left_value),
         )
         .unwrap();
     let right_key = builder
         .define(
             join,
             ty(DataType::Int64, false),
-            ExprKind::Value(right_value),
+            ExprKind::input(right_value),
         )
         .unwrap();
     let left_key = builder.root_definition(

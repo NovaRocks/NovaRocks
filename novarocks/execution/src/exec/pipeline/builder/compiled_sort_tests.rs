@@ -102,7 +102,7 @@ fn program(keys: &[Key], shape: Shape) -> Arc<LocalProgram> {
             let expr = builder
                 .unit(sort)
                 .unwrap()
-                .add(None, ty, ExprKind::Value(columns[key.column]))
+                .add(None, ty, ExprKind::input(columns[key.column]))
                 .unwrap();
             let root = builder
                 .unit(sort)
@@ -431,7 +431,7 @@ fn partial_topn_runs_as_its_instance_prefix() {
     let key = builder
         .unit(topn)
         .unwrap()
-        .add(None, int64(true), ExprKind::Value(columns[0]))
+        .add(None, int64(true), ExprKind::input(columns[0]))
         .unwrap();
     let key = builder
         .unit(topn)
@@ -493,7 +493,7 @@ fn partition_program(
     let mut key_root = |column: usize| {
         let unit = builder.unit(sort).unwrap();
         let definition = unit
-            .add(None, int64(true), ExprKind::Value(columns[column]))
+            .add(None, int64(true), ExprKind::input(columns[column]))
             .unwrap();
         unit.root(definition, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap()

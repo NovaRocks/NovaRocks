@@ -21,7 +21,9 @@ use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
 use std::fmt::{self, Write};
 
 const DEPTH: usize = 20_000;
-const SLOTS: usize = 27;
+const SLOTS: [usize; 20] = [
+    0, 1, 2, 3, 4, 5, 6, 12, 13, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26,
+];
 
 #[derive(Default)]
 struct DebugSink(usize);
@@ -89,9 +91,10 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             op: BinOp::Add,
             decimal_overflow_policy: policy,
         },
-        2 => ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr: boxed(child),
+        2 => ExprKind::Let {
+            binding: LocalBindingId(11),
+            initializer: boxed(child),
+            body: boxed(marker()),
         },
         3 => ExprKind::LambdaFunction {
             params: vec![],
@@ -107,38 +110,10 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             expr: boxed(child),
             negated: true,
         },
-        6 => ExprKind::InList {
-            expr: boxed(child),
-            list: vec![marker()].into(),
-            negated: true,
-        },
-        7 => ExprKind::Between {
-            expr: boxed(child),
-            low: boxed(marker()),
-            high: boxed(marker()),
-            negated: true,
-        },
-        8 => ExprKind::Between {
-            expr: boxed(marker()),
-            low: boxed(child),
-            high: boxed(marker()),
-            negated: true,
-        },
-        9 => ExprKind::Between {
-            expr: boxed(marker()),
-            low: boxed(marker()),
-            high: boxed(child),
-            negated: true,
-        },
-        10 => ExprKind::Like {
-            expr: boxed(child),
-            pattern: boxed(marker()),
-            negated: true,
-        },
-        11 => ExprKind::Like {
-            expr: boxed(marker()),
-            pattern: boxed(child),
-            negated: true,
+        6 => ExprKind::Let {
+            binding: LocalBindingId(11),
+            initializer: boxed(marker()),
+            body: boxed(child),
         },
         12 => ExprKind::Case {
             ieee_float_equality: false,
@@ -151,11 +126,6 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             operand: Some(boxed(marker())),
             when_then: vec![(marker(), marker())].into(),
             else_expr: Some(boxed(child)),
-        },
-        14 => ExprKind::IsTruthValue {
-            expr: boxed(child),
-            value: false,
-            negated: true,
         },
         15 => ExprKind::Nested(boxed(child)),
         16 => ExprKind::Lambda {
@@ -186,11 +156,6 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
             distinct: true,
             order_by: vec![sort(marker()), sort(child)].into(),
             resolved: binding(),
-        },
-        20 => ExprKind::InList {
-            expr: boxed(marker()),
-            list: vec![marker(), child].into(),
-            negated: true,
         },
         21 => ExprKind::Case {
             ieee_float_equality: false,
@@ -284,12 +249,27 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             right
         }
         (
-            ExprKind::UnaryOp {
-                op: UnOp::Not,
-                expr,
+            ExprKind::Let {
+                binding: LocalBindingId(11),
+                initializer,
+                body,
             },
             2,
-        ) => expr,
+        ) => {
+            check_marker(body);
+            initializer
+        }
+        (
+            ExprKind::Let {
+                binding: LocalBindingId(11),
+                initializer,
+                body,
+            },
+            6,
+        ) => {
+            check_marker(initializer);
+            body
+        }
         (ExprKind::LambdaFunction { params, body }, 3) => {
             assert!(params.is_empty());
             body
@@ -310,65 +290,6 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             },
             5,
         ) => expr,
-        (
-            ExprKind::InList {
-                expr,
-                list,
-                negated: true,
-            },
-            6,
-        ) => {
-            assert_eq!(list.len(), 1);
-            check_marker(&list[0]);
-            expr
-        }
-        (
-            ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated: true,
-            },
-            7..=9,
-        ) => match slot {
-            7 => {
-                check_marker(low);
-                check_marker(high);
-                expr
-            }
-            8 => {
-                check_marker(expr);
-                check_marker(high);
-                low
-            }
-            _ => {
-                check_marker(expr);
-                check_marker(low);
-                high
-            }
-        },
-        (
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated: true,
-            },
-            10,
-        ) => {
-            check_marker(pattern);
-            expr
-        }
-        (
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated: true,
-            },
-            11,
-        ) => {
-            check_marker(expr);
-            pattern
-        }
         (
             ExprKind::Case {
                 operand: Some(operand),
@@ -407,14 +328,6 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
                 }
             }
         }
-        (
-            ExprKind::IsTruthValue {
-                expr,
-                value: false,
-                negated: true,
-            },
-            14,
-        ) => expr,
         (ExprKind::Nested(expr), 15) => expr,
         (ExprKind::Lambda { params, body }, 16) => {
             assert_eq!(params, &["parameter"]);
@@ -464,19 +377,6 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             &order_by[1].expr
         }
         (
-            ExprKind::InList {
-                expr,
-                list,
-                negated: true,
-            },
-            20,
-        ) => {
-            assert_eq!(list.len(), 2);
-            check_marker(expr);
-            check_marker(&list[0]);
-            &list[1]
-        }
-        (
             ExprKind::WindowCall {
                 args,
                 function_order_by,
@@ -524,19 +424,12 @@ fn take_child(slot: usize, node: TypedExpr) -> TypedExpr {
     match (node.kind, slot) {
         (ExprKind::BinaryOp { left, .. }, 0) => left.into_inner(),
         (ExprKind::BinaryOp { right, .. }, 1) => right.into_inner(),
-        (ExprKind::UnaryOp { expr, .. }, 2)
-        | (ExprKind::Cast { expr, .. }, 4)
-        | (ExprKind::IsNull { expr, .. }, 5)
-        | (ExprKind::InList { expr, .. }, 6)
-        | (ExprKind::IsTruthValue { expr, .. }, 14) => expr.into_inner(),
+        (ExprKind::Let { initializer, .. }, 2) => initializer.into_inner(),
+        (ExprKind::Let { body, .. }, 6) => body.into_inner(),
+        (ExprKind::Cast { expr, .. }, 4) | (ExprKind::IsNull { expr, .. }, 5) => expr.into_inner(),
         (ExprKind::LambdaFunction { body, .. }, 3) | (ExprKind::Lambda { body, .. }, 16) => {
             body.into_inner()
         }
-        (ExprKind::Between { expr, .. }, 7) => expr.into_inner(),
-        (ExprKind::Between { low, .. }, 8) => low.into_inner(),
-        (ExprKind::Between { high, .. }, 9) => high.into_inner(),
-        (ExprKind::Like { expr, .. }, 10) => expr.into_inner(),
-        (ExprKind::Like { pattern, .. }, 11) => pattern.into_inner(),
         (
             ExprKind::Case {
                 operand: Some(expr),
@@ -557,7 +450,6 @@ fn take_child(slot: usize, node: TypedExpr) -> TypedExpr {
         | (ExprKind::WindowCall { mut args, .. }, 23) => args.pop().unwrap(),
         (ExprKind::AggregateCall { mut order_by, .. }, 19)
         | (ExprKind::WindowCall { mut order_by, .. }, 26) => order_by.pop().unwrap().expr,
-        (ExprKind::InList { mut list, .. }, 20) => list.pop().unwrap(),
         (ExprKind::Case { mut when_then, .. }, 21) => when_then.pop().unwrap().0,
         (ExprKind::Case { mut when_then, .. }, 22) => when_then.pop().unwrap().1,
         (
@@ -604,7 +496,7 @@ fn recursive_typed_expression_owners_keep_every_child_slot_and_original_allocati
     drop(original);
     // Each slot independently forms the entire owning cycle; no other protected
     // variant on a mixed path can hide a missing carrier at this slot.
-    for slot in 0..SLOTS {
+    for slot in SLOTS {
         let mut tree = leaf();
         for _ in 0..DEPTH {
             tree = wrap(slot, tree);

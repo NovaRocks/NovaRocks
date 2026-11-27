@@ -314,7 +314,7 @@ pub(crate) fn add_aggregate(
             let definition = builder
                 .unit(node)
                 .unwrap()
-                .add(None, ty, ExprKind::Value(*value))
+                .add(None, ty, ExprKind::input(*value))
                 .unwrap();
             let root = builder
                 .unit(node)
@@ -335,7 +335,7 @@ pub(crate) fn add_aggregate(
                 let definition = builder
                     .unit(node)
                     .unwrap()
-                    .add(None, ty, ExprKind::Value(*value))
+                    .add(None, ty, ExprKind::input(*value))
                     .unwrap();
                 builder
                     .unit(node)
@@ -553,7 +553,10 @@ pub(crate) fn finish(
                         value_type: value_type.clone(),
                         constant: None,
                     },
-                    FunctionArgumentType::Lambda { .. } => panic!("aggregate value channel"),
+                    FunctionArgumentType::Lambda { .. }
+                    | FunctionArgumentType::CandidateGroup { .. } => {
+                        panic!("aggregate value channel")
+                    }
                 })
                 .collect();
             entries.push((
@@ -646,7 +649,8 @@ fn freeze(
                     value_type: value_type.clone(),
                     constant: None,
                 },
-                FunctionArgumentType::Lambda { .. } => panic!("aggregate value channel"),
+                FunctionArgumentType::Lambda { .. }
+                | FunctionArgumentType::CandidateGroup { .. } => panic!("aggregate value channel"),
             })
             .collect::<Vec<_>>();
         let unit = fragment.unit(node);

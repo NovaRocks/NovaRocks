@@ -388,7 +388,7 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
     let arguments = (0..shape.lists)
         .map(|list| {
             let kind = match key {
-                Some(_) => ExprKind::Value(list_values[list]),
+                Some(_) => ExprKind::input(list_values[list]),
                 None => ExprKind::Constant(ConstantReference {
                     pool: ConstantPoolId::new(0),
                     ordinal: 0,
@@ -510,7 +510,8 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
                         value_type: value_type.clone(),
                         constant: None,
                     },
-                    FunctionArgumentType::Lambda { .. } => panic!("UNNEST takes values"),
+                    FunctionArgumentType::Lambda { .. }
+                    | FunctionArgumentType::CandidateGroup { .. } => panic!("UNNEST takes values"),
                 })
                 .collect(),
             logical_argument_count: function.argument_types.len(),

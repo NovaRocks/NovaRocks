@@ -60,7 +60,7 @@ impl fmt::Display for OperatorFunctionCatalogError {
             Self::InvalidAbi(overload) => {
                 write!(
                     formatter,
-                    "operator overload `{}` must have a ScalarV1 implementation",
+                    "operator overload `{}` has an unexpected installed ABI",
                     overload.as_str()
                 )
             }
@@ -113,7 +113,11 @@ pub fn validate_installed_operator_functions(
                     control,
                 )
                 .map_err(OperatorFunctionCatalogError::OverloadLookup)?;
-            if actual.implementation().abi != PureKernelAbi::ScalarV1 {
+            let expected = match operator {
+                OperatorFunction::InList => PureKernelAbi::ControlIntrinsicV1,
+                _ => PureKernelAbi::ScalarV1,
+            };
+            if actual.implementation().abi != expected {
                 return Err(OperatorFunctionCatalogError::InvalidAbi(
                     overload.identity.clone(),
                 ));
@@ -127,6 +131,125 @@ pub fn validate_installed_operator_functions(
 mod tests {
     use super::*;
     use crate::{EngineFunctionCatalogBuilder, InstalledPureKernel};
+
+    #[test]
+    fn candidate_group_prepares_above_the_ordinary_argument_limit() {
+        use crate::{
+            CallArgumentUses, CallEffectInput, FunctionArgument, FunctionArgumentType,
+            FunctionBindingRequest, FunctionCandidate, FunctionIntrinsicRowError,
+            FunctionValueType, MAX_CALL_EFFECT_ARGUMENTS, PreparedPureKernel, PureCallPreparation,
+            ScopedExpressionEffects,
+        };
+        use arrow_schema::DataType;
+        use novarocks_type_contract::{
+            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+            ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+        };
+        use std::sync::Arc;
+
+        let catalog = crate::builtin::catalogue::builtin_engine_function_catalog();
+        let function = OperatorFunction::InList.function_id();
+        let control = crate::binding_test_control();
+        let probe_type = FunctionValueType::new(DataType::Int64, false);
+        let element_type = FunctionValueType::new(DataType::Int64, true);
+        let member_count = MAX_CALL_EFFECT_ARGUMENTS + 1;
+        let mut members = vec![
+            FunctionCandidate {
+                value_type: probe_type.clone(),
+                constant: None,
+            };
+            member_count
+        ];
+        members[0].value_type = element_type.clone();
+        let arguments = [
+            FunctionArgument::Value {
+                value_type: probe_type,
+                constant: None,
+            },
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members: members.into_boxed_slice(),
+            },
+        ];
+        let request = FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: 2,
+            expected_result_type: None,
+        };
+        let binding = catalog
+            .resolve_bound_trusted_by_id(&function, FunctionKind::Scalar, request, control)
+            .unwrap();
+        assert_eq!(binding.logical_argument_count, 2);
+        assert!(matches!(
+            binding.selected.argument_types.as_ref(),
+            [
+                FunctionArgumentType::Value(_),
+                FunctionArgumentType::CandidateGroup { .. }
+            ]
+        ));
+
+        let selected = Arc::new(binding.selected);
+        let context = ExpressionEffectContext {
+            use_id: ExpressionUseId::new(0),
+            region: EvaluationRegionId::new(0),
+            demand: EvaluationDemand::Value,
+        };
+        let parameters = SemanticParameters::default();
+        let uses: Vec<_> = (2..2 + member_count as u32)
+            .map(ExpressionUseId::new)
+            .collect();
+        let input = CallEffectInput {
+            context: context.into(),
+            argument_uses: CallArgumentUses::CandidateGroup {
+                probe: ExpressionUseId::new(1),
+                candidates: &uses,
+            },
+            function_id: &function,
+            kind: FunctionKind::Scalar,
+            selected: &selected,
+            request,
+            environment: &[],
+            parameters: &parameters,
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            proof_scope: CallProofScope::Unconditional,
+        };
+        let options = || PureCallPreparation::ControlIntrinsic {
+            arguments: ScopedExpressionEffects::pure_value(context),
+        };
+        let prepared = catalog
+            .prepare_fresh_selected(input, Arc::clone(&selected), options(), control)
+            .unwrap();
+        let PreparedPureKernel::Membership(membership) = prepared.prepared() else {
+            panic!("expected installed membership");
+        };
+        assert_eq!(membership.call().logical_argument_count(), 2);
+        assert_eq!(
+            membership.call().effects().own_row_error,
+            FunctionIntrinsicRowError::NoRowError
+        );
+        assert!(
+            membership
+                .comparison()
+                .streaming_equality()
+                .unwrap()
+                .right_type()
+                .nullable()
+        );
+        assert_eq!(membership.call().selected().argument_types.len(), 2);
+
+        let wrong_use = CallEffectInput {
+            argument_uses: CallArgumentUses::CandidateGroup {
+                probe: ExpressionUseId::new(1),
+                candidates: &uses[1..],
+            },
+            ..input
+        };
+        assert!(
+            catalog
+                .prepare_fresh_selected(wrong_use, Arc::clone(&selected), options(), control,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn visible_operator_is_not_accepted_as_an_installed_operator() {

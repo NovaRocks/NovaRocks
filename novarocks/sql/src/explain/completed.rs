@@ -1759,13 +1759,22 @@ struct ExprDefinitionDisplay<'a> {
 
 impl fmt::Display for ExprDefinitionDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use novarocks_expression_contract::ExprKind;
+        use novarocks_expression_contract::{ExprKind, ValueAddress};
         let expr = |id: ExprId| DefinitionRef(self.node, id);
         match &self.expression.kind {
-            ExprKind::Value(value) => self
+            ExprKind::Value(ValueAddress::Input(value)) => self
                 .context
                 .value_name(self.fragment, *value)
                 .fmt(formatter),
+            ExprKind::Value(ValueAddress::Local(binder)) => {
+                write!(formatter, "local-value(binding={})", expr(*binder))
+            }
+            ExprKind::Let { value, body } => write!(
+                formatter,
+                "let(value={}, body={})",
+                expr(*value),
+                expr(*body)
+            ),
             ExprKind::LambdaParameter { lambda, ordinal } => {
                 write!(
                     formatter,
@@ -1778,14 +1787,6 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 "constant-reference(pool={}, ordinal={})",
                 reference.pool.get(),
                 reference.ordinal,
-            ),
-            ExprKind::Unary { op, expr: inner } => write!(
-                formatter,
-                "({}{})",
-                match op {
-                    novarocks_expression_contract::UnaryOperator::Not => "NOT ",
-                },
-                expr(*inner)
             ),
             ExprKind::Conjunction { args } => write!(
                 formatter,
@@ -1889,49 +1890,6 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 expr(*inner),
                 if *negated { "NOT " } else { "" }
             ),
-            ExprKind::InList {
-                expr: inner,
-                list,
-                negated,
-            } => write!(
-                formatter,
-                "({} {}IN ({}))",
-                expr(*inner),
-                if *negated { "NOT " } else { "" },
-                joined(
-                    list,
-                    ", ",
-                    |item: &ExprId, output: &mut fmt::Formatter<'_>| write!(
-                        output,
-                        "{}",
-                        expr(*item)
-                    )
-                )
-            ),
-            ExprKind::Between {
-                expr: inner,
-                low,
-                high,
-                negated,
-            } => write!(
-                formatter,
-                "({} {}BETWEEN {} AND {})",
-                expr(*inner),
-                if *negated { "NOT " } else { "" },
-                expr(*low),
-                expr(*high)
-            ),
-            ExprKind::Like {
-                expr: inner,
-                pattern,
-                negated,
-            } => write!(
-                formatter,
-                "({} {}LIKE {})",
-                expr(*inner),
-                if *negated { "NOT " } else { "" },
-                expr(*pattern)
-            ),
             ExprKind::Case {
                 operand,
                 when_then,
@@ -1950,17 +1908,6 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 }
                 formatter.write_str(" END")
             }
-            ExprKind::IsTruthValue {
-                expr: inner,
-                value,
-                negated,
-            } => write!(
-                formatter,
-                "({} IS {}{})",
-                expr(*inner),
-                if *negated { "NOT " } else { "" },
-                if *value { "TRUE" } else { "FALSE" }
-            ),
         }
     }
 }
@@ -5133,10 +5080,13 @@ mod tests {
             panic!("the projection input must expose x, y, and z");
         };
         for (operand, expected) in [(x, input_x), (y, input_y), (z, input_z)] {
-            assert!(matches!(
-                &unit.definition(*operand).expect("input definition").kind,
-                ExprKind::Value(value) if value == expected
-            ));
+            assert_eq!(
+                unit.definition(*operand)
+                    .expect("input definition")
+                    .kind
+                    .input_value(),
+                Some(*expected),
+            );
         }
         for (definition, binding, left, right) in [
             (add, add_binding, y, z),

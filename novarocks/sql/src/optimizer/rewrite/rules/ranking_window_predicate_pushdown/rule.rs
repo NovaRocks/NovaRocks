@@ -26,7 +26,7 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::optimizer::scalar::{ScalarArena, ScalarId};
 use crate::optimizer::scalar_expr;
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
@@ -389,27 +389,20 @@ fn conjunct_upper_bound(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId)
             _ => None,
         };
     }
-    match arena.node(expr) {
-        // BETWEEN low AND high: upper bound is `high`
-        ScalarNode::Between {
-            child,
-            high,
-            negated: false,
-            ..
-        } if is_rank_col(arena, *child, rank_col) => int_lit(arena, *high),
-        // IN (v1, v2, ...): upper bound is the max value in the list
-        ScalarNode::InList {
-            child,
-            list,
-            negated: false,
-        } if is_rank_col(arena, *child, rank_col) => list
-            .iter()
-            .map(|item| int_lit(arena, *item))
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .max(),
-        _ => None,
+    if let Some((probe, lower, upper)) =
+        crate::common::binary_operator::scalar_inclusive_range(arena, expr)
+        && is_rank_col(arena, probe, rank_col)
+    {
+        int_lit(arena, lower)?;
+        return int_lit(arena, upper);
     }
+    let (probe, candidates) = crate::common::binary_operator::scalar_in_list(arena, expr)?;
+    if !is_rank_col(arena, probe, rank_col) {
+        return None;
+    }
+    candidates.iter().try_fold(i64::MIN, |bound, &item| {
+        Some(bound.max(int_lit(arena, item)?))
+    })
 }
 
 #[cfg(test)]
@@ -490,26 +483,20 @@ mod tests {
     }
 
     fn between_typed(expr: TypedExpr, low_v: i64, high_v: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                low: novarocks_parser::ast::AstBox::new(int_typed(low_v)),
-                high: novarocks_parser::ast::AstBox::new(int_typed(high_v)),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_inclusive_range(
+            expr,
+            int_typed(low_v),
+            int_typed(high_v),
+        )
     }
 
     fn in_list_typed(expr: TypedExpr, values: &[i64]) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                list: values.iter().map(|&v| int_typed(v)).collect(),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::InList,
+            std::iter::once(expr)
+                .chain(values.iter().map(|&v| int_typed(v)))
+                .collect(),
+        )
     }
 
     fn rank_upper_bound_typed(predicate: TypedExpr, rank_col: ColumnId) -> Option<usize> {

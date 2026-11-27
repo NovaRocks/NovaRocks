@@ -639,6 +639,9 @@ impl FunctionValueType {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum FunctionArgumentType {
     Value(FunctionValueType),
+    CandidateGroup {
+        element_type: FunctionValueType,
+    },
     Lambda {
         parameter_types: crate::FunctionParameterTypes,
         result_type: FunctionValueType,

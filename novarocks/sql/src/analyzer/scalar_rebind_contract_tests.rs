@@ -150,6 +150,9 @@ impl Resolver {
                     parameter_types: parameter_types.clone(),
                     result_type: result_type.clone(),
                 },
+                FunctionArgument::CandidateGroup { .. } => {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
             };
             work.step()?;
             // The result really belongs to this resolver. Coercion may change

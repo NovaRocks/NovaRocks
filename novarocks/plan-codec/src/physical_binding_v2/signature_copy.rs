@@ -178,7 +178,7 @@ fn preflight_argument_counts(
     // Admit all references and collection requests before the sole type walk.
     for argument in arguments {
         match argument {
-            FunctionArgumentType::Value(_) => {
+            FunctionArgumentType::Value(_) | FunctionArgumentType::CandidateGroup { .. } => {
                 model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
             }
             FunctionArgumentType::Lambda {
@@ -208,7 +208,10 @@ fn preflight_argument_types(
 ) -> Result<(), BindingCodecError> {
     for argument in arguments {
         match argument {
-            FunctionArgumentType::Value(value) => {
+            FunctionArgumentType::Value(value)
+            | FunctionArgumentType::CandidateGroup {
+                element_type: value,
+            } => {
                 if let Some(parent) = admit.as_mut() {
                     model.count_owned_type_clone_in(value, limits, *parent, work)?;
                 } else {

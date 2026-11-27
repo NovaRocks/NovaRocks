@@ -101,7 +101,7 @@ fn program(branches: usize, sorted: bool, dop: usize) -> (Arc<LocalProgram>, Vec
         let key = builder
             .unit(sort)
             .unwrap()
-            .add(None, int64(false), ExprKind::Value(outputs[1]))
+            .add(None, int64(false), ExprKind::input(outputs[1]))
             .unwrap();
         let key = builder
             .unit(sort)

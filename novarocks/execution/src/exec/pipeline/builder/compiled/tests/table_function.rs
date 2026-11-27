@@ -315,7 +315,7 @@ fn add_table_function(
             Arg::List(list) => builder
                 .unit(node)
                 .unwrap()
-                .add(None, list_type(), ExprKind::Value(lists[list]))
+                .add(None, list_type(), ExprKind::input(lists[list]))
                 .unwrap(),
             Arg::Faulty(list) => faulty_argument(builder, node, key, lists[list]),
         })
@@ -428,7 +428,7 @@ fn faulty_argument(
     let left = builder
         .unit(node)
         .unwrap()
-        .add(None, operand.clone(), ExprKind::Value(key))
+        .add(None, operand.clone(), ExprKind::input(key))
         .unwrap();
     let right = builder.constant(
         node,
@@ -465,12 +465,12 @@ fn faulty_argument(
     let then = builder
         .unit(node)
         .unwrap()
-        .add(None, list_type(), ExprKind::Value(list))
+        .add(None, list_type(), ExprKind::input(list))
         .unwrap();
     let otherwise = builder
         .unit(node)
         .unwrap()
-        .add(None, list_type(), ExprKind::Value(list))
+        .add(None, list_type(), ExprKind::input(list))
         .unwrap();
     builder
         .unit(node)
@@ -760,7 +760,7 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
         let expr = builder
             .unit(sort)
             .unwrap()
-            .add(None, int64(false), ExprKind::Value(key))
+            .add(None, int64(false), ExprKind::input(key))
             .unwrap();
         let expr = builder
             .unit(sort)

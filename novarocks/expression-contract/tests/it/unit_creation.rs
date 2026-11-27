@@ -163,7 +163,7 @@ fn graph_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
         for ordinal in 0..12 {
             let value = ValueId::new(side * 12 + ordinal);
             values.push((value, integer(false)));
-            leaves.push(b.add(None, integer(false), ExprKind::Value(value)).unwrap());
+            leaves.push(b.add(None, integer(false), ExprKind::input(value)).unwrap());
         }
         ports.push(ExprPort {
             values: values.into_boxed_slice(),
@@ -201,7 +201,7 @@ fn graph() -> BoundExprSet {
 fn call_unit(environment: bool) -> BoundExprSet {
     let mut b = BoundExprSetBuilder::new(limits());
     let input = b
-        .add(None, integer(false), ExprKind::Value(ValueId::new(4)))
+        .add(None, integer(false), ExprKind::input(ValueId::new(4)))
         .unwrap();
     let signature = function(
         "fixture/unit/creator",
@@ -265,7 +265,7 @@ fn call_unit(environment: bool) -> BoundExprSet {
 fn temporal_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, integer(false), ExprKind::Value(ValueId::new(4)))
+        .add(None, integer(false), ExprKind::input(ValueId::new(4)))
         .unwrap();
     let mut normal = leaf;
     for _ in 0..3 {
@@ -501,14 +501,29 @@ fn each_actual_scratch_request_preserves_the_first_host_refusal_and_input_identi
                 .iter()
                 .any(|event| matches!(event.request, Request::Opaque(_)))
         );
-        // These two independent vocabulary extents belong to the hidden
-        // environment and temporal authors, rather than the graph Vec headers.
-        let expected = match fixture {
-            2 => Some(Layout::array::<SemanticParameterKey>(3).unwrap()),
-            3 => Some(Layout::array::<TemporalCastKind>(3).unwrap()),
-            _ => None,
-        };
-        if let Some(layout) = expected {
+        if fixture == 2 {
+            let baseline = Arc::new(Mutex::new(Vec::new()));
+            let (mut baseline_temporary, _) =
+                Scope::new(ScopeKind::Temporary, baseline.clone(), None);
+            let (mut baseline_retained, _) =
+                Scope::new(ScopeKind::Retained, baseline.clone(), None);
+            read(
+                parts(&call_unit(false)),
+                &mut baseline_temporary,
+                &mut baseline_retained,
+                &Control::good(),
+            )
+            .unwrap();
+            let opaque_requests = |events: &[Event]| {
+                events
+                    .iter()
+                    .filter(|event| matches!(event.request, Request::Opaque(_)))
+                    .count()
+            };
+            assert!(opaque_requests(&trace) > opaque_requests(&baseline.lock().unwrap()));
+        }
+        if fixture == 3 {
+            let layout = Layout::array::<TemporalCastKind>(3).unwrap();
             assert!(
                 trace
                     .iter()
@@ -546,6 +561,69 @@ fn each_actual_scratch_request_preserves_the_first_host_refusal_and_input_identi
         }
     }
 }
+
+#[test]
+fn candidate_group_members_use_the_original_request_creator_and_storage_hold() {
+    use novarocks_function_contract::{FunctionArgument, FunctionCandidate};
+
+    let source = PhysicalCallRequest {
+        logical_argument_count: 2,
+        expected_result_type: None,
+        arguments: Box::from([
+            FunctionArgument::Value {
+                value_type: integer(false),
+                constant: None,
+            },
+            FunctionArgument::CandidateGroup {
+                element_type: integer(false),
+                members: vec![
+                    FunctionCandidate {
+                        value_type: integer(false),
+                        constant: None
+                    };
+                    63
+                ]
+                .into_boxed_slice(),
+            },
+        ]),
+    };
+    let layout = Layout::array::<FunctionCandidate>(63).unwrap();
+    let pools = novarocks_constant_contract::ConstantPools::empty();
+    let control = Control::good();
+    for refusal in [None, Some(1)] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut scope, hold) = Scope::new(ScopeKind::Temporary, events.clone(), refusal);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let actual =
+            materialize_call_request_with_creator_in(&source, &pools, &mut scope, &mut work, 2);
+        drop(scope);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].request,
+            Request::Exact(layout.size(), layout.align())
+        );
+        match refusal {
+            None => {
+                let materialized = actual.unwrap();
+                assert!(hold.upgrade().is_some());
+                let [_, FunctionArgument::CandidateGroup { members, .. }] =
+                    materialized.request().arguments
+                else {
+                    panic!("candidate group channel is absent");
+                };
+                assert_eq!(members.len(), 63);
+                drop(materialized);
+                work.finish().unwrap();
+            }
+            Some(index) => assert!(
+                matches!(actual, Err(CallRequestMaterializationFailure::Creator(HostRefusal(actual))) if actual == index)
+            ),
+        }
+        assert!(hold.upgrade().is_none());
+    }
+}
+
 #[test]
 fn every_control_prefix_stops_without_later_creator_callbacks() {
     let unit = graph();
@@ -1167,7 +1245,7 @@ fn authored_source(
     let mut builder = BoundExprSetBuilder::new(limits());
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     for ordinal in 0..12 {
-        let kind = ExprKind::Value(ValueId::new(ordinal * 19));
+        let kind = ExprKind::input(ValueId::new(ordinal * 19));
         let id = if ordinal == 0 {
             let id = builder.reserve_with_creator_in(scope, &mut work)?;
             builder.insert(id, None, integer(false), kind).unwrap();
@@ -1200,7 +1278,12 @@ fn original_source_buffers_borrow_actual_growth_and_keep_each_creator_and_contro
     assert_eq!(builder.roots().len(), 12);
     for ordinal in 0..12 {
         assert!(
-            matches!(builder.definition(ExprId::new(ordinal)).unwrap().kind,ExprKind::Value(id) if id.get()==ordinal*19)
+            builder
+                .definition(ExprId::new(ordinal))
+                .unwrap()
+                .kind
+                .input_value()
+                == Some(ValueId::new(ordinal * 19))
         );
     }
     let trace = events.lock().unwrap().clone();

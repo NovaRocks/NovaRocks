@@ -44,19 +44,17 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
     let unit = program.unit(site.unit).unwrap();
     let flow = unit.control_flow();
     let occurrence = &flow.uses()[&unit.root(site.root).unwrap().use_id];
-    assert_eq!(
-        occurrence.control,
-        ControlShape::Membership { negated: false }
-    );
+    assert_eq!(occurrence.control, ControlShape::CandidateGroup);
     assert_eq!(occurrence.arguments.len(), 4);
     assert_ne!(occurrence.arguments[0], occurrence.arguments[1]);
     assert_ne!(occurrence.arguments[1], occurrence.arguments[3]);
     let definition = unit.definitions().node(occurrence.definition).unwrap();
-    let StaticExprKind::PreparedInList { child, values, .. } = definition.kind() else {
+    let StaticExprKind::BoundCall { args, .. } = definition.kind() else {
         panic!("actual original IN definition");
     };
     // SQL's original lowering owns each definition. Repeated lexical `k`
     // does not authorize this test to invent CSE or an aliasing receipt.
+    let (child, values) = args.split_first().unwrap();
     assert_eq!(flow.uses()[&occurrence.arguments[0]].definition, *child);
     assert_eq!(values.len(), 3);
     for (ordinal, candidate) in values.iter().enumerate() {
@@ -73,26 +71,35 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
         );
         assert_eq!(
             flow.regions()[&child.context.region].guard.unwrap().kind,
-            novarocks_type_contract::GuardKind::MembershipAfterSource {
+            novarocks_type_contract::GuardKind::CandidateAfterSource {
                 ordinal: (ordinal - 1) as u32
             }
         );
     }
-    let recipe = unit
-        .recipes()
-        .native_inlist(unit.root(site.root).unwrap().use_id)
-        .unwrap();
-    assert_eq!(recipe.source_type().data_type().clone(), DataType::Int64);
-    assert_eq!(recipe.candidate_types().len(), 3);
-    assert_eq!(recipe.result_type().data_type().clone(), DataType::Boolean);
-    assert!(recipe.result_type().nullable());
+    let novarocks_functions::PreparedPureKernel::Membership(prepared) =
+        unit.calls()[&occurrence.context.use_id].prepared()
+    else {
+        panic!("selected membership owner")
+    };
+    assert_eq!(
+        prepared.comparison().source_type().data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(prepared.call().logical_argument_count(), 2);
+    let novarocks_functions::FunctionResultType::Scalar(result) =
+        &prepared.call().selected().result_type
+    else {
+        panic!("selected membership is scalar");
+    };
+    assert_eq!(result.data_type(), &DataType::Boolean);
+    assert!(result.nullable());
 }
 
 #[test]
 fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use() {
-    for (sql, negated) in [
-        ("SELECT k IN (1,5,NULL) FROM t0", false),
-        ("SELECT k NOT IN (1,5,NULL) FROM t0", true),
+    for sql in [
+        "SELECT k IN (1,5,NULL) FROM t0",
+        "SELECT k NOT IN (1,5,NULL) FROM t0",
     ] {
         let source = sql_source_with_single_field_and_core_residuals(
             sql,
@@ -125,14 +132,14 @@ fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use
                 }
                 let before = seen;
                 for (&id, invocation) in unit.control_flow().uses() {
-                    if invocation.control == (ControlShape::Membership { negated }) {
+                    if invocation.control == ControlShape::CandidateGroup {
                         let emitted = encoded
                             .uses
                             .iter_mut()
                             .find(|entry| entry.id == id.get())
                             .unwrap();
                         assert_eq!(emitted.argument_use_ids.len(), 4);
-                        emitted.argument_use_ids.pop();
+                        emitted.argument_use_ids.truncate(1);
                         seen += 1;
                     }
                 }

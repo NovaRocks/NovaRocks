@@ -26,7 +26,7 @@ fn try_body_has_its_own_region_and_value_demand() {
     let ty = boolean(true);
     let mut builder = BoundExprSetBuilder::new(limits());
     let leaf = builder
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let function = function(
         "fixture/unit/try",
@@ -87,7 +87,7 @@ fn shared_if_retains_independent_value_truth_uses_and_hand_checked_guards() {
     let ty = boolean(true);
     let mut builder = BoundExprSetBuilder::new(limits());
     let leaf = builder
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let mut f = function(
         "fixture/unit/if",
@@ -311,7 +311,7 @@ fn neutral_parts_preserve_sparse_non_dfs_use_ids_and_root_specific_port_bindings
             id: definition,
             lambda_scope: None,
             ty,
-            kind: ExprKind::Value(ValueId::new(9)),
+            kind: ExprKind::input(ValueId::new(9)),
         }]),
         Box::new([
             ExprRoot {
@@ -341,7 +341,7 @@ fn neutral_parts_preserve_sparse_non_dfs_use_ids_and_root_specific_port_bindings
 fn repeated_roots() -> BoundExprSetBuilder {
     let mut b = BoundExprSetBuilder::new(limits());
     let id = b
-        .add(None, boolean(false), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(false), ExprKind::input(ValueId::new(9)))
         .unwrap();
     for _ in 0..320 {
         b.root(id, EvaluationDemand::Value, RootScope::Port(0))
@@ -381,7 +381,7 @@ fn actual_320_shared_roots_observe_real_quantums_and_each_control_cause_keeps_it
 fn dag(levels: usize) -> BoundExprSetBuilder {
     let mut b = BoundExprSetBuilder::new(limits());
     let mut id = b
-        .add(None, boolean(false), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(false), ExprKind::input(ValueId::new(9)))
         .unwrap();
     for _ in 0..levels {
         id = b
@@ -432,17 +432,17 @@ fn intrinsic_boolean_and_both_case_shapes_keep_ordered_hand_checked_guards() {
     let mut b = BoundExprSetBuilder::new(limits());
     let ty = boolean(false);
     let a = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let c = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(8)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(8)))
         .unwrap();
     let not = b
         .add(
             None,
             ty.clone(),
-            ExprKind::Unary {
-                op: UnaryOperator::Not,
+            ExprKind::IsNull {
+                negated: true,
                 expr: a,
             },
         )
@@ -559,7 +559,7 @@ fn coalesce_keeps_its_guard_and_nested_eager_calls_keep_the_guarded_region() {
     let ty = integer(true);
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let f = function(
         "fixture/unit/eager",
@@ -674,7 +674,7 @@ fn no_arguments_keeps_static_children_but_does_not_invent_runtime_uses() {
     let ty = integer(false);
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let f = function(
         "fixture/unit/no-arguments",
@@ -722,7 +722,7 @@ fn no_arguments_keeps_static_children_but_does_not_invent_runtime_uses() {
 fn neutral_parts_cannot_bind_an_independent_root_inside_another_roots_guard() {
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let case = b
         .add(
@@ -791,7 +791,7 @@ fn neutral_parts_cannot_relabel_the_exact_temporal_source_shape() {
     let ty = integer(false);
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let f = function(
         "fixture/unit/time_to_sec",

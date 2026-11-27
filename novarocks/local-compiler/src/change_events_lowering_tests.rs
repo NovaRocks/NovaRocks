@@ -236,14 +236,14 @@ fn try_fixture(
         .fixture_definition(
             event_node,
             integer.clone(),
-            ExprKind::Value(initial_values[0]),
+            ExprKind::input(initial_values[0]),
         )
         .unwrap();
     let nested_expr = builder
         .fixture_definition(
             event_node,
             nested.clone(),
-            ExprKind::Value(initial_values[1]),
+            ExprKind::input(initial_values[1]),
         )
         .unwrap();
     let predicate = builder
@@ -381,9 +381,9 @@ fn try_fixture(
             next,
             event_node,
             vec![
-                (ExprKind::Value(nested_value), nested),
+                (ExprKind::input(nested_value), nested),
                 (
-                    ExprKind::Value(effect),
+                    ExprKind::input(effect),
                     FunctionValueType::new(DataType::Int8, false),
                 ),
             ],

@@ -407,8 +407,8 @@ impl Fixture {
             definition(
                 1,
                 3,
-                K::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Not as i32,
+                K::IsNull(wire::IsNullExpression {
+                    negated: true,
                     expr_id: Some(0),
                 }),
             ),
@@ -458,29 +458,22 @@ impl Fixture {
             definition(
                 9,
                 3,
-                K::InList(wire::InListExpression {
-                    expr_id: Some(16),
-                    list_expr_ids: vec![0, 16, 0],
-                    negated: true,
+                K::Conjunction(wire::ExpressionIds {
+                    expr_ids: vec![16, 0, 16, 0],
                 }),
             ),
             definition(
                 10,
                 3,
-                K::Between(wire::BetweenExpression {
-                    expr_id: Some(0),
-                    low_expr_id: Some(0),
-                    high_expr_id: Some(16),
-                    negated: false,
+                K::Conjunction(wire::ExpressionIds {
+                    expr_ids: vec![0, 0, 16],
                 }),
             ),
             definition(
                 11,
                 3,
-                K::Like(wire::LikeExpression {
-                    expr_id: Some(15),
-                    pattern_expr_id: Some(15),
-                    negated: true,
+                K::Disjunction(wire::ExpressionIds {
+                    expr_ids: vec![15, 15],
                 }),
             ),
             definition(
@@ -507,9 +500,8 @@ impl Fixture {
             definition(
                 14,
                 2,
-                K::IsTruthValue(wire::TruthValueExpression {
+                K::IsNull(wire::IsNullExpression {
                     expr_id: Some(4),
-                    value: true,
                     negated: false,
                 }),
             ),
@@ -524,8 +516,8 @@ fn small() -> Vec<wire::ExpressionDefinition> {
         definition(
             0,
             2,
-            wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                op: wire::UnaryOperator::Not as i32,
+            wire::expression_definition::Kind::IsNull(wire::IsNullExpression {
+                negated: true,
                 expr_id: Some(1),
             }),
         ),
@@ -584,6 +576,38 @@ fn owned(
 }
 
 #[test]
+fn lexical_value_materialization_preserves_the_let_edges_and_address() {
+    use novarocks_expression_contract::{ExprKind, ValueAddress};
+    use wire::expression_definition::Kind;
+    let fixture = Fixture::new(&Control::default());
+    let definitions = [
+        definition(0, 0, Kind::ValueId(0)),
+        definition(1, 0, Kind::LocalValueExprId(2)),
+        definition(
+            2,
+            0,
+            Kind::LetExpression(wire::LetExpression {
+                value_expr_id: Some(0),
+                body_expr_id: Some(1),
+            }),
+        ),
+    ];
+    let decoded = owned(&fixture, &definitions);
+    assert_eq!(decoded[0].kind, ExprKind::input(p::ValueId::new(0)));
+    assert_eq!(
+        decoded[1].kind,
+        ExprKind::Value(ValueAddress::Local(p::ExprId::new(2)))
+    );
+    assert_eq!(
+        decoded[2].kind,
+        ExprKind::Let {
+            value: p::ExprId::new(0),
+            body: p::ExprId::new(1)
+        }
+    );
+}
+
+#[test]
 fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_payload_oracles() {
     let control = Control::default();
     let f = Fixture::new(&control);
@@ -599,7 +623,7 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
     for (i, expected) in [
         (
             16,
-            novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+            novarocks_expression_contract::ExprKind::input(p::ValueId::new(0)),
         ),
         (
             0,
@@ -610,8 +634,8 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         ),
         (
             1,
-            novarocks_expression_contract::ExprKind::Unary {
-                op: novarocks_expression_contract::UnaryOperator::Not,
+            novarocks_expression_contract::ExprKind::IsNull {
+                negated: true,
                 expr: id(0),
             },
         ),
@@ -661,27 +685,20 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         ),
         (
             9,
-            novarocks_expression_contract::ExprKind::InList {
-                expr: id(16),
-                list: Box::from([id(0), id(16), id(0)]),
-                negated: true,
+            novarocks_expression_contract::ExprKind::Conjunction {
+                args: Box::from([id(16), id(0), id(16), id(0)]),
             },
         ),
         (
             10,
-            novarocks_expression_contract::ExprKind::Between {
-                expr: id(0),
-                low: id(0),
-                high: id(16),
-                negated: false,
+            novarocks_expression_contract::ExprKind::Conjunction {
+                args: Box::from([id(0), id(0), id(16)]),
             },
         ),
         (
             11,
-            novarocks_expression_contract::ExprKind::Like {
-                expr: id(15),
-                pattern: id(15),
-                negated: true,
+            novarocks_expression_contract::ExprKind::Disjunction {
+                args: Box::from([id(15), id(15)]),
             },
         ),
         (
@@ -702,9 +719,8 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         ),
         (
             14,
-            novarocks_expression_contract::ExprKind::IsTruthValue {
+            novarocks_expression_contract::ExprKind::IsNull {
                 expr: id(4),
-                value: true,
                 negated: false,
             },
         ),

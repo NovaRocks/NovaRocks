@@ -43,7 +43,7 @@ pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
                 &crate::exec::operators::family_fixture::constant_sources::i64(19),
             )
         } else {
-            ExprKind::Value(values[0])
+            ExprKind::input(values[0])
         };
         let expr = builder
             .unit(PROJECT)

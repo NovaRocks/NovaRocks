@@ -21,7 +21,7 @@
 use super::{ExpressionCodecError, PreparedExpressionIds};
 use crate::allocation_exit_v2::reserve_exit;
 use crate::physical_semantics_v2::{encode_decimal_policy, encode_reference};
-use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, UnaryOperator};
+use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, ValueAddress};
 use novarocks_physical_plan::{
     ExprId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
@@ -37,7 +37,12 @@ pub(super) fn encode_kind(
     // The borrowed variant has been visited; children are observed separately.
     work.step()?;
     Ok(match &node.kind {
-        ExprKind::Value(value) => Kind::ValueId(value.get()),
+        ExprKind::Value(ValueAddress::Input(value)) => Kind::ValueId(value.get()),
+        ExprKind::Value(ValueAddress::Local(binding)) => Kind::LocalValueExprId(binding.get()),
+        ExprKind::Let { value, body } => Kind::LetExpression(wire::LetExpression {
+            value_expr_id: Some(value.get()),
+            body_expr_id: Some(body.get()),
+        }),
         ExprKind::LambdaParameter { lambda, ordinal } => {
             Kind::LambdaParameter(wire::LambdaParameter {
                 lambda_expr_id: Some(lambda.get()),
@@ -47,10 +52,6 @@ pub(super) fn encode_kind(
         ExprKind::Constant(reference) => Kind::Constant(wire::ConstantReference {
             pool_id: Some(reference.pool.get()),
             row_ordinal: reference.ordinal,
-        }),
-        ExprKind::Unary { op, expr } => Kind::Unary(wire::UnaryExpression {
-            op: unary(*op),
-            expr_id: Some(expr.get()),
         }),
         ExprKind::Binary {
             left,
@@ -114,35 +115,6 @@ pub(super) fn encode_kind(
             expr_id: Some(expr.get()),
             negated: *negated,
         }),
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => Kind::InList(wire::InListExpression {
-            expr_id: Some(expr.get()),
-            list_expr_ids: expression_ids(list, work)?,
-            negated: *negated,
-        }),
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => Kind::Between(wire::BetweenExpression {
-            expr_id: Some(expr.get()),
-            low_expr_id: Some(low.get()),
-            high_expr_id: Some(high.get()),
-            negated: *negated,
-        }),
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => Kind::Like(wire::LikeExpression {
-            expr_id: Some(expr.get()),
-            pattern_expr_id: Some(pattern.get()),
-            negated: *negated,
-        }),
         ExprKind::Case {
             ieee_float_equality,
             operand,
@@ -156,15 +128,6 @@ pub(super) fn encode_kind(
                 then_expr_id: Some(then.get()),
             })?,
             else_expr_id: else_expr.map(ExprId::get),
-        }),
-        ExprKind::IsTruthValue {
-            expr,
-            value,
-            negated,
-        } => Kind::IsTruthValue(wire::TruthValueExpression {
-            expr_id: Some(expr.get()),
-            value: *value,
-            negated: *negated,
         }),
     })
 }
@@ -213,12 +176,6 @@ fn project<T, U>(
         work.step()?;
     }
     Ok(output)
-}
-
-fn unary(op: UnaryOperator) -> i32 {
-    (match op {
-        UnaryOperator::Not => wire::UnaryOperator::Not,
-    }) as i32
 }
 
 fn binary(op: BinaryOperator) -> i32 {

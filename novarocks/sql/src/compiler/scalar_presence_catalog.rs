@@ -392,16 +392,6 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_value_conversion_binding(_argument, _target, control)?;
         self.admit(binding, control)
     }
-    fn resolve_like_with_escape_binding(
-        &self,
-        arguments: &[novarocks_functions::FunctionArgument],
-        control: &dyn PureCompileControl,
-    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        let binding = self
-            .original
-            .resolve_like_with_escape_binding(arguments, control)?;
-        self.admit(binding, control)
-    }
     fn resolve_json_canonical_key_binding(
         &self,
         argument: &novarocks_functions::FunctionArgument,

@@ -150,7 +150,7 @@ pub(crate) fn author_physical_argument_observed(
 #[path = "physical_call_arguments_tests.rs"]
 mod tests;
 
-/// The sole borrowed exact Value/Lambda signature comparison, shared by
+/// The sole borrowed exact argument signature comparison, shared by
 /// original journal consumers. It grants neither source identity nor effects.
 pub(crate) fn argument_types_exact_observed<E>(
     left: &novarocks_type_contract::FunctionArgumentType,
@@ -166,6 +166,12 @@ where
         (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
             left.exactly_equals_observed(right, || work.step().map_err(E::from))
         }
+        (
+            FunctionArgumentType::CandidateGroup { element_type: left },
+            FunctionArgumentType::CandidateGroup {
+                element_type: right,
+            },
+        ) => left.exactly_equals_observed(right, || work.step().map_err(E::from)),
         (
             FunctionArgumentType::Lambda {
                 parameter_types: left,

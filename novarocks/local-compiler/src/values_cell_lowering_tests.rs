@@ -172,7 +172,7 @@ fn cast_package_with_cells(
                 .add_root(
                     project,
                     ty.clone(),
-                    ExprKind::Value(input),
+                    ExprKind::input(input),
                     RootScope::Port(0),
                     EvaluationDemand::Value,
                 )

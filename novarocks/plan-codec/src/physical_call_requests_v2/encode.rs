@@ -462,7 +462,7 @@ fn preflight<H, K: WireRequestKey>(
         if model.parent.is_none() {
             count_request_header(request, ids, &mut model, &mut owned_source, limits)?;
         }
-        for (argument, ids) in request.arguments.iter().zip(ids.arguments) {
+        for (ordinal, (argument, ids)) in request.arguments.iter().zip(ids.arguments).enumerate() {
             match (argument, ids) {
                 (Argument::Value { .. }, ArgumentTypeIds::Value(_)) => {
                     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
@@ -474,6 +474,47 @@ fn preflight<H, K: WireRequestKey>(
                         }
                     ) {
                         model.constants = add(model.constants, 1)?;
+                    }
+                }
+                (
+                    Argument::CandidateGroup { members, .. },
+                    ArgumentTypeIds::CandidateGroup {
+                        members: member_ids,
+                        ..
+                    },
+                ) => {
+                    checked_shape(
+                        K::ALLOWS_CANDIDATE_GROUP
+                            && ordinal == 1
+                            && request.logical_argument_count == 2
+                            && matches!(request.arguments.as_ref(), [Argument::Value { .. }, _])
+                            && !members.is_empty()
+                            && members.len() == member_ids.len(),
+                        "request candidate group differs from its original scalar shape",
+                        w,
+                    )?;
+                    model.items = add(model.items, members.len())?;
+                    model.facts.type_reference_count =
+                        add(model.facts.type_reference_count, add(members.len(), 1)?)?;
+                    owned_source = add(
+                        owned_source,
+                        bytes::<
+                            novarocks_physical_plan::StaticFunctionCandidate<
+                                novarocks_physical_plan::ConstantReference,
+                            >,
+                        >(members.len())?,
+                    )?;
+                    model.known = model.known.max(owned_source).max(add(
+                        size_of::<ArgumentTypeIds<'_>>(),
+                        bytes::<u32>(member_ids.len())?,
+                    )?);
+                    model.request::<wire::OriginalValueArgument>(members.len())?;
+                    model.check(limits)?;
+                    for member in members {
+                        if member.constant.is_some() {
+                            model.constants = add(model.constants, 1)?;
+                        }
+                        w.step()?;
                     }
                 }
                 (
@@ -543,6 +584,32 @@ fn preflight<H, K: WireRequestKey>(
                     verify_id(types, *id, value_type, &mut model, limits, w)?;
                     if let Some(reference) = constant {
                         validate_constant(*reference, value_type, pools, &mut model, limits, w)?;
+                    }
+                }
+                (
+                    Argument::CandidateGroup {
+                        element_type,
+                        members,
+                    },
+                    ArgumentTypeIds::CandidateGroup {
+                        element,
+                        members: member_ids,
+                    },
+                ) => {
+                    verify_id(types, *element, element_type, &mut model, limits, w)?;
+                    for (member, id) in members.iter().zip(*member_ids) {
+                        verify_id(types, *id, &member.value_type, &mut model, limits, w)?;
+                        if let Some(reference) = member.constant {
+                            validate_constant(
+                                reference,
+                                &member.value_type,
+                                pools,
+                                &mut model,
+                                limits,
+                                w,
+                            )?;
+                        }
+                        w.step()?;
                     }
                 }
                 (
@@ -635,13 +702,28 @@ fn emit_core<K: WireRequestKey>(
             for (argument, ids) in request.arguments.iter().zip(ids.arguments) {
                 let kind = match (argument, ids) {
                     (Argument::Value { constant, .. }, ArgumentTypeIds::Value(id)) => {
-                        wire::original_function_argument::Kind::Value(wire::OriginalValueArgument {
-                            value_type_id: Some(*id),
-                            constant: constant.map(|r| wire::ConstantReference {
-                                pool_id: Some(r.pool.get()),
-                                row_ordinal: r.ordinal,
-                            }),
-                        })
+                        wire::original_function_argument::Kind::Value(project_original_value(
+                            *id, *constant,
+                        ))
+                    }
+                    (
+                        Argument::CandidateGroup { members, .. },
+                        ArgumentTypeIds::CandidateGroup {
+                            element,
+                            members: ids,
+                        },
+                    ) => {
+                        let mut values = reserve::<wire::OriginalValueArgument>(ids.len(), w)?;
+                        for (member, id) in members.iter().zip(*ids) {
+                            values.push(project_original_value(*id, member.constant));
+                            w.step()?;
+                        }
+                        wire::original_function_argument::Kind::CandidateGroup(
+                            wire::OriginalCandidateGroup {
+                                element_value_type_id: Some(*element),
+                                members: values,
+                            },
+                        )
                     }
                     (Argument::Lambda { .. }, ArgumentTypeIds::Lambda { parameters, result }) => {
                         let mut parameter_value_type_ids = reserve::<u32>(parameters.len(), w)?;
@@ -804,12 +886,27 @@ struct RequestFields {
     logical_argument_count: Option<u32>,
     expected_result_value_type_id: Option<u32>,
 }
+fn project_original_value(
+    id: u32,
+    constant: Option<novarocks_physical_plan::ConstantReference>,
+) -> wire::OriginalValueArgument {
+    wire::OriginalValueArgument {
+        value_type_id: Some(id),
+        constant: constant.map(|reference| wire::ConstantReference {
+            pool_id: Some(reference.pool.get()),
+            row_ordinal: reference.ordinal,
+        }),
+    }
+}
+
 trait WireRequestKey: Copy + Ord {
     type Wire;
+    const ALLOWS_CANDIDATE_GROUP: bool;
     fn project(self, fields: RequestFields) -> Self::Wire;
 }
 impl WireRequestKey for PhysicalCallSite {
     type Wire = wire::OriginalCallRequest;
+    const ALLOWS_CANDIDATE_GROUP: bool = false;
     fn project(self, f: RequestFields) -> Self::Wire {
         wire::OriginalCallRequest {
             definition: Some(wire::CallRequestDefinition {
@@ -825,6 +922,7 @@ impl WireRequestKey for PhysicalCallSite {
 }
 impl WireRequestKey for novarocks_expression_contract::ExprId {
     type Wire = wire::UnitCallRequest;
+    const ALLOWS_CANDIDATE_GROUP: bool = true;
     fn project(self, f: RequestFields) -> Self::Wire {
         wire::UnitCallRequest {
             definition_id: Some(self.get()),

@@ -298,7 +298,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         &mut join_builder,
         aggregate,
         ty.clone(),
-        ExprKind::Value(right_value),
+        ExprKind::input(right_value),
         novarocks_expression_contract::RootScope::Port(0),
     );
     join_builder
@@ -324,14 +324,14 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         &mut join_builder,
         join,
         ty.clone(),
-        ExprKind::Value(left_value),
+        ExprKind::input(left_value),
         novarocks_expression_contract::RootScope::Port(0),
     );
     let right_key = crate::test_constants::pure_root(
         &mut join_builder,
         join,
         ty.clone(),
-        ExprKind::Value(right_value),
+        ExprKind::input(right_value),
         novarocks_expression_contract::RootScope::Port(1),
     );
     join_builder

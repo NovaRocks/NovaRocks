@@ -76,12 +76,12 @@ pub fn case_program(kind: CaseKind) -> Fixture {
     let mut builder = unit_draft();
     let port = project_port(columns, &mut source_pools);
     let when_first = builder
-        .add(None, boolean.clone(), ExprKind::Value(first))
+        .add(None, boolean.clone(), ExprKind::input(first))
         .unwrap();
     let mut authors = BTreeMap::new();
     let (when_second, then_first, then_second, otherwise, result_type) = match kind {
         CaseKind::Priority | CaseKind::NoElse => {
-            let when_second = builder.add(None, boolean, ExprKind::Value(second)).unwrap();
+            let when_second = builder.add(None, boolean, ExprKind::input(second)).unwrap();
             let first = literal_i64(&mut builder, 11, &mut source_pools);
             let second = literal_i64(&mut builder, 22, &mut source_pools);
             let otherwise = if matches!(kind, CaseKind::Priority) {
@@ -100,7 +100,7 @@ pub fn case_program(kind: CaseKind) -> Fixture {
         CaseKind::Random | CaseKind::DeferredRandom => {
             let when_second = if matches!(kind, CaseKind::DeferredRandom) {
                 let value = builder
-                    .add(None, decimal.clone(), ExprKind::Value(decimal_value))
+                    .add(None, decimal.clone(), ExprKind::input(decimal_value))
                     .unwrap();
                 let round = round_value(
                     &mut builder,
@@ -120,7 +120,7 @@ pub fn case_program(kind: CaseKind) -> Fixture {
                     )
                     .unwrap()
             } else {
-                builder.add(None, boolean, ExprKind::Value(second)).unwrap()
+                builder.add(None, boolean, ExprKind::input(second)).unwrap()
             };
             let first = random(&mut builder, &mut authors, &functions, &mut source_pools);
             let second = random(&mut builder, &mut authors, &functions, &mut source_pools);
@@ -134,9 +134,9 @@ pub fn case_program(kind: CaseKind) -> Fixture {
             )
         }
         CaseKind::ErrorThen => {
-            let when_second = builder.add(None, boolean, ExprKind::Value(second)).unwrap();
+            let when_second = builder.add(None, boolean, ExprKind::input(second)).unwrap();
             let value = builder
-                .add(None, decimal.clone(), ExprKind::Value(decimal_value))
+                .add(None, decimal.clone(), ExprKind::input(decimal_value))
                 .unwrap();
             let first = round_value(
                 &mut builder,
@@ -146,7 +146,7 @@ pub fn case_program(kind: CaseKind) -> Fixture {
                 &mut source_pools,
             );
             let fallback = builder
-                .add(None, decimal.clone(), ExprKind::Value(fallback))
+                .add(None, decimal.clone(), ExprKind::input(fallback))
                 .unwrap();
             // Repeated definition is allowed, but the THEN and ELSE occurrences
             // must have distinct required-domain uses and independent mappings.

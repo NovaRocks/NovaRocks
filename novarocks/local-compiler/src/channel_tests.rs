@@ -270,7 +270,7 @@ fn package_with_outputs(
         )
         .unwrap();
     let predicate_definition = builder
-        .fixture_definition(filter, bool_type, ExprKind::Value(bool_value))
+        .fixture_definition(filter, bool_type, ExprKind::input(bool_value))
         .unwrap();
     let predicate = builder
         .fixture_occurrence(
@@ -288,7 +288,7 @@ fn package_with_outputs(
             second_project,
             bound_type.clone(),
             match mode {
-                BoundMode::Input => ExprKind::Value(bound_value),
+                BoundMode::Input => ExprKind::input(bound_value),
                 BoundMode::DirectConstant | BoundMode::LiteralWithoutConstant => {
                     crate::test_constants::i64(&mut constants, &bound_type, 1, options(1).constants)
                 }
@@ -370,14 +370,14 @@ fn package_with_outputs(
         .fixture_value_root(
             second_project,
             bound_type.clone(),
-            ExprKind::Value(bound_value),
+            ExprKind::input(bound_value),
         )
         .unwrap();
     let identity_b = builder
         .fixture_value_root(
             second_project,
             bound_type.clone(),
-            ExprKind::Value(bound_value),
+            ExprKind::input(bound_value),
         )
         .unwrap();
     let mut project_expressions = vec![(call, sample_value)];
@@ -401,7 +401,7 @@ fn package_with_outputs(
         .unwrap();
     let limit_input = if downstream_consumer {
         let downstream_expr = builder
-            .fixture_value_root(downstream, bound_type.clone(), ExprKind::Value(bound_value))
+            .fixture_value_root(downstream, bound_type.clone(), ExprKind::input(bound_value))
             .unwrap();
         builder
             .add_project(
@@ -639,7 +639,7 @@ fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_bind
         let unit = compiled_unit_for(&program, physical.id);
         for (&physical_use, invocation) in bound.control_flow().uses() {
             let physical_expr = bound.definition(invocation.definition).unwrap();
-            let ExprKind::Value(value) = physical_expr.kind else {
+            let Some(value) = physical_expr.kind.input_value() else {
                 continue;
             };
             let expected = if physical.id == NodeId::new(3) {
@@ -784,7 +784,7 @@ fn downstream_value_uses_first_proven_repeated_child_output_without_collapsing_p
         .unwrap();
     let invocation = &bound.control_flow().uses()[&physical_use];
     let definition = bound.definition(invocation.definition).unwrap();
-    assert!(matches!(definition.kind, ExprKind::Value(value) if value == ValueId::new(100)));
+    assert!(definition.kind.input_value() == Some(ValueId::new(100)));
     let expected_source = ProgramChannelSite::Layout {
         node: ProgramNodeId::new(3),
         role: ProgramChannelLayoutRole::NodeOutput,

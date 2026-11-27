@@ -19,7 +19,7 @@ use arrow_array::*;
 use arrow_buffer::i256;
 use arrow_schema::{DataType, Field};
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_functions::native_inlist::{InError, PreparedNativeInListRecipe};
+use novarocks_functions::native_inlist::{InError, MembershipComparison};
 use novarocks_functions::opaque_memory::OpaqueAllocationHost;
 use novarocks_functions::{
     AggregateStateAllocator, ComparisonOperator, ComparisonPrepareError, EvaluatedArgument,
@@ -51,23 +51,19 @@ impl KernelEvaluationControl for Active {
     }
 }
 
-fn prepare(input: &FunctionValueType, candidate: &FunctionValueType) -> PreparedNativeInListRecipe {
-    PreparedNativeInListRecipe::try_new(
-        false,
-        input,
-        &[candidate],
-        &FunctionValueType::new(DataType::Boolean, true),
-        &Active,
-    )
-    .unwrap()
+fn prepare(input: &FunctionValueType, candidate: &FunctionValueType) -> MembershipComparison {
+    MembershipComparison::try_new(input, candidate, &Active).unwrap()
 }
 
 fn assert_matches_equal(input: ArrayRef, candidate: ArrayRef, logical: ValueLogicalType) {
     let ty =
         FunctionValueType::try_with_logical_type(input.data_type().clone(), true, logical).unwrap();
     let membership = prepare(&ty, &ty);
-    let equality =
-        PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &ty, &ty, &Active).unwrap();
+    let equality = if matches!(ty.data_type(), DataType::Float32 | DataType::Float64) {
+        PreparedComparisonRecipe::try_new_ieee_float_equality(&ty, &ty, &Active).unwrap()
+    } else {
+        PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &ty, &ty, &Active).unwrap()
+    };
     for (candidate, scalar) in [(candidate.slice(0, 1), true), (candidate, false)] {
         let actual = membership
             .membership_equalities_observed(&input, &candidate, None, &Active, &mut |_| {
@@ -189,14 +185,7 @@ fn in_matches_equal_for_flat_domains_and_scalar_candidates() {
 fn in_comparison_accepts_nullable_candidate_beside_required_source() {
     let required = FunctionValueType::new(DataType::Int64, false);
     let nullable = FunctionValueType::new(DataType::Int64, true);
-    let recipe = PreparedNativeInListRecipe::try_new(
-        false,
-        &required,
-        &[&required, &nullable],
-        &FunctionValueType::new(DataType::Boolean, true),
-        &Active,
-    )
-    .unwrap();
+    let recipe = MembershipComparison::try_new(&required, &nullable, &Active).unwrap();
     let input: ArrayRef = Arc::new(Int64Array::from(vec![7, 7]));
     let candidate: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(7)]));
     let equalities = recipe
@@ -229,8 +218,7 @@ fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
         ),
     ] {
         assert_eq!(
-            PreparedNativeInListRecipe::try_new(false, input, &[candidate], &boolean, &Active)
-                .unwrap_err(),
+            MembershipComparison::try_new(input, candidate, &Active).unwrap_err(),
             failure
         );
     }
@@ -249,7 +237,7 @@ fn in_admission_checks_the_comparison_domain_and_exact_operand_carriers() {
     ));
 }
 
-fn json_recipe() -> PreparedNativeInListRecipe {
+fn json_recipe() -> MembershipComparison {
     let json = FunctionValueType::try_with_logical_type(
         DataType::LargeBinary,
         true,
@@ -279,7 +267,7 @@ impl novarocks_functions::json_value::JsonWork for JsonWork {
 #[test]
 fn in_json_uses_canonical_keys_while_varchar_compares_bytes() {
     let string = FunctionValueType::new(DataType::Utf8, false);
-    let evaluate = |recipe: &PreparedNativeInListRecipe, left: ArrayRef, right: ArrayRef| {
+    let evaluate = |recipe: &MembershipComparison, left: ArrayRef, right: ArrayRef| {
         recipe
             .membership_equalities_observed(&left, &right, None, &Active, &mut |_| Ok::<_, ()>(()))
             .unwrap()

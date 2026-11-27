@@ -275,7 +275,7 @@ fn table_source(
     let mut unit_builder = BoundExprSetBuilder::new(unit_limits());
     let arguments = if scalar_input {
         let def = unit_builder
-            .add(None, input_type.clone(), ExprKind::Value(input_value))
+            .add(None, input_type.clone(), ExprKind::input(input_value))
             .unwrap();
         // Value leaves use their intrinsic Eager flow; no function control record.
         Box::from([unit_builder
@@ -482,7 +482,7 @@ fn broadcast_input_read_fixture(
     let value = ValueId::new(0);
     let node = builder.reserve_node_id().unwrap();
     let mut draft = BoundExprSetBuilder::new(unit_limits());
-    let def = draft.add(None, integer(), ExprKind::Value(value)).unwrap();
+    let def = draft.add(None, integer(), ExprKind::input(value)).unwrap();
     // Value leaves use their intrinsic Eager flow; no function control record.
     let root = draft
         .root(def, EvaluationDemand::Value, RootScope::Port(0))

@@ -386,7 +386,7 @@ fn rand_operand_fixture(
         )
         .unwrap();
     let value = builder
-        .fixture_definition(NodeId::new(0), ty, ExprKind::Value(input))
+        .fixture_definition(NodeId::new(0), ty, ExprKind::input(input))
         .unwrap();
     let result = FunctionValueType::new(DataType::Boolean, true);
     let expression = builder

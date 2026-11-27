@@ -779,7 +779,7 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
                 )
                 .unwrap();
             let arg = builder
-                .add_expression(owner, integer.clone(), ExprKind::Value(value))
+                .add_expression(owner, integer.clone(), ExprKind::input(value))
                 .unwrap();
             (builder, leaf, owner, arg)
         } else {
@@ -1457,7 +1457,7 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
         )
         .unwrap();
     let arg = builder
-        .add_expression(owner, source_type.clone(), ExprKind::Value(value))
+        .add_expression(owner, source_type.clone(), ExprKind::input(value))
         .unwrap();
     let root = window_with_passthrough(
         &mut builder,

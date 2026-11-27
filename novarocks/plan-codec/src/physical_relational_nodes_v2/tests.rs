@@ -265,7 +265,7 @@ impl Fixture {
             ),
             (
                 1,
-                novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+                novarocks_expression_contract::ExprKind::input(p::ValueId::new(0)),
             ),
             (
                 2,

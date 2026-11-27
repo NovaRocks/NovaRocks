@@ -167,7 +167,7 @@ fn count_eq_zero(
     count: &(ValueId, FunctionValueType),
 ) -> ExprId {
     let left = draft
-        .add(None, count.1.clone(), ExprKind::Value(count.0))
+        .add(None, count.1.clone(), ExprKind::input(count.0))
         .unwrap();
     let zero = integer_literal(draft, pools, 0);
     let right = cast(
@@ -181,7 +181,7 @@ fn count_eq_zero(
 
 fn present_date(draft: &mut BoundExprSetBuilder, max: &(ValueId, FunctionValueType)) -> ExprId {
     let max = draft
-        .add(None, max.1.clone(), ExprKind::Value(max.0))
+        .add(None, max.1.clone(), ExprKind::input(max.0))
         .unwrap();
     let date = cast(
         draft,

@@ -95,7 +95,7 @@ fn compiled_slot_program(
                         Some(value),
                     )
                 } else {
-                    (ExprKind::Value(*input), None)
+                    (ExprKind::input(*input), None)
                 };
             args.push(draft.add(None, ty.clone(), kind).unwrap());
             requests.push(FunctionArgument::Value {

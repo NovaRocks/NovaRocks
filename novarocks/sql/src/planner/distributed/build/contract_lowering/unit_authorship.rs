@@ -89,7 +89,7 @@ pub(super) fn standalone_input_ports_observed(
     let mut used = BTreeSet::new();
     for definition in draft.definitions() {
         work.step()?;
-        if let ContractExprKind::Value(value) = definition.kind {
+        if let Some(value) = definition.kind.input_value() {
             used.insert(value);
         }
     }

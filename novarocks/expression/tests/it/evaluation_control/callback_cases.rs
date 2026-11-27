@@ -166,7 +166,7 @@ fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
         EvaluationDemand::Value,
         |functions, draft, _, authors, column| {
             let input = draft
-                .add(None, ty.clone(), ExprKind::Value(column))
+                .add(None, ty.clone(), ExprKind::input(column))
                 .unwrap();
             let author = ClaimAuthor::with_exact_ordinary_binding(
                 functions,
@@ -318,7 +318,7 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
             let boolean = FunctionValueType::new(DataType::Boolean, true);
             let literal_type = FunctionValueType::new(DataType::Int32, false);
             let input = draft
-                .add(None, column_type.clone(), ExprKind::Value(column))
+                .add(None, column_type.clone(), ExprKind::input(column))
                 .unwrap();
             let not_null = draft
                 .add(
@@ -332,7 +332,7 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
                 .unwrap();
             let mut comparison = |op, value| {
                 let left = draft
-                    .add(None, column_type.clone(), ExprKind::Value(column))
+                    .add(None, column_type.clone(), ExprKind::input(column))
                     .unwrap();
                 let literal = ConstantValue::from_i32(
                     Arc::new(literal_type.try_to_field("constant").unwrap()),

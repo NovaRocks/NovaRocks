@@ -242,7 +242,7 @@ fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_p
         .definition(receipt.arguments()[0])
         .unwrap();
     assert_eq!(child.ty, ValueType::new(DataType::Utf8, true));
-    let ContractExprKind::Value(value) = child.kind else {
+    let Some(value) = child.kind.input_value() else {
         panic!("actual materialized Repeat value")
     };
     let value = fragment.values().get(&value).unwrap();

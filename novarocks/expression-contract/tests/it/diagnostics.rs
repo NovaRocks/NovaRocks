@@ -48,7 +48,7 @@ fn port(types: &[ValueType]) -> ExprPort {
 }
 fn value(builder: &mut BoundExprSetBuilder, id: u32, ty: ValueType) -> ExprId {
     builder
-        .add(None, ty, ExprKind::Value(ValueId::new(id)))
+        .add(None, ty, ExprKind::input(ValueId::new(id)))
         .unwrap()
 }
 fn root(builder: &mut BoundExprSetBuilder, definition: ExprId) {
@@ -173,8 +173,8 @@ fn lazy_type_issues_keep_lambda_parent_and_function_argument_payload() {
         .add(
             None,
             boolean(false),
-            ExprKind::Unary {
-                op: UnaryOperator::Not,
+            ExprKind::IsNull {
+                negated: true,
                 expr: lambda,
             },
         )

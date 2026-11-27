@@ -321,7 +321,7 @@ fn fixture_with_source_parameters(
             builder
                 .unit(grouped)
                 .unwrap()
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -359,7 +359,7 @@ fn fixture_with_source_parameters(
                 .add(
                     None,
                     bound.intermediate_type(),
-                    ExprKind::Value(partial_output[ordinal + groups]),
+                    ExprKind::input(partial_output[ordinal + groups]),
                 )
                 .unwrap();
             builder
@@ -479,7 +479,7 @@ fn fixture_with_source_parameters(
                     .add(
                         None,
                         key_types[ordinal].clone(),
-                        ExprKind::Value(columns[ordinal]),
+                        ExprKind::input(columns[ordinal]),
                     )
                     .unwrap();
                 builder

@@ -25,42 +25,43 @@ const REQUIRED: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/filter/sql/filter_decimal_binary_pred_mixed_precision.sql"
 ));
-fn between_count(source: &SqlAuthoredPhysicalPlan) -> usize {
-    source
-        .plan()
-        .fragments()
-        .values()
-        .flat_map(super::sql_test_source::unit_definitions)
-        .filter(|(_, _, _, e)| matches!(e.kind, ExprKind::Between { .. }))
-        .count()
-}
 #[test]
 fn between_sql_source_original_required_native_case_retains_actual_bound_decimal_domains() {
-    let source = sql_source(REQUIRED, DataType::Int64);
-    assert_eq!(between_count(&source), 1);
+    let source: SqlAuthoredPhysicalPlan = sql_source(REQUIRED, DataType::Int64);
+    let mut count = 0;
     for fragment in source.plan().fragments().values() {
-        for (_source_node, unit, _, node) in super::sql_test_source::unit_definitions(fragment) {
-            if let ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } = &node.kind
-            {
-                assert!(!negated);
-                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
-                let operand = &unit.definition(*expr).unwrap().ty;
-                assert!(matches!(operand.data_type(), DataType::Decimal128(..)));
-                for child in [low, high] {
-                    assert!(operand.same_value_domain(&unit.definition(*child).unwrap().ty));
-                }
+        for node in fragment.nodes().values() {
+            let Some(unit) = node.expressions.as_deref() else {
+                continue;
+            };
+            for expansion in unit.control_expansions().records() {
+                count += 1;
+                assert_eq!(expansion.root, expansion.positive);
                 assert_eq!(
-                    node.ty.nullable(),
-                    operand.nullable()
-                        || unit.definition(*low).unwrap().ty.nullable()
-                        || unit.definition(*high).unwrap().ty.nullable()
+                    unit.definition(expansion.root).unwrap().ty.data_type(),
+                    &DataType::Boolean
                 );
+                for branch in expansion.branches {
+                    let ExprKind::FunctionCall { function, args } =
+                        &unit.definition(branch).unwrap().kind
+                    else {
+                        panic!("ordinary ordering call")
+                    };
+                    assert_eq!(
+                        function.function_id.as_str(),
+                        novarocks_type_contract::OperatorFunction::LessThanOrEqual
+                            .function_id_text()
+                    );
+                    let [left, right] = args.as_ref() else {
+                        panic!("one binary comparison")
+                    };
+                    let left = &unit.definition(*left).unwrap().ty;
+                    let right = &unit.definition(*right).unwrap().ty;
+                    assert!(matches!(left.data_type(), DataType::Decimal128(..)));
+                    assert!(left.same_value_domain(right));
+                }
             }
         }
     }
+    assert_eq!(count, 1);
 }

@@ -106,7 +106,7 @@ fn fixture(name: &str, values: Vec<ArrayRef>) -> (Arc<CompiledExprSet>, RootOrdi
     let arguments = port
         .values
         .iter()
-        .map(|(id, ty)| draft.add(None, ty.clone(), ExprKind::Value(*id)).unwrap())
+        .map(|(id, ty)| draft.add(None, ty.clone(), ExprKind::input(*id)).unwrap())
         .collect();
     let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,

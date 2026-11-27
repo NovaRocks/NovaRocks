@@ -18,7 +18,7 @@
 //! SQL-authored aggregate channels through the frozen package and LocalCompiler.
 use arrow::datatypes::DataType;
 use novarocks_expression::StaticExprKind;
-use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
+use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_local_program::{
     DiagnosticSourceNodeId, LocalProgram, ProgramNode, ProgramNodeKind, ProgramRootRef,
 };
@@ -45,7 +45,7 @@ fn aggregates(
 
 fn input_value(fragment: &Fragment, node: &PhysicalNode, root: RootOrdinal) -> ValueId {
     let expression = fragment.root_expression(node.id, root).unwrap();
-    let ExprKind::Value(value) = expression.kind else {
+    let Some(value) = expression.kind.input_value() else {
         panic!("expected the root to read the existing input directly");
     };
     value

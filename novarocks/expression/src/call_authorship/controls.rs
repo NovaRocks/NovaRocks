@@ -145,6 +145,7 @@ pub fn installed_scalar_control_shape(
         ArgumentControl::NullIf => ControlShape::NullIf,
         ArgumentControl::OrderedRegexp => ControlShape::OrderedRegexp,
         ArgumentControl::OrderedNull => ControlShape::OrderedNull,
+        ArgumentControl::CandidateGroup => ControlShape::CandidateGroup,
         ArgumentControl::SimpleCase | ArgumentControl::SearchedCase => {
             let simple = control == ArgumentControl::SimpleCase;
             let tail = count.checked_sub(usize::from(simple))?;

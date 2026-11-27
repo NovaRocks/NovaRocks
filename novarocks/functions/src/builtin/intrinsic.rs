@@ -54,7 +54,11 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (
-        crate::native_like::ESCAPE_FUNCTION_NAME,
+        super::like_escape_owner::BOOLEAN_NOT,
+        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
+    ),
+    (
+        super::like_escape_owner::LIKE,
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::MayRaise),
     ),
     (

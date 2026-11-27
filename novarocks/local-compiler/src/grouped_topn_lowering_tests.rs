@@ -54,7 +54,7 @@ fn append_count_chain(
             let ty = builder.value(*key).unwrap().ty.clone();
             groups.push((
                 builder
-                    .fixture_value_root(node, ty, ExprKind::Value(*key))
+                    .fixture_value_root(node, ty, ExprKind::input(*key))
                     .unwrap(),
                 *key,
             ));
@@ -63,7 +63,7 @@ fn append_count_chain(
             .map(|value| {
                 let ty = builder.value(value).unwrap().ty.clone();
                 Box::from([builder
-                    .fixture_value_root(node, ty, ExprKind::Value(value))
+                    .fixture_value_root(node, ty, ExprKind::input(value))
                     .unwrap()])
             })
             .unwrap_or_default();
@@ -160,7 +160,7 @@ fn append_count_chain(
             let ty = builder.value(keys[ordinal]).unwrap().ty.clone();
             SortExpr {
                 expr: builder
-                    .fixture_value_root(final_topn, ty, ExprKind::Value(keys[ordinal]))
+                    .fixture_value_root(final_topn, ty, ExprKind::input(keys[ordinal]))
                     .unwrap(),
                 direction,
                 null_ordering,

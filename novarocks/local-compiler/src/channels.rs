@@ -21,7 +21,6 @@
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
-use novarocks_expression_contract::ExprKind;
 use novarocks_local_program::{ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId};
 use novarocks_physical_plan::{FragmentPackage, NodeId, NodeKind, ValueId};
 use novarocks_type_contract::{
@@ -492,8 +491,8 @@ fn resolve_core_with_creation<H>(
                         .ok_or(ChannelLoweringError::Invalid("missing project value"))?;
                     work.step()?;
                     exact_type(&definition.ty, &output.ty, work)?;
-                    let input = match definition.kind {
-                        ExprKind::Value(value) => {
+                    let input = match definition.kind.input_value() {
+                        Some(value) => {
                             let input = resolve_input(value, child_channels, child_port)?;
                             let source_type = &fragment
                                 .values()

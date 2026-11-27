@@ -203,6 +203,17 @@ fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Op
 
 fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
     match arena.node(expr) {
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => format!(
+            "Let({}, {}, {})",
+            binding.0,
+            canonical_expr_key(arena, *initializer),
+            canonical_expr_key(arena, *body),
+        ),
+        ScalarNode::LocalValue(binding) => format!("LocalValue({})", binding.0),
         ScalarNode::Nested(inner) => canonical_expr_key(arena, *inner),
         ScalarNode::BinaryOp {
             left,
@@ -233,9 +244,6 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
                 (lk, rk)
             };
             format!("BinaryOp({op:?},{decimal_overflow_policy:?},{lk},{rk})")
-        }
-        ScalarNode::UnaryOp { op, child } => {
-            format!("UnaryOp({op:?},{})", canonical_expr_key(arena, *child))
         }
         ScalarNode::FunctionCall {
             name,
@@ -276,35 +284,6 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
         ScalarNode::IsNull { child, negated } => {
             format!("IsNull({},{negated})", canonical_expr_key(arena, *child))
         }
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => format!(
-            "InList({},{},{negated})",
-            canonical_expr_key(arena, *child),
-            canonical_expr_list_key(arena, list)
-        ),
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => format!(
-            "Between({},{},{},{negated})",
-            canonical_expr_key(arena, *child),
-            canonical_expr_key(arena, *low),
-            canonical_expr_key(arena, *high)
-        ),
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => format!(
-            "Like({},{},{negated})",
-            canonical_expr_key(arena, *child),
-            canonical_expr_key(arena, *pattern)
-        ),
         ScalarNode::Case {
             operand,
             when_then,
@@ -332,14 +311,6 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
                 .unwrap_or_else(|| "None".to_string());
             format!("Case({operand_key},{when_then_key},{else_key})")
         }
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => format!(
-            "IsTruthValue({},{value},{negated})",
-            canonical_expr_key(arena, *child)
-        ),
         ScalarNode::WindowCall {
             name,
             args,

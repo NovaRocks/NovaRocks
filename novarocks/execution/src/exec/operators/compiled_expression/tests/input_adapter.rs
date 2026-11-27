@@ -671,7 +671,7 @@ fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
     let expression = builder
         .unit(project)
         .unwrap()
-        .add(None, source_type, ExprKind::Value(input))
+        .add(None, source_type, ExprKind::input(input))
         .unwrap();
     let expression = builder
         .unit(project)

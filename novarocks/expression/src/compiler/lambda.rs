@@ -117,6 +117,7 @@ struct FreeReferences {
     // names its identity, never an approximate carrier or a parameter name.
     sources: BTreeMap<LambdaCaptureSource, ExpressionUseId>,
     insertions: usize,
+    contains_local: bool,
 }
 impl FreeReferences {
     fn insert<H>(
@@ -147,6 +148,7 @@ impl FreeReferences {
         if self.sources.len() < child.sources.len() {
             std::mem::swap(self, &mut child);
         }
+        self.contains_local |= child.contains_local;
         for (source, use_id) in child.sources {
             self.insert(source, use_id, owner, work)?;
         }
@@ -221,8 +223,11 @@ impl LexicalReferences {
         let use_id = invocation.context.use_id;
         match &source.kind {
             ExprKind::Lambda { .. } => references.remove_binder(source.id, work)?,
-            ExprKind::Value(value) => {
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(value)) => {
                 references.insert(LambdaCaptureSource::Input(*value), use_id, owner, work)?
+            }
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(_)) => {
+                references.contains_local = true;
             }
             ExprKind::LambdaParameter { lambda, ordinal } => references.insert(
                 LambdaCaptureSource::Parameter {
@@ -235,7 +240,7 @@ impl LexicalReferences {
             )?,
             _ => {}
         }
-        if !references.sources.is_empty() {
+        if !references.sources.is_empty() || references.contains_local {
             owner.before_tree_insert::<ExprCompileError, ExpressionUseId, FreeReferences>(
                 self.insertions,
                 work,
@@ -272,6 +277,11 @@ impl LexicalReferences {
             return Ok(None);
         }
         let references = self.pending.get(&use_id);
+        if references.is_some_and(|refs| refs.contains_local) {
+            // The active Let frame owns these values. A replay in an outer
+            // lambda domain has no authority to borrow that activation.
+            return Ok(None);
+        }
         let mut scope = Some(current);
         while let Some(lambda) = scope {
             work.step()?;

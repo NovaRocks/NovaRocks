@@ -355,13 +355,13 @@ fn fixture(
         )
         .unwrap();
     let a = builder
-        .fixture_definition(NodeId::new(0), left.clone(), ExprKind::Value(inputs[0].1))
+        .fixture_definition(NodeId::new(0), left.clone(), ExprKind::input(inputs[0].1))
         .unwrap();
     let b = if matches!(shape, Shape::CarrierCast(_)) {
         a
     } else {
         builder
-            .fixture_definition(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
+            .fixture_definition(NodeId::new(0), right.clone(), ExprKind::input(inputs[1].1))
             .unwrap()
     };
     let mut rand_selected = None;

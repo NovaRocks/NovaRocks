@@ -1224,6 +1224,11 @@ fn collect_aggregates(
                     writer.u32(1);
                     writer.value_type(value.value_type());
                 }
+                FunctionArgumentType::CandidateGroup { .. } => {
+                    return Err(AnalyzeError::internal(
+                        "MV aggregate selected a grouped IN argument",
+                    ));
+                }
                 FunctionArgumentType::Lambda {
                     parameter_types,
                     result_type,
@@ -1271,14 +1276,17 @@ fn walk_expression<'a, E>(
         return Ok(());
     }
     match &expression.kind {
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             walk_expression(left, visitor)?;
             walk_expression(right, visitor)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
+        ExprKind::Cast { expr, .. }
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::Nested(expr)
         | ExprKind::Lambda { body: expr, .. }
         | ExprKind::LambdaFunction { body: expr, .. } => walk_expression(expr, visitor),
@@ -1294,21 +1302,6 @@ fn walk_expression<'a, E>(
             }
             walk_expressions(args, visitor)?;
             walk_sort_items(order_by, visitor)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            walk_expression(expr, visitor)?;
-            walk_expressions(list, visitor)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            walk_expression(expr, visitor)?;
-            walk_expression(low, visitor)?;
-            walk_expression(high, visitor)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            walk_expression(expr, visitor)?;
-            walk_expression(pattern, visitor)
         }
         ExprKind::Case {
             operand,
@@ -1341,6 +1334,7 @@ fn walk_expression<'a, E>(
             walk_sort_items(order_by, visitor)
         }
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)

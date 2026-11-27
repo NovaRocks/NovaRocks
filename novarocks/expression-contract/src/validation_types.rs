@@ -20,7 +20,7 @@ use crate::{ExprId, ExprKind, ValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use novarocks_type_contract::{
-    FunctionArgumentType, FunctionKind, arithmetic_result_value_shape_with_op,
+    FunctionArgumentType, FunctionKind, OperatorFunction, arithmetic_result_value_shape_with_op,
 };
 use std::collections::BTreeSet;
 
@@ -270,7 +270,36 @@ pub(crate) fn validate_expression_types<'a, H>(
 ) -> Result<(), ValidationFailure<'a, H>> {
     let path = expression.id;
     match &expression.kind {
-        ExprKind::Value(_) => {}
+        ExprKind::Value(crate::ValueAddress::Input(_)) => {}
+        ExprKind::Value(crate::ValueAddress::Local(binding)) => {
+            let matches = matches_definition(definitions, *binding, |owner| {
+                let ExprKind::Let { value, .. } = owner.kind else {
+                    return Ok(false);
+                };
+                if owner.lambda_scope != expression.lambda_scope {
+                    return Ok(false);
+                }
+                matches_definition(definitions, value, |value| {
+                    exact_type(&value.ty, &expression.ty, work)
+                })
+            })?;
+            if !matches {
+                errors.push(TypeIssue::new(
+                    path,
+                    "local value does not reference a matching Let initializer in its lambda scope",
+                ));
+            }
+        }
+        ExprKind::Let { body, .. } => {
+            if !matches_definition(definitions, *body, |body| {
+                exact_type(&body.ty, &expression.ty, work)
+            })? {
+                errors.push(TypeIssue::new(
+                    path,
+                    "Let result differs from its complete body type",
+                ));
+            }
+        }
         // Exact table/address/value checks are mandatory at plan/package publication.
         ExprKind::Constant(_) => {}
         ExprKind::LambdaParameter { lambda, ordinal } => {
@@ -340,23 +369,6 @@ pub(crate) fn validate_expression_types<'a, H>(
                     path,
                     "lambda type differs from its body type",
                 ));
-            }
-        }
-        ExprKind::Unary {
-            op: crate::UnaryOperator::Not,
-            expr,
-        } => {
-            if let Some(input) = definitions.get((*expr).get() as usize) {
-                let valid =
-                    novarocks_type_contract::supports_boolean_negation_value_type(&input.ty)
-                        && *expression.ty.data_type() == DataType::Boolean
-                        && (expression.ty.nullable() || !input.ty.nullable());
-                if !valid {
-                    errors.push(TypeIssue::new(
-                        path,
-                        "unary expression types are inconsistent with its operator",
-                    ));
-                }
             }
         }
         ExprKind::Binary {
@@ -468,85 +480,8 @@ pub(crate) fn validate_expression_types<'a, H>(
                 ));
             }
         }
-        ExprKind::IsNull { .. } | ExprKind::IsTruthValue { .. } => {
+        ExprKind::IsNull { .. } => {
             require_non_nullable_boolean(&expression.ty, path, errors);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            require_boolean_result(&expression.ty, path, errors);
-            if let Some(input) = definitions.get((*expr).get() as usize) {
-                let nullable = input.ty.nullable()
-                    || any_definition(
-                        definitions,
-                        list.iter().copied(),
-                        |candidate| candidate.ty.nullable(),
-                        work,
-                    )?;
-                if nullable && !expression.ty.nullable() {
-                    errors.push(TypeIssue::new(
-                        path,
-                        "IN-list result stops admitting null its operands admit",
-                    ));
-                }
-                for candidate in list {
-                    if matches_definition(definitions, *candidate, |candidate| {
-                        Ok(!same_domain(&candidate.ty, &input.ty, work)?)
-                    })? {
-                        errors.push(TypeIssue::new(
-                            path,
-                            "IN-list candidate type differs from its input",
-                        ));
-                    }
-                }
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            require_boolean_result(&expression.ty, path, errors);
-            if let Some(input) = definitions.get((*expr).get() as usize) {
-                let nullable = [*low, *high].into_iter().any(|bound| {
-                    definitions
-                        .get((bound).get() as usize)
-                        .is_some_and(|bound| bound.ty.nullable())
-                }) || input.ty.nullable();
-                if nullable && !expression.ty.nullable() {
-                    errors.push(TypeIssue::new(
-                        path,
-                        "BETWEEN result stops admitting null its operands admit",
-                    ));
-                }
-                for bound in [*low, *high] {
-                    if matches_definition(definitions, bound, |bound| {
-                        Ok(!same_domain(&bound.ty, &input.ty, work)?)
-                    })? {
-                        errors.push(TypeIssue::new(
-                            path,
-                            "BETWEEN bound type differs from its input",
-                        ));
-                    }
-                }
-            }
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            require_boolean_result(&expression.ty, path, errors);
-            let nullable = [*expr, *pattern].into_iter().any(|id| {
-                definitions
-                    .get((id).get() as usize)
-                    .is_some_and(|value| value.ty.nullable())
-            });
-            if nullable && !expression.ty.nullable() {
-                errors.push(TypeIssue::new(
-                    path,
-                    "LIKE result stops admitting null its operands admit",
-                ));
-            }
-            if [*expr, *pattern].into_iter().any(|id| {
-                definitions
-                    .get((id).get() as usize)
-                    .is_some_and(|value| !is_utf8(value.ty.data_type()))
-            }) {
-                errors.push(TypeIssue::new(path, "LIKE operands must use a UTF-8 type"));
-            }
         }
         ExprKind::Case {
             ieee_float_equality,
@@ -828,12 +763,6 @@ pub(crate) fn validate_case_types<'a, H>(
     Ok(())
 }
 
-pub(crate) fn require_boolean_result(ty: &ValueType, path: ExprId, errors: &mut TypeChecks<'_>) {
-    if *ty.data_type() != DataType::Boolean {
-        errors.push(TypeIssue::new(path, "expression result is not Boolean"));
-    }
-}
-
 pub(crate) fn require_non_nullable_boolean(
     ty: &ValueType,
     path: ExprId,
@@ -845,13 +774,6 @@ pub(crate) fn require_non_nullable_boolean(
             "expression result must be non-nullable Boolean",
         ));
     }
-}
-
-pub(crate) fn is_utf8(ty: &DataType) -> bool {
-    matches!(
-        ty,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    )
 }
 
 pub(crate) fn validate_function_call<'a, H>(
@@ -890,7 +812,19 @@ pub(crate) fn validate_function_arguments<'a, H>(
     errors: &mut TypeChecks<'a>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ValidationFailure<'a, H>> {
-    if expected.len() != args.len() {
+    let group = match expected {
+        [
+            FunctionArgumentType::Value(_),
+            group @ FunctionArgumentType::CandidateGroup { .. },
+        ] if function.as_str() == OperatorFunction::InList.function_id_text() => Some(group),
+        _ => None,
+    };
+    let valid_arity = if group.is_some() {
+        args.len() >= expected.len()
+    } else {
+        args.len() == expected.len()
+    };
+    if !valid_arity {
         errors.push(TypeIssue::new(
             path,
             TypeIssueMessage::ArgumentCount {
@@ -900,7 +834,9 @@ pub(crate) fn validate_function_arguments<'a, H>(
         ));
         return Ok(());
     }
-    for (ordinal, (expected, argument)) in expected.iter().zip(args).enumerate() {
+    let scalar_arguments = expected.len() - usize::from(group.is_some());
+    for (ordinal, (expected, argument)) in expected[..scalar_arguments].iter().zip(args).enumerate()
+    {
         let valid = matches_definition(definitions, *argument, |actual| {
             Ok(match (expected, &actual.kind) {
                 (FunctionArgumentType::Value(_), ExprKind::Lambda { .. }) => false,
@@ -923,7 +859,11 @@ pub(crate) fn validate_function_arguments<'a, H>(
                     value_types_equal(actual_parameters, parameter_types.as_slice(), work)?
                         && exact_type(&actual.ty, result_type, work)?
                 }
-                (FunctionArgumentType::Lambda { .. }, _) => false,
+                (
+                    FunctionArgumentType::Lambda { .. }
+                    | FunctionArgumentType::CandidateGroup { .. },
+                    _,
+                ) => false,
             })
         })?;
         if !valid {
@@ -937,6 +877,52 @@ pub(crate) fn validate_function_arguments<'a, H>(
                         .get(argument.get() as usize)
                         .map(|actual| &actual.ty),
                 },
+            ));
+        }
+    }
+    if group.is_some()
+        && let [
+            FunctionArgumentType::Value(probe_type),
+            group @ FunctionArgumentType::CandidateGroup { element_type },
+        ] = expected
+    {
+        if !value_bindings_match_ignoring_root_nullability(probe_type, element_type, work)? {
+            errors.push(TypeIssue::new(
+                path,
+                "probe and candidate group must share a physical value domain",
+            ));
+        }
+        let mut nullable = false;
+        for (ordinal, &argument) in args.iter().enumerate().skip(1) {
+            let actual = definitions.get(argument.get() as usize);
+            if let Some(actual) = actual {
+                nullable |= actual.ty.nullable();
+                if !matches!(actual.kind, ExprKind::Lambda { .. })
+                    && value_bindings_match_ignoring_root_nullability(
+                        &actual.ty,
+                        element_type,
+                        work,
+                    )?
+                {
+                    work.step()?;
+                    continue;
+                }
+            }
+            errors.push(TypeIssue::new(
+                path,
+                TypeIssueMessage::FunctionArgument {
+                    function,
+                    ordinal,
+                    expected: group,
+                    actual: actual.map(|actual| &actual.ty),
+                },
+            ));
+            work.step()?;
+        }
+        if nullable != element_type.nullable() {
+            errors.push(TypeIssue::new(
+                path,
+                "candidate group root nullability differs from its members",
             ));
         }
     }

@@ -79,7 +79,7 @@ fn input_derived_expression_sender_preserves_wire_and_admitted_geometry() {
 
 #[test]
 fn caller_owned_sender_seven_exact_axes_and_one_under_replay_actual_source() {
-    let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let f = Fixture::single(ExprKind::input(ValueId::new(0)));
     let (facts, _) = invoke(&f, &Control::default(), limits()).unwrap();
     let exact = ExpressionProjectionLimits {
         max_definitions: facts.definition_count,
@@ -118,7 +118,7 @@ fn caller_owned_sender_seven_exact_axes_and_one_under_replay_actual_source() {
 }
 #[test]
 fn caller_owned_sender_known_root_request_refuses_before_pending_quantum_and_emit() {
-    let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let f = Fixture::single(ExprKind::input(ValueId::new(0)));
     f.with_sources(|types, functions, aggregates, inputs| {
         for cause in CAUSES {
             let c = Control {
@@ -178,9 +178,9 @@ fn caller_owned_sender_known_root_request_refuses_before_pending_quantum_and_emi
 }
 #[test]
 fn caller_owned_sender_actual_success_and_ordinary_refusal_have_all_three_primary_prefixes() {
-    let good = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let good = Fixture::single(ExprKind::input(ValueId::new(0)));
     prefixes(|c| invoke(&good, c, limits()), true);
-    let mut bad = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let mut bad = Fixture::single(ExprKind::input(ValueId::new(0)));
     bad.input[0].id = 7;
     prefixes(|c| invoke(&bad, c, limits()), false);
 }

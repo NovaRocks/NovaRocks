@@ -6017,14 +6017,12 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             "Iceberg IMV refresh contract does not support aggregate or window expressions outside direct aggregate outputs"
                 .to_string(),
         ),
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let { initializer: left, body: right, .. } => {
             validate_non_contract_aggregate_projection_expr(left)?;
             validate_non_contract_aggregate_projection_expr(right)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => {
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
             validate_non_contract_aggregate_projection_expr(expr)
         }
         ExprKind::Nested(expr) => validate_non_contract_aggregate_projection_expr(expr),
@@ -6050,22 +6048,6 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
         ExprKind::LambdaFunction { body, .. } => {
             validate_non_contract_aggregate_projection_expr(body)
         }
-        ExprKind::InList { expr, list, .. } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            list.iter()
-                .try_for_each(validate_non_contract_aggregate_projection_expr)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            validate_non_contract_aggregate_projection_expr(low)?;
-            validate_non_contract_aggregate_projection_expr(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            validate_non_contract_aggregate_projection_expr(pattern)
-        }
         ExprKind::Case {
             operand,
             when_then,
@@ -6089,7 +6071,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             "Iceberg IMV refresh contract does not support subquery expressions in aggregate projections"
                 .to_string(),
         ),
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
+        ExprKind::LocalValue(_) | ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
             Ok(())
         }
     }
@@ -6175,17 +6157,12 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             "Iceberg IMV refresh contract does not support subquery expressions in projection/filter shapes"
                 .to_string(),
         ),
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let { initializer: left, body: right, .. } => {
             validate_projection_filter_expr(left)?;
             validate_projection_filter_expr(right)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::LambdaFunction { body: expr, .. }
-        | ExprKind::Lambda { body: expr, .. } => validate_projection_filter_expr(expr),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) | ExprKind::LambdaFunction { body: expr, .. } | ExprKind::Lambda { body: expr, .. } => validate_projection_filter_expr(expr),
         ExprKind::FunctionCall {
             name,
             args,
@@ -6207,24 +6184,6 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             }
             Ok(())
         }
-        ExprKind::InList { expr, list, .. } => {
-            validate_projection_filter_expr(expr)?;
-            for item in list {
-                validate_projection_filter_expr(item)?;
-            }
-            Ok(())
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            validate_projection_filter_expr(expr)?;
-            validate_projection_filter_expr(low)?;
-            validate_projection_filter_expr(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            validate_projection_filter_expr(expr)?;
-            validate_projection_filter_expr(pattern)
-        }
         ExprKind::Case {
             operand,
             when_then,
@@ -6243,7 +6202,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             }
             Ok(())
         }
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
+        ExprKind::LocalValue(_) | ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
             Ok(())
         }
     }

@@ -187,7 +187,7 @@ pub fn program(shape: Shape) -> Program {
     });
     let mut authors = BTreeMap::new();
     let decimal_input = builder
-        .add(None, decimal.clone(), ExprKind::Value(value))
+        .add(None, decimal.clone(), ExprKind::input(value))
         .unwrap();
     let (first, source_type) = if matches!(shape, Shape::ObservableSibling) {
         let bound_type = FunctionValueType::new(DataType::Int64, true);
@@ -229,7 +229,7 @@ pub fn program(shape: Shape) -> Program {
             None,
             integer.clone(),
             if matches!(shape, Shape::ObservableSibling) {
-                ExprKind::Value(digits_value)
+                ExprKind::input(digits_value)
             } else {
                 checked_constants::kind(&mut constants, integer_constant(&integer, -1))
             },

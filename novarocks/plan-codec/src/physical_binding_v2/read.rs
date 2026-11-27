@@ -305,7 +305,10 @@ fn preflight_namespace(
         work.step()?;
         for argument in &definition.arguments {
             let references = match &argument.kind {
-                Some(wire::function_argument_type::Kind::ValueTypeId(_)) => 1,
+                Some(
+                    wire::function_argument_type::Kind::ValueTypeId(_)
+                    | wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(_),
+                ) => 1,
                 Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
                     known = add(
                         known,
@@ -419,7 +422,10 @@ pub(super) fn validate_definitions_with_lookup(
         }
         for argument in &definition.arguments {
             match &argument.kind {
-                Some(wire::function_argument_type::Kind::ValueTypeId(id)) => value(*id, work)?,
+                Some(
+                    wire::function_argument_type::Kind::ValueTypeId(id)
+                    | wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(id),
+                ) => value(*id, work)?,
                 Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
                     for id in &lambda.parameter_value_type_ids {
                         value(*id, work)?;

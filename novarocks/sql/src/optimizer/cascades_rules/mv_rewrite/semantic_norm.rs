@@ -18,7 +18,7 @@
 //! Exact, observed MV expression identity. Bucket keys are not semantic proofs.
 use crate::{
     column_id::ColumnId,
-    common::{BinOp, UnOp},
+    common::BinOp,
     compiler::SqlCompileError,
     optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode},
 };
@@ -163,6 +163,24 @@ fn normalize_inner(
         order_by: vec![],
     };
     Ok(Some(match arena.node(expr) {
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => call(
+            &format!("let_{}", binding.0),
+            vec![
+                required!(normalize_inner(
+                    arena,
+                    *initializer,
+                    base_names,
+                    control,
+                    work
+                )?),
+                required!(normalize_inner(arena, *body, base_names, control, work)?),
+            ],
+        ),
+        ScalarNode::LocalValue(binding) => call(&format!("local_{}", binding.0), vec![]),
         ScalarNode::ColumnRef(column_id) => NormExpr::Column {
             name: required!(base_names.get(column_id)).clone(),
             value_type: value_type.clone(),
@@ -211,6 +229,7 @@ fn normalize_inner(
                 BinOp::Ne => ("ne", true),
                 BinOp::EqForNull => ("eq_for_null", true),
                 BinOp::And => ("and", true),
+                BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => ("and", false),
                 BinOp::Or => ("or", true),
                 BinOp::Lt => ("lt", false),
                 BinOp::Le => ("le", false),
@@ -239,17 +258,6 @@ fn normalize_inner(
                 cast_mode: None,
                 order_by: vec![],
             }
-        }
-        ScalarNode::UnaryOp { op, child } => {
-            let name = match op {
-                UnOp::Not => "not",
-            };
-            call(
-                name,
-                vec![required!(normalize_inner(
-                    arena, *child, base_names, control, work
-                )?)],
-            )
         }
         ScalarNode::FunctionCall {
             name,
@@ -331,47 +339,6 @@ fn normalize_inner(
             vec![required!(normalize_inner(
                 arena, *child, base_names, control, work
             )?)],
-        ),
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let mut args = vec![required!(normalize_inner(
-                arena, *child, base_names, control, work
-            )?)];
-            let items = required!(normalize_args(arena, list, base_names, control, work)?);
-
-            args.extend(items);
-            let mut result = call(if *negated { "not_in" } else { "in" }, args);
-            if let NormExpr::Call { argument_order, .. } = &mut result {
-                *argument_order = NormArgumentOrder::HeadThenMultiset;
-            }
-            result
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => call(
-            if *negated { "not_between" } else { "between" },
-            vec![
-                required!(normalize_inner(arena, *child, base_names, control, work)?),
-                required!(normalize_inner(arena, *low, base_names, control, work)?),
-                required!(normalize_inner(arena, *high, base_names, control, work)?),
-            ],
-        ),
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => call(
-            if *negated { "not_like" } else { "like" },
-            vec![
-                required!(normalize_inner(arena, *child, base_names, control, work)?),
-                required!(normalize_inner(arena, *pattern, base_names, control, work)?),
-            ],
         ),
         ScalarNode::Nested(inner) => {
             let normalized = required!(normalize_inner(arena, *inner, base_names, control, work)?);

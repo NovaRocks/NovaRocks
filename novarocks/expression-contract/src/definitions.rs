@@ -106,11 +106,6 @@ impl BoundFunction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnaryOperator {
-    Not,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
     Add,
     Subtract,
@@ -157,19 +152,23 @@ impl BinaryOperator {
     }
 }
 
+/// A checked value address. Local bindings identify their Let definition in
+/// this unit and never enter a physical input port's namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueAddress {
+    Input(ValueId),
+    Local(ExprId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
-    Value(ValueId),
+    Value(ValueAddress),
     LambdaParameter {
         lambda: ExprId,
         ordinal: u32,
     },
     /// Exact address in the sole immutable plan/package checked pool table.
     Constant(crate::ConstantReference),
-    Unary {
-        op: UnaryOperator,
-        expr: ExprId,
-    },
     Binary {
         left: ExprId,
         op: BinaryOperator,
@@ -194,6 +193,11 @@ pub enum ExprKind {
     Conjunction {
         args: Box<[ExprId]>,
     },
+    /// Evaluate `value` once and expose it only while evaluating `body`.
+    Let {
+        value: ExprId,
+        body: ExprId,
+    },
     /// SQL `OR` over an ordered argument list. Mirrors [`ExprKind::Conjunction`],
     /// stopping at the first `true`.
     Disjunction {
@@ -216,22 +220,6 @@ pub enum ExprKind {
         expr: ExprId,
         negated: bool,
     },
-    InList {
-        expr: ExprId,
-        list: Box<[ExprId]>,
-        negated: bool,
-    },
-    Between {
-        expr: ExprId,
-        low: ExprId,
-        high: ExprId,
-        negated: bool,
-    },
-    Like {
-        expr: ExprId,
-        pattern: ExprId,
-        negated: bool,
-    },
     Case {
         /// Use ordinary IEEE equality for the original floating comparison domain.
         ieee_float_equality: bool,
@@ -239,14 +227,20 @@ pub enum ExprKind {
         when_then: Box<[(ExprId, ExprId)]>,
         else_expr: Option<ExprId>,
     },
-    IsTruthValue {
-        expr: ExprId,
-        value: bool,
-        negated: bool,
-    },
 }
 
 impl ExprKind {
+    pub const fn input(value: ValueId) -> Self {
+        Self::Value(ValueAddress::Input(value))
+    }
+
+    pub const fn input_value(&self) -> Option<ValueId> {
+        match self {
+            Self::Value(ValueAddress::Input(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
     /// Intrinsic invocation topology from the original definition vocabulary.
     /// Function calls deliberately return None: their exact installed owner
     /// supplies control, independently of legacy binding metadata. This proves
@@ -261,6 +255,7 @@ impl ExprKind {
         use novarocks_type_contract::ControlShape;
         Ok(match self {
             ExprKind::Conjunction { .. } => Some(ControlShape::Conjunction),
+            ExprKind::Let { .. } => Some(ControlShape::Let),
             ExprKind::Disjunction { .. } => Some(ControlShape::Disjunction),
             ExprKind::Case {
                 operand,
@@ -274,48 +269,23 @@ impl ExprKind {
                 })?,
                 has_else: else_expr.is_some(),
             }),
-            ExprKind::Between { negated, .. } => Some(ControlShape::Between { negated: *negated }),
-            ExprKind::InList { negated, .. } => {
-                Some(ControlShape::Membership { negated: *negated })
-            }
             ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
             ExprKind::FunctionCall { .. } => None,
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Constant(_)
-            | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::IsTruthValue { .. } => Some(ControlShape::Eager),
+            | ExprKind::IsNull { .. } => Some(ControlShape::Eager),
         })
     }
 
-    /// Original ordered evaluation occurrences. A definition edge is not a
-    /// memoized invocation: BETWEEN reads its operand in both comparisons.
+    /// Original ordered evaluation occurrences.
     pub fn invocation_references_observed<E>(
         &self,
-        mut visit: impl FnMut(ExprId) -> Result<(), E>,
+        visit: impl FnMut(ExprId) -> Result<(), E>,
     ) -> Result<(), E> {
-        if let Self::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } = self
-        {
-            for role in novarocks_type_contract::NativeBetweenPlan::new(*negated).sources() {
-                visit(match role {
-                    novarocks_type_contract::BetweenSourceRole::Operand => *expr,
-                    novarocks_type_contract::BetweenSourceRole::Lower => *low,
-                    novarocks_type_contract::BetweenSourceRole::Upper => *high,
-                })?;
-            }
-            Ok(())
-        } else {
-            self.expression_references_observed(visit)
-        }
+        self.expression_references_observed(visit)
     }
 
     /// Actual primitive parameter consumers, independent of function-call
@@ -340,13 +310,14 @@ impl ExprKind {
     ) -> Result<(), E> {
         match self {
             Self::Value(_) | Self::LambdaParameter { .. } | Self::Constant(_) => {}
-            Self::Unary { expr, .. }
-            | Self::Cast { expr, .. }
-            | Self::IsNull { expr, .. }
-            | Self::IsTruthValue { expr, .. } => visit(*expr)?,
+            Self::Cast { expr, .. } | Self::IsNull { expr, .. } => visit(*expr)?,
             Self::Binary { left, right, .. } => {
                 visit(*left)?;
                 visit(*right)?;
+            }
+            Self::Let { value, body } => {
+                visit(*value)?;
+                visit(*body)?;
             }
             Self::Conjunction { args }
             | Self::Disjunction { args }
@@ -356,23 +327,6 @@ impl ExprKind {
                 }
             }
             Self::Lambda { body, .. } => visit(*body)?,
-            Self::InList { expr, list, .. } => {
-                visit(*expr)?;
-                for id in list {
-                    visit(*id)?;
-                }
-            }
-            Self::Between {
-                expr, low, high, ..
-            } => {
-                visit(*expr)?;
-                visit(*low)?;
-                visit(*high)?;
-            }
-            Self::Like { expr, pattern, .. } => {
-                visit(*expr)?;
-                visit(*pattern)?;
-            }
             Self::Case {
                 operand,
                 when_then,

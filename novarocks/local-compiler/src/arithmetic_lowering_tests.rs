@@ -197,14 +197,14 @@ fn fixture(
         .fixture_definition(
             NodeId::new(0),
             left_type.clone(),
-            ExprKind::Value(ValueId::new(103)),
+            ExprKind::input(ValueId::new(103)),
         )
         .unwrap();
     let right = builder
         .fixture_definition(
             NodeId::new(0),
             right_type.clone(),
-            ExprKind::Value(ValueId::new(109)),
+            ExprKind::input(ValueId::new(109)),
         )
         .unwrap();
     let (effective_left, effective_type, child) = if nested_mod {

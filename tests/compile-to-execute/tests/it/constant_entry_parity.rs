@@ -85,7 +85,6 @@ enum Family {
     Operator(OperatorFunction),
     And,
     Or,
-    Not,
     Carrier,
     Call(&'static str),
 }
@@ -98,7 +97,6 @@ impl Family {
             }
             Self::And => matches!(kind, StaticExprKind::NaryAnd { .. }),
             Self::Or => matches!(kind, StaticExprKind::NaryOr { .. }),
-            Self::Not => matches!(kind, StaticExprKind::Not(_)),
             Self::Carrier => matches!(
                 kind,
                 StaticExprKind::PreparedCast {
@@ -461,7 +459,12 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         ),
         ("FALSE AND TRUE", Family::And, false, boolean(Some(false))),
         ("TRUE OR FALSE", Family::Or, false, boolean(Some(true))),
-        ("NOT TRUE", Family::Not, false, boolean(Some(false))),
+        (
+            "NOT TRUE",
+            Family::Operator(OperatorFunction::BooleanNot),
+            false,
+            boolean(Some(false)),
+        ),
         (
             "CAST(42 AS TINYINT)",
             Family::Carrier,
@@ -564,7 +567,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         ),
         (
             "NOT CAST(NULL AS BOOLEAN)",
-            Family::Not,
+            Family::Constant,
             true,
             FoldOutcome::Folded,
             boolean(None),

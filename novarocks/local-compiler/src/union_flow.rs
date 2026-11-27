@@ -96,14 +96,14 @@ pub(crate) fn compile_reads<H, F: ValueSchemaCreationFactory<H>>(
             let definition = builder.add_with_creator_in(
                 None,
                 ty.clone(),
-                ExprKind::Value(*value),
+                ExprKind::input(*value),
                 creation,
                 work,
             )?;
             builder.root_with_creator_in(definition, demand, RootScope::Port(0), creation, work)?
         } else {
             let definition = builder
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .map_err(unit_error)?;
             builder
                 .root(definition, demand, RootScope::Port(0))

@@ -722,9 +722,10 @@ fn preflight(
         }
         for argument in &definition.arguments {
             match &argument.kind {
-                Some(wire::function_argument_type::Kind::ValueTypeId(_)) => {
-                    model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?
-                }
+                Some(
+                    wire::function_argument_type::Kind::ValueTypeId(_)
+                    | wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(_),
+                ) => model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?,
                 Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
                     model.items = add(model.items, lambda.parameter_value_type_ids.len())?;
                     model.facts.type_reference_count = add(
@@ -785,7 +786,10 @@ fn preflight(
     for definition in headers.as_wire() {
         for argument in &definition.arguments {
             match &argument.kind {
-                Some(wire::function_argument_type::Kind::ValueTypeId(id)) => count_clone(
+                Some(
+                    wire::function_argument_type::Kind::ValueTypeId(id)
+                    | wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(id),
+                ) => count_clone(
                     headers.type_table(),
                     *id,
                     &mut model,
@@ -967,6 +971,11 @@ fn materialize_definition_in<H>(
         let value = match &argument.kind {
             Some(wire::function_argument_type::Kind::ValueTypeId(id)) => {
                 FunctionArgumentType::Value(clone_type(*id, w)?)
+            }
+            Some(wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(id)) => {
+                FunctionArgumentType::CandidateGroup {
+                    element_type: clone_type(*id, w)?,
+                }
             }
             Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
                 let mut parameters =

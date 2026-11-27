@@ -23,9 +23,7 @@ use arrow::datatypes::DataType;
 
 use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnostic};
 use super::{ExplainLevel, PlanNodeExplainStage};
-use crate::analysis::{
-    BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
-};
+use crate::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
 use crate::common::ApplyKind;
 use crate::common::negation::{typed_operand, typed_operand_has_lower_precedence, write_negation};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
@@ -680,6 +678,11 @@ fn expression(
         }
         return Ok(());
     }
+    if let Some(operand) = crate::common::negation::typed_boolean_operand(expr) {
+        out.write_str("NOT (")?;
+        expression(out, operand, next, diagnostic)?;
+        return out.write_str(")");
+    }
     if let Some(operand) = typed_operand(expr) {
         let needs_parentheses = typed_operand_has_lower_precedence(operand)
             || matches!(operand.kind, ExprKind::Nested(_));
@@ -696,6 +699,18 @@ fn expression(
             }
             out.write_str(column)
         }
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => {
+            write!(out, "LET v{} = ", binding.0)?;
+            expression(out, initializer, next, diagnostic)?;
+            out.write_str(" IN (")?;
+            expression(out, body, next, diagnostic)?;
+            out.write_str(")")
+        }
+        ExprKind::LocalValue(binding) => write!(out, "v{}", binding.0),
         ExprKind::LambdaParamRef { name, .. } => out.write_str(name),
         ExprKind::Constant(value) => match diagnostic {
             Some(diagnostic) => diagnostic.constant(value, out),
@@ -733,7 +748,9 @@ fn expression(
                 BinOp::Gt => ">",
                 BinOp::Ge => ">=",
                 BinOp::EqForNull => "<=>",
-                BinOp::And => "AND",
+                BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
+                    "AND"
+                }
                 BinOp::Or => "OR",
             };
             let (left, right) = if matches!(op, BinOp::Eq | BinOp::EqForNull)
@@ -747,12 +764,6 @@ fn expression(
             expression(out, left, next, diagnostic)?;
             write!(out, " {op_str} ")?;
             expression(out, right, next, diagnostic)
-        }
-        ExprKind::UnaryOp { op, expr } => {
-            out.write_str(match op {
-                UnOp::Not => "NOT ",
-            })?;
-            expression(out, expr, next, diagnostic)
         }
         ExprKind::FunctionCall {
             name,
@@ -812,54 +823,6 @@ fn expression(
         ExprKind::IsNull { expr, negated } => {
             expression(out, expr, next, diagnostic)?;
             out.write_str(if *negated { " IS NOT NULL" } else { " IS NULL" })
-        }
-        ExprKind::IsTruthValue {
-            expr,
-            value,
-            negated,
-        } => {
-            expression(out, expr, next, diagnostic)?;
-            write!(
-                out,
-                " IS{} {}",
-                if *negated { " NOT" } else { "" },
-                if *value { "TRUE" } else { "FALSE" }
-            )
-        }
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            expression(out, expr, next, diagnostic)?;
-            out.write_str(if *negated { " NOT IN (" } else { " IN (" })?;
-            expressions(out, list, ", ", next, diagnostic)?;
-            out.write_char(')')
-        }
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            expression(out, expr, next, diagnostic)?;
-            out.write_str(if *negated {
-                " NOT BETWEEN "
-            } else {
-                " BETWEEN "
-            })?;
-            expression(out, low, next, diagnostic)?;
-            out.write_str(" AND ")?;
-            expression(out, high, next, diagnostic)
-        }
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => {
-            expression(out, expr, next, diagnostic)?;
-            out.write_str(if *negated { " NOT LIKE " } else { " LIKE " })?;
-            expression(out, pattern, next, diagnostic)
         }
         ExprKind::Case {
             operand,
@@ -962,10 +925,9 @@ fn validate_expression_depth(expr: &TypedExpr, depth: usize, visited: &mut usize
             validate_expression_depth(left, next, visited)?;
             validate_expression_depth(right, next, visited)?;
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => validate_expression_depth(expr, next, visited)?,
+        ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) => {
+            validate_expression_depth(expr, next, visited)?
+        }
         ExprKind::Cast { expr, target, .. } => {
             validate_type_depth(target, 0)?;
             validate_expression_depth(expr, next, visited)?;
@@ -979,23 +941,6 @@ fn validate_expression_depth(expr: &TypedExpr, depth: usize, visited: &mut usize
         }
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
             validate_expression_depth(body, next, visited)?
-        }
-        ExprKind::InList { expr, list, .. } => {
-            validate_expression_depth(expr, next, visited)?;
-            for expr in list {
-                validate_expression_depth(expr, next, visited)?;
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            validate_expression_depth(expr, next, visited)?;
-            validate_expression_depth(low, next, visited)?;
-            validate_expression_depth(high, next, visited)?;
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            validate_expression_depth(expr, next, visited)?;
-            validate_expression_depth(pattern, next, visited)?;
         }
         ExprKind::Case {
             operand,

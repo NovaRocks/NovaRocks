@@ -35,7 +35,7 @@ fn sorted_global_row_assertion_has_a_local_order_preserving_owner() {
     let value = values[0];
     let sort = builder.reserve_node_id().unwrap();
     let unit = builder.unit(sort).unwrap();
-    let read = unit.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+    let read = unit.add(None, ty.clone(), ExprKind::input(value)).unwrap();
     let expr = unit
         .root(read, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();

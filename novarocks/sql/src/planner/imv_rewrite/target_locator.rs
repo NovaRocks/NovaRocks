@@ -842,9 +842,12 @@ mod tests {
     fn find_ref_type(expr: &TypedExpr, id: ColumnId) -> Option<&FunctionValueType> {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } if *column_id == id => Some(&expr.value_type),
-            ExprKind::BinaryOp { left, right, .. } => {
-                find_ref_type(left, id).or_else(|| find_ref_type(right, id))
-            }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => find_ref_type(left, id).or_else(|| find_ref_type(right, id)),
             _ => None,
         }
     }

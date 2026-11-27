@@ -352,16 +352,11 @@ fn scalar_claim_cannot_borrow_another_guarded_occurrences_proof() {
     )
     .unwrap();
     work.finish().unwrap();
-    let first = unit
-        .claims()
-        .values()
-        .find(|c| c.context.demand == EvaluationDemand::TruthOnly)
-        .unwrap();
-    let then = unit
-        .claims()
-        .values()
-        .find(|c| c.context.demand == EvaluationDemand::Value)
-        .unwrap();
+    let root = &unit.control_flow().uses()[&unit.root_use_ids()[0]];
+    let first = &unit.claims()[&root.arguments[0]];
+    let then = &unit.claims()[&root.arguments[1]];
+    assert_eq!(first.context.demand, EvaluationDemand::Value);
+    assert_eq!(then.context.demand, EvaluationDemand::Value);
     assert_ne!(first.context.region, then.context.region);
     let first_proof = first.effects.proof_scope;
     let then_id = then.context.use_id;
@@ -452,7 +447,7 @@ fn actual_300_scalar_source_observes_quantum_and_each_original_primary_prefix() 
 fn value_outside_declared_root_port_is_rejected_before_call_claim_correspondence() {
     let unit = repeated(1);
     let mut parts = copy_fixture_parts(&unit);
-    parts.definitions[0].kind = ExprKind::Value(ValueId::new(17));
+    parts.definitions[0].kind = ExprKind::input(ValueId::new(17));
     parts.claims.clear();
     parts.requests.clear();
     invalid_message(reconstruct(parts), "value is outside its root input scope");

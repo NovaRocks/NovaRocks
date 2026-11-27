@@ -18,9 +18,9 @@
 //! Mutable unit construction ends before any immutable unit is exposed.
 // Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 use crate::{
-    BoundExprSet, DefinitionControl, ExprId, ExprKind, ExprNode, ExprPort, ExprRoot,
-    ExpressionCallClaim, PhysicalCallRequest, RootOrdinal, RootScope, UnitError, UnitLimits,
-    UnitParts,
+    BoundExprSet, ControlExpansion, ControlExpansions, DefinitionControl, ExprId, ExprKind,
+    ExprNode, ExprPort, ExprRoot, ExpressionCallClaim, PhysicalCallRequest, RootOrdinal, RootScope,
+    UnitError, UnitLimits, UnitParts,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, EvaluationDemand, ExpressionUseId,
@@ -63,6 +63,7 @@ pub struct BoundExprSetBuilder {
     definitions: Vec<Option<ExprNode>>,
     roots: Vec<ExprRoot>,
     controls: BTreeMap<ExprId, DefinitionControl>,
+    expansions: Vec<ControlExpansion>,
     requests: BTreeMap<ExprId, PhysicalCallRequest>,
     storage: ValueTypeStorageLifetime,
 }
@@ -73,6 +74,7 @@ impl BoundExprSetBuilder {
             definitions: Vec::new(),
             roots: Vec::new(),
             controls: BTreeMap::new(),
+            expansions: Vec::new(),
             requests: BTreeMap::new(),
             storage: ValueTypeStorageLifetime::pure(),
         }
@@ -308,6 +310,37 @@ impl BoundExprSetBuilder {
             definitions: &mut self.definitions,
         }
     }
+    pub fn record_control_expansion(
+        &mut self,
+        root: ExprId,
+        positive: ExprId,
+        conjunction: ExprId,
+        branches: [ExprId; 2],
+    ) -> Result<(), UnitError> {
+        reserve_source::<_, std::convert::Infallible>(&mut self.expansions, None)
+            .map_err(pure_source_error)?;
+        self.expansions.push(ControlExpansion {
+            root,
+            positive,
+            conjunction,
+            branches,
+        });
+        Ok(())
+    }
+
+    pub fn record_control_expansion_with_creator_in<H>(
+        &mut self,
+        expansion: ControlExpansion,
+        creator: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), crate::UnitConstructionFailure<H>> {
+        let mut creation = crate::unit_creation::UnitValidationCreation::single(creator);
+        self.retain_source_storage(&mut creation, work)?;
+        reserve_source(&mut self.expansions, Some((&mut creation, work)))
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        self.expansions.push(expansion);
+        Ok(())
+    }
     /// Borrow the original work scope without a runtime creator. The enclosing
     /// pure producer remains responsible for its source/header allocations.
     pub fn seal(
@@ -369,10 +402,17 @@ impl BoundExprSetBuilder {
             })?);
             work.step()?;
         }
+        let expansions = creation
+            .boxed_retained(self.expansions, work)
+            .map_err(|error| creation.finish_error(error.into(), work))?;
+        let expansions =
+            ControlExpansions::try_new_created(expansions, &definitions, creation, work)
+                .map_err(|error| creation.finish_error(error, work))?;
         crate::validation::validate_core(
             &ports,
             &definitions,
             &self.roots,
+            &expansions,
             self.limits,
             creation,
             work,
@@ -382,6 +422,7 @@ impl BoundExprSetBuilder {
             &definitions,
             &self.roots,
             &self.controls,
+            &expansions,
             creation,
             work,
         )
@@ -409,6 +450,7 @@ impl BoundExprSetBuilder {
             roots,
             root_uses: derived.root_uses,
             control: derived.flow,
+            expansions,
             temporal_sources: derived.temporal_sources,
             requests: self.requests,
             storage,
@@ -421,6 +463,7 @@ pub struct SealedUnit {
     roots: Box<[ExprRoot]>,
     root_uses: Box<[ExpressionUseId]>,
     control: novarocks_type_contract::ExpressionControlFlow<ExprId>,
+    expansions: ControlExpansions,
     temporal_sources:
         BTreeMap<ExpressionUseId, novarocks_type_contract::TemporalSourcePlan<ExprId>>,
     requests: BTreeMap<ExprId, PhysicalCallRequest>,
@@ -477,6 +520,7 @@ impl SealedUnit {
             claims,
             self.requests,
         )
+        .with_control_expansions(self.expansions)
         .with_storage_lifetime(self.storage)
         .map_err(|error| {
             let mut creation =
@@ -500,6 +544,7 @@ impl SealedUnit {
                 claims,
                 self.requests,
             )
+            .with_control_expansions(self.expansions)
             .with_storage_lifetime(self.storage)?,
             work,
         )

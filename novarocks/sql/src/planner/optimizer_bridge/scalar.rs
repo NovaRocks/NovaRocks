@@ -880,6 +880,16 @@ pub(crate) fn intern_typed(
             arena.remember_source_column_display(*column_id, qualifier.clone(), column.clone());
             ScalarNode::ColumnRef(*column_id)
         }
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => ScalarNode::Let {
+            binding: *binding,
+            initializer: intern_typed(arena, initializer, control)?,
+            body: intern_typed(arena, body, control)?,
+        },
+        ExprKind::LocalValue(binding) => ScalarNode::LocalValue(*binding),
         ExprKind::LambdaParamRef { name, slot_id } => ScalarNode::LambdaParamRef {
             name: name.clone(),
             slot_id: *slot_id,
@@ -901,10 +911,6 @@ pub(crate) fn intern_typed(
                 decimal_overflow_policy: *decimal_overflow_policy,
             }
         }
-        ExprKind::UnaryOp { op, expr } => ScalarNode::UnaryOp {
-            op: *op,
-            child: intern_typed(arena, expr, control)?,
-        },
         ExprKind::FunctionCall {
             name,
             args,
@@ -969,38 +975,6 @@ pub(crate) fn intern_typed(
             child: intern_typed(arena, expr, control)?,
             negated: *negated,
         },
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: intern_typed(arena, expr, control)?,
-            list: list
-                .iter()
-                .map(|item| intern_typed(arena, item, control))
-                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
-            negated: *negated,
-        },
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: intern_typed(arena, expr, control)?,
-            low: intern_typed(arena, low, control)?,
-            high: intern_typed(arena, high, control)?,
-            negated: *negated,
-        },
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: intern_typed(arena, expr, control)?,
-            pattern: intern_typed(arena, pattern, control)?,
-            negated: *negated,
-        },
         ExprKind::Case {
             ieee_float_equality,
             operand,
@@ -1025,15 +999,6 @@ pub(crate) fn intern_typed(
                 .as_ref()
                 .map(|item| intern_typed(arena, item, control))
                 .transpose()?,
-        },
-        ExprKind::IsTruthValue {
-            expr,
-            value,
-            negated,
-        } => ScalarNode::IsTruthValue {
-            child: intern_typed(arena, expr, control)?,
-            value: *value,
-            negated: *negated,
         },
         ExprKind::Nested(expr) => ScalarNode::Nested(intern_typed(arena, expr, control)?),
         ExprKind::WindowCall {
@@ -1096,6 +1061,16 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
                     .unwrap_or_else(|| format!("col{}", cid.0)),
             }
         }
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => ExprKind::Let {
+            binding: *binding,
+            initializer: novarocks_parser::ast::AstBox::new(materialize(arena, *initializer)),
+            body: novarocks_parser::ast::AstBox::new(materialize(arena, *body)),
+        },
+        ScalarNode::LocalValue(binding) => ExprKind::LocalValue(*binding),
         ScalarNode::LambdaParamRef { name, slot_id } => ExprKind::LambdaParamRef {
             name: name.clone(),
             slot_id: *slot_id,
@@ -1112,10 +1087,6 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             op: *op,
             right: novarocks_parser::ast::AstBox::new(materialize(arena, *right)),
             decimal_overflow_policy: *decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ExprKind::UnaryOp {
-            op: *op,
-            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
         },
         ScalarNode::FunctionCall {
             name,
@@ -1171,35 +1142,6 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
             negated: *negated,
         },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ExprKind::InList {
-            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
-            list: list.iter().map(|item| materialize(arena, *item)).collect(),
-            negated: *negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ExprKind::Between {
-            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
-            low: novarocks_parser::ast::AstBox::new(materialize(arena, *low)),
-            high: novarocks_parser::ast::AstBox::new(materialize(arena, *high)),
-            negated: *negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ExprKind::Like {
-            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
-            pattern: novarocks_parser::ast::AstBox::new(materialize(arena, *pattern)),
-            negated: *negated,
-        },
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -1215,15 +1157,6 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
                 .collect(),
             else_expr: else_expr
                 .map(|item| novarocks_parser::ast::AstBox::new(materialize(arena, item))),
-        },
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => ExprKind::IsTruthValue {
-            expr: novarocks_parser::ast::AstBox::new(materialize(arena, *child)),
-            value: *value,
-            negated: *negated,
         },
         ScalarNode::Nested(child) => ExprKind::Nested(novarocks_parser::ast::AstBox::new(
             materialize(arena, *child),

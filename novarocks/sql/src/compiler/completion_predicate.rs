@@ -282,9 +282,11 @@ fn exact_atom(predicate: &TypedExpr) -> bool {
             && left.value_type.value_type().temporal() == right.value_type.value_type().temporal()
             && ((is_column(left) && is_literal(right)) || (is_literal(left) && is_column(right)));
     }
+    if let Some((probe, candidates)) = crate::common::binary_operator::typed_in_list(predicate) {
+        return is_column(probe) && candidates.iter().all(is_literal);
+    }
     match &predicate.kind {
         ExprKind::IsNull { expr, .. } => is_column(expr),
-        ExprKind::InList { expr, list, .. } => is_column(expr) && list.iter().all(is_literal),
         _ => false,
     }
 }
@@ -295,6 +297,19 @@ fn can_offer_atom(
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
 ) -> bool {
     let predicate = unnest(predicate);
+    if let Some((probe, candidates)) = crate::common::binary_operator::typed_in_list(predicate) {
+        return lower_column(scan, columns, probe).is_some()
+            && crate::common::binary_operator::permits_equality_substitution(
+                probe.value_type.data_type(),
+            )
+            && candidates.iter().all(|candidate| {
+                !candidate.value_type.nullable()
+                    && matches!(
+                        unnest(candidate).kind,
+                        ExprKind::Literal(_) | ExprKind::Constant(_)
+                    )
+            });
+    }
     let ExprKind::FunctionCall { binding, .. } = &predicate.kind else {
         return true;
     };
@@ -355,6 +370,20 @@ pub(super) fn lower_atom_with_literal(
             comparison_domain(column.value_type, op, value)?,
         ));
     }
+    if let Some((probe, candidates)) = crate::common::binary_operator::typed_in_list(predicate) {
+        if !crate::common::binary_operator::permits_equality_substitution(
+            probe.value_type.data_type(),
+        ) {
+            return None;
+        }
+        let column = resolve_column(probe)?;
+        let values = candidates
+            .iter()
+            .map(|literal| lower_literal(literal, column.value_type))
+            .collect::<Option<Vec<_>>>()?;
+        let values = ValueSet::of_values(column.value_type, values).ok()?;
+        return Some((column.ordinal, Domain::new(values, false)));
+    }
     match &predicate.kind {
         ExprKind::IsNull { expr, negated } => {
             let column = resolve_column(expr)?;
@@ -366,19 +395,6 @@ pub(super) fn lower_atom_with_literal(
                     Domain::only_null(column.value_type)
                 },
             ))
-        }
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } if !negated && !list.is_empty() => {
-            let column = resolve_column(expr)?;
-            let values = list
-                .iter()
-                .map(|literal| lower_literal(literal, column.value_type))
-                .collect::<Option<Vec<_>>>()?;
-            let values = ValueSet::of_values(column.value_type, values).ok()?;
-            Some((column.ordinal, Domain::new(values, false)))
         }
         _ => None,
     }
@@ -468,6 +484,8 @@ fn comparison_domain(
         | BinOp::Div
         | BinOp::Mod
         | BinOp::And
+        | BinOp::ExpandedConjunction
+        | BinOp::ExpandedNegatedConjunction
         | BinOp::Or => return None,
     };
     Some(Domain::new(values, false))
@@ -663,6 +681,8 @@ const fn reverse_comparison(op: BinOp) -> BinOp {
         | BinOp::Div
         | BinOp::Mod
         | BinOp::And
+        | BinOp::ExpandedConjunction
+        | BinOp::ExpandedNegatedConjunction
         | BinOp::Or => op,
     }
 }
@@ -890,6 +910,25 @@ mod tests {
             assert_eq!(range.low(), &Bound::Exclusive(ConnectorValue::Integer(10)));
             assert_eq!(range.high(), &Bound::Unbounded);
         }
+        let membership = crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::InList,
+            vec![column_ref(), integer(1), integer(2)],
+        );
+        assert!(offered(&scan(vec![checked.clone(), membership.clone()]), &columns()).is_empty());
+        let needs = offered(&scan(vec![membership, checked]), &columns());
+        let [need] = needs.as_ref() else {
+            panic!("expected a single leading exact membership offer");
+        };
+        assert_eq!(need.occurrence().get(), 0);
+        assert!(need.exact_eligible());
+        assert!(
+            !need
+                .constraint()
+                .summary()
+                .domain_for(&0)
+                .unwrap()
+                .null_allowed()
+        );
     }
 
     #[test]
@@ -1091,14 +1130,15 @@ mod tests {
 
     #[test]
     fn negated_in_list_remains_an_engine_residual() {
-        let predicate = TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(column_ref()),
-                list: (vec![integer(1), integer(2)]).into(),
-                negated: true,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        };
+        let predicate = crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::BooleanNot,
+            vec![crate::common::binary_operator::test_predicate(
+                novarocks_type_contract::OperatorFunction::InList,
+                std::iter::once(column_ref())
+                    .chain(vec![integer(1), integer(2)])
+                    .collect(),
+            )],
+        );
 
         assert!(offered(&scan(vec![predicate]), &columns()).is_empty());
     }

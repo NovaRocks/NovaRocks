@@ -66,16 +66,9 @@ fn between(
 ) -> ScalarId {
     let low = bound(arena, low, dtype.clone());
     let high = bound(arena, high, dtype);
-    intern(
-        arena,
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated: false,
-        },
-        FunctionValueType::new(DataType::Boolean, true),
-    )
+    let lower = binary(arena, low, BinOp::Le, child);
+    let upper = binary(arena, child, BinOp::Le, high);
+    binary(arena, lower, BinOp::ExpandedConjunction, upper)
 }
 fn branches(
     arena: &mut ScalarArena,
@@ -120,21 +113,17 @@ fn envelope_axes(
         .iter()
         .filter(|group| group.derived == PredicateDerivedKind::RangeEnvelope)
     {
-        let ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated: false,
-        } = arena.node(group.expr)
+        let Some((child, low, high)) =
+            crate::common::binary_operator::scalar_inclusive_range(arena, group.expr)
         else {
             panic!("necessary interval")
         };
         assert!(matches!(
-            arena.node(*low),
+            arena.node(low),
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(10)))
         ));
         assert!(matches!(
-            arena.node(*high),
+            arena.node(high),
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(40)))
         ));
         let ScalarNode::Cast {
@@ -142,7 +131,7 @@ fn envelope_axes(
             child: base,
             target: actual_target,
             decimal_overflow_policy,
-        } = arena.node(*child)
+        } = arena.node(child)
         else {
             panic!("original widening comparison remains")
         };
@@ -152,8 +141,8 @@ fn envelope_axes(
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull
         );
         assert_eq!(arena.data_type(*base), source);
-        assert_eq!(arena.data_type(*child), target);
-        assert!(arena.nullable(*base) && arena.nullable(*child));
+        assert_eq!(arena.data_type(child), target);
+        assert!(arena.nullable(*base) && arena.nullable(child));
         let ScalarNode::ColumnRef(id) = arena.node(*base) else {
             panic!("exact base column")
         };

@@ -132,6 +132,7 @@ impl StandaloneDraft {
             work,
             constant_emission: &mut self.constants,
             lambda_scope: &mut self.lambda_scope,
+            local_scope: Vec::new(),
             storage: ScalarStorage::Standalone(StandaloneScalarStorage {
                 brand: &self.brand,
                 draft: &mut self.draft,

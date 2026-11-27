@@ -341,7 +341,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 .add_root(
                     owner,
                     int64(true),
-                    ExprKind::Value(columns[column]),
+                    ExprKind::input(columns[column]),
                     RootScope::Port(0),
                 )
                 .unwrap(),
@@ -386,7 +386,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                             .add_root(
                                 WINDOW,
                                 int64(true),
-                                ExprKind::Value(columns[*column]),
+                                ExprKind::input(columns[*column]),
                                 RootScope::Port(0),
                             )
                             .unwrap(),
@@ -540,7 +540,10 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                             value_type: value_type.clone(),
                             constant,
                         },
-                        FunctionArgumentType::Lambda { .. } => panic!("window value channel"),
+                        FunctionArgumentType::Lambda { .. }
+                        | FunctionArgumentType::CandidateGroup { .. } => {
+                            panic!("window value channel")
+                        }
                     })
                     .collect(),
                 logical_argument_count: call.args.len(),
@@ -607,7 +610,8 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     value_type: value_type.clone(),
                     constant: constant.map(|reference| pool_value(reference.ordinal)),
                 },
-                StaticFunctionArgument::Lambda { .. } => panic!("window value channel"),
+                StaticFunctionArgument::Lambda { .. }
+                | StaticFunctionArgument::CandidateGroup { .. } => panic!("window value channel"),
             })
             .collect::<Vec<_>>();
         let selection = Arc::new(novarocks_functions::FunctionBindingSelection {

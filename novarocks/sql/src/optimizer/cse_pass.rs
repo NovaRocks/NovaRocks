@@ -141,11 +141,11 @@ fn rewrite_node(
 
 fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
     match scalars.node(id) {
+        // Nothing inside this activation may be hoisted by this traversal.
+        ScalarNode::Let { .. } => Vec::new(),
         ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => vec![*child],
         ScalarNode::FunctionCall { args, .. } => args.clone(),
         ScalarNode::AggregateCall {
@@ -161,16 +161,6 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
             children.extend(*filter);
             children
         }
-        ScalarNode::InList { child, list, .. } => {
-            let mut children = Vec::with_capacity(1 + list.len());
-            children.push(*child);
-            children.extend(list.iter().copied());
-            children
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => vec![*child, *low, *high],
-        ScalarNode::Like { child, pattern, .. } => vec![*child, *pattern],
         ScalarNode::Case {
             operand,
             when_then,
@@ -189,6 +179,7 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
@@ -227,9 +218,11 @@ fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
         return false;
     }
     match scalars.node(id) {
-        ScalarNode::ColumnRef(_)
+        ScalarNode::Let { .. }
+        | ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
@@ -262,11 +255,11 @@ fn collect_cse_semantic_guard_ids(
     id: ScalarId,
     guards: &mut HashSet<ScalarId>,
 ) {
-    if let ScalarNode::InList { child, .. } = scalars.node(id)
-        && is_complex_data_type(scalars.data_type(*child))
-        && !scalar_contains_column_ref(scalars, *child)
+    if let Some((probe, _)) = crate::common::binary_operator::scalar_in_list(scalars, id)
+        && is_complex_data_type(scalars.data_type(probe))
+        && !scalar_contains_column_ref(scalars, probe)
     {
-        guard_subtree(scalars, *child, guards);
+        guard_subtree(scalars, probe, guards);
     }
     for child in child_ids(scalars, id) {
         collect_cse_semantic_guard_ids(scalars, child, guards);
@@ -363,14 +356,17 @@ fn collect_column_refs_inner(
                 refs.push((*column_id, scalars.value_type(id).clone()));
             }
         }
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_refs_inner(scalars, *left, seen, refs);
             collect_column_refs_inner(scalars, *right, seen, refs);
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => collect_column_refs_inner(scalars, *child, seen, refs),
         ScalarNode::FunctionCall { args, .. } => {
             for &arg in args {
@@ -392,23 +388,6 @@ fn collect_column_refs_inner(
             for key in order_by {
                 collect_column_refs_inner(scalars, key.expr, seen, refs);
             }
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_column_refs_inner(scalars, *child, seen, refs);
-            for &item in list {
-                collect_column_refs_inner(scalars, item, seen, refs);
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_column_refs_inner(scalars, *child, seen, refs);
-            collect_column_refs_inner(scalars, *low, seen, refs);
-            collect_column_refs_inner(scalars, *high, seen, refs);
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_column_refs_inner(scalars, *child, seen, refs);
-            collect_column_refs_inner(scalars, *pattern, seen, refs);
         }
         ScalarNode::Case {
             operand,
@@ -446,7 +425,10 @@ fn collect_column_refs_inner(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_column_refs_inner(scalars, *body, seen, refs);
         }
-        ScalarNode::Literal(_) | ScalarNode::Constant(_) | ScalarNode::LambdaParamRef { .. } => {}
+        ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_) => {}
     }
 }
 
@@ -474,10 +456,6 @@ fn substitute(
             left: substitute(scalars, left, subst, control)?,
             right: substitute(scalars, right, subst, control)?,
             decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
-            op,
-            child: substitute(scalars, child, subst, control)?,
         },
         ScalarNode::FunctionCall {
             name,
@@ -538,38 +516,6 @@ fn substitute(
             child: substitute(scalars, child, subst, control)?,
             negated,
         },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: substitute(scalars, child, subst, control)?,
-            list: list
-                .into_iter()
-                .map(|item| substitute(scalars, item, subst, control))
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: substitute(scalars, child, subst, control)?,
-            low: substitute(scalars, low, subst, control)?,
-            high: substitute(scalars, high, subst, control)?,
-            negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: substitute(scalars, child, subst, control)?,
-            pattern: substitute(scalars, pattern, subst, control)?,
-            negated,
-        },
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -593,21 +539,14 @@ fn substitute(
                 .map(|else_expr| substitute(scalars, else_expr, subst, control))
                 .transpose()?,
         },
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => ScalarNode::IsTruthValue {
-            child: substitute(scalars, child, subst, control)?,
-            value,
-            negated,
-        },
         ScalarNode::Nested(child) => {
             ScalarNode::Nested(substitute(scalars, child, subst, control)?)
         }
-        ScalarNode::ColumnRef(_)
+        ScalarNode::Let { .. }
+        | ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
@@ -1814,21 +1753,15 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(10)),
             novarocks_type_contract::FunctionValueType::new(array_map_type.clone(), true),
         );
-        let in_list = arena.intern(
-            ScalarNode::InList {
-                child: cast_null_array,
-                list: vec![candidate],
-                negated: false,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let in_list = crate::common::binary_operator::intern_test_predicate(
+            &mut arena,
+            novarocks_type_contract::OperatorFunction::InList,
+            vec![cast_null_array, candidate],
         );
-        let not_in_list = arena.intern(
-            ScalarNode::InList {
-                child: cast_null_array,
-                list: vec![candidate],
-                negated: true,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let not_in_list = crate::common::binary_operator::intern_test_predicate(
+            &mut arena,
+            novarocks_type_contract::OperatorFunction::BooleanNot,
+            vec![in_list],
         );
 
         assert_eq!(

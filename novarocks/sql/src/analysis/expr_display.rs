@@ -20,7 +20,7 @@
 //! These labels preserve SQL/path spelling. Expression identity belongs to
 //! `expr_identity` and ColumnId; diagnostic text is never a selected-value key.
 
-use crate::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr, UnOp};
+use crate::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
 use crate::common::negation::{
     negation_delimiters, typed_operand, typed_operand_has_lower_precedence,
 };
@@ -142,6 +142,35 @@ fn expression(
         out.append(" ")?;
         return with_parens(right, out);
     }
+    if let Some(operand) = crate::common::negation::typed_boolean_operand(expr) {
+        out.append("NOT ")?;
+        return with_parens(operand, out);
+    }
+    if let ExprKind::FunctionCall { binding, args, .. } = &expr.kind {
+        use novarocks_type_contract::OperatorFunction;
+        match (
+            OperatorFunction::from_function_id(&binding.function_id),
+            &args[..],
+        ) {
+            (Some(OperatorFunction::Like), [text, pattern, tail @ ..]) => {
+                with_parens(text, out)?;
+                out.append(" LIKE ")?;
+                with_parens(pattern, out)?;
+                if let [escape] = tail {
+                    out.append(" ESCAPE ")?;
+                    with_parens(escape, out)?;
+                }
+                return Ok(());
+            }
+            (Some(OperatorFunction::InList), [probe, candidates @ ..]) => {
+                with_parens(probe, out)?;
+                out.append(" IN (")?;
+                expressions(candidates, ", ", false, out)?;
+                return out.append(")");
+            }
+            _ => {}
+        }
+    }
     if let Some(operand) = typed_operand(expr) {
         if let ExprKind::Constant(value) = &operand.kind {
             out.work.step()?;
@@ -184,6 +213,18 @@ fn expression(
             }
             out.append(column)
         }
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => {
+            out.append(&format!("LET v{} = ", binding.0))?;
+            expression(initializer, false, out)?;
+            out.append(" IN (")?;
+            expression(body, false, out)?;
+            out.append(")")
+        }
+        ExprKind::LocalValue(binding) => out.append(&format!("v{}", binding.0)),
         ExprKind::LambdaParamRef { name, .. } => out.append(name),
         ExprKind::Literal(value) => match value {
             query_ir::LiteralValue::Null => out.append("NULL"),
@@ -338,47 +379,6 @@ fn expression(
             out.append(" ")?;
             with_parens(right, out)
         }
-        ExprKind::UnaryOp { op, expr: inner } => {
-            out.append(match op {
-                UnOp::Not => "NOT ",
-            })?;
-            with_parens(inner, out)
-        }
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => {
-            with_parens(inner, out)?;
-            out.append(if *negated { " NOT IN (" } else { " IN (" })?;
-            expressions(list, ", ", false, out)?;
-            out.append(")")
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => {
-            with_parens(inner, out)?;
-            out.append(if *negated {
-                " NOT BETWEEN "
-            } else {
-                " BETWEEN "
-            })?;
-            with_parens(low, out)?;
-            out.append(" AND ")?;
-            with_parens(high, out)
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => {
-            with_parens(inner, out)?;
-            out.append(if *negated { " NOT LIKE " } else { " LIKE " })?;
-            with_parens(pattern, out)
-        }
         ExprKind::Case {
             operand,
             when_then,
@@ -401,15 +401,6 @@ fn expression(
                 expression(value, false, out)?;
             }
             out.append(" END")
-        }
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => {
-            with_parens(inner, out)?;
-            out.append(if *negated { " IS NOT " } else { " IS " })?;
-            out.append(if *value { "TRUE" } else { "FALSE" })
         }
         ExprKind::Nested(inner) => {
             out.append("(")?;
@@ -716,7 +707,7 @@ fn bin_op_display(op: BinOp) -> &'static str {
         BinOp::Gt => ">",
         BinOp::Ge => ">=",
         BinOp::EqForNull => "<=>",
-        BinOp::And => "AND",
+        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => "AND",
         BinOp::Or => "OR",
     }
 }

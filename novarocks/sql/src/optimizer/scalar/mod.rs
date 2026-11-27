@@ -34,7 +34,7 @@ use std::hash::{Hash, Hasher};
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, LambdaParam, LiteralValue, UnOp, WindowFrame};
+use crate::common::{BinOp, LambdaParam, LiteralValue, WindowFrame};
 use crate::functions::FunctionVolatility;
 use novarocks_type_contract::FunctionValueType;
 
@@ -89,6 +89,13 @@ pub(crate) struct SortKey {
 #[derive(Clone, Debug)]
 pub(crate) enum ScalarNode {
     ColumnRef(ColumnId),
+    Let {
+        binding: crate::analysis::LocalBindingId,
+        initializer: ScalarId,
+        body: ScalarId,
+    },
+    LocalValue(crate::analysis::LocalBindingId),
+
     LambdaParamRef {
         name: String,
         slot_id: i32,
@@ -101,10 +108,6 @@ pub(crate) enum ScalarNode {
         left: ScalarId,
         right: ScalarId,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    },
-    UnaryOp {
-        op: UnOp,
-        child: ScalarId,
     },
     FunctionCall {
         name: String,
@@ -138,32 +141,11 @@ pub(crate) enum ScalarNode {
         child: ScalarId,
         negated: bool,
     },
-    InList {
-        child: ScalarId,
-        list: Vec<ScalarId>,
-        negated: bool,
-    },
-    Between {
-        child: ScalarId,
-        low: ScalarId,
-        high: ScalarId,
-        negated: bool,
-    },
-    Like {
-        child: ScalarId,
-        pattern: ScalarId,
-        negated: bool,
-    },
     Case {
         ieee_float_equality: bool,
         operand: Option<ScalarId>,
         when_then: Vec<(ScalarId, ScalarId)>,
         else_expr: Option<ScalarId>,
-    },
-    IsTruthValue {
-        child: ScalarId,
-        value: bool,
-        negated: bool,
     },
     Nested(ScalarId),
     WindowCall {
@@ -887,8 +869,8 @@ mod tests {
 mod bridge_tests {
     use super::*;
     use crate::analysis::{
-        BinOp, ExprKind, LambdaParam, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
-        WindowBound, WindowFrame, WindowFrameType,
+        BinOp, ExprKind, LambdaParam, LiteralValue, ProjectItem, SortItem, TypedExpr, WindowBound,
+        WindowFrame, WindowFrameType,
     };
     use crate::column_id::ColumnId;
     use crate::planner::optimizer_bridge::scalar::{
@@ -1443,21 +1425,19 @@ mod bridge_tests {
         let lambda = typed(
             ExprKind::Lambda {
                 params: vec!["y".to_string()],
-                body: novarocks_parser::ast::AstBox::new(typed(
-                    ExprKind::UnaryOp {
-                        op: UnOp::Not,
-                        expr: novarocks_parser::ast::AstBox::new(typed(
+                body: novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_predicate(
+                        novarocks_type_contract::OperatorFunction::BooleanNot,
+                        vec![typed(
                             ExprKind::LambdaParamRef {
                                 name: "y".to_string(),
                                 slot_id: 11,
                             },
-                            DataType::Int64,
+                            DataType::Boolean,
                             false,
-                        )),
-                    },
-                    DataType::Int64,
-                    false,
-                )),
+                        )],
+                    ),
+                ),
             },
             DataType::Int64,
             false,
@@ -1483,14 +1463,12 @@ mod bridge_tests {
                 DataType::Boolean,
                 false,
             ),
-            typed(
-                ExprKind::InList {
-                    expr: novarocks_parser::ast::AstBox::new(col(3, DataType::Int64)),
-                    list: (vec![lit_int(7), lit_int(8)]).into(),
-                    negated: true,
-                },
-                DataType::Boolean,
-                false,
+            crate::common::binary_operator::test_predicate(
+                novarocks_type_contract::OperatorFunction::BooleanNot,
+                vec![crate::common::binary_operator::test_predicate(
+                    novarocks_type_contract::OperatorFunction::InList,
+                    vec![col(3, DataType::Int64), lit_int(7), lit_int(8)],
+                )],
             ),
             typed(
                 ExprKind::Case {
@@ -1524,44 +1502,33 @@ mod bridge_tests {
                 true,
             ),
             typed(
-                ExprKind::Nested(novarocks_parser::ast::AstBox::new(typed(
-                    ExprKind::UnaryOp {
-                        op: UnOp::Not,
-                        expr: novarocks_parser::ast::AstBox::new(lit_bool(false)),
-                    },
-                    DataType::Boolean,
-                    false,
-                ))),
+                ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_predicate(
+                        novarocks_type_contract::OperatorFunction::BooleanNot,
+                        vec![lit_bool(false)],
+                    ),
+                )),
                 DataType::Boolean,
                 false,
             ),
-            typed(
-                ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col(7, DataType::Int64)),
-                    low: novarocks_parser::ast::AstBox::new(lit_int(3)),
-                    high: novarocks_parser::ast::AstBox::new(lit_int(9)),
-                    negated: false,
-                },
-                DataType::Boolean,
-                false,
+            crate::common::binary_operator::test_inclusive_range(
+                col(7, DataType::Int64),
+                lit_int(3),
+                lit_int(9),
             ),
-            typed(
-                ExprKind::Like {
-                    expr: novarocks_parser::ast::AstBox::new(col(8, DataType::Utf8)),
-                    pattern: novarocks_parser::ast::AstBox::new(lit_string("ab%")),
-                    negated: true,
-                },
-                DataType::Boolean,
-                false,
+            crate::common::binary_operator::test_predicate(
+                novarocks_type_contract::OperatorFunction::BooleanNot,
+                vec![crate::common::binary_operator::test_predicate(
+                    novarocks_type_contract::OperatorFunction::Like,
+                    vec![col(8, DataType::Utf8), lit_string("ab%")],
+                )],
             ),
-            typed(
-                ExprKind::IsTruthValue {
-                    expr: novarocks_parser::ast::AstBox::new(lit_bool(true)),
-                    value: true,
-                    negated: true,
-                },
-                DataType::Boolean,
-                false,
+            crate::common::binary_operator::test_predicate(
+                novarocks_type_contract::OperatorFunction::BooleanNot,
+                vec![crate::common::binary_operator::test_predicate(
+                    novarocks_type_contract::OperatorFunction::Identical,
+                    vec![lit_bool(true), lit_bool(true)],
+                )],
             ),
             lambda_function,
             lambda,

@@ -264,7 +264,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         .enumerate()
     {
         let expr = builder
-            .fixture_value_root(duplicate, ty.clone(), ExprKind::Value(value))
+            .fixture_value_root(duplicate, ty.clone(), ExprKind::input(value))
             .unwrap();
         let output = builder
             .add_value(
@@ -361,8 +361,8 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             root,
             assertion,
             vec![
-                (ExprKind::Value(child[0]), integer),
-                (ExprKind::Value(child[3]), text),
+                (ExprKind::input(child[0]), integer),
+                (ExprKind::input(child[3]), text),
             ],
         );
         (root, output)

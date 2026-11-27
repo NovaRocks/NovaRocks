@@ -45,7 +45,8 @@ impl<'a> AggregateTypeArguments<'a> {
             Self::Arrow(values) => values.get(index),
             Self::Values(values) => match values.get(index)? {
                 crate::FunctionArgument::Value { value_type, .. } => Some(value_type.data_type()),
-                crate::FunctionArgument::Lambda { .. } => None,
+                crate::FunctionArgument::Lambda { .. }
+                | crate::FunctionArgument::CandidateGroup { .. } => None,
             },
         }
     }
@@ -53,7 +54,8 @@ impl<'a> AggregateTypeArguments<'a> {
         match self {
             Self::Values(values) => match values.get(index)? {
                 crate::FunctionArgument::Value { value_type, .. } => Some(value_type),
-                crate::FunctionArgument::Lambda { .. } => None,
+                crate::FunctionArgument::Lambda { .. }
+                | crate::FunctionArgument::CandidateGroup { .. } => None,
             },
             Self::Arrow(_) => None,
         }

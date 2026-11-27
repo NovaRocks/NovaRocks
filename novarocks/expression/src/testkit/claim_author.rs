@@ -22,14 +22,14 @@ use novarocks_expression_contract::{
     BoundExprSet, BoundExprSetBuilder, BoundFunction, ExprId, ExprKind, LegacyBindingMetadata,
     PhysicalCallRequest, SealedUnit,
 };
-use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
+use novarocks_function_contract::{FunctionArgument as StaticFunctionArgument, FunctionCandidate};
 use novarocks_functions::{
     FunctionArgument, FunctionBindingRequest, FunctionBindingSelection, FunctionKind,
     FunctionResultType, PureEngineFunctionCatalog, ResolvedFunctionBinding,
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, ControlShape, DecimalOverflowPolicy, FunctionValueType,
-    PureCompileControl, SemanticParameters,
+    OperatorFunction, PureCompileControl, SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -227,6 +227,84 @@ pub fn add_call(
     id
 }
 
+/// Bind a test predicate through the installed owner and the actual input definitions.
+pub fn add_catalogue_predicate(
+    draft: &mut BoundExprSetBuilder,
+    pools: &mut ConstantPools,
+    operator: novarocks_type_contract::OperatorFunction,
+    sources: Vec<ExprId>,
+) -> Result<ExprId, novarocks_functions::FunctionBindingError> {
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let control = &crate::testkit::HarnessControl;
+    let mut work = CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )?;
+    let mut arguments = Vec::new();
+    let mut children = Vec::new();
+    for &source in &sources {
+        let source = draft
+            .definition(source)
+            .expect("predicate source is present");
+        let constant = match source.kind {
+            ExprKind::Constant(reference) => Some(
+                pools
+                    .resolve_observed(reference, &source.ty, &mut work)
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        arguments.push(FunctionArgument::Value {
+            value_type: source.ty.clone(),
+            constant: constant.clone(),
+        });
+        children.push(crate::typing::ChildTyping {
+            value_type: source.ty.clone(),
+            constant,
+            form: crate::typing::ChildForm::Other,
+        });
+    }
+    if operator == novarocks_type_contract::OperatorFunction::InList {
+        arguments = crate::typing::in_list_arguments(&children, &mut work)
+            .expect("fixture has one nonempty ordered candidate group")
+            .into();
+    }
+    work.finish()?;
+    let binding = functions.metadata().resolve_bound_trusted_by_id(
+        &operator.function_id(),
+        FunctionKind::Scalar,
+        FunctionBindingRequest {
+            logical_argument_count: arguments.len(),
+            arguments: &arguments,
+            expected_result_type: None,
+        },
+        control,
+    )?;
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        panic!("predicate selects a scalar")
+    };
+    let function = BoundFunction::from_exact_signature(
+        binding.function_id,
+        binding.selected.overload,
+        binding.kind,
+        binding.selected.argument_types,
+        result.clone(),
+    );
+    let definition = draft
+        .add(
+            None,
+            result.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: sources.into_boxed_slice(),
+            },
+        )
+        .unwrap();
+    let request = physical_call_request(&arguments, None, pools);
+    draft.request(definition, request).unwrap();
+    Ok(definition)
+}
+
 /// Freeze the original requests using the explicit constant table of the caller.
 pub fn register_call_requests(
     draft: &mut BoundExprSetBuilder,
@@ -261,6 +339,22 @@ pub(super) fn physical_call_request(
                 constant: constant
                     .as_ref()
                     .map(|value| register_constant(constants, value)),
+            },
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => StaticFunctionArgument::CandidateGroup {
+                element_type: element_type.clone(),
+                members: members
+                    .iter()
+                    .map(|member| FunctionCandidate {
+                        value_type: member.value_type.clone(),
+                        constant: member
+                            .constant
+                            .as_ref()
+                            .map(|value| register_constant(constants, value)),
+                    })
+                    .collect(),
             },
             FunctionArgument::Lambda {
                 parameter_types,
@@ -319,10 +413,27 @@ pub fn try_finish_unit(
     parameters: &SemanticParameters,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundExprSet, crate::CallAuthorError> {
-    let decimal_overflow = authors
+    let mut decimal_overflow = authors
         .iter()
         .map(|(&definition, owner)| (definition, owner.decimal_policy))
         .collect::<BTreeMap<_, _>>();
+    for definition in sealed.definitions() {
+        if let ExprKind::FunctionCall { function, .. } = &definition.kind
+            && matches!(
+                OperatorFunction::from_function_id(&function.function_id),
+                Some(
+                    OperatorFunction::BooleanNot
+                        | OperatorFunction::InList
+                        | OperatorFunction::Like
+                        | OperatorFunction::LessThanOrEqual
+                )
+            )
+        {
+            decimal_overflow
+                .entry(definition.id)
+                .or_insert(DecimalOverflowPolicy::OutputNull);
+        }
+    }
     let inputs = crate::CallAuthorInputs {
         environment: crate::EvaluationEnvironment {
             constants,

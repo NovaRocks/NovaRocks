@@ -3684,13 +3684,10 @@ mod tests {
     }
 
     fn assert_grouped_state_topn_sources(owner: &super::super::SqlAuthoredPhysicalPlan) {
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
-        use {
-            novarocks_expression_contract::ExprKind as PhysicalExprKind,
-            novarocks_physical_plan::{
-                AggregateGrouping, AggregatePhase, PhysicalCallSite, TopNReduction,
-            },
+        use novarocks_physical_plan::{
+            AggregateGrouping, AggregatePhase, PhysicalCallSite, TopNReduction,
         };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
         let control = SqlCompileControl::unbounded();
         let mut work =
             CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
@@ -3736,7 +3733,12 @@ mod tests {
                     binding.phase = call.binding.phase;
                     assert_eq!(call.binding, binding);
                     assert!(
-                        matches!(fragment.root_expression(node.id, call.arguments[0]).unwrap().kind, PhysicalExprKind::Value(input) if input == original.output)
+                        fragment
+                            .root_expression(node.id, call.arguments[0])
+                            .unwrap()
+                            .kind
+                            .input_value()
+                            == Some(original.output)
                     );
                     let ordinal = u32::try_from(ordinal).unwrap();
                     let consumer = owner

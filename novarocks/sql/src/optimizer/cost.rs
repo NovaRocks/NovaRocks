@@ -793,18 +793,20 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
     };
     match arena.node(expr) {
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => 0.1,
         ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
             0.2 + scalar_complexity(Some(arena), *child)
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. } => 0.5 + scalar_complexity(Some(arena), *child),
-        ScalarNode::BinaryOp { left, right, .. } => {
-            1.0 + scalar_complexity(Some(arena), *left) + scalar_complexity(Some(arena), *right)
-        }
+        ScalarNode::IsNull { child, .. } => 0.5 + scalar_complexity(Some(arena), *child),
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => 1.0 + scalar_complexity(Some(arena), *left) + scalar_complexity(Some(arena), *right),
         ScalarNode::FunctionCall { args, .. } => {
             3.0 + args
                 .iter()
@@ -820,19 +822,6 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
                 .map(|arg| scalar_complexity(Some(arena), *arg))
                 .sum::<f64>()
                 + order_by.len() as f64
-        }
-        ScalarNode::InList { child, list, .. } => {
-            1.0 + scalar_complexity(Some(arena), *child) + list.len() as f64 * 0.2
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            1.0 + scalar_complexity(Some(arena), *child)
-                + scalar_complexity(Some(arena), *low)
-                + scalar_complexity(Some(arena), *high)
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            3.0 + scalar_complexity(Some(arena), *child) + scalar_complexity(Some(arena), *pattern)
         }
         ScalarNode::Case {
             operand,

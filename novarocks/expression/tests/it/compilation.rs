@@ -244,9 +244,9 @@ fn two_ports_combined_scope_and_repeated_value_definition_bind_each_real_use() {
     let left = [(ValueId::new(10), int(false))];
     let right = [(ValueId::new(20), int(false))];
     let mut b = builder();
-    let a = b.add(None, int(false), ExprKind::Value(left[0].0)).unwrap();
+    let a = b.add(None, int(false), ExprKind::input(left[0].0)).unwrap();
     let z = b
-        .add(None, int(false), ExprKind::Value(right[0].0))
+        .add(None, int(false), ExprKind::input(right[0].0))
         .unwrap();
     let eq = b
         .add(
@@ -324,7 +324,7 @@ fn scope_full_type_width_and_missing_combined_layout_are_rejected() {
     let values = [(ValueId::new(3), int(false))];
     let mut b = builder();
     let id = b
-        .add(None, int(false), ExprKind::Value(values[0].0))
+        .add(None, int(false), ExprKind::input(values[0].0))
         .unwrap();
     b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
@@ -414,9 +414,9 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
     let middle = b.reserve().unwrap();
     let inner = b.reserve().unwrap();
     let column = ValueId::new(63);
-    let root_input = b.add(None, int(false), ExprKind::Value(column)).unwrap();
+    let root_input = b.add(None, int(false), ExprKind::input(column)).unwrap();
     let capture = b
-        .add(Some(inner), int(false), ExprKind::Value(column))
+        .add(Some(inner), int(false), ExprKind::input(column))
         .unwrap();
     let x = [outer, middle, inner].map(|lambda| {
         b.add(
@@ -528,7 +528,7 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
         )
         .unwrap();
         let collection = if scope.is_some() {
-            b.add(scope, int(false), ExprKind::Value(column)).unwrap()
+            b.add(scope, int(false), ExprKind::input(column)).unwrap()
         } else {
             root_input
         };
@@ -776,74 +776,102 @@ fn all_original_control_causes_stop_at_every_actual_compile_callback() {
     }
 }
 #[test]
-fn intrinsic_recipes_are_keyed_by_each_use_and_between_keeps_four_edges() {
-    let (pools, _) = checked_pool();
-    let mut b = builder();
-    let a = constant(&mut b, 0);
-    let z = constant(&mut b, 2);
-    let between = b
+fn range_comparisons_keep_separate_ordered_uses_of_a_direct_probe() {
+    use novarocks_expression::testkit::add_catalogue_predicate;
+    let (mut pools, _) = checked_pool();
+    let mut draft = builder();
+    let probe = constant(&mut draft, 0);
+    let upper = constant(&mut draft, 2);
+    let left = add_catalogue_predicate(
+        &mut draft,
+        &mut pools,
+        OperatorFunction::LessThanOrEqual,
+        vec![probe, probe],
+    )
+    .unwrap();
+    let right = add_catalogue_predicate(
+        &mut draft,
+        &mut pools,
+        OperatorFunction::LessThanOrEqual,
+        vec![probe, upper],
+    )
+    .unwrap();
+    let conjunction = draft
         .add(
             None,
             boolean(true),
-            ExprKind::Between {
-                expr: a,
-                low: a,
-                high: z,
-                negated: false,
+            ExprKind::Conjunction {
+                args: Box::new([left, right]),
             },
         )
         .unwrap();
-    let eq = b
-        .add(
-            None,
-            boolean(false),
-            ExprKind::Binary {
-                left: a,
-                right: z,
-                op: BinaryOperator::EqForNull,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-        )
-        .unwrap();
-    for id in [between, eq, between] {
-        b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
+    for _ in 0..2 {
+        draft
+            .root(conjunction, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
     }
-    let u = finish(b, vec![]);
-    let p = compile(
-        &u,
-        &pools,
-        &SemanticParameters::default(),
+    let (_unit, program) =
+        compile_catalogue_predicate_fixture(draft, &pools, &SemanticParameters::default());
+    let uses = program.control_flow().uses();
+    let mut probes = Vec::new();
+    for root in program.roots() {
+        let [left, right] = uses[&root.use_id].arguments.as_ref() else {
+            panic!("two comparisons")
+        };
+        for comparison in [left, right] {
+            assert_eq!(
+                program.calls()[comparison].call_contract().function_id(),
+                &OperatorFunction::LessThanOrEqual.function_id()
+            );
+        }
+        probes.extend([uses[left].arguments[1], uses[right].arguments[0]]);
+    }
+    assert!(probes.windows(2).all(|pair| pair[0] != pair[1]));
+    assert!(
+        probes
+            .iter()
+            .all(|probe| uses[probe].definition == uses[&probes[0]].definition)
+    );
+}
+
+fn compile_catalogue_predicate_fixture(
+    mut draft: BoundExprSetBuilder,
+    pools: &ConstantPools,
+    parameters: &SemanticParameters,
+) -> (BoundExprSet, Arc<CompiledExprSet>) {
+    use novarocks_expression::testkit::{declare_call_controls, finish_unit};
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    declare_call_controls(&mut draft, &functions, pools, parameters, &mut work);
+    let sealed = draft.seal(vec![], &mut work).unwrap();
+    let unit = finish_unit(
+        &functions,
+        sealed,
+        &BTreeMap::new(),
+        pools,
+        parameters,
+        &mut work,
+    );
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let compiled = compile_expr_set_pure(
+        &unit,
+        EvaluationEnvironment {
+            constants: pools,
+            parameters,
+        },
         ScopeLayouts {
             ports: &[],
             all_ports: None,
         },
-        &Control::good(),
+        policy(),
+        &functions,
+        &mut work,
     )
     .unwrap();
-    for i in [0, 2] {
-        let id = p.roots()[i].use_id;
-        let args = &p.control_flow().uses()[&id].arguments;
-        assert_eq!(args.len(), 4);
-        assert_ne!(args[0], args[2]);
-        assert!(
-            p.recipes()
-                .comparison(ComparisonSite::BetweenLower(id))
-                .is_some()
-        );
-        assert!(
-            p.recipes()
-                .comparison(ComparisonSite::BetweenUpper(id))
-                .is_some()
-        );
-    }
-    assert_ne!(p.roots()[0].use_id, p.roots()[2].use_id);
-    assert!(
-        p.recipes()
-            .null_safe_comparison(p.roots()[1].use_id)
-            .is_some()
-    );
+    work.finish().unwrap();
+    (unit, compiled)
 }
 #[test]
 fn non_topological_dense_definitions_compile_to_exact_source_mapping() {
@@ -1144,7 +1172,7 @@ fn caller_creation_refusals_remain_typed_without_footer_and_final_holds_survive(
     b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
     let value = b
-        .add(None, int(false), ExprKind::Value(ValueId::new(99)))
+        .add(None, int(false), ExprKind::input(ValueId::new(99)))
         .unwrap();
     b.root(value, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -1409,7 +1437,7 @@ fn neutral_parts_preserve_sparse_non_dfs_use_ids_and_root_specific_port_bindings
             id: definition,
             lambda_scope: None,
             ty,
-            kind: ExprKind::Value(ValueId::new(9)),
+            kind: ExprKind::input(ValueId::new(9)),
         }]),
         Box::new([
             ExprRoot {
@@ -1525,17 +1553,13 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             },
         )
         .unwrap();
-    let inlist = b
-        .add(
-            None,
-            boolean(true),
-            ExprKind::InList {
-                expr: a,
-                list: Box::new([z, a]),
-                negated: true,
-            },
-        )
-        .unwrap();
+    let inlist = novarocks_expression::testkit::add_catalogue_predicate(
+        &mut b,
+        &mut pools,
+        OperatorFunction::InList,
+        vec![a, z, a],
+    )
+    .unwrap();
     let mut strings = Vec::new();
     for (pool_id, payload) in [(8, "hello"), (9, "h%")] {
         let ty = ValueType::new(DataType::Utf8, false);
@@ -1563,17 +1587,13 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
             .unwrap(),
         );
     }
-    let like = b
-        .add(
-            None,
-            boolean(false),
-            ExprKind::Like {
-                expr: strings[0],
-                pattern: strings[1],
-                negated: true,
-            },
-        )
-        .unwrap();
+    let like = novarocks_expression::testkit::add_catalogue_predicate(
+        &mut b,
+        &mut pools,
+        OperatorFunction::Like,
+        strings,
+    )
+    .unwrap();
     let case = b
         .add(
             None,
@@ -1590,27 +1610,24 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
         b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
     }
-    let unit = finish(b, vec![]);
-    let compiled = compile(
-        &unit,
-        &pools,
-        &parameters,
-        ScopeLayouts {
-            ports: &[],
-            all_ports: None,
-        },
-        &Control::good(),
-    )
-    .unwrap();
+    let (unit, compiled) = compile_catalogue_predicate_fixture(b, &pools, &parameters);
     let uses: Vec<_> = compiled.roots().iter().map(|r| r.use_id).collect();
     let recipes = compiled.recipes();
     assert!(recipes.arithmetic(uses[0]).is_some());
     assert!(recipes.cast(uses[1]).is_some());
-    assert!(recipes.native_inlist(uses[2]).is_some());
-    let like = recipes.native_like(uses[3]).unwrap();
-    assert!(like.negated());
-    assert_eq!(like.text_type(), &ValueType::new(DataType::Utf8, false));
-    assert_eq!(like.pattern_type(), &ValueType::new(DataType::Utf8, false));
+    assert!(matches!(
+        compiled.calls()[&uses[2]].prepared(),
+        novarocks_functions::PreparedPureKernel::Membership(_)
+    ));
+    let like = compiled.calls()[&uses[3]].call_contract();
+    assert_eq!(like.function_id(), &OperatorFunction::Like.function_id());
+    assert!(
+        like.selected()
+            .argument_types
+            .iter()
+            .all(|argument| argument
+                == &FunctionArgumentType::Value(ValueType::new(DataType::Utf8, false)))
+    );
     assert!(
         recipes
             .comparison(ComparisonSite::CaseWhen {
@@ -1897,7 +1914,7 @@ fn complete_map64_scope_preserves_exact_carrier_and_all_control_causes() {
     let ty = ValueType::new(map(DataType::Utf8), true);
     let value = ValueId::new(91);
     let mut b = builder();
-    let id = b.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+    let id = b.add(None, ty.clone(), ExprKind::input(value)).unwrap();
     b.root(id, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let unit = finish(
@@ -2173,7 +2190,7 @@ fn original_no_arguments_invocation_keeps_full_static_request_without_input_uses
     };
     let mut b = builder();
     let ids = [
-        b.add(None, source_type.clone(), ExprKind::Value(ValueId::new(1)))
+        b.add(None, source_type.clone(), ExprKind::input(ValueId::new(1)))
             .unwrap(),
         b.add(
             None,
@@ -2184,7 +2201,7 @@ fn original_no_arguments_invocation_keeps_full_static_request_without_input_uses
             }),
         )
         .unwrap(),
-        b.add(None, extra_type.clone(), ExprKind::Value(ValueId::new(3)))
+        b.add(None, extra_type.clone(), ExprKind::input(ValueId::new(3)))
             .unwrap(),
     ];
     let call = b
@@ -2422,7 +2439,7 @@ fn wide_combined_scope_is_indexed_once_and_keeps_original_control_prefix() {
     let combined = layouts(&reversed);
     let mut b = builder();
     let value = b
-        .add(None, int(false), ExprKind::Value(ValueId::new(511)))
+        .add(None, int(false), ExprKind::input(ValueId::new(511)))
         .unwrap();
     b.root(value, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
@@ -2514,7 +2531,7 @@ fn late_scope_clone_shares_source_columns_and_retains_only_their_original_owner(
     .unwrap();
     let mut b = builder();
     let input = b
-        .add(None, int(false), ExprKind::Value(ValueId::new(1)))
+        .add(None, int(false), ExprKind::input(ValueId::new(1)))
         .unwrap();
     b.root(input, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -2580,7 +2597,7 @@ fn source_dictionary_ids_do_not_change_complete_static_binding_and_invalid_nomin
     let ty = ValueType::new(left, true);
     let mut b = builder();
     let input = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(1)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(1)))
         .unwrap();
     b.root(input, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -2771,7 +2788,7 @@ fn runtime_columns_keep_canonical_value_reads_after_repeated_publications() {
         (right_value, RootScope::Port(1)),
         (right_value, RootScope::AllPorts),
     ] {
-        let definition = b.add(None, int(false), ExprKind::Value(value)).unwrap();
+        let definition = b.add(None, int(false), ExprKind::input(value)).unwrap();
         b.root(definition, EvaluationDemand::Value, scope).unwrap();
     }
     let unit = finish(
@@ -2941,7 +2958,7 @@ fn nullable_boolean_connectives_require_actual_deciding_cv_under_both_root_deman
                     pools.insert(reference.pool, value.pool().clone()).unwrap();
                     let mut b = builder();
                     let input = b
-                        .add(None, source_type.clone(), ExprKind::Value(ValueId::new(7)))
+                        .add(None, source_type.clone(), ExprKind::input(ValueId::new(7)))
                         .unwrap();
                     let literal = b
                         .add(None, source_type.clone(), ExprKind::Constant(reference))
@@ -3022,10 +3039,10 @@ fn nullable_boolean_connectives_require_actual_deciding_cv_under_both_root_deman
         let ty = boolean(false);
         let mut b = builder();
         let left = b
-            .add(None, ty.clone(), ExprKind::Value(ValueId::new(7)))
+            .add(None, ty.clone(), ExprKind::input(ValueId::new(7)))
             .unwrap();
         let right = b
-            .add(None, ty.clone(), ExprKind::Value(ValueId::new(19)))
+            .add(None, ty.clone(), ExprKind::input(ValueId::new(19)))
             .unwrap();
         let args = Box::new([left, right]);
         let root = b
@@ -3569,7 +3586,7 @@ fn null_list_json_carrier_compiles_live_and_unused_with_the_implicit_mode() {
     for unused in [false, true] {
         let mut builder = builder();
         let child = builder
-            .add(None, source.clone(), ExprKind::Value(input))
+            .add(None, source.clone(), ExprKind::input(input))
             .unwrap();
         let cast = builder
             .add(

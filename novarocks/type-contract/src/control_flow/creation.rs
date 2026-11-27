@@ -168,7 +168,7 @@ fn visit<D, E: From<ControlResourceError>>(
     )?;
     emit(
         CreationRetentionKind::Temporary,
-        Geometry::Opaque(tree::<ExpressionUseId, usize>(u)?),
+        Geometry::Opaque(tree::<ExpressionUseId, UseDepth>(u)?),
     )?;
     // Same locked original child-Vec growth allowance; not a guessed public
     // Layout or exact retained capacity for a private library operation.

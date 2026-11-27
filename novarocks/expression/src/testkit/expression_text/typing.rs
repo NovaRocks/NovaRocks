@@ -217,6 +217,15 @@ impl<'a> TextTyping<'a> {
                 node.typing.form = form;
                 Ok(node)
             }
+            ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Not => {
+                let child = self.lower(&unary.expression, work, next)?;
+                self.type_call(
+                    NodeShape::Operator(novarocks_type_contract::OperatorFunction::BooleanNot),
+                    vec![child],
+                    span,
+                    work,
+                )
+            }
             ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Plus => {
                 let child = self.lower(&unary.expression, work, next)?;
                 let (_, mut children) =
@@ -980,7 +989,7 @@ impl TextNode {
         let lambda_scope = lambda_frames.last().copied();
         let mut ty = self.typing.value_type.clone();
         let kind = match &self.kind {
-            TextKind::Input(value) => ExprKind::Value(*value),
+            TextKind::Input(value) => ExprKind::input(*value),
             TextKind::LambdaParameter { parent, ordinal } => ExprKind::LambdaParameter {
                 lambda: *lambda_frames
                     .iter()

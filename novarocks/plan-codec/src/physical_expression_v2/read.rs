@@ -427,11 +427,15 @@ fn references(
         .ok_or_else(|| shape("expression kind is absent"))?
     {
         K::ValueId(_) | K::Constant(_) => {}
+        K::LocalValueExprId(binding) => visit(*binding)?,
+        K::LetExpression(value) => {
+            visit(required(value.value_expr_id, "Let initializer is absent")?)?;
+            visit(required(value.body_expr_id, "Let body is absent")?)?;
+        }
         K::LambdaParameter(value) => visit(required(
             value.lambda_expr_id,
             "lambda parameter owner is absent",
         )?)?,
-        K::Unary(value) => visit(required(value.expr_id, "unary operand is absent")?)?,
         K::Binary(value) => {
             visit(required(
                 value.left_expr_id,
@@ -455,27 +459,6 @@ fn references(
         K::Lambda(value) => visit(required(value.body_expr_id, "lambda body is absent")?)?,
         K::Cast(value) => visit(required(value.expr_id, "cast operand is absent")?)?,
         K::IsNull(value) => visit(required(value.expr_id, "null-test operand is absent")?)?,
-        K::InList(value) => {
-            visit(required(value.expr_id, "in-list operand is absent")?)?;
-            for id in &value.list_expr_ids {
-                visit(*id)?;
-            }
-        }
-        K::Between(value) => {
-            visit(required(value.expr_id, "between operand is absent")?)?;
-            visit(required(
-                value.low_expr_id,
-                "between low operand is absent",
-            )?)?;
-            visit(required(
-                value.high_expr_id,
-                "between high operand is absent",
-            )?)?;
-        }
-        K::Like(value) => {
-            visit(required(value.expr_id, "like operand is absent")?)?;
-            visit(required(value.pattern_expr_id, "like pattern is absent")?)?;
-        }
         K::CaseExpression(value) => {
             if let Some(id) = value.operand_expr_id {
                 visit(id)?;
@@ -488,7 +471,6 @@ fn references(
                 visit(id)?;
             }
         }
-        K::IsTruthValue(value) => visit(required(value.expr_id, "truth-test operand is absent")?)?,
     }
     Ok(())
 }
@@ -546,7 +528,6 @@ fn preflight(
             }
             K::FunctionCall(value) => numeric.bytes::<u32>(value.argument_expr_ids.capacity())?,
             K::Lambda(value) => numeric.bytes::<u32>(value.parameter_value_type_ids.capacity())?,
-            K::InList(value) => numeric.bytes::<u32>(value.list_expr_ids.capacity())?,
             K::CaseExpression(value) => numeric.bytes::<wire::WhenThen>(value.arms.capacity())?,
 
             _ => 0,
@@ -753,6 +734,37 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     self.match_types(header, &value.ty, admission, work)?;
                 }
             }
+            K::LocalValueExprId(binding) => {
+                let owner = self.required_expression(*binding, work)?;
+                let Some(K::LetExpression(local)) = owner.kind.as_ref() else {
+                    return Err(shape("local value owner is not a Let"));
+                };
+                if owner.lambda_scope_expr_id != definition.lambda_scope_expr_id {
+                    return Err(shape("local value crosses a lambda scope"));
+                }
+                let value = self.required_expression(
+                    required(local.value_expr_id, "Let initializer is absent")?,
+                    work,
+                )?;
+                self.match_type_root(
+                    header,
+                    required(value.value_type_id, "Let initializer type is absent")?,
+                    admission,
+                    work,
+                )?;
+            }
+            K::LetExpression(value) => {
+                let body = self.required_expression(
+                    required(value.body_expr_id, "Let body is absent")?,
+                    work,
+                )?;
+                self.match_type_root(
+                    header,
+                    required(body.value_type_id, "Let body type is absent")?,
+                    admission,
+                    work,
+                )?;
+            }
             K::Constant(reference) => {
                 let reference = ConstantReference {
                     pool: ConstantPoolId::new(required(
@@ -839,9 +851,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     .ok_or_else(|| shape("lambda parameter ordinal is out of bounds"))?;
                 self.match_type_root(header, parameter, admission, work)?;
             }
-            K::Unary(value) => {
-                super::receiving_grammar::decode_unary(value.op)?;
-            }
             K::Binary(value) => {
                 let op = super::receiving_grammar::decode_binary(value.op)?;
                 let arithmetic = op.arithmetic_operator().is_some();
@@ -923,12 +932,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     return Err(shape("cast carrier differs from its complete result type"));
                 }
             }
-            K::IsNull(_)
-            | K::InList(_)
-            | K::Between(_)
-            | K::Like(_)
-            | K::CaseExpression(_)
-            | K::IsTruthValue(_) => {}
+            K::IsNull(_) | K::CaseExpression(_) => {}
         }
         work.step()?;
         Ok(())
@@ -1015,13 +1019,31 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     }
     fn arguments(
         &mut self,
-        expected: &[wire::FunctionArgumentType],
+        function: &wire::FunctionBindingDefinition,
         arguments: &[u32],
         admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        use wire::function_argument_type::Kind;
         let numeric = Arithmetic(admission.observed());
-        let same_count = expected.len() == arguments.len();
+        let expected = &function.arguments;
+        let grouped = function.function_id
+            == novarocks_type_contract::OperatorFunction::InList.function_id_text();
+        let same_count = if grouped {
+            matches!(
+                expected.as_slice(),
+                [
+                    wire::FunctionArgumentType {
+                        kind: Some(Kind::ValueTypeId(_))
+                    },
+                    wire::FunctionArgumentType {
+                        kind: Some(Kind::CandidateGroupElementValueTypeId(_))
+                    },
+                ]
+            ) && arguments.len() >= 2
+        } else {
+            expected.len() == arguments.len()
+        };
         work.step()?;
         if !same_count {
             return Err(shape(
@@ -1030,12 +1052,25 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         }
         self.charge(
             numeric.mul(
-                expected.len(),
+                arguments.len(),
                 numeric.add(16, tree_lookup_work(self.definitions.len())?)?,
             )?,
             admission,
             work,
         )?;
+        if grouped {
+            for &id in arguments {
+                let actual = self.required_expression(id, work)?;
+                if matches!(
+                    actual.kind,
+                    Some(wire::expression_definition::Kind::Lambda(_))
+                ) {
+                    return Err(shape("candidate group call references a lambda argument"));
+                }
+                work.step()?;
+            }
+            return Ok(());
+        }
         let types = self.values.types();
         for (expected, id) in expected.iter().zip(arguments) {
             let actual = self.required_expression(*id, work)?;
@@ -1044,7 +1079,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 .as_ref()
                 .ok_or_else(|| shape("function argument shape is absent"))?
             {
-                wire::function_argument_type::Kind::ValueTypeId(_) => {
+                Kind::ValueTypeId(_) => {
                     // Exact Value-domain compatibility includes lawful nested
                     // nullability widening. Its sole fits author requires the
                     // final Fragment; this component proves only the shape.
@@ -1055,7 +1090,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         return Err(shape("value argument references a lambda"));
                     }
                 }
-                wire::function_argument_type::Kind::Lambda(expected) => {
+                Kind::CandidateGroupElementValueTypeId(_) => {
+                    return Err(shape(
+                        "candidate group type is outside its scalar signature",
+                    ));
+                }
+                Kind::Lambda(expected) => {
                     let Some(wire::expression_definition::Kind::Lambda(actual_lambda)) =
                         actual.kind.as_ref()
                     else {
@@ -1143,7 +1183,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             return Err(shape("expression function binding has the wrong kind"));
         }
         self.call_result(definition, function, admission, work)?;
-        self.arguments(&function.arguments, arguments, admission, work)
+        self.arguments(function, arguments, admission, work)
     }
 }
 

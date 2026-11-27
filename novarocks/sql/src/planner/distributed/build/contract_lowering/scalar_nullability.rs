@@ -20,6 +20,7 @@
 use super::scalar_emission::ScalarEmission;
 use super::*;
 use crate::binding::SqlResultConstraintOrigin;
+use novarocks_expression_contract::ValueAddress;
 
 fn invalid(detail: &'static str) -> ContractLoweringError {
     ContractLoweringError::InvalidAggregate { detail }
@@ -127,44 +128,6 @@ impl ScalarEmission<'_, '_> {
             .ok_or_else(|| invalid("nullable transaction expression is absent"))
     }
 
-    pub(super) fn membership_nullable(
-        &mut self,
-        source: ExprId,
-        candidates: &[ExprId],
-    ) -> Result<bool, ContractLoweringError> {
-        use novarocks_functions::PreparedCompositeComparisonRecipe;
-        let source = self.expression_value_type(source)?;
-        if source.nullable() {
-            return Ok(true);
-        }
-        let composite = PreparedCompositeComparisonRecipe::is_composite(&source);
-        for &candidate in candidates {
-            self.work.step()?;
-            let candidate = self.expression_value_type(candidate)?;
-            if candidate.nullable() {
-                return Ok(true);
-            }
-            if composite {
-                let recipe = PreparedCompositeComparisonRecipe::try_new(
-                    novarocks_type_contract::KeyRelation::Equal,
-                    &source,
-                    &candidate,
-                    self.control,
-                )
-                .map_err(|error| match error.control_error() {
-                    Some(cause) => ContractLoweringError::Control(cause),
-                    None => ContractLoweringError::InvalidFunctionBinding {
-                        detail: error.to_string(),
-                    },
-                })?;
-                if recipe.nullable_result() {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     /// Visit every original definition event, including CAST/negate seeds with
     /// no dirty dependency. A true result requires the caller's original dirty
     /// insertion and immediately following checkpoint before its next event.
@@ -180,6 +143,16 @@ impl ScalarEmission<'_, '_> {
         self.work.flush()?;
         let mut operands = Vec::new();
         collect_operand_expressions(&old.kind, &mut operands);
+        let local_initializer = match old.kind {
+            ContractExprKind::Value(ValueAddress::Local(binder)) => {
+                let ContractExprKind::Let { value, .. } = self.nullability_definition(binder)?.kind
+                else {
+                    return Err(invalid("local nullable source is not a Let"));
+                };
+                Some(value)
+            }
+            _ => None,
+        };
         self.work.flush()?;
         let mut dependency_changed = false;
         for &operand in operands.iter() {
@@ -187,7 +160,11 @@ impl ScalarEmission<'_, '_> {
             dependency_changed |= expression_dirty(operand);
         }
         dependency_changed |= match &old.kind {
-            ContractExprKind::Value(value) => value_dirty(*value),
+            ContractExprKind::Value(ValueAddress::Input(value)) => value_dirty(*value),
+            ContractExprKind::Value(ValueAddress::Local(_)) => {
+                local_initializer.is_some_and(&expression_dirty)
+            }
+            ContractExprKind::Let { body, .. } => expression_dirty(*body),
             ContractExprKind::Lambda { body, .. } => expression_dirty(*body),
             ContractExprKind::FunctionCall { args, .. } => {
                 let mut dirty = false;
@@ -231,24 +208,24 @@ impl ScalarEmission<'_, '_> {
                     )
                     .expect("validated root NULL contract")
             }
-            ContractExprKind::Value(value) if dependency_changed => published_value_type(
-                &old.ty,
-                self.storage
-                    .current_value_type(*value)
-                    .ok_or_else(|| invalid("nullable transaction value is absent"))?,
-            ),
-            ContractExprKind::Lambda { body, .. } if dependency_changed => {
+            ContractExprKind::Value(ValueAddress::Input(value)) if dependency_changed => {
+                published_value_type(
+                    &old.ty,
+                    self.storage
+                        .current_value_type(*value)
+                        .ok_or_else(|| invalid("nullable transaction value is absent"))?,
+                )
+            }
+            ContractExprKind::Value(ValueAddress::Local(_)) if dependency_changed => {
+                let initializer = local_initializer
+                    .ok_or_else(|| invalid("local nullable initializer is absent"))?;
+                published_value_type(&old.ty, &self.nullability_definition(initializer)?.ty)
+            }
+            ContractExprKind::Let { body, .. } if dependency_changed => {
                 published_value_type(&old.ty, &self.nullability_definition(*body)?.ty)
             }
-            ContractExprKind::InList { expr, list, .. } if dependency_changed => {
-                let source = *expr;
-                let candidates = list.clone();
-                let nullable =
-                    old.ty.nullable() || self.membership_nullable(source, &candidates)?;
-                old.ty
-                    .clone()
-                    .with_nullable(nullable)
-                    .expect("validated Boolean NULL contract")
+            ContractExprKind::Lambda { body, .. } if dependency_changed => {
+                published_value_type(&old.ty, &self.nullability_definition(*body)?.ty)
             }
             _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
                 let mut revised = old.ty.clone();

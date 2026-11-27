@@ -354,7 +354,7 @@ fn fixture(
     .enumerate()
     {
         let expr = builder
-            .fixture_value_root(duplicate, ty.clone(), ExprKind::Value(source))
+            .fixture_value_root(duplicate, ty.clone(), ExprKind::input(source))
             .unwrap();
         let value = builder
             .add_value(
@@ -548,7 +548,7 @@ fn fixture(
             },
         };
         let scalar_kind = if matches!(shape, Shape::BadScalar) {
-            ExprKind::Value(child[3])
+            ExprKind::input(child[3])
         } else if index % 2 == 0 {
             literal.clone().unwrap_or(ExprKind::Constant(selected))
         } else {
@@ -621,10 +621,10 @@ fn fixture(
             unpivot,
             vec![
                 (
-                    ExprKind::Value(output[0]),
+                    ExprKind::input(output[0]),
                     FunctionValueType::new(DataType::Utf8, false),
                 ),
-                (ExprKind::Value(output[2]), nullable),
+                (ExprKind::input(output[2]), nullable),
             ],
         );
         (root, values)

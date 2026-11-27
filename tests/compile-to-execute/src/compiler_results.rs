@@ -293,6 +293,13 @@ pub fn source_packages(
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
     source_packages_with_reads(source, frozen_reads(source))
 }
+pub fn source_packages_with_declared_read_fields(
+    source: &SqlAuthoredPhysicalPlan,
+    declared_fields: &[Field],
+) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
+    let reads = frozen_reads_with_declared_fields(source, Some(declared_fields));
+    source_packages_with_reads(source, reads)
+}
 fn source_packages_with_reads(
     source: &SqlAuthoredPhysicalPlan,
     reads: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
@@ -362,8 +369,10 @@ pub fn compiler_results_with_declared_read_fields(
     declared_fields: &[Field],
     functions: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, Result<LocalProgram, novarocks_local_compiler::FragmentCompileError>> {
-    let reads = frozen_reads_with_declared_fields(source, Some(declared_fields));
-    compiler_results_from_packages(source_packages_with_reads(source, reads), functions)
+    compiler_results_from_packages(
+        source_packages_with_declared_read_fields(source, declared_fields),
+        functions,
+    )
 }
 fn compiler_results_from_packages(
     packages: BTreeMap<FragmentId, Arc<FragmentPackage>>,

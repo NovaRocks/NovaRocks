@@ -162,18 +162,12 @@ fn inlist_actual_compiler_utf8_value_nullable_original_region_source() {
 }
 #[test]
 fn inlist_actual_compiler_i32_notin_truthonly_original_scan_source() {
-    // TruthOnly projects SQL UNKNOWN to false; 3 and 9 are the two nonmembers.
+    // The scalar NOT keeps UNKNOWN for the filter consumer.
     evaluate(
         "SELECT ship_code FROM t0 WHERE ship_code NOT IN (1,2)",
         Field::new("ship_code", DataType::Int32, true),
         ints(),
-        &[
-            Some(false),
-            Some(false),
-            Some(true),
-            Some(false),
-            Some(true),
-        ],
+        &[Some(false), Some(false), Some(true), None, Some(true)],
         true,
     );
 }

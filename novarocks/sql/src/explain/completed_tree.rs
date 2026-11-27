@@ -928,10 +928,20 @@ impl ExprText<'_> {
             formatter.write_str("(")?;
         }
         match &node.kind {
-            ExprKind::Value(value) => self
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(value)) => self
                 .context
                 .value_name(self.fragment.id(), *value)
                 .fmt(formatter),
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(binder)) => {
+                write!(formatter, "local{}", binder.get())
+            }
+            ExprKind::Let { value, body } => write!(
+                formatter,
+                "let(local{} = {}, {})",
+                node.id.get(),
+                inner(*value),
+                inner(*body)
+            ),
             ExprKind::Constant(reference) => match &self.context.diagnostic {
                 Some(diagnostic) => {
                     diagnostic.plan_constant(self.context.plan, *reference, &node.ty, formatter)
@@ -945,12 +955,6 @@ impl ExprText<'_> {
             },
             ExprKind::LambdaParameter { ordinal, .. } => write!(formatter, "arg{ordinal}"),
             ExprKind::Lambda { body, .. } => write!(formatter, "-> {}", inner(*body)),
-            ExprKind::Unary { op, expr } => {
-                use novarocks_expression_contract::UnaryOperator;
-                match op {
-                    UnaryOperator::Not => write!(formatter, "NOT {}", operand(*expr)),
-                }
-            }
             ExprKind::Binary {
                 left, op, right, ..
             } => write!(
@@ -981,58 +985,9 @@ impl ExprText<'_> {
                 operand(*expr),
                 if *negated { "NOT " } else { "" }
             ),
-            ExprKind::IsTruthValue {
-                expr,
-                value,
-                negated,
-            } => write!(
-                formatter,
-                "{} IS {}{}",
-                operand(*expr),
-                if *negated { "NOT " } else { "" },
-                if *value { "TRUE" } else { "FALSE" }
-            ),
             ExprKind::Cast { expr, target, .. } => {
                 write!(formatter, "CAST({} AS {target})", inner(*expr))
             }
-            ExprKind::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                write!(
-                    formatter,
-                    "{} {}IN (",
-                    operand(*expr),
-                    if *negated { "NOT " } else { "" }
-                )?;
-                write_joined(formatter, list, ", ", |item| inner(*item))?;
-                write!(formatter, ")")
-            }
-            ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => write!(
-                formatter,
-                "{} {}BETWEEN {} AND {}",
-                operand(*expr),
-                if *negated { "NOT " } else { "" },
-                operand(*low),
-                operand(*high)
-            ),
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } => write!(
-                formatter,
-                "{} {}LIKE {}",
-                operand(*expr),
-                if *negated { "NOT " } else { "" },
-                operand(*pattern)
-            ),
             ExprKind::Case {
                 operand,
                 when_then,
@@ -1067,6 +1022,45 @@ impl ExprText<'_> {
                 write_negation(formatter, needs_parentheses, |out| {
                     write!(out, "{}", inner(*operand))
                 })
+            }
+            ExprKind::FunctionCall { function, args }
+                if crate::common::negation::is_boolean_not(&function.function_id) =>
+            {
+                let [argument] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                write!(formatter, "NOT ({})", inner(*argument))
+            }
+            ExprKind::FunctionCall { function, args }
+                if novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                ) == Some(novarocks_type_contract::OperatorFunction::Like) =>
+            {
+                match args.as_ref() {
+                    [input, pattern] => {
+                        write!(formatter, "{} LIKE {}", operand(*input), operand(*pattern))
+                    }
+                    [input, pattern, escape] => write!(
+                        formatter,
+                        "{} LIKE {} ESCAPE {}",
+                        operand(*input),
+                        operand(*pattern),
+                        operand(*escape),
+                    ),
+                    _ => Err(fmt::Error),
+                }
+            }
+            ExprKind::FunctionCall { function, args }
+                if novarocks_type_contract::OperatorFunction::from_function_id(
+                    &function.function_id,
+                ) == Some(novarocks_type_contract::OperatorFunction::InList) =>
+            {
+                let Some((probe, candidates)) = args.split_first() else {
+                    return Err(fmt::Error);
+                };
+                write!(formatter, "{} IN (", operand(*probe))?;
+                write_joined(formatter, candidates, ", ", |candidate| inner(*candidate))?;
+                write!(formatter, ")")
             }
             ExprKind::FunctionCall { function, args }
                 if novarocks_type_contract::OperatorFunction::from_function_id(
@@ -1124,13 +1118,7 @@ fn needs_operand_group(kind: &ExprKind) -> bool {
                 | BinaryOperator::Gt
                 | BinaryOperator::GtEq
         ),
-        ExprKind::Unary { .. }
-        | ExprKind::Conjunction { .. }
-        | ExprKind::IsNull { .. }
-        | ExprKind::IsTruthValue { .. }
-        | ExprKind::InList { .. }
-        | ExprKind::Between { .. }
-        | ExprKind::Like { .. } => true,
+        ExprKind::Conjunction { .. } | ExprKind::IsNull { .. } => true,
         // Disjunction already groups at non-root rendering depth.
         _ => false,
     }

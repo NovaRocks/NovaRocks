@@ -344,7 +344,7 @@ fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_a
 #[test]
 fn physical_call_request_value_and_cast_stay_nonconstant_with_actual_nullable_source_type() {
     let ty = FunctionValueType::new(DataType::Int64, false);
-    let slot = source(ty.clone(), ExprKind::Value(ValueId::new(u32::MAX)));
+    let slot = source(ty.clone(), ExprKind::input(ValueId::new(u32::MAX)));
     let (actual, constant) = value(
         invoke(
             &slot,

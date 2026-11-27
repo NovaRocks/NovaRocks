@@ -204,15 +204,21 @@ fn collect_scalar_column_id_refs_inner(
                 out.insert(*column_id);
             }
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::LocalValue(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_scalar_column_id_refs_inner(arena, *left, out);
             collect_scalar_column_id_refs_inner(arena, *right, out);
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => collect_scalar_column_id_refs_inner(arena, *child, out),
         ScalarNode::FunctionCall { args, .. } => {
             for arg in args {
@@ -237,23 +243,6 @@ fn collect_scalar_column_id_refs_inner(
             for item in order_by {
                 collect_scalar_column_id_refs_inner(arena, item.expr, out);
             }
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_scalar_column_id_refs_inner(arena, *child, out);
-            for item in list {
-                collect_scalar_column_id_refs_inner(arena, *item, out);
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_scalar_column_id_refs_inner(arena, *child, out);
-            collect_scalar_column_id_refs_inner(arena, *low, out);
-            collect_scalar_column_id_refs_inner(arena, *high, out);
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_scalar_column_id_refs_inner(arena, *child, out);
-            collect_scalar_column_id_refs_inner(arena, *pattern, out);
         }
         ScalarNode::Case {
             operand,

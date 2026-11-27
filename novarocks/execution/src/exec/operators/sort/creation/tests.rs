@@ -129,7 +129,7 @@ fn list_program(
             .add(
                 None,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Value(values[2]),
+                ExprKind::input(values[2]),
             )
             .unwrap();
         let predicate = builder
@@ -146,7 +146,7 @@ fn list_program(
             let expression = builder
                 .unit(project)
                 .unwrap()
-                .add(None, ty.clone(), ExprKind::Value(*source_value))
+                .add(None, ty.clone(), ExprKind::input(*source_value))
                 .unwrap();
             let expression = builder
                 .unit(project)
@@ -185,7 +185,7 @@ fn list_program(
             .add(
                 None,
                 FunctionValueType::new(DataType::Utf8, false),
-                ExprKind::Value(values[0]),
+                ExprKind::input(values[0]),
             )
             .unwrap();
         let key = builder

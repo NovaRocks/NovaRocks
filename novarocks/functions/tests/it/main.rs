@@ -24,7 +24,6 @@ mod comparison;
 mod from_binary;
 mod kernel_control;
 mod listagg;
-mod native_between;
 mod native_inlist;
 mod public_function_metadata;
 mod scalar_rows;

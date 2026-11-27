@@ -54,10 +54,10 @@ fn two_ports_and_synthetic_scope_preserve_exact_values_and_root_ordinals() {
     let ty = boolean(true);
     let mut builder = BoundExprSetBuilder::new(limits());
     let a = builder
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let b = builder
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(71)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(71)))
         .unwrap();
     let both = builder
         .add(
@@ -219,7 +219,7 @@ fn dense_definitions_keep_complete_typed_source_and_repeated_ordered_children() 
     let child = Arc::clone(child);
     let mut b = BoundExprSetBuilder::new(limits());
     let value = b
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(9)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let f = function(
         "fixture/unit/ordered",
@@ -280,7 +280,7 @@ fn seal_and_finish_borrow_the_original_phase_and_leave_its_footer_to_the_caller(
     let make = |wrong_scope| {
         let mut b = BoundExprSetBuilder::new(limits());
         let id = b
-            .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+            .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
             .unwrap();
         b.root(
             id,

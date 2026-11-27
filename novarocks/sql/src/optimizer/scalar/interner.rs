@@ -222,6 +222,20 @@ fn node_fields<'a>(
             f.number(0)?;
             f.number(id.0 as u128)?;
         }
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => {
+            f.number(19)?;
+            f.number(binding.0 as u128)?;
+            f.id(*initializer)?;
+            f.id(*body)?;
+        }
+        ScalarNode::LocalValue(binding) => {
+            f.number(20)?;
+            f.number(binding.0 as u128)?;
+        }
         ScalarNode::LambdaParamRef { name, slot_id } => {
             f.number(1)?;
             f.text(name)?;
@@ -246,11 +260,6 @@ fn node_fields<'a>(
             f.id(*left)?;
             f.id(*right)?;
             f.number(*decimal_overflow_policy as u128)?;
-        }
-        ScalarNode::UnaryOp { op, child } => {
-            f.number(4)?;
-            f.number(*op as u128)?;
-            f.id(*child)?;
         }
         ScalarNode::FunctionCall {
             name,
@@ -320,38 +329,6 @@ fn node_fields<'a>(
             f.id(*child)?;
             f.boolean(*negated)?;
         }
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            f.number(10)?;
-            f.id(*child)?;
-            f.ids(list)?;
-            f.boolean(*negated)?;
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => {
-            f.number(11)?;
-            f.id(*child)?;
-            f.id(*low)?;
-            f.id(*high)?;
-            f.boolean(*negated)?;
-        }
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => {
-            f.number(12)?;
-            f.id(*child)?;
-            f.id(*pattern)?;
-            f.boolean(*negated)?;
-        }
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -367,16 +344,6 @@ fn node_fields<'a>(
                 f.id(*then)?;
             }
             f.optional_id(*else_expr)?;
-        }
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => {
-            f.number(14)?;
-            f.id(*child)?;
-            f.boolean(*value)?;
-            f.boolean(*negated)?;
         }
         ScalarNode::Nested(child) => {
             f.number(15)?;

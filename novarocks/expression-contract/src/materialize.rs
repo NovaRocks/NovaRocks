@@ -20,9 +20,11 @@
 //! same meter. This is neither physical-shape inference nor pure preparation.
 
 use crate::PhysicalCallRequest;
-use novarocks_constant_contract::{ConstantPools, ConstantTableError};
+use novarocks_constant_contract::{
+    ConstantPools, ConstantReference, ConstantTableError, ConstantValue,
+};
 use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
-use novarocks_function_contract::{FunctionArgument, FunctionBindingRequest};
+use novarocks_function_contract::{FunctionArgument, FunctionBindingRequest, FunctionCandidate};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, FunctionValueType, ValueSchemaCreationFactory,
     ValueSchemaCreationScope, ValueTypeStorageLifetime,
@@ -221,19 +223,25 @@ fn materialize_core<'a, H, S: ValueSchemaCreationScope<H>>(
         )
         .into());
     }
-    // Admit all owned parameter-header extents before the first output reserve.
+    // Admit all owned nested header extents before the first output reserve.
     // The original package owns complete type/resource validity; this does not
     // duplicate its recursive grammar or invent a second retained-byte budget.
     for argument in &source.arguments {
-        if let StaticFunctionArgument::Lambda {
-            parameter_types, ..
-        } = argument
-        {
-            if parameter_types.len() > max_arguments {
-                return Err(CompileControlError::ResourceExhausted.into());
+        match argument {
+            StaticFunctionArgument::Lambda {
+                parameter_types, ..
+            } => {
+                if parameter_types.len() > max_arguments {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                Layout::array::<FunctionValueType>(parameter_types.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
             }
-            Layout::array::<FunctionValueType>(parameter_types.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            StaticFunctionArgument::CandidateGroup { members, .. } => {
+                Layout::array::<FunctionCandidate>(members.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+            }
+            StaticFunctionArgument::Value { .. } => {}
         }
         work.step()?;
     }
@@ -250,21 +258,17 @@ fn materialize_core<'a, H, S: ValueSchemaCreationScope<H>>(
             StaticFunctionArgument::Value {
                 value_type,
                 constant,
-            } => {
-                let constant = match constant {
-                    Some(reference) => {
-                        work.flush()?;
-                        let value = pools.resolve_observed(*reference, value_type, work)?;
-                        work.flush()?;
-                        Some(value)
-                    }
-                    None => None,
-                };
-                FunctionArgument::Value {
-                    value_type: clone_type(value_type, work)?,
-                    constant,
-                }
-            }
+            } => FunctionArgument::Value {
+                constant: resolve_constant(*constant, value_type, pools, work)?,
+                value_type: clone_type(value_type, work)?,
+            },
+            StaticFunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => FunctionArgument::CandidateGroup {
+                element_type: clone_type(element_type, work)?,
+                members: materialize_candidates(members, pools, &mut creation, work)?,
+            },
             StaticFunctionArgument::Lambda {
                 parameter_types,
                 result_type,
@@ -293,6 +297,46 @@ fn materialize_core<'a, H, S: ValueSchemaCreationScope<H>>(
     })
 }
 
+fn resolve_constant(
+    reference: Option<ConstantReference>,
+    value_type: &FunctionValueType,
+    pools: &ConstantPools,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ConstantValue>, CallRequestMaterializationError> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    work.flush()?;
+    let value = pools.resolve_observed(reference, value_type, work)?;
+    work.flush()?;
+    Ok(Some(value))
+}
+
+fn materialize_candidates<H>(
+    source: &[FunctionCandidate<ConstantReference>],
+    pools: &ConstantPools,
+    creation: &mut Option<&mut dyn ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[FunctionCandidate]>, CallRequestMaterializationFailure<H>> {
+    let mut members = Vec::new();
+    if !source.is_empty() {
+        let layout = Layout::array::<FunctionCandidate>(source.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        work.flush()?;
+        reserve_backing(&mut members, source.len(), layout, creation.as_deref_mut())?;
+        work.step()?;
+        work.flush()?;
+    }
+    for member in source {
+        members.push(FunctionCandidate {
+            constant: resolve_constant(member.constant, &member.value_type, pools, work)?,
+            value_type: clone_type(&member.value_type, work)?,
+        });
+        work.step()?;
+    }
+    boxed(members, creation, work)
+}
+
 fn clone_type(
     source: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -317,7 +361,19 @@ fn reserve<T, H, S: ValueSchemaCreationScope<H>>(
     let layout = Layout::array::<T>(count).map_err(|_| CompileControlError::ResourceExhausted)?;
     work.flush()?;
     *creation = begin(count).map_err(CallRequestMaterializationFailure::Creator)?;
-    if let Some(scope) = creation.as_mut() {
+    reserve_backing(values, count, layout, creation.as_mut())?;
+    work.step()?;
+    work.flush()?;
+    Ok(())
+}
+
+fn reserve_backing<T, H, S: ValueSchemaCreationScope<H> + ?Sized>(
+    values: &mut Vec<T>,
+    count: usize,
+    layout: Layout,
+    creation: Option<&mut S>,
+) -> Result<(), CallRequestMaterializationFailure<H>> {
+    if let Some(scope) = creation {
         scope
             .request_layout(layout)
             .map_err(CallRequestMaterializationFailure::Creator)?;
@@ -325,8 +381,6 @@ fn reserve<T, H, S: ValueSchemaCreationScope<H>>(
     values
         .try_reserve_exact(count)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    work.step()?;
-    work.flush()?;
     Ok(())
 }
 fn boxed<T, H>(

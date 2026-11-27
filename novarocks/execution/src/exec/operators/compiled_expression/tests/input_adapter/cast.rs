@@ -98,7 +98,7 @@ fn identity_cast_program(ty: FunctionValueType) -> Arc<LocalProgram> {
         .unwrap();
     let unit = builder.unit(output).unwrap();
     let child = unit
-        .add(None, ty.clone(), ExprKind::Value(columns[0].0))
+        .add(None, ty.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let cast = unit
         .add(

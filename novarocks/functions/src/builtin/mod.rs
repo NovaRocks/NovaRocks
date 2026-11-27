@@ -110,6 +110,7 @@ pub mod collection_arrow;
 mod collection_cardinality;
 mod collection_cardinality_owner;
 mod control_owner;
+pub(crate) mod in_list_owner;
 mod json_canonical_owner;
 mod json_canonical_selected;
 pub mod json_sql;

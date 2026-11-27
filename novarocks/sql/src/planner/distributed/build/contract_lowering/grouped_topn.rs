@@ -150,7 +150,7 @@ impl ContractLoweringVisitor<'_> {
             )
             .root_definition(key.expr)
             .ok_or_else(|| grouped_shape("GroupedStates TopN ordering expression is absent"))?;
-            let ContractExprKind::Value(value) = expression.kind else {
+            let Some(value) = expression.kind.input_value() else {
                 return Err(grouped_shape(
                     "GroupedStates TopN rank is not a direct complete grouping key",
                 ));
@@ -182,7 +182,7 @@ impl ContractLoweringVisitor<'_> {
                 ));
             }
             let expression =
-                self.add_unscoped_expression(node, ty, ContractExprKind::Value(*value))?;
+                self.add_unscoped_expression(node, ty, ContractExprKind::input(*value))?;
             let root = self.root_definition(
                 node,
                 expression,
@@ -262,7 +262,7 @@ impl ContractLoweringVisitor<'_> {
                 ));
             }
             let argument =
-                self.add_unscoped_expression(node, ty, ContractExprKind::Value(original.output))?;
+                self.add_unscoped_expression(node, ty, ContractExprKind::input(original.output))?;
             let argument_root =
                 self.root_definition(node, argument, EvaluationDemand::Value, RootScope::Port(0))?;
             let id = self.allocate_aggregate_call()?;

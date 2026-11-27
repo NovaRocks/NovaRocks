@@ -218,7 +218,7 @@ fn null_safe_join_filter(
     let (left_source, left_value) = append_literal(&mut builder, true, fixture_constants);
     let left = builder.reserve_node_id().unwrap();
     let left_identity = builder
-        .define(left, ty(DataType::Int64, true), ExprKind::Value(left_value))
+        .define(left, ty(DataType::Int64, true), ExprKind::input(left_value))
         .unwrap();
     let left_identity = builder.root_definition(
         left,
@@ -280,7 +280,7 @@ fn null_safe_join_filter(
     let join = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, true);
     let left_key = builder
-        .define(join, value_type.clone(), ExprKind::Value(left_value))
+        .define(join, value_type.clone(), ExprKind::input(left_value))
         .unwrap();
     let left_key = builder.root_definition(
         join,
@@ -289,7 +289,7 @@ fn null_safe_join_filter(
         crate::RootScope::Port(0),
     );
     let right_key = builder
-        .define(join, value_type.clone(), ExprKind::Value(right_value))
+        .define(join, value_type.clone(), ExprKind::input(right_value))
         .unwrap();
     let right_key = builder.root_definition(
         join,
@@ -535,7 +535,7 @@ pub(super) fn scan_lineage_filter(
             .define(
                 project,
                 ty(DataType::Int64, false),
-                ExprKind::Value(lineage_value),
+                ExprKind::input(lineage_value),
             )
             .unwrap();
         let identity = builder.root_definition(
@@ -626,7 +626,7 @@ pub(super) fn scan_lineage_filter(
             .define(
                 inner_join,
                 ty(DataType::Int64, false),
-                ExprKind::Value(probe_value),
+                ExprKind::input(probe_value),
             )
             .unwrap();
         let left_key = builder.root_definition(
@@ -639,7 +639,7 @@ pub(super) fn scan_lineage_filter(
             .define(
                 inner_join,
                 ty(DataType::Int64, false),
-                ExprKind::Value(equivalent_value),
+                ExprKind::input(equivalent_value),
             )
             .unwrap();
         let right_key = builder.root_definition(
@@ -707,7 +707,7 @@ pub(super) fn scan_lineage_filter(
         .define(
             join,
             ty(DataType::Int64, false),
-            ExprKind::Value(probe_value),
+            ExprKind::input(probe_value),
         )
         .unwrap();
     let probe_key = builder.root_definition(
@@ -720,7 +720,7 @@ pub(super) fn scan_lineage_filter(
         .define(
             join,
             ty(DataType::Int64, false),
-            ExprKind::Value(build_value),
+            ExprKind::input(build_value),
         )
         .unwrap();
     let build_key = builder.root_definition(
@@ -914,7 +914,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         .define(
             aggregate,
             ty(DataType::Int64, false),
-            ExprKind::Value(scan_value),
+            ExprKind::input(scan_value),
         )
         .unwrap();
     let group_key = builder.root_definition(
@@ -946,7 +946,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         .define(
             topn,
             ty(DataType::Int64, false),
-            ExprKind::Value(scan_value),
+            ExprKind::input(scan_value),
         )
         .unwrap();
     let order_key = builder.root_definition(
@@ -1722,7 +1722,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
         .define(
             aggregate,
             ty(DataType::Int64, false),
-            ExprKind::Value(aggregate_value),
+            ExprKind::input(aggregate_value),
         )
         .unwrap();
     let group_key = builder.root_definition(
@@ -1906,7 +1906,7 @@ fn append_partitioned_inner_join(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let left_key = builder
-        .define(node, value_type.clone(), ExprKind::Value(left.1))
+        .define(node, value_type.clone(), ExprKind::input(left.1))
         .unwrap();
     let left_key = builder.root_definition(
         node,
@@ -1915,7 +1915,7 @@ fn append_partitioned_inner_join(
         crate::RootScope::Port(0),
     );
     let right_key = builder
-        .define(node, value_type, ExprKind::Value(right.1))
+        .define(node, value_type, ExprKind::input(right.1))
         .unwrap();
     let right_key = builder.root_definition(
         node,
@@ -2077,7 +2077,7 @@ fn append_inner_join_with_properties(
     let node = builder.reserve_node_id().unwrap();
     let value_type = ty(DataType::Int64, false);
     let left_key = builder
-        .define(node, value_type.clone(), ExprKind::Value(left.1))
+        .define(node, value_type.clone(), ExprKind::input(left.1))
         .unwrap();
     let left_key = builder.root_definition(
         node,
@@ -2086,7 +2086,7 @@ fn append_inner_join_with_properties(
         crate::RootScope::Port(0),
     );
     let right_key = builder
-        .define(node, value_type, ExprKind::Value(right.1))
+        .define(node, value_type, ExprKind::input(right.1))
         .unwrap();
     let right_key = builder.root_definition(
         node,
@@ -2486,7 +2486,7 @@ fn table_function_fragment(
         .define(
             node,
             ty(DataType::Int64, false),
-            ExprKind::Value(outer_value),
+            ExprKind::input(outer_value),
         )
         .unwrap();
     let argument = builder.root_definition(

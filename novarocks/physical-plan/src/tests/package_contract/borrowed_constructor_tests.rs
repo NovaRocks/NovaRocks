@@ -512,7 +512,7 @@ fn collection_fragment(
         .define(
             project,
             integer.clone(),
-            crate::ExprKind::Value(source_value),
+            crate::ExprKind::input(source_value),
         )
         .unwrap();
     let root = builder.root_definition(

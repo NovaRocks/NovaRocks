@@ -477,14 +477,17 @@ fn collect_sort_items(items: &[SortItem], max_id: &mut u32) {
 fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
     match &expr.kind {
         ExprKind::ColumnRef { column_id, .. } => collect_column_id(*column_id, max_id),
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_expr_column_ids(left, max_id);
             collect_expr_column_ids(right, max_id);
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
+        ExprKind::Cast { expr, .. }
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::Nested(expr)
         | ExprKind::Lambda { body: expr, .. }
         | ExprKind::LambdaFunction { body: expr, .. } => collect_expr_column_ids(expr, max_id),
@@ -498,23 +501,6 @@ fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
                 collect_expr_column_ids(arg, max_id);
             }
             collect_sort_items(order_by, max_id);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            collect_expr_column_ids(expr, max_id);
-            for item in list {
-                collect_expr_column_ids(item, max_id);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_expr_column_ids(expr, max_id);
-            collect_expr_column_ids(low, max_id);
-            collect_expr_column_ids(high, max_id);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_expr_column_ids(expr, max_id);
-            collect_expr_column_ids(pattern, max_id);
         }
         ExprKind::Case {
             operand,
@@ -547,7 +533,8 @@ fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
             }
             collect_sort_items(order_by, max_id);
         }
-        ExprKind::LambdaParamRef { .. }
+        ExprKind::LocalValue(_)
+        | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => {}
@@ -4014,7 +4001,12 @@ crate::constant::test_constant_policy(),
                     refs.insert(*column_id);
                 }
             }
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 collect_column_refs(left, refs);
                 collect_column_refs(right, refs);
             }
@@ -4030,9 +4022,7 @@ crate::constant::test_constant_policy(),
             }
             ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Nested(expr)
-            | ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
+            | ExprKind::Nested(expr) => collect_column_refs(expr, refs),
             ExprKind::Case {
                 operand,
                 when_then,
@@ -4049,23 +4039,6 @@ crate::constant::test_constant_policy(),
                 if let Some(else_expr) = else_expr {
                     collect_column_refs(else_expr, refs);
                 }
-            }
-            ExprKind::InList { expr, list, .. } => {
-                collect_column_refs(expr, refs);
-                for item in list {
-                    collect_column_refs(item, refs);
-                }
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                collect_column_refs(expr, refs);
-                collect_column_refs(low, refs);
-                collect_column_refs(high, refs);
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                collect_column_refs(expr, refs);
-                collect_column_refs(pattern, refs);
             }
             ExprKind::WindowCall {
                 args,
@@ -4086,7 +4059,8 @@ crate::constant::test_constant_policy(),
             ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
                 collect_column_refs(body, refs);
             }
-            ExprKind::LambdaParamRef { .. }
+            ExprKind::LocalValue(_)
+            | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}

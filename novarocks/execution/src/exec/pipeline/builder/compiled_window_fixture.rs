@@ -431,7 +431,7 @@ pub(super) fn package_typed(
                     .add(
                         None,
                         types[key.column].clone(),
-                        ExprKind::Value(columns[key.column]),
+                        ExprKind::input(columns[key.column]),
                     )
                     .unwrap();
                 sort_expr(
@@ -459,7 +459,7 @@ pub(super) fn package_typed(
                             .add(
                                 None,
                                 types[*column].clone(),
-                                ExprKind::Value(columns[*column]),
+                                ExprKind::input(columns[*column]),
                             )
                             .unwrap();
                         sort_expr(
@@ -488,7 +488,7 @@ pub(super) fn package_typed(
                 .add(
                     None,
                     types[*column].clone(),
-                    ExprKind::Value(columns[*column]),
+                    ExprKind::input(columns[*column]),
                 )
                 .unwrap();
             sort_expr(
@@ -512,7 +512,7 @@ pub(super) fn package_typed(
                 .add(
                     None,
                     types[key.column].clone(),
-                    ExprKind::Value(columns[key.column]),
+                    ExprKind::input(columns[key.column]),
                 )
                 .unwrap();
             sort_expr(
@@ -544,7 +544,7 @@ pub(super) fn package_typed(
                             .add(
                                 None,
                                 types[*column].clone(),
-                                ExprKind::Value(columns[*column]),
+                                ExprKind::input(columns[*column]),
                             )
                             .unwrap(),
                     );
@@ -566,7 +566,7 @@ pub(super) fn package_typed(
                         .add(
                             None,
                             types[*column].clone(),
-                            ExprKind::Value(columns[*column]),
+                            ExprKind::input(columns[*column]),
                         )
                         .unwrap();
                     let max = builder.constant(
@@ -744,7 +744,10 @@ pub(super) fn package_typed(
                             value_type: value_type.clone(),
                             constant,
                         },
-                        FunctionArgumentType::Lambda { .. } => panic!("window value channel"),
+                        FunctionArgumentType::Lambda { .. }
+                        | FunctionArgumentType::CandidateGroup { .. } => {
+                            panic!("window value channel")
+                        }
                     })
                     .collect(),
                 logical_argument_count: call.args.len(),
@@ -883,7 +886,8 @@ pub(super) fn package_typed(
                             .unwrap()
                     }),
                 },
-                StaticFunctionArgument::Lambda { .. } => panic!("window value channel"),
+                StaticFunctionArgument::Lambda { .. }
+                | StaticFunctionArgument::CandidateGroup { .. } => panic!("window value channel"),
             })
             .collect::<Vec<_>>();
         let selection = Arc::new(novarocks_functions::FunctionBindingSelection {

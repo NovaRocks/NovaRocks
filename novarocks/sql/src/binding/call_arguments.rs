@@ -98,6 +98,18 @@ impl CapturedLogicalCallArguments {
     }
 }
 
+/// Number of physical source occurrences retained in the original scalar request.
+pub(crate) fn scalar_source_count(request: FunctionBindingRequest<'_>) -> Option<usize> {
+    match request.arguments {
+        [
+            FunctionArgument::Value { .. },
+            FunctionArgument::CandidateGroup { members, .. },
+        ] if request.logical_argument_count == 2 => members.len().checked_add(1),
+        arguments if arguments.len() == request.logical_argument_count => Some(arguments.len()),
+        _ => None,
+    }
+}
+
 /// Capture actual already-typed logical channels in their original order,
 /// followed by any function ORDER BY channels supplied by the caller. The sole
 /// analysis argument author owns literals, CV type checks and Lambda shape;
@@ -113,6 +125,63 @@ pub(crate) fn capture_logical_call_arguments<'a>(
     constant_policy: ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
+    if let [
+        novarocks_functions::FunctionArgumentType::Value(_),
+        novarocks_functions::FunctionArgumentType::CandidateGroup { element_type },
+    ] = binding.selected.argument_types.as_ref()
+    {
+        let mut ordered = ordered.into_iter();
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let grouped = (|| {
+            let probe = ordered
+                .next()
+                .ok_or(LogicalCallArgumentCaptureError::InvalidSource(
+                    "IN source has no probe",
+                ))?;
+            let probe = crate::analysis::function_argument(probe, constant_policy, control)?;
+            let mut members = Vec::new();
+            for expression in ordered {
+                work.step()?;
+                work.flush()?;
+                let FunctionArgument::Value {
+                    value_type,
+                    constant,
+                } = crate::analysis::function_argument(expression, constant_policy, control)?
+                else {
+                    return Err(LogicalCallArgumentCaptureError::InvalidSource(
+                        "IN source has a non-value candidate",
+                    ));
+                };
+                members
+                    .try_reserve(1)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                members.push(novarocks_functions::FunctionCandidate {
+                    value_type,
+                    constant,
+                });
+            }
+            if members.is_empty() {
+                return Err(LogicalCallArgumentCaptureError::InvalidSource(
+                    "IN source has no candidates",
+                ));
+            }
+            Ok(vec![
+                probe,
+                FunctionArgument::CandidateGroup {
+                    element_type: element_type.clone(),
+                    members: members.into_boxed_slice(),
+                },
+            ])
+        })();
+        let arguments = work.finish_result(grouped, LogicalCallArgumentCaptureError::from)?;
+        return move_authored_call_arguments_observed(
+            binding,
+            logical_argument_count,
+            arguments,
+            constant_policy,
+            control,
+        );
+    }
     capture_call_arguments_with(
         binding,
         logical_argument_count,

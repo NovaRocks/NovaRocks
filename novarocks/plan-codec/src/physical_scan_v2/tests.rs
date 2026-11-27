@@ -501,7 +501,7 @@ fn with_token_payload_mode<R>(
             id: ExprId::new(ordinal as u32),
             lambda_scope: None,
             ty: ty.clone(),
-            kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(id)),
+            kind: novarocks_expression_contract::ExprKind::input(p::ValueId::new(id)),
         }
     });
     let unit = unit_from_sources(nodes, &defs, c);

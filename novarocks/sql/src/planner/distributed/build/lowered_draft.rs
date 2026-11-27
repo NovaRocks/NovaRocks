@@ -858,10 +858,10 @@ pub(super) fn validate_expression_source_entry_observed(
     };
     let count = args.len();
     let request = entry.captured.request();
+    let source_count = crate::binding::scalar_source_count(request);
     let same_count = count == entry.arguments.len()
         && count == entry.channels.len()
-        && count == request.arguments.len()
-        && args.len() == request.logical_argument_count;
+        && Some(count) == source_count;
     work.step()?;
     if !same_scope || !same_count {
         return Err(SqlSourceJournalError::InvalidSource(

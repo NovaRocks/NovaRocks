@@ -177,7 +177,7 @@ pub fn conversion_program(
         .zip(values)
         .map(|(ty, (value, _))| {
             builder
-                .add(None, ty.clone(), ExprKind::Value(value))
+                .add(None, ty.clone(), ExprKind::input(value))
                 .unwrap()
         })
         .collect::<Vec<_>>();

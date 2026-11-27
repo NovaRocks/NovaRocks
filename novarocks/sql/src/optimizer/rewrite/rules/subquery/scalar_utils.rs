@@ -433,6 +433,15 @@ where
     let node = arena.node(expr).clone();
     let value_type = arena.value_type(expr).clone();
     let rebuilt = match node {
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => ScalarNode::Let {
+            binding,
+            initializer: candidate_or_none!(rewrite(arena, initializer)?),
+            body: candidate_or_none!(rewrite(arena, body)?),
+        },
         ScalarNode::BinaryOp {
             op,
             left,
@@ -443,10 +452,6 @@ where
             left: candidate_or_none!(rewrite(arena, left)?),
             right: candidate_or_none!(rewrite(arena, right)?),
             decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
-            op,
-            child: candidate_or_none!(rewrite(arena, child)?),
         },
         ScalarNode::FunctionCall {
             name,
@@ -500,35 +505,6 @@ where
             child: candidate_or_none!(rewrite(arena, child)?),
             negated,
         },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: candidate_or_none!(rewrite(arena, child)?),
-            list: candidate_or_none!(rewrite_vec(arena, list, rewrite, control)?),
-            negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: candidate_or_none!(rewrite(arena, child)?),
-            low: candidate_or_none!(rewrite(arena, low)?),
-            high: candidate_or_none!(rewrite(arena, high)?),
-            negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: candidate_or_none!(rewrite(arena, child)?),
-            pattern: candidate_or_none!(rewrite(arena, pattern)?),
-            negated,
-        },
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -553,15 +529,6 @@ where
                 Some(item) => Some(candidate_or_none!(rewrite(arena, item)?)),
                 None => None,
             },
-        },
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => ScalarNode::IsTruthValue {
-            child: candidate_or_none!(rewrite(arena, child)?),
-            value,
-            negated,
         },
         ScalarNode::Nested(child) => ScalarNode::Nested(candidate_or_none!(rewrite(arena, child)?)),
         ScalarNode::WindowCall {
@@ -597,6 +564,7 @@ where
             body: candidate_or_none!(rewrite(arena, body)?),
         },
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {

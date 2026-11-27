@@ -74,6 +74,10 @@ struct ExpressionRow {
 }
 enum RequestArgumentRow {
     Value(u32),
+    CandidateGroup {
+        element: u32,
+        members: Range<usize>,
+    },
     Lambda {
         parameters: Range<usize>,
         result: u32,
@@ -600,14 +604,18 @@ impl<'source> Visitor<'source> for CountPass<'_, 'source, '_> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         for argument in &r.arguments {
-            if let p::StaticFunctionArgument::Lambda {
-                parameter_types, ..
-            } = argument
-            {
+            let repeated_types = match argument {
+                p::StaticFunctionArgument::Lambda {
+                    parameter_types, ..
+                } => parameter_types.len(),
+                p::StaticFunctionArgument::CandidateGroup { members, .. } => members.len(),
+                p::StaticFunctionArgument::Value { .. } => 0,
+            };
+            if repeated_types > 0 {
                 self.counts.request_parameters =
-                    add(self.counts.request_parameters, parameter_types.len())?;
-                self.gate(add(parameter_types.len(), 4)?, budget, work)?;
-                for _ in parameter_types {
+                    add(self.counts.request_parameters, repeated_types)?;
+                self.gate(add(repeated_types, 4)?, budget, work)?;
+                for _ in 0..repeated_types {
                     self.completed(2, budget, work)?;
                 }
             }
@@ -831,6 +839,34 @@ impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
                 p::StaticFunctionArgument::Value { value_type, .. } => RequestArgumentRow::Value(
                     self.root(owner, Channel::Argument(argument), value_type, budget, work)?,
                 ),
+                p::StaticFunctionArgument::CandidateGroup {
+                    element_type,
+                    members,
+                } => {
+                    let element = self.root(
+                        owner,
+                        Channel::Argument(argument),
+                        element_type,
+                        budget,
+                        work,
+                    )?;
+                    let start = self.sources.request_parameters.len();
+                    for (ordinal, member) in members.iter().enumerate() {
+                        let root = self.root(
+                            owner,
+                            Channel::CandidateMember { argument, ordinal },
+                            &member.value_type,
+                            budget,
+                            work,
+                        )?;
+                        self.sources.request_parameters.push(root);
+                        work.step()?;
+                    }
+                    RequestArgumentRow::CandidateGroup {
+                        element,
+                        members: start..self.sources.request_parameters.len(),
+                    }
+                }
                 p::StaticFunctionArgument::Lambda {
                     parameter_types,
                     result_type,
@@ -1183,6 +1219,12 @@ impl<'source> DefinitionSources<'source> {
         for row in &self.arguments {
             arguments.push(match row {
                 RequestArgumentRow::Value(id) => ArgumentTypeIds::Value(*id),
+                RequestArgumentRow::CandidateGroup { element, members } => {
+                    ArgumentTypeIds::CandidateGroup {
+                        element: *element,
+                        members: &self.request_parameters[members.clone()],
+                    }
+                }
                 RequestArgumentRow::Lambda { parameters, result } => ArgumentTypeIds::Lambda {
                     parameters: &self.request_parameters[parameters.clone()],
                     result: *result,

@@ -233,12 +233,12 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
     let probe = builder
         .unit(JOIN)
         .unwrap()
-        .add(None, int64(), ExprKind::Value(scan[0]))
+        .add(None, int64(), ExprKind::input(scan[0]))
         .unwrap();
     let build_key = builder
         .unit(JOIN)
         .unwrap()
-        .add(None, int64(), ExprKind::Value(build))
+        .add(None, int64(), ExprKind::input(build))
         .unwrap();
     let probe = builder
         .unit(JOIN)

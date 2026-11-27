@@ -301,7 +301,7 @@ fn package_with_case(
         let definition = builder
             .unit(node)
             .unwrap()
-            .add(None, result_type.clone(), ExprKind::Value(output[0]))
+            .add(None, result_type.clone(), ExprKind::input(output[0]))
             .unwrap();
         let root = builder
             .unit(node)

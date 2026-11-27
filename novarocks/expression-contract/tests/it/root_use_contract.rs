@@ -23,7 +23,7 @@ use novarocks_type_contract::*;
 fn roots(count: usize) -> BoundExprSetBuilder {
     let mut builder = BoundExprSetBuilder::new(limits());
     let definition = builder
-        .add(None, boolean(false), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(false), ExprKind::input(ValueId::new(9)))
         .unwrap();
     for ordinal in 0..count {
         assert_eq!(
@@ -69,7 +69,7 @@ fn root_only_occurrences_keep_original_shared_near_exact_and_over_bound() {
 fn repeated() -> BoundExprSet {
     let mut builder = BoundExprSetBuilder::new(limits());
     let leaf = builder
-        .add(None, boolean(false), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(false), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let conjunction = builder
         .add(

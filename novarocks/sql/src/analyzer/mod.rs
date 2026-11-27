@@ -1988,21 +1988,6 @@ impl<'a> AnalyzerContext<'a> {
                     decimal_overflow_policy,
                 },
             },
-            ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-                value_type: expr.value_type.clone(),
-
-                kind: ExprKind::UnaryOp {
-                    op,
-                    expr: novarocks_parser::ast::AstBox::new(
-                        self.substitute_select_aliases_for_select_inner(
-                            inner.into_inner(),
-                            projection,
-                            from_scope,
-                            inside_agg,
-                        ),
-                    ),
-                },
-            },
             ExprKind::FunctionCall {
                 name,
                 args,
@@ -2137,26 +2122,6 @@ impl<'a> AnalyzerContext<'a> {
                     negated,
                 },
             },
-            ExprKind::IsTruthValue {
-                expr: inner,
-                value,
-                negated,
-            } => TypedExpr {
-                value_type: expr.value_type.clone(),
-
-                kind: ExprKind::IsTruthValue {
-                    expr: novarocks_parser::ast::AstBox::new(
-                        self.substitute_select_aliases_for_select_inner(
-                            inner.into_inner(),
-                            projection,
-                            from_scope,
-                            inside_agg,
-                        ),
-                    ),
-                    value,
-                    negated,
-                },
-            },
             ExprKind::Case {
                 ieee_float_equality,
                 operand,
@@ -2255,18 +2220,6 @@ impl<'a> AnalyzerContext<'a> {
                         ),
                     ),
                     decimal_overflow_policy,
-                },
-            },
-            ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-                value_type: expr.value_type.clone(),
-
-                kind: ExprKind::UnaryOp {
-                    op,
-                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
-                        inner.into_inner(),
-                        projection,
-                        inside_agg,
-                    )),
                 },
             },
             ExprKind::FunctionCall {
@@ -2375,23 +2328,6 @@ impl<'a> AnalyzerContext<'a> {
                         projection,
                         inside_agg,
                     )),
-                    negated,
-                },
-            },
-            ExprKind::IsTruthValue {
-                expr: inner,
-                value,
-                negated,
-            } => TypedExpr {
-                value_type: expr.value_type.clone(),
-
-                kind: ExprKind::IsTruthValue {
-                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
-                        inner.into_inner(),
-                        projection,
-                        inside_agg,
-                    )),
-                    value,
                     negated,
                 },
             },
@@ -3599,6 +3535,23 @@ impl<'a> AnalyzerContext<'a> {
             mut value_type,
         } = expr;
         let kind = match kind {
+            ExprKind::Let {
+                binding,
+                initializer,
+                body,
+            } => ExprKind::Let {
+                binding,
+                initializer: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    initializer.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                body: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    body.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+            },
             ExprKind::ColumnRef {
                 column_id,
                 qualifier,
@@ -3667,14 +3620,6 @@ impl<'a> AnalyzerContext<'a> {
                 )),
                 decimal_overflow_policy,
             },
-            ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
-                op,
-                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    inner.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-            },
             ExprKind::FunctionCall {
                 name,
                 args,
@@ -3717,78 +3662,9 @@ impl<'a> AnalyzerContext<'a> {
                 )),
                 negated,
             },
-            ExprKind::IsTruthValue {
-                expr: inner,
-                value,
-                negated,
-            } => ExprKind::IsTruthValue {
-                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    inner.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                value,
-                negated,
-            },
             ExprKind::Nested(inner) => ExprKind::Nested(novarocks_parser::ast::AstBox::new(
                 self.rebind_order_by_agg_args(inner.into_inner(), from_scope, inside_agg),
             )),
-            ExprKind::InList {
-                expr: inner,
-                list,
-                negated,
-            } => ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    inner.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                list: list
-                    .into_iter()
-                    .map(|item| self.rebind_order_by_agg_args(item, from_scope, inside_agg))
-                    .collect(),
-                negated,
-            },
-            ExprKind::Between {
-                expr: inner,
-                low,
-                high,
-                negated,
-            } => ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    inner.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                low: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    low.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                high: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    high.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                negated,
-            },
-            ExprKind::Like {
-                expr: inner,
-                pattern,
-                negated,
-            } => ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    inner.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                pattern: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
-                    pattern.into_inner(),
-                    from_scope,
-                    inside_agg,
-                )),
-                negated,
-            },
             ExprKind::Case {
                 ieee_float_equality,
                 operand,
@@ -3834,13 +3710,15 @@ impl<'a> AnalyzerContext<'a> {
 fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { .. } => true,
-        ExprKind::BinaryOp { left, right, .. } => {
-            contains_subquery_placeholder(left) || contains_subquery_placeholder(right)
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => contains_subquery_placeholder(left) || contains_subquery_placeholder(right),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
+            contains_subquery_placeholder(expr)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => contains_subquery_placeholder(expr),
         ExprKind::FunctionCall { args, .. } => args.iter().any(contains_subquery_placeholder),
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
             contains_subquery_placeholder(body)
@@ -3855,19 +3733,6 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
             .chain(order_by.iter().map(|item| &item.expr))
             .chain(filter.as_deref())
             .any(contains_subquery_placeholder),
-        ExprKind::InList { expr, list, .. } => {
-            contains_subquery_placeholder(expr) || list.iter().any(contains_subquery_placeholder)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            contains_subquery_placeholder(expr)
-                || contains_subquery_placeholder(low)
-                || contains_subquery_placeholder(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            contains_subquery_placeholder(expr) || contains_subquery_placeholder(pattern)
-        }
         ExprKind::Case {
             operand,
             when_then,
@@ -3898,6 +3763,7 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
                     .any(|item| contains_subquery_placeholder(&item.expr))
         }
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_) => false,
@@ -5742,12 +5608,16 @@ mod tests {
                 column: c,
                 ..
             } => q.eq_ignore_ascii_case(qualifier) && c.eq_ignore_ascii_case(column),
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 expr_has_qualified_column(left, qualifier, column)
                     || expr_has_qualified_column(right, qualifier, column)
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::IsNull { expr, .. }
+            ExprKind::IsNull { expr, .. }
             | ExprKind::Cast { expr, .. }
             | ExprKind::Nested(expr) => expr_has_qualified_column(expr, qualifier, column),
             ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
@@ -5770,12 +5640,6 @@ mod tests {
                         .as_ref()
                         .is_some_and(|expr| expr_has_qualified_column(expr, qualifier, column))
             }
-            ExprKind::InList { expr, list, .. } => {
-                expr_has_qualified_column(expr, qualifier, column)
-                    || list
-                        .iter()
-                        .any(|item| expr_has_qualified_column(item, qualifier, column))
-            }
             _ => false,
         }
     }
@@ -5787,12 +5651,16 @@ mod tests {
                 column: c,
                 ..
             } => c.eq_ignore_ascii_case(column),
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 expr_has_unqualified_column(left, column)
                     || expr_has_unqualified_column(right, column)
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::IsNull { expr, .. }
+            ExprKind::IsNull { expr, .. }
             | ExprKind::Cast { expr, .. }
             | ExprKind::Nested(expr) => expr_has_unqualified_column(expr, column),
             ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
@@ -5814,12 +5682,6 @@ mod tests {
                     || else_expr
                         .as_ref()
                         .is_some_and(|expr| expr_has_unqualified_column(expr, column))
-            }
-            ExprKind::InList { expr, list, .. } => {
-                expr_has_unqualified_column(expr, column)
-                    || list
-                        .iter()
-                        .any(|item| expr_has_unqualified_column(item, column))
             }
             _ => false,
         }
@@ -6453,10 +6315,12 @@ mod tests {
     fn expr_has_placeholder(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_has_placeholder(left) || expr_has_placeholder(right)
-            }
-            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder(expr),
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_has_placeholder(left) || expr_has_placeholder(right),
             ExprKind::Nested(inner) => expr_has_placeholder(inner),
             _ => false,
         }
@@ -6466,10 +6330,12 @@ mod tests {
     fn expr_has_placeholder_deep(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_has_placeholder_deep(left) || expr_has_placeholder_deep(right)
-            }
-            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder_deep(expr),
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_has_placeholder_deep(left) || expr_has_placeholder_deep(right),
             ExprKind::Nested(inner) => expr_has_placeholder_deep(inner),
             ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
                 args.iter().any(expr_has_placeholder_deep)
@@ -6493,20 +6359,6 @@ mod tests {
                         .as_ref()
                         .is_some_and(|e| expr_has_placeholder_deep(e))
             }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                expr_has_placeholder_deep(expr)
-                    || expr_has_placeholder_deep(low)
-                    || expr_has_placeholder_deep(high)
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                expr_has_placeholder_deep(expr) || expr_has_placeholder_deep(pattern)
-            }
-            ExprKind::InList { expr, list, .. } => {
-                expr_has_placeholder_deep(expr) || list.iter().any(expr_has_placeholder_deep)
-            }
-            ExprKind::IsTruthValue { expr, .. } => expr_has_placeholder_deep(expr),
             ExprKind::WindowCall { args, .. } => args.iter().any(expr_has_placeholder_deep),
             _ => false,
         }
@@ -6979,14 +6831,15 @@ mod tests {
                 ExprKind::ColumnRef {
                     qualifier, column, ..
                 } => qualifier.is_none() && column.eq_ignore_ascii_case("l"),
-                ExprKind::BinaryOp { left, right, .. } => {
-                    contains_unresolved_l(left) || contains_unresolved_l(right)
-                }
-                ExprKind::UnaryOp { expr, .. }
-                | ExprKind::Cast { expr, .. }
+                ExprKind::BinaryOp { left, right, .. }
+                | ExprKind::Let {
+                    initializer: left,
+                    body: right,
+                    ..
+                } => contains_unresolved_l(left) || contains_unresolved_l(right),
+                ExprKind::Cast { expr, .. }
                 | ExprKind::Nested(expr)
-                | ExprKind::IsNull { expr, .. }
-                | ExprKind::IsTruthValue { expr, .. } => contains_unresolved_l(expr),
+                | ExprKind::IsNull { expr, .. } => contains_unresolved_l(expr),
                 ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
                     args.iter().any(contains_unresolved_l)
                 }
@@ -7238,13 +7091,14 @@ mod tests {
             ExprKind::ColumnRef {
                 column_id, column, ..
             } if column == name => Some(*column_id),
-            ExprKind::BinaryOp { left, right, .. } => {
-                find_grouping_ref_id(left, name).or_else(|| find_grouping_ref_id(right, name))
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => find_grouping_ref_id(left, name).or_else(|| find_grouping_ref_id(right, name)),
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr)
             | ExprKind::LambdaFunction { body: expr, .. }
             | ExprKind::Lambda { body: expr, .. } => find_grouping_ref_id(expr, name),
@@ -7259,18 +7113,6 @@ mod tests {
                         .iter()
                         .find_map(|item| find_grouping_ref_id(&item.expr, name))
                 }),
-            ExprKind::InList { expr, list, .. } => find_grouping_ref_id(expr, name).or_else(|| {
-                list.iter()
-                    .find_map(|item| find_grouping_ref_id(item, name))
-            }),
-            ExprKind::Between {
-                expr, low, high, ..
-            } => find_grouping_ref_id(expr, name)
-                .or_else(|| find_grouping_ref_id(low, name))
-                .or_else(|| find_grouping_ref_id(high, name)),
-            ExprKind::Like { expr, pattern, .. } => {
-                find_grouping_ref_id(expr, name).or_else(|| find_grouping_ref_id(pattern, name))
-            }
             ExprKind::Case {
                 operand,
                 when_then,
@@ -7309,6 +7151,7 @@ mod tests {
                         .find_map(|item| find_grouping_ref_id(&item.expr, name))
                 }),
             ExprKind::ColumnRef { .. }
+            | ExprKind::LocalValue(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)
@@ -7319,13 +7162,14 @@ mod tests {
     fn expr_contains_column_id(expr: &TypedExpr, target: crate::column_id::ColumnId) -> bool {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } => *column_id == target,
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_contains_column_id(left, target) || expr_contains_column_id(right, target)
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_contains_column_id(left, target) || expr_contains_column_id(right, target),
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr)
             | ExprKind::LambdaFunction { body: expr, .. }
             | ExprKind::Lambda { body: expr, .. } => expr_contains_column_id(expr, target),
@@ -7337,22 +7181,6 @@ mod tests {
                     || order_by
                         .iter()
                         .any(|item| expr_contains_column_id(&item.expr, target))
-            }
-            ExprKind::InList { expr, list, .. } => {
-                expr_contains_column_id(expr, target)
-                    || list
-                        .iter()
-                        .any(|item| expr_contains_column_id(item, target))
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                expr_contains_column_id(expr, target)
-                    || expr_contains_column_id(low, target)
-                    || expr_contains_column_id(high, target)
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                expr_contains_column_id(expr, target) || expr_contains_column_id(pattern, target)
             }
             ExprKind::Case {
                 operand,
@@ -7385,7 +7213,8 @@ mod tests {
                         .iter()
                         .any(|item| expr_contains_column_id(&item.expr, target))
             }
-            ExprKind::LambdaParamRef { .. }
+            ExprKind::LocalValue(_)
+            | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
@@ -7395,13 +7224,14 @@ mod tests {
     fn contains_grouping_marker_literal(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) if *v <= -9000 => true,
-            ExprKind::BinaryOp { left, right, .. } => {
-                contains_grouping_marker_literal(left) || contains_grouping_marker_literal(right)
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => contains_grouping_marker_literal(left) || contains_grouping_marker_literal(right),
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr)
             | ExprKind::LambdaFunction { body: expr, .. }
             | ExprKind::Lambda { body: expr, .. } => contains_grouping_marker_literal(expr),
@@ -7413,20 +7243,6 @@ mod tests {
                     || order_by
                         .iter()
                         .any(|item| contains_grouping_marker_literal(&item.expr))
-            }
-            ExprKind::InList { expr, list, .. } => {
-                contains_grouping_marker_literal(expr)
-                    || list.iter().any(contains_grouping_marker_literal)
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                contains_grouping_marker_literal(expr)
-                    || contains_grouping_marker_literal(low)
-                    || contains_grouping_marker_literal(high)
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                contains_grouping_marker_literal(expr) || contains_grouping_marker_literal(pattern)
             }
             ExprKind::Case {
                 operand,
@@ -7458,6 +7274,7 @@ mod tests {
                         .any(|item| contains_grouping_marker_literal(&item.expr))
             }
             ExprKind::ColumnRef { .. }
+            | ExprKind::LocalValue(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)
@@ -7984,12 +7801,6 @@ mod tests {
         );
         match &sel.projection[0].expr.kind {
             ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) => assert_eq!(*v, -9000),
-            ExprKind::UnaryOp { expr, .. } => match &expr.kind {
-                ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) => {
-                    assert_eq!(*v, 9000)
-                }
-                other => panic!("expected numeric literal under unary op, got {other:?}"),
-            },
             other => panic!("expected real -9000 literal to remain literal, got {other:?}"),
         }
     }
@@ -9352,13 +9163,16 @@ mod tests {
                 (cast_target == target && expr_refs_column(inner, column_id))
                     || expr_casts_column_to_type(inner, column_id, target)
             }
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 expr_casts_column_to_type(left, column_id, target)
                     || expr_casts_column_to_type(right, column_id, target)
             }
-            ExprKind::Nested(inner)
-            | ExprKind::UnaryOp { expr: inner, .. }
-            | ExprKind::IsNull { expr: inner, .. } => {
+            ExprKind::Nested(inner) | ExprKind::IsNull { expr: inner, .. } => {
                 expr_casts_column_to_type(inner, column_id, target)
             }
             _ => false,
@@ -9370,11 +9184,13 @@ mod tests {
             ExprKind::ColumnRef { column_id: id, .. } => *id == column_id,
             ExprKind::Cast { expr: inner, .. }
             | ExprKind::Nested(inner)
-            | ExprKind::UnaryOp { expr: inner, .. }
             | ExprKind::IsNull { expr: inner, .. } => expr_refs_column(inner, column_id),
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_refs_column(left, column_id) || expr_refs_column(right, column_id)
-            }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_refs_column(left, column_id) || expr_refs_column(right, column_id),
             ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
                 args.iter().any(|arg| expr_refs_column(arg, column_id))
             }
@@ -9411,10 +9227,12 @@ mod tests {
     fn expr_has_subquery_placeholder(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_has_subquery_placeholder(left) || expr_has_subquery_placeholder(right)
-            }
-            ExprKind::UnaryOp { expr: inner, .. } => expr_has_subquery_placeholder(inner),
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_has_subquery_placeholder(left) || expr_has_subquery_placeholder(right),
             ExprKind::IsNull { expr: inner, .. } => expr_has_subquery_placeholder(inner),
             ExprKind::Cast { expr: inner, .. } => expr_has_subquery_placeholder(inner),
             ExprKind::Nested(inner) => expr_has_subquery_placeholder(inner),

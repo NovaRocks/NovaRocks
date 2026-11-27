@@ -578,7 +578,7 @@ fn function_heap(function: &BoundFunction) -> usize {
             .argument_types
             .iter()
             .map(|argument| match argument {
-                FunctionArgumentType::Value(_) => 0,
+                FunctionArgumentType::Value(_) | FunctionArgumentType::CandidateGroup { .. } => 0,
                 FunctionArgumentType::Lambda {
                     parameter_types, ..
                 } => parameter_types.len() * size_of::<ValueType>(),

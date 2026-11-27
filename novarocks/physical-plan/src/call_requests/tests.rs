@@ -521,7 +521,7 @@ fn relation_fragment(id: u32, calls: Vec<(u32, Vec<ValueType>)>) -> Fragment {
         let mut roots = Vec::new();
         for (&value, ty) in input_values.iter().zip(&types) {
             let draft = builder.unit(node).unwrap();
-            let definition = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+            let definition = draft.add(None, ty.clone(), ExprKind::input(value)).unwrap();
             roots.push(
                 draft
                     .root(
@@ -675,7 +675,7 @@ fn ordered_window_fragment() -> Fragment {
         .iter()
         .map(|value| {
             let definition = draft
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap();
             draft
                 .root(

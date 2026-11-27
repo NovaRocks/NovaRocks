@@ -218,7 +218,7 @@ fn source_fixture() -> SourceFixture {
     let read = builder
         .unit(project)
         .unwrap()
-        .add(None, int64(false), ExprKind::Value(key))
+        .add(None, int64(false), ExprKind::input(key))
         .unwrap();
     let later = builder
         .unit(project)

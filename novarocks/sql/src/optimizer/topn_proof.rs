@@ -73,16 +73,22 @@ pub(crate) fn collect_column_ids(arena: &ScalarArena, expr: ScalarId) -> ColumnI
 fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ColumnId>) {
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => out.push(*column_id),
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::LocalValue(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_ids_inner(arena, *left, out);
             collect_column_ids_inner(arena, *right, out);
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::LambdaFunction { body: child, .. }
+        ScalarNode::LambdaFunction { body: child, .. }
         | ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child)
         | ScalarNode::Lambda { body: child, .. } => {
             collect_column_ids_inner(arena, *child, out);
@@ -107,23 +113,6 @@ fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<C
             for key in order_by {
                 collect_column_ids_inner(arena, key.expr, out);
             }
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_column_ids_inner(arena, *child, out);
-            for item in list {
-                collect_column_ids_inner(arena, *item, out);
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_column_ids_inner(arena, *child, out);
-            collect_column_ids_inner(arena, *low, out);
-            collect_column_ids_inner(arena, *high, out);
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_column_ids_inner(arena, *child, out);
-            collect_column_ids_inner(arena, *pattern, out);
         }
         ScalarNode::Case {
             operand,

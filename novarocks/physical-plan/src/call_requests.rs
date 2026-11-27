@@ -29,7 +29,7 @@ pub use novarocks_expression_contract::{
 use crate::{Fragment, FragmentId, FrozenCallError, PhysicalCallBinding, PhysicalCallSite};
 use novarocks_function_contract::FunctionBindingError;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType, PureCompileControl,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -372,7 +372,9 @@ fn validate_request_binding(
         return Err(CallRequestError::InvalidArgumentCount(definition));
     }
     for (actual, expected) in request.arguments.iter().zip(types) {
-        if !actual.matches_type_observed(expected, work)? {
+        if matches!(expected, FunctionArgumentType::CandidateGroup { .. })
+            || !actual.matches_type_observed(expected, work)?
+        {
             return Err(CallRequestError::ArgumentTypeMismatch(definition));
         }
         work.step()?;

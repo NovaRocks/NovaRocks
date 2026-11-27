@@ -30,7 +30,7 @@ use std::sync::Arc;
 const BYTE_FUNCTIONS: [&str; 3] = ["from_hex", "from_base64", "to_utf8"];
 
 #[test]
-fn byte_functions_compile_strict_eager_and_preserve_selected_values_and_data() {
+fn byte_functions_compile_ordered_strict_calls_and_preserve_selected_values_and_data() {
     use novarocks_type_contract::{ArgumentControl, FunctionNullBehavior};
 
     let cases = [
@@ -105,7 +105,7 @@ fn byte_functions_compile_strict_eager_and_preserve_selected_values_and_data() {
             );
             assert_eq!(
                 call.call_contract().effects().argument_control,
-                ArgumentControl::Eager
+                ArgumentControl::OrderedNull
             );
         }
         for selection in [

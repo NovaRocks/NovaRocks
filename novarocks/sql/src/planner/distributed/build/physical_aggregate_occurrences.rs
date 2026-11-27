@@ -316,7 +316,7 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
         && std::ptr::eq(input.occurrences.fragment(), input.fragment)
         && state_root.fragment == input.fragment.id()
         && input.node.inputs.as_ref() == [state_root.node]
-        && matches!(input.request.state().kind, novarocks_expression_contract::ExprKind::Value(value) if value == state_root.value);
+        && input.request.state().kind.input_value() == Some(state_root.value);
     work.step()?;
     if !same {
         return Err(PhysicalAggregateOccurrenceError::InvalidSource(

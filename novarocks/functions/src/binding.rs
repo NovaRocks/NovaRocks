@@ -194,6 +194,7 @@ impl<'a> CheckedCallEffectInput<'a> {
 
 /// The installed catalog consumes admitted constants, never pool addresses.
 pub type FunctionArgument = novarocks_function_contract::FunctionArgument<crate::ConstantValue>;
+pub type FunctionCandidate = novarocks_function_contract::FunctionCandidate<crate::ConstantValue>;
 pub type FunctionBindingRequest<'a> =
     novarocks_function_contract::FunctionBindingRequest<'a, crate::ConstantValue>;
 
@@ -224,6 +225,7 @@ impl FunctionSemantics {
             | ArgumentControl::Try
             | ArgumentControl::OrderedRegexp
             | ArgumentControl::OrderedNull
+            | ArgumentControl::CandidateGroup
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase => FunctionArgumentEvaluation::ShortCircuit,
             ArgumentControl::Eager
@@ -685,6 +687,7 @@ enum BindingResolverOwnerKind {
     BorrowedArraySequence(Arc<crate::builtin::array_generation_owner::SequenceResolver>),
     BorrowedTemporalContext(Arc<crate::builtin::temporal_context::TemporalContextResolver>),
     BorrowedBinaryOperator(Arc<crate::builtin::binary_operator_owner::BinaryOperatorOwner>),
+    BorrowedMembership(Arc<crate::builtin::in_list_owner::InListOwner>),
     CollectionLambda(Arc<crate::builtin::collection_lambda::CollectionLambdaOwner>),
     ArrayOrder(Arc<crate::builtin::array_order_owner::ArrayOrderOwner>),
     ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
@@ -748,6 +751,11 @@ impl FunctionBindingResolverOwner {
     ) -> Self {
         Self(BindingResolverOwnerKind::BorrowedBinaryOperator(owner))
     }
+    pub(crate) fn borrowed_membership(
+        owner: Arc<crate::builtin::in_list_owner::InListOwner>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedMembership(owner))
+    }
     pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
         Self(BindingResolverOwnerKind::ParametricAggregate(owner))
     }
@@ -807,6 +815,9 @@ impl FunctionBindingResolverOwner {
                     BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedMembership(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
                     BindingResolverOwnerKind::CollectionLambda(owner) => owner
                         .validate_selected(selected, request, control)
                         .map_err(Into::into),
@@ -834,6 +845,7 @@ impl FunctionBindingResolverOwner {
             BindingResolverOwnerKind::BorrowedArraySequence(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedTemporalContext(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedBinaryOperator(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedMembership(owner) => owner.as_ref(),
             BindingResolverOwnerKind::CollectionLambda(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ArrayOrder(owner) => owner.as_ref(),
             BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
@@ -1830,15 +1842,21 @@ fn validate_request(
                 value_type,
                 constant,
             } => {
-                validate_value_type(value_type, work)?;
-                if let Some(constant) = constant
-                    && !value_type.exactly_equals_observed(constant.value_type(), || {
-                        work.step().map_err(FunctionBindingError::from)
-                    })?
-                {
+                validate_value_argument(value_type, constant.as_ref(), work)?;
+            }
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => {
+                if kind != FunctionKind::Scalar || members.is_empty() {
                     return Err(invalid_binding(
-                        "constant source type differs from its argument type",
+                        "candidate groups require scalar membership",
                     ));
+                }
+                validate_value_type(element_type, work)?;
+                for member in members {
+                    work.step()?;
+                    validate_value_argument(&member.value_type, member.constant.as_ref(), work)?;
                 }
             }
             FunctionArgument::Lambda {
@@ -1866,7 +1884,7 @@ fn validate_request(
     }
     for argument in &request.arguments[request.logical_argument_count..] {
         work.step()?;
-        if matches!(argument, FunctionArgument::Lambda { .. }) {
+        if !matches!(argument, FunctionArgument::Value { .. }) {
             return Err(invalid_binding(
                 "aggregate ORDER BY update channels must be values, not lambdas",
             ));
@@ -1915,6 +1933,12 @@ fn validate_selection(
         match (argument, selected_type) {
             (FunctionArgument::Value { .. }, FunctionArgumentType::Value(_)) => {}
             (
+                FunctionArgument::CandidateGroup { .. },
+                FunctionArgumentType::CandidateGroup { .. },
+            ) if overload.effects.as_ref().is_some_and(|effects| {
+                effects.argument_control == novarocks_type_contract::ArgumentControl::CandidateGroup
+            }) => {}
+            (
                 FunctionArgument::Lambda {
                     parameter_types, ..
                 },
@@ -1925,7 +1949,7 @@ fn validate_selection(
             ) if parameter_types.len() == selected_parameters.len() => {}
             _ => {
                 return Err(invalid_binding(
-                    "selected argument shape or lambda arity differs from the request",
+                    "selected argument shape differs from the request",
                 ));
             }
         }
@@ -1974,12 +1998,33 @@ fn validate_value_type(
     crate::kernel_input::validate_type_observed(value, work).map_err(binding_kernel_failure)
 }
 
+fn validate_value_argument(
+    value_type: &FunctionValueType,
+    constant: Option<&crate::ConstantValue>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    validate_value_type(value_type, work)?;
+    if let Some(constant) = constant
+        && !value_type.exactly_equals_observed(constant.value_type(), || {
+            work.step().map_err(FunctionBindingError::from)
+        })?
+    {
+        return Err(invalid_binding(
+            "constant source type differs from its argument type",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_argument_type(
     argument: &FunctionArgumentType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
     match argument {
         FunctionArgumentType::Value(value) => validate_value_type(value, work),
+        FunctionArgumentType::CandidateGroup { element_type } => {
+            validate_value_type(element_type, work)
+        }
         FunctionArgumentType::Lambda {
             parameter_types,
             result_type,

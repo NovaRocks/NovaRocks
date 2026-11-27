@@ -73,7 +73,8 @@ pub(crate) fn with_original_relational_requests(
                         value_type: value_type.clone(),
                         constant: None,
                     },
-                    FunctionArgumentType::Lambda { .. } => {
+                    FunctionArgumentType::Lambda { .. }
+                    | FunctionArgumentType::CandidateGroup { .. } => {
                         panic!("relational fixture calls take Value arguments")
                     }
                 })

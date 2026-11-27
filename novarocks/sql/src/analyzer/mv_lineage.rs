@@ -533,27 +533,20 @@ fn unwrap_nested_expr(mut expr: &TypedExpr) -> &TypedExpr {
 
 fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
     match &expr.kind {
-        ExprKind::BinaryOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => vec![left.as_ref(), right.as_ref()],
+        ExprKind::Cast { expr, .. }
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::Nested(expr)
         | ExprKind::Lambda { body: expr, .. } => vec![expr.as_ref()],
         ExprKind::FunctionCall { args, .. }
         | ExprKind::AggregateCall { args, .. }
         | ExprKind::WindowCall { args, .. } => args.iter().collect(),
         ExprKind::LambdaFunction { body, .. } => vec![body.as_ref()],
-        ExprKind::InList { expr, list, .. } => {
-            let mut out = Vec::with_capacity(1 + list.len());
-            out.push(expr.as_ref());
-            out.extend(list.iter());
-            out
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => vec![expr.as_ref(), low.as_ref(), high.as_ref()],
-        ExprKind::Like { expr, pattern, .. } => vec![expr.as_ref(), pattern.as_ref()],
         ExprKind::Case {
             operand,
             when_then,
@@ -574,6 +567,7 @@ fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
             out
         }
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
@@ -632,14 +626,15 @@ fn collect_column_refs(
             kind.saw_cast();
             collect_column_refs(expr, out, kind);
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             kind.saw_func();
             collect_column_refs(left, out, kind);
             collect_column_refs(right, out, kind);
-        }
-        ExprKind::UnaryOp { expr, .. } => {
-            kind.saw_func();
-            collect_column_refs(expr, out, kind);
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             kind.saw_func();
@@ -650,26 +645,6 @@ fn collect_column_refs(
         ExprKind::IsNull { expr, .. } => {
             kind.saw_func();
             collect_column_refs(expr, out, kind);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            kind.saw_func();
-            collect_column_refs(expr, out, kind);
-            for e in list {
-                collect_column_refs(e, out, kind);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            kind.saw_func();
-            collect_column_refs(expr, out, kind);
-            collect_column_refs(low, out, kind);
-            collect_column_refs(high, out, kind);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            kind.saw_func();
-            collect_column_refs(expr, out, kind);
-            collect_column_refs(pattern, out, kind);
         }
         ExprKind::Case {
             operand,
@@ -688,10 +663,6 @@ fn collect_column_refs(
             if let Some(e) = else_expr {
                 collect_column_refs(e, out, kind);
             }
-        }
-        ExprKind::IsTruthValue { expr, .. } => {
-            kind.saw_func();
-            collect_column_refs(expr, out, kind);
         }
         ExprKind::Nested(inner) => {
             collect_column_refs(inner, out, kind);

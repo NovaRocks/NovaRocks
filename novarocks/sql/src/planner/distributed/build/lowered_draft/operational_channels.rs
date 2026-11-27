@@ -333,6 +333,24 @@ impl Projection<'_> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), SqlOperationalProjectionError> {
         let count = self.channels.len();
+        let group = match self.captured.arguments {
+            [
+                FunctionArgument::Value { .. },
+                FunctionArgument::CandidateGroup { members, .. },
+            ] => Some(members),
+            _ => None,
+        };
+        if let Some(members) = group {
+            let exact = self.kind == Some(SqlExpressionCallKind::Scalar)
+                && !members.is_empty()
+                && members.len().checked_add(1) == Some(count)
+                && count == self.arguments.len();
+            work.step()?;
+            return require(
+                exact,
+                "operational IN channels differ from their original source extent",
+            );
+        }
         if count > MAX_CALL_EFFECT_ARGUMENTS
             || self.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
             || self.captured.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
@@ -363,11 +381,112 @@ impl Projection<'_> {
         ))
     }
 
+    fn argument_expression(
+        &self,
+        ordinal: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<&ExprNode, SqlOperationalProjectionError> {
+        let channel = &self.channels[ordinal];
+        let id = self.arguments[ordinal];
+        work.step()?;
+        require(
+            channel.expression == id,
+            "operational channel differs from its recorded expression identity",
+        )?;
+        let expression = self.expression(id, work)?;
+        let same_scope =
+            self.expressions.owner() == self.owner && expression.lambda_scope == self.lambda_scope;
+        work.step()?;
+        require(
+            same_scope,
+            "operational argument belongs to a different owner or Lambda scope",
+        )?;
+        Ok(expression)
+    }
+
+    fn project_group_value(
+        &self,
+        ordinal: usize,
+        original_type: &FunctionValueType,
+        constant: Option<&ConstantValue>,
+        pools: &ConstantPools,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<novarocks_functions::FunctionCandidate, SqlOperationalProjectionError> {
+        let expression = self.argument_expression(ordinal, work)?;
+        let role = &self.channels[ordinal].role;
+        match (role, constant) {
+            (SqlOperationalChannelRole::ValueWithoutConstant, None) => {
+                require(
+                    !matches!(expression.kind, ExprKind::Lambda { .. }),
+                    "IN value source refers to a Lambda",
+                )?;
+                Ok(novarocks_functions::FunctionCandidate {
+                    value_type: clone_type(&expression.ty, work)?,
+                    constant: None,
+                })
+            }
+            (SqlOperationalChannelRole::CapturedConstant, Some(value)) => {
+                exact_type(original_type, value.value_type(), work)?;
+                verify_constant(expression, value, pools, work)?;
+                Ok(novarocks_functions::FunctionCandidate {
+                    value_type: clone_type(value.value_type(), work)?,
+                    constant: Some(value.clone()),
+                })
+            }
+            _ => Err(SqlOperationalProjectionError::InvalidSource(
+                "IN value source differs from its original captured argument",
+            )),
+        }
+    }
+
     fn project(
         &self,
         pools: &ConstantPools,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+        if let [
+            FunctionArgument::Value {
+                value_type,
+                constant,
+            },
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            },
+        ] = self.captured.arguments
+        {
+            let probe = self.project_group_value(0, value_type, constant.as_ref(), pools, work)?;
+            let mut nullable = false;
+            work.flush()?;
+            let mut actual_members = Vec::new();
+            actual_members
+                .try_reserve_exact(members.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for (ordinal, member) in members.iter().enumerate() {
+                let projected = self.project_group_value(
+                    ordinal + 1,
+                    &member.value_type,
+                    member.constant.as_ref(),
+                    pools,
+                    work,
+                )?;
+                nullable |= projected.value_type.nullable();
+                actual_members.push(projected);
+                work.step()?;
+            }
+            let element_type = element_type.with_nullable(nullable)?;
+            work.flush()?;
+            return Ok(Box::from([
+                FunctionArgument::Value {
+                    value_type: probe.value_type,
+                    constant: probe.constant,
+                },
+                FunctionArgument::CandidateGroup {
+                    element_type,
+                    members: actual_members.into_boxed_slice(),
+                },
+            ]));
+        }
         work.flush()?;
         let mut result = Vec::new();
         result
@@ -375,27 +494,13 @@ impl Projection<'_> {
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         work.step()?;
         work.flush()?;
-        for (ordinal, ((channel, id), original)) in self
+        for (ordinal, (channel, original)) in self
             .channels
             .iter()
-            .zip(self.arguments)
             .zip(self.captured.arguments)
             .enumerate()
         {
-            let same_id = channel.expression == *id;
-            work.step()?;
-            require(
-                same_id,
-                "operational channel differs from its recorded expression identity",
-            )?;
-            let expression = self.expression(*id, work)?;
-            let same_scope = self.expressions.owner() == self.owner
-                && expression.lambda_scope == self.lambda_scope;
-            work.step()?;
-            require(
-                same_scope,
-                "operational argument belongs to a different owner or Lambda scope",
-            )?;
+            let expression = self.argument_expression(ordinal, work)?;
             let argument = match (&channel.role, original) {
                 (
                     SqlOperationalChannelRole::ValueWithoutConstant,

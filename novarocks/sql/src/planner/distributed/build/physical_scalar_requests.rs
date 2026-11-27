@@ -21,10 +21,11 @@ use std::sync::Arc;
 
 use novarocks_functions::{
     ConstantValidation, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
-    FunctionKind, FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
+    FunctionCandidate, FunctionKind, FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType,
+    OperatorFunction,
 };
 use {
     novarocks_expression_contract::{BoundFunction, ExprKind, ExprNode},
@@ -171,7 +172,9 @@ pub(crate) fn author_physical_scalar_request_from_journal_observed<'source>(
     }
     let request = canonical.request();
     let selected = canonical.selected();
-    if args.len() > MAX_CALL_EFFECT_ARGUMENTS
+    let group = candidate_element_type(function).is_some();
+    let channels = if group { 2 } else { args.len() };
+    if channels > MAX_CALL_EFFECT_ARGUMENTS
         || request.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
         || selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
         || function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
@@ -185,11 +188,15 @@ pub(crate) fn author_physical_scalar_request_from_journal_observed<'source>(
         && selected.overload == function.overload
         && selected.overload == resolved.selected.overload
         && selected.aggregate.is_none()
-        && request.logical_argument_count == args.len()
-        && resolved.logical_argument_count == args.len()
-        && request.arguments.len() == args.len()
-        && function.argument_types.len() == args.len()
-        && selected.argument_types.len() == args.len();
+        && request.logical_argument_count == channels
+        && resolved.logical_argument_count == channels
+        && request.arguments.len() == channels
+        && function.argument_types.len() == channels
+        && selected.argument_types.len() == channels
+        && (!group
+            || matches!(request.arguments,
+            [FunctionArgument::Value { .. }, FunctionArgument::CandidateGroup { members, .. }]
+                if !members.is_empty() && members.len() == args.len().saturating_sub(1)));
     work.step()?;
     if !matching {
         return Err(PhysicalScalarRequestError::InvalidSource(
@@ -269,10 +276,12 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
             "physical scalar request carries a non-scalar binding",
         ));
     }
-    if args.len() > MAX_CALL_EFFECT_ARGUMENTS {
+    let group = candidate_element_type(function);
+    let channels = if group.is_some() { 2 } else { args.len() };
+    if channels > MAX_CALL_EFFECT_ARGUMENTS {
         return Err(PhysicalScalarRequestError::TooManyArguments);
     }
-    if args.len() != function.argument_types.len() {
+    if channels != function.argument_types.len() || group.is_some() && args.len() < 2 {
         return Err(PhysicalScalarRequestError::InvalidSource(
             "physical scalar argument count differs from its selected signature",
         ));
@@ -280,20 +289,55 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
     work.flush()?;
     let mut arguments = Vec::new();
     arguments
-        .try_reserve_exact(args.len())
+        .try_reserve_exact(channels)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    for &id in args {
+    let author = |id, work: &mut CompileCheckpoints<'_>| {
         let argument = expressions.definition(id);
         work.step()?;
         let argument = argument.ok_or(PhysicalScalarRequestError::MissingArgument(id))?;
-        arguments.push(author_physical_argument_observed(
+        let argument = author_physical_argument_observed(
             argument,
             pools,
             literal_policy,
             CompilePhase::FunctionSpecialization,
             work,
-        )?);
+        )?;
         work.step()?;
+        Ok::<_, PhysicalScalarRequestError>(argument)
+    };
+    if let Some(element_type) = group {
+        arguments.push(author(args[0], work)?);
+        work.flush()?;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(args.len() - 1)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for &id in &args[1..] {
+            let FunctionArgument::Value {
+                value_type,
+                constant,
+            } = author(id, work)?
+            else {
+                return Err(PhysicalScalarRequestError::InvalidSource(
+                    "IN candidate must be a scalar value",
+                ));
+            };
+            members.push(FunctionCandidate {
+                value_type,
+                constant,
+            });
+        }
+        work.flush()?;
+        arguments.push(FunctionArgument::CandidateGroup {
+            element_type: element_type.clone(),
+            members: members.into_boxed_slice(),
+        });
+        work.step()?;
+        work.flush()?;
+    } else {
+        for &id in args {
+            arguments.push(author(id, work)?);
+        }
     }
     let selected = author_scalar_result_selection_observed(function, None, work)?;
     Ok(AuthoredPhysicalScalarRequest {
@@ -304,6 +348,18 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
             result_constraint: &source.ty,
         },
     })
+}
+
+fn candidate_element_type(function: &BoundFunction) -> Option<&FunctionValueType> {
+    match &*function.argument_types {
+        [
+            FunctionArgumentType::Value(_),
+            FunctionArgumentType::CandidateGroup { element_type },
+        ] if function.function_id.as_str() == OperatorFunction::InList.function_id_text() => {
+            Some(element_type)
+        }
+        _ => None,
+    }
 }
 
 /// Loan the actual frozen signature; neither resolve a name nor reconstruct

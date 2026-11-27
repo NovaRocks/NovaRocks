@@ -168,7 +168,7 @@ fn predicate(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> ExprId {
     let left = builder
-        .define(node, ty(DataType::Int64), ExprKind::Value(value))
+        .define(node, ty(DataType::Int64), ExprKind::input(value))
         .unwrap();
     let right = builder
         .define(
@@ -569,7 +569,7 @@ fn project_fixture(
     let (scan, value) = append_scan(&mut builder, false, fixture_constants);
     let project = builder.reserve_node_id().unwrap();
     let expression = builder
-        .define(project, ty(DataType::Int64), ExprKind::Value(value))
+        .define(project, ty(DataType::Int64), ExprKind::input(value))
         .unwrap();
     let expression = builder.root_definition(
         project,

@@ -290,7 +290,7 @@ fn fixture(spec: Spec) -> Fixture {
     let mut residuals = Vec::new();
     for ordinal in 0..spec.residuals {
         let column = builder
-            .fixture_definition(SCAN, int64(), ExprKind::Value(provider[ordinal % 2]))
+            .fixture_definition(SCAN, int64(), ExprKind::input(provider[ordinal % 2]))
             .unwrap();
         let literal = builder
             .fixture_definition(
@@ -435,7 +435,7 @@ fn fixture(spec: Spec) -> Fixture {
     if spec.filter {
         // A row-local filter over the unconstrained scan, reading `v1`.
         let column = builder
-            .fixture_definition(FILTER, int64(), ExprKind::Value(provider[1]))
+            .fixture_definition(FILTER, int64(), ExprKind::input(provider[1]))
             .unwrap();
         let literal = builder
             .fixture_definition(
@@ -537,7 +537,7 @@ fn fixture(spec: Spec) -> Fixture {
             match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: {
                 let definition = builder
-                    .fixture_definition(JOIN, int64(), ExprKind::Value(provider[0]))
+                    .fixture_definition(JOIN, int64(), ExprKind::input(provider[0]))
                     .unwrap();
                 builder
                     .fixture_occurrence(
@@ -550,7 +550,7 @@ fn fixture(spec: Spec) -> Fixture {
             },
             right: {
                 let definition = builder
-                    .fixture_definition(JOIN, int64(), ExprKind::Value(imported))
+                    .fixture_definition(JOIN, int64(), ExprKind::input(imported))
                     .unwrap();
                 builder
                     .fixture_occurrence(

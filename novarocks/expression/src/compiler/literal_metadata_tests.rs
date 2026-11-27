@@ -280,7 +280,7 @@ fn literal_metadata_preserves_nonzero_pool_ordinal_and_null_vs_nonconstant() {
         literal_argument(
             &source(
                 ty,
-                ExprKind::Value(novarocks_expression_contract::ValueId::new(91))
+                ExprKind::input(novarocks_expression_contract::ValueId::new(91))
             ),
             &node,
             &Control::good()

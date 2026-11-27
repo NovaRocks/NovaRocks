@@ -57,7 +57,7 @@ fn ordered_input() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
         .add(
             None,
             ValueType::new(DataType::Int64, false),
-            ExprKind::Value(key),
+            ExprKind::input(key),
         )
         .unwrap();
     let root = unit

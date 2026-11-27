@@ -947,7 +947,16 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
             unit.control_flow().use_reference_count(),
             unit.claims().len(),
             unit.requests().len(),
+            unit.control_expansions().records().len(),
         ]);
+        usage.add_bytes(std::mem::size_of_val(unit.control_expansions().records()));
+        if !unit.control_expansions().records().is_empty() {
+            usage.add_bytes(
+                unit.definitions()
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<crate::ExprId>>()),
+            );
+        }
         for port in unit.ports() {
             usage.add_items(port.values.len());
             for (value, ty) in &port.values {
@@ -1085,7 +1094,6 @@ fn add_expression_usage_core<P: TypeValidationPolicy>(
                 policy,
             )?;
         }
-        ExprKind::InList { list, .. } => usage.add_items(list.len()),
         ExprKind::Case { when_then, .. } => usage.add_items(when_then.len().saturating_mul(2)),
         _ => {}
     };
@@ -1171,6 +1179,13 @@ fn add_argument_types_usage_core<P: TypeValidationPolicy>(
             FunctionArgumentType::Value(ty) => validate_value_type_core(
                 ty,
                 &format!("{path}.argument_types[{index}]"),
+                usage,
+                errors,
+                policy,
+            )?,
+            FunctionArgumentType::CandidateGroup { element_type } => validate_value_type_core(
+                element_type,
+                &format!("{path}.argument_types[{index}].element_type"),
                 usage,
                 errors,
                 policy,
@@ -3026,7 +3041,7 @@ fn add_call_request_usage<E>(
     errors: &mut ValidationContext,
     observe: &mut impl FnMut(bool) -> Result<(), E>,
 ) -> Result<(), E> {
-    use novarocks_function_contract::FunctionArgument;
+    use novarocks_function_contract::{FunctionArgument, FunctionCandidate};
     usage.add_items(request.arguments.len());
     usage.add_bytes(request.arguments.len().saturating_mul(std::mem::size_of::<
         FunctionArgument<crate::ConstantReference>,
@@ -3045,6 +3060,35 @@ fn add_call_request_usage<E>(
                     errors,
                     observe,
                 )?;
+            }
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => {
+                usage.add_items(members.len());
+                usage.add_bytes(members.len().saturating_mul(std::mem::size_of::<
+                    FunctionCandidate<crate::ConstantReference>,
+                >()));
+                validate_call_request_type_with(
+                    element_type,
+                    "requests.candidates.element_type",
+                    usage,
+                    errors,
+                    observe,
+                )?;
+                for member in members {
+                    if usage.exhausted() {
+                        return Ok(());
+                    }
+                    observe(false)?;
+                    validate_call_request_type_with(
+                        &member.value_type,
+                        "requests.candidates.member.type",
+                        usage,
+                        errors,
+                        observe,
+                    )?;
+                }
             }
             FunctionArgument::Lambda {
                 parameter_types,

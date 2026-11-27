@@ -54,6 +54,10 @@ pub(crate) fn visit_fields<'a, E>(
                 visit(Number(0))?;
                 visit(ValueType(ty))?;
             }
+            FunctionArgumentType::CandidateGroup { element_type } => {
+                visit(Number(2))?;
+                visit(ValueType(element_type))?;
+            }
             FunctionArgumentType::Lambda {
                 parameter_types,
                 result_type,

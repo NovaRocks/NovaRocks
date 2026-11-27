@@ -48,78 +48,61 @@ pub fn signed_inlist_source(sql: &str, dtype: DataType) -> SqlAuthoredPhysicalPl
 
 /// Check the original membership definitions and report their cardinality.
 pub fn inspect_inlist_source(source: &SqlAuthoredPhysicalPlan) -> usize {
-    let mut n = 0;
+    let mut count = 0;
     for (&id, fragment) in source.plan().fragments() {
-        for (_source_node, unit, _, node) in unit_definitions(fragment) {
-            if let ExprKind::InList {
-                expr,
-                list,
-                negated,
-            } = &node.kind
-            {
-                n += 1;
-                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
-                let input = unit.definition(*expr).unwrap();
+        for (_, unit, _, node) in unit_definitions(fragment) {
+            let ExprKind::FunctionCall { function, args } = &node.kind else {
+                continue;
+            };
+            if function.function_id.as_str() != "builtin.scalar/__operator_in/v1" {
+                continue;
+            }
+            count += 1;
+            assert_eq!(node.ty.data_type(), &DataType::Boolean);
+            let (probe, candidates) = args.split_first().unwrap();
+            assert!(!candidates.is_empty());
+            let input = unit.definition(*probe).unwrap();
+            println!(
+                "original IN fragment={id:?} input={:?} result={:?} candidates={}",
+                input.ty,
+                node.ty,
+                candidates.len()
+            );
+            for candidate in candidates {
                 println!(
-                    "actual original IN source fragment={id:?} input={:?} result={:?} negated={negated} candidates={}",
-                    input.ty,
-                    node.ty,
-                    list.len()
+                    "original IN candidate {:?}",
+                    unit.definition(*candidate).unwrap().ty
                 );
-                for value in list.iter() {
-                    println!(
-                        "actual original IN candidate {:?}",
-                        unit.definition(*value).unwrap().ty
-                    );
-                }
             }
         }
     }
-    n
+    count
 }
 
 /// Check the original LIKE operands and result's full nullable carrier facts.
 pub fn inspect_like_source(source: &SqlAuthoredPhysicalPlan) -> usize {
-    let mut n = 0;
-    for (&id, fragment) in source.plan().fragments() {
-        for (_source_node, unit, definition, node) in unit_definitions(fragment) {
-            if let ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } = &node.kind
-            {
-                n += 1;
-                let input = unit.definition(*expr).unwrap();
-                let pattern = unit.definition(*pattern).unwrap();
-                println!(
-                    "actual original LIKE fragment={id:?} definition={definition:?} operand={:?} pattern={:?} result={:?} negated={negated}",
-                    input.ty, pattern.ty, node.ty
-                );
-                assert_eq!(input.ty.data_type().clone(), DataType::Utf8);
-                assert_eq!(pattern.ty.data_type().clone(), DataType::Utf8);
-                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
-                assert_eq!(
-                    node.ty.nullable(),
-                    input.ty.nullable() || pattern.ty.nullable()
-                );
-            } else if let ExprKind::FunctionCall { function, args } = &node.kind
-                && function.function_id.as_str() == "builtin.scalar/__like_with_escape/v1"
-            {
-                n += 1;
-                assert_eq!(args.len(), 3);
-                let mut nullable = false;
-                for argument in args.iter() {
-                    let ty = &unit.definition(*argument).unwrap().ty;
-                    assert_eq!(ty.data_type(), &DataType::Utf8);
-                    nullable |= ty.nullable();
-                }
-                assert_eq!(node.ty.data_type(), &DataType::Boolean);
-                assert_eq!(node.ty.nullable(), nullable);
+    let mut count = 0;
+    for fragment in source.plan().fragments().values() {
+        for (_, unit, _, node) in unit_definitions(fragment) {
+            let ExprKind::FunctionCall { function, args } = &node.kind else {
+                continue;
+            };
+            if function.function_id.as_str() != "builtin.scalar/__operator_like/v1" {
+                continue;
             }
+            count += 1;
+            assert!(matches!(args.len(), 2 | 3));
+            let mut nullable = false;
+            for argument in args.iter() {
+                let ty = &unit.definition(*argument).unwrap().ty;
+                assert_eq!(ty.data_type(), &DataType::Utf8);
+                nullable |= ty.nullable();
+            }
+            assert_eq!(node.ty.data_type(), &DataType::Boolean);
+            assert_eq!(node.ty.nullable(), nullable);
         }
     }
-    n
+    count
 }
 
 /// Author the original single-column ordered scan with core residuals.

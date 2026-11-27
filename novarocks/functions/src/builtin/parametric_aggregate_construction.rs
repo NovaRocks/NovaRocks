@@ -42,7 +42,7 @@ impl ParametricAggregateBindingResolver {
                 work.step()?;
                 match argument {
                     FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
-                    FunctionArgument::Lambda { .. } => {
+                    FunctionArgument::Lambda { .. } | FunctionArgument::CandidateGroup { .. } => {
                         Err(FunctionBindingError::NoMatchingOverload)
                     }
                 }
@@ -73,7 +73,7 @@ impl ParametricAggregateBindingResolver {
             work.step()?;
             let value = match argument {
                 FunctionArgument::Value { value_type, .. } => value_type.clone(),
-                FunctionArgument::Lambda { .. } => {
+                FunctionArgument::Lambda { .. } | FunctionArgument::CandidateGroup { .. } => {
                     return Err(FunctionBindingError::NoMatchingOverload.into());
                 }
             };
@@ -146,7 +146,9 @@ impl ParametricAggregateBindingResolver {
                 Some(arguments) => &arguments[index],
                 None => match &request.arguments[index] {
                     FunctionArgument::Value { value_type, .. } => value_type.data_type(),
-                    FunctionArgument::Lambda { .. } => unreachable!("original Lambda gate"),
+                    FunctionArgument::Lambda { .. } | FunctionArgument::CandidateGroup { .. } => {
+                        unreachable!("checked aggregate value channels")
+                    }
                 },
             };
             let exact =

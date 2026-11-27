@@ -29,7 +29,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
-use novarocks_expression_contract::{BoundFunction, UnaryOperator};
+use novarocks_expression_contract::BoundFunction;
 use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, AggregateSequenceId, ConstantPoolId, ConstantReference,
     ValueId,
@@ -404,7 +404,7 @@ fn all_kinds() -> Fixture {
     let a = ExprId::new(0);
     let z = ExprId::new(15);
     let kinds = vec![
-        ExprKind::Value(ValueId::new(u32::MAX)),
+        ExprKind::input(ValueId::new(u32::MAX)),
         ExprKind::LambdaParameter {
             lambda: ExprId::new(8),
             ordinal: 1,
@@ -413,8 +413,8 @@ fn all_kinds() -> Fixture {
             pool: ConstantPoolId::new(u32::MAX),
             ordinal: 2,
         }),
-        ExprKind::Unary {
-            op: UnaryOperator::Not,
+        ExprKind::IsNull {
+            negated: true,
             expr: z,
         },
         ExprKind::Binary {
@@ -447,21 +447,14 @@ fn all_kinds() -> Fixture {
             expr: a,
             negated: true,
         },
-        ExprKind::InList {
-            expr: a,
-            list: Box::from([z, a, z]),
-            negated: true,
+        ExprKind::Conjunction {
+            args: Box::from([a, z, a, z]),
         },
-        ExprKind::Between {
-            expr: z,
-            low: a,
-            high: z,
-            negated: false,
+        ExprKind::Conjunction {
+            args: Box::from([z, a, z]),
         },
-        ExprKind::Like {
-            expr: a,
-            pattern: z,
-            negated: true,
+        ExprKind::Disjunction {
+            args: Box::from([a, z]),
         },
         ExprKind::Case {
             ieee_float_equality: false,
@@ -469,9 +462,8 @@ fn all_kinds() -> Fixture {
             when_then: Box::from([(a, z), (a, a)]),
             else_expr: Some(a),
         },
-        ExprKind::IsTruthValue {
+        ExprKind::IsNull {
             expr: z,
-            value: false,
             negated: true,
         },
     ];
@@ -560,8 +552,8 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
     );
     assert_eq!(
         out[3].kind,
-        Some(Kind::Unary(wire::UnaryExpression {
-            op: wire::UnaryOperator::Not as i32,
+        Some(Kind::IsNull(wire::IsNullExpression {
+            negated: true,
             expr_id: Some(15)
         }))
     );
@@ -622,27 +614,20 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
     );
     assert_eq!(
         out[11].kind,
-        Some(Kind::InList(wire::InListExpression {
-            expr_id: Some(0),
-            list_expr_ids: vec![15, 0, 15],
-            negated: true
+        Some(Kind::Conjunction(wire::ExpressionIds {
+            expr_ids: vec![0, 15, 0, 15]
         }))
     );
     assert_eq!(
         out[12].kind,
-        Some(Kind::Between(wire::BetweenExpression {
-            expr_id: Some(15),
-            low_expr_id: Some(0),
-            high_expr_id: Some(15),
-            negated: false
+        Some(Kind::Conjunction(wire::ExpressionIds {
+            expr_ids: vec![15, 0, 15]
         }))
     );
     assert_eq!(
         out[13].kind,
-        Some(Kind::Like(wire::LikeExpression {
-            expr_id: Some(0),
-            pattern_expr_id: Some(15),
-            negated: true
+        Some(Kind::Disjunction(wire::ExpressionIds {
+            expr_ids: vec![0, 15]
         }))
     );
     assert_eq!(
@@ -665,9 +650,8 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
     );
     assert_eq!(
         out[15].kind,
-        Some(Kind::IsTruthValue(wire::TruthValueExpression {
+        Some(Kind::IsNull(wire::IsNullExpression {
             expr_id: Some(15),
-            value: false,
             negated: true
         }))
     );
@@ -700,7 +684,7 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     rejected(&f);
     // Equal type roots do not prove the same function namespace emission.
     // No expression function lookup is needed to expose this mismatch.
-    let mut distinct = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let mut distinct = Fixture::single(ExprKind::input(ValueId::new(0)));
     distinct.other_function_token = true;
     rejected(&distinct);
 
@@ -774,7 +758,7 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
             ),
         ),
     ] {
-        let mut f = Fixture::new(vec![node(0, ExprKind::Value(ValueId::new(0)), left)]);
+        let mut f = Fixture::new(vec![node(0, ExprKind::input(ValueId::new(0)), left)]);
         f.roots.push((17, right));
         f.input[0].type_id = 17;
         rejected(&f);
@@ -1144,7 +1128,7 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
 #[test]
 fn sealed_namespace_preserves_original_loans_dense_sources_and_selected_constant() {
     let f = Fixture::new(vec![
-        node(0, ExprKind::Value(ValueId::new(u32::MAX)), int()),
+        node(0, ExprKind::input(ValueId::new(u32::MAX)), int()),
         node(
             1,
             ExprKind::Constant(ConstantReference {
@@ -1295,7 +1279,7 @@ fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tai
     );
     assert!(encoded.expression(0).unwrap().is_none());
     assert!(encoded.expression(u32::MAX).unwrap().is_none());
-    let foreign = node(0, ExprKind::Value(ValueId::new(0)), int());
+    let foreign = node(0, ExprKind::input(ValueId::new(0)), int());
     assert!(matches!(
         encoded.source_id(&foreign),
         Err(Error::InvalidShape(_))
@@ -1305,7 +1289,7 @@ fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tai
 
 #[test]
 fn sealed_namespace_queries_keep_every_original_control_prefix_and_ordinary_tail() {
-    let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let f = Fixture::single(ExprKind::input(ValueId::new(0)));
     let foreign = f.definitions.first().unwrap().clone();
     for ordinary in [false, true] {
         let invoke = |control: &Control| {
@@ -1362,7 +1346,7 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
         }),
         Fixture::new(
             (0..320)
-                .map(|id| node(id, ExprKind::Value(ValueId::new(u32::MAX)), int()))
+                .map(|id| node(id, ExprKind::input(ValueId::new(u32::MAX)), int()))
                 .collect(),
         ),
     ];
@@ -1419,7 +1403,7 @@ fn cast_modes_encode_separately_with_exact_target_carrier() {
         (Mode::StoreAssignment, Some(4)),
     ] {
         let mut fixture = Fixture::new(vec![
-            node(0, ExprKind::Value(ValueId::new(44)), source.clone()),
+            node(0, ExprKind::input(ValueId::new(44)), source.clone()),
             node(
                 1,
                 ExprKind::Cast {
@@ -1450,7 +1434,7 @@ fn namespace_rejects_sparse_or_duplicate_local_definition_ids_without_reminting(
     for ids in [[0, 7], [0, u32::MAX], [0, 0]] {
         let fixture = Fixture::new(
             ids.into_iter()
-                .map(|id| node(id, ExprKind::Value(ValueId::new(u32::MAX)), int()))
+                .map(|id| node(id, ExprKind::input(ValueId::new(u32::MAX)), int()))
                 .collect(),
         );
         assert!(matches!(

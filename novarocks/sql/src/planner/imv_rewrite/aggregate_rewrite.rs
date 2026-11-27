@@ -20,7 +20,7 @@ use arrow::datatypes::DataType;
 use std::collections::HashSet;
 
 use crate::analysis::{
-    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
+    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
 use crate::column_id::ColumnId;
 use crate::compiler::mv_rewrite::SqlImvAggregateStateRole;
@@ -546,27 +546,30 @@ fn build_relational_aggregate_change_stream(
         ctx.scalar_arena().borrow().constant_policy(),
         &ctx.control_view(),
     )?;
+    let zero_state = TypedExpr {
+        kind: ExprKind::FunctionCall {
+            volatility: state_all_zero_binding.semantics.volatility,
+            name: "state_all_zero".to_string(),
+            args: state_all_zero_args.into(),
+            distinct: false,
+            binding: state_all_zero_binding,
+        },
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+    };
+    let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
+    let args = vec![zero_state];
+    let binding = crate::binding::SqlFunctionBinding::resolve_operator_for_plan(
+        crate::planner::BINDING_AUTHORITY,
+        ctx.function_catalog(),
+        operator,
+        &args,
+        ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view(),
+    )?;
     let insert_predicate = bool_and(
         branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
-        TypedExpr {
-            kind: ExprKind::UnaryOp {
-                op: UnOp::Not,
-                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: crate::functions::builtin_function_volatility("state_all_zero"),
-                        name: "state_all_zero".to_string(),
-                        args: (state_all_zero_args).into(),
-                        distinct: false,
-                        binding: state_all_zero_binding,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        },
+        crate::common::binary_operator::typed_call(operator, binding, args),
     );
     let filtered = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -1978,15 +1981,16 @@ fn align_expr_column_refs_to_child(
             }
             Ok(())
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             align_expr_column_refs_to_child(left, input_columns)?;
             align_expr_column_refs_to_child(right, input_columns)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::IsTruthValue { expr, .. } => {
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) => {
             align_expr_column_refs_to_child(expr, input_columns)
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
@@ -1994,24 +1998,6 @@ fn align_expr_column_refs_to_child(
                 align_expr_column_refs_to_child(arg, input_columns)?;
             }
             Ok(())
-        }
-        ExprKind::InList { expr, list, .. } => {
-            align_expr_column_refs_to_child(expr, input_columns)?;
-            for item in list {
-                align_expr_column_refs_to_child(item, input_columns)?;
-            }
-            Ok(())
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            align_expr_column_refs_to_child(expr, input_columns)?;
-            align_expr_column_refs_to_child(low, input_columns)?;
-            align_expr_column_refs_to_child(high, input_columns)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            align_expr_column_refs_to_child(expr, input_columns)?;
-            align_expr_column_refs_to_child(pattern, input_columns)
         }
         ExprKind::Case {
             operand,
@@ -2051,7 +2037,8 @@ fn align_expr_column_refs_to_child(
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
             align_expr_column_refs_to_child(body, input_columns)
         }
-        ExprKind::LambdaParamRef { .. }
+        ExprKind::LocalValue(_)
+        | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
@@ -3992,30 +3979,17 @@ mod tests {
                 name.eq_ignore_ascii_case(target)
                     || args.iter().any(|arg| expr_contains_function(arg, target))
             }
-            ExprKind::BinaryOp { left, right, .. } => {
-                expr_contains_function(left, target) || expr_contains_function(right, target)
-            }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => expr_contains_function(left, target) || expr_contains_function(right, target),
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr)
             | ExprKind::Lambda { body: expr, .. }
             | ExprKind::LambdaFunction { body: expr, .. } => expr_contains_function(expr, target),
-            ExprKind::InList { expr, list, .. } => {
-                expr_contains_function(expr, target)
-                    || list.iter().any(|item| expr_contains_function(item, target))
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                expr_contains_function(expr, target)
-                    || expr_contains_function(low, target)
-                    || expr_contains_function(high, target)
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                expr_contains_function(expr, target) || expr_contains_function(pattern, target)
-            }
             ExprKind::Case {
                 operand,
                 when_then,
@@ -4033,6 +4007,7 @@ mod tests {
                         .is_some_and(|expr| expr_contains_function(expr, target))
             }
             ExprKind::ColumnRef { .. }
+            | ExprKind::LocalValue(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
             | ExprKind::Constant(_)

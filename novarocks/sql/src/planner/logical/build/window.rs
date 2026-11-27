@@ -203,22 +203,17 @@ fn logical_sort_satisfies_window_ordering(
 fn has_window_call(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::WindowCall { .. } => true,
-        ExprKind::BinaryOp { left, right, .. } => has_window_call(left) || has_window_call(right),
-        ExprKind::UnaryOp { expr, .. } => has_window_call(expr),
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => has_window_call(left) || has_window_call(right),
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             args.iter().any(has_window_call)
         }
         ExprKind::Cast { expr, .. } => has_window_call(expr),
-        ExprKind::IsNull { expr, .. } | ExprKind::IsTruthValue { expr, .. } => {
-            has_window_call(expr)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            has_window_call(expr) || list.iter().any(has_window_call)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => has_window_call(expr) || has_window_call(low) || has_window_call(high),
-        ExprKind::Like { expr, pattern, .. } => has_window_call(expr) || has_window_call(pattern),
+        ExprKind::IsNull { expr, .. } => has_window_call(expr),
         ExprKind::Case {
             operand,
             when_then,
@@ -385,6 +380,30 @@ fn rewrite_window_calls(
                 value_type: expr.value_type.clone(),
             }
         }
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => TypedExpr {
+            value_type: expr.value_type.clone(),
+            kind: ExprKind::Let {
+                binding: *binding,
+                initializer: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
+                    initializer,
+                    base_name,
+                    output_ids,
+                    window_exprs,
+                    counter,
+                )),
+                body: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
+                    body,
+                    base_name,
+                    output_ids,
+                    window_exprs,
+                    counter,
+                )),
+            },
+        },
         ExprKind::BinaryOp {
             left,
             right,
@@ -408,19 +427,6 @@ fn rewrite_window_calls(
                     counter,
                 )),
                 decimal_overflow_policy: *decimal_overflow_policy,
-            },
-            value_type: expr.value_type.clone(),
-        },
-        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            kind: ExprKind::UnaryOp {
-                op: *op,
-                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
             },
             value_type: expr.value_type.clone(),
         },
@@ -519,85 +525,6 @@ fn rewrite_window_calls(
             },
             value_type: expr.value_type.clone(),
         },
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                list: list
-                    .iter()
-                    .map(|item| {
-                        rewrite_window_calls(item, base_name, output_ids, window_exprs, counter)
-                    })
-                    .collect(),
-                negated: *negated,
-            },
-            value_type: expr.value_type.clone(),
-        },
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                low: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    low,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                high: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    high,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                negated: *negated,
-            },
-            value_type: expr.value_type.clone(),
-        },
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => TypedExpr {
-            kind: ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                pattern: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    pattern,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                negated: *negated,
-            },
-            value_type: expr.value_type.clone(),
-        },
         ExprKind::Case {
             ieee_float_equality,
             operand,
@@ -645,24 +572,6 @@ fn rewrite_window_calls(
                         counter,
                     ))
                 }),
-            },
-            value_type: expr.value_type.clone(),
-        },
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => TypedExpr {
-            kind: ExprKind::IsTruthValue {
-                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    output_ids,
-                    window_exprs,
-                    counter,
-                )),
-                value: *value,
-                negated: *negated,
             },
             value_type: expr.value_type.clone(),
         },

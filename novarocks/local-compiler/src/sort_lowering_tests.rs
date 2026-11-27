@@ -49,7 +49,7 @@ pub(super) fn package(
     let column = input.fragment.nodes()[&values].output.columns[0];
     let sort = NodeId::new(0);
     let definition = builder
-        .define(sort, source.value_type().clone(), ExprKind::Value(column))
+        .define(sort, source.value_type().clone(), ExprKind::input(column))
         .unwrap();
     match &mut mode {
         SortMode::Analytic { partition_by } | SortMode::PartitionTopN { partition_by, .. } => {
@@ -117,7 +117,7 @@ pub(super) fn package(
             .add_root(
                 project,
                 source.value_type().clone(),
-                ExprKind::Value(column),
+                ExprKind::input(column),
                 RootScope::Port(0),
                 EvaluationDemand::Value,
             )

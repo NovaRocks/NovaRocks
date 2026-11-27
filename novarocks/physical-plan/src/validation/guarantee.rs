@@ -83,16 +83,13 @@ pub(super) fn validate_guarantees_observed(
             for guarantee in relation.predicate_guarantees() {
                 let next = guarantees.checked_add(1);
                 if let Some(unit) = unit
-                    && unit
+                    && let Some(definition) = unit
                         .root(guarantee.predicate)
                         .and_then(|root| unit.definition(root.definition))
-                        .is_some_and(|definition| {
-                            matches!(definition.kind, ExprKind::FunctionCall { .. })
-                        })
+                    && let ExprKind::FunctionCall { function, args } = &definition.kind
                 {
-                    // Meter each map by its own retained cardinality. The
-                    // shape checks operate on two flat type bindings and the
-                    // bounded built-in identity, request and claim fields.
+                    // The exact atom proof reads the retained request, claim,
+                    // and each value whose source will be skipped at execution.
                     let mut own_work = add(value_lookup, 32, limits)?;
                     for count in [
                         unit.requests().len(),
@@ -102,6 +99,13 @@ pub(super) fn validate_guarantees_observed(
                         let lookup = btree::lookup_work(count).map_err(|_| resource(limits))?;
                         own_work = add(own_work, lookup, limits)?;
                         work.step()?;
+                    }
+                    if function.function_id.as_str() == OperatorFunction::InList.function_id_text()
+                    {
+                        let definition_lookup = btree::lookup_work(unit.definitions().len())
+                            .map_err(|_| resource(limits))?;
+                        let candidate_work = add(definition_lookup, 4, limits)?;
+                        own_work = add(own_work, mul(args.len(), candidate_work, limits)?, limits)?;
                     }
                     comparison_work = add(comparison_work, own_work, limits)?;
                 }
@@ -289,6 +293,9 @@ fn prove_provider_comparison(
     let Some(operator) = OperatorFunction::from_function_id(&function.function_id) else {
         return Ok(false);
     };
+    if operator == OperatorFunction::InList {
+        return prove_provider_membership(fragment, scan, unit, ordinal, definition, work);
+    }
     let (Some(_), Some(overload), FunctionKind::Scalar, [left, right]) = (
         operator.comparison(),
         operator.comparison_overload_text(),
@@ -304,8 +311,14 @@ fn prove_provider_comparison(
         return Ok(false);
     };
     let (column, constant, reference) = match (&left.kind, &right.kind) {
-        (ExprKind::Value(column), ExprKind::Constant(reference)) => (column, right, reference),
-        (ExprKind::Constant(reference), ExprKind::Value(column)) => (column, left, reference),
+        (
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(column)),
+            ExprKind::Constant(reference),
+        ) => (column, right, reference),
+        (
+            ExprKind::Constant(reference),
+            ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(column)),
+        ) => (column, left, reference),
         _ => return Ok(false),
     };
     let provider_value = fragment.values().get(column);
@@ -364,6 +377,104 @@ fn prove_provider_comparison(
         work.step()?;
     }
 
+    prove_provider_call_effects(unit, ordinal, definition, false, work)
+}
+
+fn prove_provider_membership(
+    fragment: &Fragment,
+    scan: NodeId,
+    unit: &BoundExprSet,
+    ordinal: RootOrdinal,
+    definition: &ExprNode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FragmentPropertyError> {
+    let ExprKind::FunctionCall { function, args } = &definition.kind else {
+        return Ok(false);
+    };
+    let [
+        FunctionArgumentType::Value(probe_type),
+        FunctionArgumentType::CandidateGroup { element_type },
+    ] = function.argument_types.as_ref()
+    else {
+        return Ok(false);
+    };
+    let Some((probe, candidates)) = args
+        .split_first()
+        .filter(|(_, candidates)| !candidates.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(probe) = unit.definition(*probe) else {
+        return Ok(false);
+    };
+    let Some(column) = probe.kind.input_value() else {
+        return Ok(false);
+    };
+    let Some(request) = unit.requests().get(&definition.id) else {
+        return Ok(false);
+    };
+    let [
+        StaticFunctionArgument::Value {
+            value_type: request_probe,
+            constant: None,
+        },
+        StaticFunctionArgument::CandidateGroup {
+            element_type: request_element,
+            members,
+        },
+    ] = request.arguments.as_ref()
+    else {
+        return Ok(false);
+    };
+    work.step()?;
+    if function.kind != FunctionKind::Scalar
+        || function.overload.as_str() != OperatorFunction::IN_LIST_OVERLOAD
+        || function.result_type != definition.ty
+        || definition.ty.logical_type() != ValueLogicalType::Physical
+        || definition.ty.data_type() != &DataType::Boolean
+        || definition.ty.nullable() != probe_type.nullable()
+        || request.logical_argument_count != 2
+        || request_probe != probe_type
+        || request_element != element_type
+        || probe_type != &probe.ty
+        || element_type.nullable()
+        || !supports_provider_scan_comparison(probe_type)
+        || !supports_provider_scan_comparison(element_type)
+        || !probe_type
+            .same_physical_binding_ignoring_root_nullability_observed(element_type, || {
+                work.step()
+            })?
+        || !matches!(fragment.values().get(&column).map(|value| &value.origin),
+            Some(ValueOrigin::ProviderField { scan_node, .. }) if *scan_node == scan)
+        || members.len() != candidates.len()
+    {
+        return Ok(false);
+    }
+    for (member, &candidate) in members.iter().zip(candidates) {
+        work.step()?;
+        let Some(candidate) = unit.definition(candidate) else {
+            return Ok(false);
+        };
+        let ExprKind::Constant(reference) = candidate.kind else {
+            return Ok(false);
+        };
+        if member.constant != Some(reference)
+            || &member.value_type != element_type
+            || &candidate.ty != element_type
+        {
+            return Ok(false);
+        }
+    }
+    prove_provider_call_effects(unit, ordinal, definition, true, work)
+}
+
+fn prove_provider_call_effects(
+    unit: &BoundExprSet,
+    ordinal: RootOrdinal,
+    definition: &ExprNode,
+    grouped: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FragmentPropertyError> {
     let (Some(root), Some(use_id)) = (unit.root(ordinal), unit.root_use(ordinal)) else {
         return Ok(false);
     };
@@ -375,19 +486,24 @@ fn prove_provider_comparison(
         return Ok(false);
     };
     let effects = &claim.effects;
+    let shape_matches = if grouped {
+        invocation.control == ControlShape::CandidateGroup
+            && effects.null_behavior == FunctionNullBehavior::ControlDefined
+    } else {
+        matches!(
+            invocation.control,
+            ControlShape::Eager | ControlShape::OrderedNull
+        ) && effects.null_behavior == FunctionNullBehavior::Strict
+    };
     Ok(root.scope == RootScope::Port(0)
         && root.demand == EvaluationDemand::TruthOnly
         && invocation.definition == definition.id
-        && matches!(
-            invocation.control,
-            ControlShape::Eager | ControlShape::OrderedNull
-        )
+        && shape_matches
         && invocation.context == claim.context
         && effects.proof_scope == CallProofScope::Region(invocation.context.region)
         && effects.value_stability == FunctionVolatility::Immutable
         && effects.failure_behavior == FunctionFailureBehavior::Propagate
         && effects.own_row_error == FunctionIntrinsicRowError::NoRowError
-        && effects.null_behavior == FunctionNullBehavior::Strict
         && effects
             .argument_control
             .matches_scalar_shape(invocation.control)

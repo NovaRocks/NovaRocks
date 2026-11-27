@@ -135,7 +135,7 @@ fn change_event_root_with_assignment(
         .define(
             node,
             ty(DataType::Int64, false),
-            ExprKind::Value(source_value),
+            ExprKind::input(source_value),
         )
         .unwrap();
     let effect = builder

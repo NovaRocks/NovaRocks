@@ -169,7 +169,7 @@ fn collection_fragment_with_scalar(
         .define(
             project,
             integer.clone(),
-            crate::ExprKind::Value(source_value),
+            crate::ExprKind::input(source_value),
         )
         .unwrap();
     let expression = builder.root_definition(

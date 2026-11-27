@@ -105,6 +105,7 @@ pub(crate) struct ColumnMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnRefFactory {
     next_id: u32,
+    next_local_binding: u32,
 
     columns: Vec<Option<ColumnMeta>>,
     pub(crate) prepared_description: Option<Box<crate::compiler::DescriptionAnalysis>>,
@@ -114,9 +115,16 @@ impl ColumnRefFactory {
     pub(crate) fn new() -> Self {
         Self {
             next_id: 1,
+            next_local_binding: 0,
             columns: Vec::new(),
             prepared_description: None,
         }
+    }
+
+    pub(crate) fn create_local_binding(&mut self) -> Option<crate::analysis::LocalBindingId> {
+        let id = self.next_local_binding;
+        self.next_local_binding = id.checked_add(1)?;
+        Some(crate::analysis::LocalBindingId(id))
     }
 
     /// Allocate a new [`ColumnId`] for a column with the given metadata.

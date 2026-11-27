@@ -305,6 +305,16 @@ fn snapshot_keys_only_prune_before_later_required_filter_effects() {
             true,
         ),
         (
+            "SELECT payload FROM system.metadata.fixture \
+             WHERE CAST(payload AS BIGINT) > 0 AND schema_name IN ('missing', 'other')",
+            false,
+        ),
+        (
+            "SELECT payload FROM system.metadata.fixture \
+             WHERE schema_name IN ('missing', 'other') AND CAST(payload AS BIGINT) > 0",
+            true,
+        ),
+        (
             "SELECT payload FROM (SELECT schema_name, payload FROM system.metadata.fixture \
              WHERE CAST(payload AS BIGINT) > 0) t WHERE schema_name = 'missing'",
             false,

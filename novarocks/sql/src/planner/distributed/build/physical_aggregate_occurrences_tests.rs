@@ -259,7 +259,7 @@ impl Fixture {
         };
         let kind = match source {
             Source::Star => None,
-            Source::Value => Some(ExprKind::Value(v.unwrap())),
+            Source::Value => Some(ExprKind::input(v.unwrap())),
             Source::Literal => Some(if *t.data_type() == DataType::Utf8 {
                 constant_kind(&mut pools, &t, checked::utf8("中国".into()))
             } else {
@@ -1292,7 +1292,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     b.add_values(leaf, Box::from([Box::from([seed_root])]), Box::from([key]))
         .unwrap();
     let key_expr = b
-        .add_expression(partial, key_type.clone(), ExprKind::Value(key))
+        .add_expression(partial, key_type.clone(), ExprKind::input(key))
         .unwrap();
     let partial_phase = AggregatePhase::Partial {
         sequence: AggregateSequenceId::new(u32::MAX),
@@ -1338,7 +1338,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         .add_expression(
             owner,
             binding.intermediate_type.clone(),
-            ExprKind::Value(state),
+            ExprKind::input(state),
         )
         .unwrap();
     let mut binding = binding;
@@ -1371,7 +1371,7 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     };
     let (kind, columns): (NodeKind, Box<[ValueId]>) = if topn {
         let key_expr = b
-            .add_expression(owner, key_type, ExprKind::Value(key))
+            .add_expression(owner, key_type, ExprKind::input(key))
             .unwrap();
         let key_root = root(&mut b, owner, key_expr, RootScope::Port(0));
         let order_root = root(&mut b, owner, key_expr, RootScope::Port(0));

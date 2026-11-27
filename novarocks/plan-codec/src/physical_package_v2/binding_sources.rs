@@ -66,6 +66,7 @@ pub(crate) struct FunctionRow<'source> {
 }
 enum ArgumentRow {
     Value(u32),
+    CandidateGroup(u32),
     Lambda {
         parameters: Range<usize>,
         result: u32,
@@ -655,6 +656,14 @@ impl<'source> BindingSources<'source> {
                 p::FunctionArgumentType::Value(ty) => self.arguments.push(ArgumentRow::Value(
                     root(Channel::Argument(argument), ty, budget, work)?,
                 )),
+                p::FunctionArgumentType::CandidateGroup { element_type } => {
+                    self.arguments.push(ArgumentRow::CandidateGroup(root(
+                        Channel::Argument(argument),
+                        element_type,
+                        budget,
+                        work,
+                    )?));
+                }
                 p::FunctionArgumentType::Lambda {
                     parameter_types,
                     result_type,
@@ -743,6 +752,10 @@ impl<'source> BindingSources<'source> {
         for row in &self.arguments {
             arguments.push(match row {
                 ArgumentRow::Value(id) => ArgumentTypeIds::Value(*id),
+                ArgumentRow::CandidateGroup(element) => ArgumentTypeIds::CandidateGroup {
+                    element: *element,
+                    members: &[],
+                },
                 ArgumentRow::Lambda { parameters, result } => ArgumentTypeIds::Lambda {
                     parameters: &self.parameters[parameters.clone()],
                     result: *result,

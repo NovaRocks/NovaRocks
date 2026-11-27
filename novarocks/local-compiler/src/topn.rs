@@ -199,7 +199,7 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
         for (id, value) in group_by {
             let definition = crate::expressions::bound_root(package, node.id, *id)?;
             work.step()?;
-            if !matches!(definition.kind, novarocks_expression_contract::ExprKind::Value(source) if source == *value)
+            if definition.kind.input_value() != Some(*value)
                 || !novarocks_physical_plan::grouped_state_topn_key_supported(
                     *comparator,
                     &definition.ty,
@@ -218,7 +218,7 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
         crate::assert_rows::reserve_vec(&mut permutation, order_by.len(), &mut work)?;
         for key in order_by {
             let definition = crate::expressions::bound_root(package, node.id, key.expr)?;
-            let novarocks_expression_contract::ExprKind::Value(value) = definition.kind else {
+            let Some(value) = definition.kind.input_value() else {
                 return Err((FragmentCompileError::Invalid(
                     "GroupedTopN rank is not a direct value",
                 ))

@@ -89,6 +89,8 @@ pub(super) fn compiled_unit_can_fold(
             PreparedPureKernel::Scalar(kernel)
                 if kernel.instance_inline_allocation_bytes() == 0 => {}
             PreparedPureKernel::ControlIntrinsic(_) => {}
+            PreparedPureKernel::Membership(prepared)
+                if !prepared.comparison().requires_comparison_allocator() => {}
             PreparedPureKernel::NullIf(recipe) => {
                 if let PreparedNullIfEquality::Composite(recipe) = recipe.equality()
                     && recipe.requires_allocator()
@@ -115,7 +117,8 @@ pub(super) fn compiled_unit_can_fold(
             | ArgumentControl::NullIf
             | ArgumentControl::Try
             | ArgumentControl::OrderedNull
-            | ArgumentControl::NoArguments => {}
+            | ArgumentControl::NoArguments
+            | ArgumentControl::CandidateGroup => {}
             ArgumentControl::TemporalSource(_) => return Ok(false),
             _ => return Err(invalid_program("unsupported frozen constant call control")),
         }

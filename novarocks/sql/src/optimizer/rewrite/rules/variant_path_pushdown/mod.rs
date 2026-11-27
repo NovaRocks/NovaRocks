@@ -263,7 +263,12 @@ mod tests {
     /// so after a round-trip through the arena the left/right positions may swap.
     fn binary_column_ref_side(expr: &TypedExpr) -> &TypedExpr {
         match &expr.kind {
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 if matches!(left.kind, ExprKind::ColumnRef { .. }) {
                     left
                 } else if matches!(right.kind, ExprKind::ColumnRef { .. }) {

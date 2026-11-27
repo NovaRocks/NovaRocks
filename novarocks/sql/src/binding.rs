@@ -26,7 +26,7 @@
 mod call_arguments;
 pub(crate) use call_arguments::{
     CapturedLogicalCallArguments, LogicalCallArgumentCaptureError, capture_logical_call_arguments,
-    move_authored_call_arguments_observed,
+    move_authored_call_arguments_observed, scalar_source_count,
 };
 
 mod aggregate_request;
@@ -94,6 +94,7 @@ pub(crate) enum PlanBindingAuthority {
     Optimizer(crate::optimizer::BindingAuthority),
     Planner(crate::planner::BindingAuthority),
     Planning(crate::planning::BindingAuthority),
+    MvRefresh(crate::mv_refresh::first_refresh::BindingAuthority),
     #[cfg(test)]
     Test,
 }
@@ -156,6 +157,31 @@ impl SqlFunctionBinding {
     ) -> Result<Self, novarocks_functions::FunctionBindingError> {
         let resolved =
             crate::analysis::select_scalar_function(catalog, name, args, constant_policy, control)?;
+        Ok(Self::from_plan(authority, resolved, policy))
+    }
+
+    pub(crate) fn resolve_operator_for_plan(
+        authority: PlanBindingAuthority,
+        catalog: &dyn crate::compiler::SqlFunctionCatalog,
+        operator: novarocks_type_contract::OperatorFunction,
+        args: &[crate::analysis::TypedExpr],
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, novarocks_functions::FunctionBindingError> {
+        let arguments = args
+            .iter()
+            .map(|arg| crate::analysis::function_argument(arg, constant_policy, control))
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolved = catalog.resolve_scalar_operator_binding(
+            operator,
+            novarocks_functions::FunctionBindingRequest {
+                logical_argument_count: arguments.len(),
+                arguments: &arguments,
+                expected_result_type: None,
+            },
+            control,
+        )?;
         Ok(Self::from_plan(authority, resolved, policy))
     }
 

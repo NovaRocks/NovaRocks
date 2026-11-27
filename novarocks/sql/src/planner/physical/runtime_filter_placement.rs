@@ -185,15 +185,18 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
                 out.push(*column_id);
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_typed_expr_column_ids(left, out);
             collect_typed_expr_column_ids(right, out);
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => collect_typed_expr_column_ids(expr, out),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) => {
+            collect_typed_expr_column_ids(expr, out)
+        }
         ExprKind::FunctionCall { args, .. } => {
             for arg in args {
                 collect_typed_expr_column_ids(arg, out);
@@ -207,23 +210,6 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
             for item in order_by {
                 collect_typed_expr_column_ids(&item.expr, out);
             }
-        }
-        ExprKind::InList { expr, list, .. } => {
-            collect_typed_expr_column_ids(expr, out);
-            for item in list {
-                collect_typed_expr_column_ids(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_typed_expr_column_ids(expr, out);
-            collect_typed_expr_column_ids(low, out);
-            collect_typed_expr_column_ids(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_typed_expr_column_ids(expr, out);
-            collect_typed_expr_column_ids(pattern, out);
         }
         ExprKind::Case {
             operand,
@@ -261,6 +247,7 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
         ExprKind::Lambda { body, .. } => collect_typed_expr_column_ids(body, out),
         ExprKind::Literal(_)
         | ExprKind::Constant(_)
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::SubqueryPlaceholder { .. } => {}
     }
@@ -413,14 +400,17 @@ fn bind_expression_to_columns(
                     .with_nullable(input.value_type.nullable())
                     .expect("validated root NULL contract");
             }
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 **left = bind(left, columns_by_id)?;
                 **right = bind(right, columns_by_id)?;
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr) => **expr = bind(expr, columns_by_id)?,
             ExprKind::FunctionCall { args, .. } => {
                 for argument in args {
@@ -437,23 +427,6 @@ fn bind_expression_to_columns(
                 for item in order_by {
                     item.expr = bind(&item.expr, columns_by_id)?;
                 }
-            }
-            ExprKind::InList { expr, list, .. } => {
-                **expr = bind(expr, columns_by_id)?;
-                for item in list {
-                    *item = bind(item, columns_by_id)?;
-                }
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                **expr = bind(expr, columns_by_id)?;
-                **low = bind(low, columns_by_id)?;
-                **high = bind(high, columns_by_id)?;
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                **expr = bind(expr, columns_by_id)?;
-                **pattern = bind(pattern, columns_by_id)?;
             }
             ExprKind::Case {
                 operand,
@@ -490,6 +463,7 @@ fn bind_expression_to_columns(
             }
             ExprKind::Literal(_)
             | ExprKind::Constant(_)
+            | ExprKind::LocalValue(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }

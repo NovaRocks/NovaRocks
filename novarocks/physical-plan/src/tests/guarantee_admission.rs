@@ -344,7 +344,7 @@ fn fixture_with_guarantee_count(
     let predicate_definition = match predicate {
         Predicate::Primitive | Predicate::PrimitiveWithIndependentVolatileResidual => {
             let value = builder
-                .define(scan, ty(DataType::Int64, false), ExprKind::Value(source))
+                .define(scan, ty(DataType::Int64, false), ExprKind::input(source))
                 .unwrap();
             builder
                 .define(
@@ -366,7 +366,7 @@ fn fixture_with_guarantee_count(
             let operand = ty(DataType::Int64, false);
             let result = ty(DataType::Boolean, false);
             let left = builder
-                .define(scan, operand.clone(), ExprKind::Value(source))
+                .define(scan, operand.clone(), ExprKind::input(source))
                 .unwrap();
             let right = if column_argument {
                 left
@@ -409,8 +409,8 @@ fn fixture_with_guarantee_count(
                 .define(
                     scan,
                     ty(DataType::Boolean, false),
-                    ExprKind::Unary {
-                        op: UnaryOperator::Not,
+                    ExprKind::IsNull {
+                        negated: true,
                         expr: call,
                     },
                 )
@@ -445,9 +445,8 @@ fn fixture_with_guarantee_count(
                 .define(
                     scan,
                     ty(DataType::Boolean, false),
-                    ExprKind::IsTruthValue {
+                    ExprKind::IsNull {
                         expr: predicate_definition,
-                        value: true,
                         negated: false,
                     },
                 )

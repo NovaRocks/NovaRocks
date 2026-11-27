@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow_schema::DataType;
-use novarocks_expression_contract::{ExprKind, ExprPort, RootScope, UnaryOperator};
+use novarocks_expression_contract::{ExprKind, ExprPort, RootScope};
 use novarocks_physical_plan::*;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
@@ -81,7 +81,7 @@ fn filter(demand: EvaluationDemand, scope: RootScope) -> (FragmentBuilder, NodeI
     let node = builder.reserve_node_id().unwrap();
     let draft = builder.unit(node).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     let root = draft.root(definition, demand, scope).unwrap();
     builder
@@ -126,15 +126,15 @@ fn aggregate_filter(
     let node = builder.reserve_node_id().unwrap();
     let draft = builder.unit(node).unwrap();
     let filter_input = draft
-        .add(None, filter_type.clone(), ExprKind::Value(input_values[0]))
+        .add(None, filter_type.clone(), ExprKind::input(input_values[0]))
         .unwrap();
     let filter_definition = match predicate {
         AggregateFilterDefinition::ComputedBoolean => draft
             .add(
                 None,
                 filter_type,
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
+                ExprKind::IsNull {
+                    negated: true,
                     expr: filter_input,
                 },
             )
@@ -155,7 +155,7 @@ fn aggregate_filter(
         .root(filter_definition, filter_demand, filter_scope)
         .unwrap();
     let argument = draft
-        .add(None, argument_type, ExprKind::Value(input_values[1]))
+        .add(None, argument_type, ExprKind::input(input_values[1]))
         .unwrap();
     let argument_root = draft
         .root(argument, EvaluationDemand::Value, RootScope::Port(0))
@@ -248,7 +248,7 @@ fn aggregate_filter_root_reads_the_original_boolean_input_only_on_update() {
         assert_eq!(root.get(), 0);
         let expression = fragment.root_expression(node.id, root).unwrap();
         let filter_value = fragment.nodes()[&node.inputs[0]].output.columns[0];
-        assert!(matches!(expression.kind, ExprKind::Value(value) if value == filter_value));
+        assert_eq!(expression.kind.input_value(), Some(filter_value));
         assert_eq!(expression.ty, boolean(true));
     }
     for phase in [
@@ -300,7 +300,7 @@ fn predicate_fragment(
     let node = b.reserve_node_id().unwrap();
     let draft = b.unit(node).unwrap();
     let leaf = draft
-        .add(None, boolean(true), ExprKind::Value(value))
+        .add(None, boolean(true), ExprKind::input(value))
         .unwrap();
     let definition = if let Some(null_test) = wrappers {
         draft
@@ -313,8 +313,8 @@ fn predicate_fragment(
                         negated: false,
                     }
                 } else {
-                    ExprKind::Unary {
-                        op: UnaryOperator::Not,
+                    ExprKind::IsNull {
+                        negated: true,
                         expr: leaf,
                     }
                 },
@@ -416,7 +416,7 @@ fn truth_only_change_condition_is_not_a_relation_search_predicate() {
     let node = b.reserve_node_id().unwrap();
     let draft = b.unit(node).unwrap();
     let leaf = draft
-        .add(None, boolean(true), ExprKind::Value(value))
+        .add(None, boolean(true), ExprKind::input(value))
         .unwrap();
     let root = draft
         .root(leaf, EvaluationDemand::TruthOnly, RootScope::Port(0))

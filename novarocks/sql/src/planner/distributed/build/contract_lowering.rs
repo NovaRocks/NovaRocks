@@ -67,9 +67,7 @@ use novarocks_type_contract::{
 };
 use sha2::{Digest, Sha256};
 use {
-    novarocks_expression_contract::{
-        BinaryOperator, BoundFunction, ExprKind as ContractExprKind, UnaryOperator,
-    },
+    novarocks_expression_contract::{BinaryOperator, BoundFunction, ExprKind as ContractExprKind},
     novarocks_physical_plan::{
         AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId,
         AggregateGrouping, AggregatePhase, AggregateSequenceId, BoundTableFunction,
@@ -117,7 +115,7 @@ use super::lowered_draft::{
     validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
-use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
+use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::binding::{
     AggregateRequestCaptureError, CapturedLogicalCallArguments, LogicalCallArgumentCaptureError,
     SqlFunctionBinding, capture_aggregate_logical_request, capture_logical_call_arguments,
@@ -1590,6 +1588,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             work: &mut self.work,
             constant_emission: &mut self.constant_emission,
             lambda_scope: &mut self.lambda_scope,
+            local_scope: Vec::new(),
             storage: scalar_emission::ScalarStorage::Node(scalar_emission::NodeScalarStorage {
                 fragment_id: fragment,
                 node: owner,
@@ -1921,7 +1920,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             .copied()
             .ok_or(ContractLoweringError::UnknownColumnReference(column))?;
         let ty = self.value_declared_type(value)?;
-        let definition = self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?;
+        let definition = self.add_unscoped_expression(node, ty, ContractExprKind::input(value))?;
         Ok((definition, value))
     }
 
@@ -2050,10 +2049,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 node,
             )
             .root_definition(*expression)
-            .map(|actual| match actual.kind {
-                ContractExprKind::Value(value) => Some(value),
-                _ => None,
-            });
+            .map(|actual| actual.kind.input_value());
             self.work.step()?;
             let source = source.ok_or(ContractLoweringError::InvalidAggregate {
                 detail: "aggregate state projection expression is absent",
@@ -3568,7 +3564,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let input = *value;
             let ty = self.value_declared_type(input)?;
             let mut expression =
-                self.add_unscoped_expression(node, ty, ContractExprKind::Value(input))?;
+                self.add_unscoped_expression(node, ty, ContractExprKind::input(input))?;
             if let Some(target) = projections.get(&input) {
                 expression = self.add_unscoped_expression(
                     node,
@@ -4257,7 +4253,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     let expression = self.add_unscoped_expression(
                         node,
                         source_ty.clone(),
-                        ContractExprKind::Value(value),
+                        ContractExprKind::input(value),
                     )?;
                     let expression_root = self.root_definition(
                         node,
@@ -4274,7 +4270,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     let read = self.add_unscoped_expression(
                         node,
                         source_ty.clone(),
-                        ContractExprKind::Value(value),
+                        ContractExprKind::input(value),
                     )?;
                     // A conversion changes what a value is, not whether it is
                     // there: a null converts to a null. So the converted value
@@ -7134,7 +7130,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let expression_id = match input_value {
                 Some(value) => {
                     let ty = self.value_declared_type(value)?;
-                    self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?
+                    self.add_unscoped_expression(node, ty, ContractExprKind::input(value))?
                 }
                 None => self.lower_expression(node, expression, &child.columns)?,
             };
@@ -7366,7 +7362,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     });
                 }
                 let definition =
-                    self.add_unscoped_expression(node, state_type, ContractExprKind::Value(state))?;
+                    self.add_unscoped_expression(node, state_type, ContractExprKind::input(state))?;
                 state_definition = Some(definition);
                 arguments.push(self.root_definition(
                     node,
@@ -8056,7 +8052,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.add_unscoped_expression(
                     node,
                     source_type.clone(),
-                    ContractExprKind::Value(source),
+                    ContractExprKind::input(source),
                 )?
             };
             let expression = if source_type == published_type || known_null {
@@ -8139,7 +8135,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             let ty = self.value_declared_type(value)?;
             let expression =
-                self.add_unscoped_expression(node, ty, ContractExprKind::Value(value))?;
+                self.add_unscoped_expression(node, ty, ContractExprKind::input(value))?;
             let expression_root = self.root_definition(
                 node,
                 expression,
@@ -9066,7 +9062,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     let expression = self.add_unscoped_expression(
                         node,
                         ty.clone(),
-                        ContractExprKind::Value(*source),
+                        ContractExprKind::input(*source),
                     )?;
                     let root = self.root_definition(
                         node,
@@ -10730,7 +10726,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
                 SqlOperationalChannelRole::Lambda
             }
-            None => {
+            Some(novarocks_functions::FunctionArgument::CandidateGroup { .. }) | None => {
                 return Err(ContractLoweringError::InvalidAggregate {
                     detail: "Single operational channel lacks its original capture ordinal",
                 });
@@ -12439,33 +12435,22 @@ fn expression_is_replica_deterministic(expression: &TypedExpr) -> bool {
         ExprKind::ColumnRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. } => true,
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             expression_is_replica_deterministic(left) && expression_is_replica_deterministic(right)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => expression_is_replica_deterministic(expr),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) => {
+            expression_is_replica_deterministic(expr)
+        }
         ExprKind::FunctionCall { args, binding, .. } => {
             binding.semantics.volatility == novarocks_physical_plan::FunctionVolatility::Immutable
                 && args.iter().all(expression_is_replica_deterministic)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            expression_is_replica_deterministic(expr)
-                && list.iter().all(expression_is_replica_deterministic)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            expression_is_replica_deterministic(expr)
-                && expression_is_replica_deterministic(low)
-                && expression_is_replica_deterministic(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            expression_is_replica_deterministic(expr)
-                && expression_is_replica_deterministic(pattern)
         }
         ExprKind::Case {
             operand,
@@ -12928,11 +12913,7 @@ const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
     }
     matches!(
         kind,
-        ContractExprKind::Unary { .. }
-            | ContractExprKind::Cast { .. }
-            | ContractExprKind::InList { .. }
-            | ContractExprKind::Between { .. }
-            | ContractExprKind::Like { .. }
+        ContractExprKind::Cast { .. }
             | ContractExprKind::Case { .. }
             | ContractExprKind::Conjunction { .. }
             | ContractExprKind::Disjunction { .. }
@@ -12942,25 +12923,12 @@ const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
 /// The expressions one of those kinds answers about.
 fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprId>) {
     match kind {
-        ContractExprKind::Unary { expr, .. } | ContractExprKind::Cast { expr, .. } => {
+        ContractExprKind::Cast { expr, .. } => {
             operands.push(*expr);
         }
         ContractExprKind::Binary { left, right, .. } => {
             operands.push(*left);
             operands.push(*right);
-        }
-        ContractExprKind::InList { expr, list, .. } => {
-            operands.push(*expr);
-            operands.extend(list.iter().copied());
-        }
-        ContractExprKind::Between {
-            expr, low, high, ..
-        } => {
-            operands.extend([*expr, *low, *high]);
-        }
-        ContractExprKind::Like { expr, pattern, .. } => {
-            operands.push(*expr);
-            operands.push(*pattern);
         }
         ContractExprKind::Conjunction { args } | ContractExprKind::Disjunction { args } => {
             operands.extend(args.iter().copied());
@@ -13088,16 +13056,10 @@ fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
     }
     match operator {
         BinOp::EqForNull => BinaryOperator::EqForNull,
-        BinOp::And | BinOp::Or => {
+        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction | BinOp::Or => {
             unreachable!("boolean connectives lower to n-ary Conjunction/Disjunction")
         }
         _ => unreachable!("neutral binary operator projection is exhaustive"),
-    }
-}
-
-fn lower_unary_operator(operator: UnOp) -> UnaryOperator {
-    match operator {
-        UnOp::Not => UnaryOperator::Not,
     }
 }
 
@@ -13336,20 +13298,17 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
 fn expression_kind_name(kind: &ExprKind) -> &'static str {
     match kind {
         ExprKind::ColumnRef { .. } => "ColumnRef",
+        ExprKind::Let { .. } => "Let",
+        ExprKind::LocalValue(_) => "LocalValue",
         ExprKind::LambdaParamRef { .. } => "LambdaParamRef",
         ExprKind::Literal(_) | ExprKind::Constant(_) => "Literal",
         ExprKind::BinaryOp { .. } => "BinaryOp",
-        ExprKind::UnaryOp { .. } => "UnaryOp",
         ExprKind::FunctionCall { .. } => "FunctionCall",
         ExprKind::LambdaFunction { .. } => "LambdaFunction",
         ExprKind::AggregateCall { .. } => "AggregateCall",
         ExprKind::Cast { .. } => "Cast",
         ExprKind::IsNull { .. } => "IsNull",
-        ExprKind::InList { .. } => "InList",
-        ExprKind::Between { .. } => "Between",
-        ExprKind::Like { .. } => "Like",
         ExprKind::Case { .. } => "Case",
-        ExprKind::IsTruthValue { .. } => "IsTruthValue",
         ExprKind::Nested(_) => "Nested",
         ExprKind::WindowCall { .. } => "WindowCall",
         ExprKind::SubqueryPlaceholder { .. } => "SubqueryPlaceholder",
@@ -20028,17 +19987,6 @@ mod tests {
                 right: novarocks_parser::ast::AstBox::new(signed.clone()),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(large.clone()),
-                list: (vec![signed.clone()]).into(),
-                negated: false,
-            },
-            ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(large.clone()),
-                low: novarocks_parser::ast::AstBox::new(signed.clone()),
-                high: novarocks_parser::ast::AstBox::new(large.clone()),
-                negated: false,
-            },
             ExprKind::Case {
                 ieee_float_equality: false,
                 operand: Some(novarocks_parser::ast::AstBox::new(large)),
@@ -20057,7 +20005,6 @@ mod tests {
             },
         ];
         for kind in kinds {
-            let membership = matches!(&kind, ExprKind::InList { .. });
             let expression = TypedExpr {
                 kind,
                 value_type: ValueType::new(DataType::Boolean, false),
@@ -20131,29 +20078,7 @@ mod tests {
                     &mut observer,
                 );
             assert_eq!(observer.calls, 1);
-            let finalized = result.unwrap().finish_observed(&control).unwrap();
-            if membership {
-                let fragment = finalized.plan().fragments().get(&ROOT_FRAGMENT_ID).unwrap();
-                let root = fragment.nodes().get(&fragment.root()).unwrap();
-                let NodeKind::Values { rows } = &root.kind else {
-                    panic!("expected Values root");
-                };
-                let unit = fragment.unit(root.id).unwrap();
-                let expression = fragment.root_expression(root.id, rows[0][0]).unwrap();
-                let ContractExprKind::InList { expr, list, .. } = &expression.kind else {
-                    panic!("expected the finalized membership expression");
-                };
-                let [candidate] = list.as_ref() else {
-                    panic!("expected one converted membership candidate");
-                };
-                let source = unit.definition(*expr).unwrap();
-                let candidate = unit.definition(*candidate).unwrap();
-                assert_eq!(
-                    source.ty.logical_type(),
-                    novarocks_type_contract::ValueLogicalType::LargeInt
-                );
-                assert_eq!(candidate.ty, source.ty);
-            }
+            result.unwrap().finish_observed(&control).unwrap();
         }
     }
 

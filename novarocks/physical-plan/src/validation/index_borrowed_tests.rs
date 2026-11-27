@@ -400,7 +400,7 @@ fn genuine_wide_project_fanout_keeps_one_source_port_with_full_original_occurren
     for value in values.iter().take(256) {
         let project = builder.reserve_node_id().unwrap();
         let expression = builder
-            .define(project, ty.clone(), ExprKind::Value(*value))
+            .define(project, ty.clone(), ExprKind::input(*value))
             .unwrap();
         let expression = builder.root_definition(
             project,

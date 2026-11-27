@@ -192,7 +192,7 @@ impl Fixture {
                     pool: ConstantPoolId::new(u32::MAX),
                     ordinal: 1,
                 }),
-                Source::Value => ExprKind::Value(value),
+                Source::Value => ExprKind::input(value),
                 Source::ChildError => {
                     let a = constant(
                         &mut builder,

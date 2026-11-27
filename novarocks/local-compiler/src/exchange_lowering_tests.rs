@@ -176,10 +176,10 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let root = if repeated {
         let project = NodeId::new(11);
         let read_a = producer
-            .fixture_value_root(project, ty.clone(), ExprKind::Value(a))
+            .fixture_value_root(project, ty.clone(), ExprKind::input(a))
             .unwrap();
         let read_b = producer
-            .fixture_value_root(project, b_type.clone(), ExprKind::Value(b))
+            .fixture_value_root(project, b_type.clone(), ExprKind::input(b))
             .unwrap();
         let repeated_b = producer.fixture_repeated_root(project, read_b).unwrap();
         producer
@@ -1085,7 +1085,7 @@ fn full_outer_exchange_input_packages(
             match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
             left: {
                 let definition = consumer
-                    .fixture_definition(join, ty.clone(), ExprKind::Value(imported[0][ordinal]))
+                    .fixture_definition(join, ty.clone(), ExprKind::input(imported[0][ordinal]))
                     .unwrap();
                 consumer
                     .fixture_occurrence(
@@ -1098,7 +1098,7 @@ fn full_outer_exchange_input_packages(
             },
             right: {
                 let definition = consumer
-                    .fixture_definition(join, ty.clone(), ExprKind::Value(imported[1][ordinal]))
+                    .fixture_definition(join, ty.clone(), ExprKind::input(imported[1][ordinal]))
                     .unwrap();
                 consumer
                     .fixture_occurrence(

@@ -48,6 +48,7 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
         OperatorFunction::Add.catalog_name(),
         OperatorFunction::Divide.catalog_name(),
         OperatorFunction::Equal.catalog_name(),
+        OperatorFunction::InList.catalog_name(),
     ] {
         let definition = metadata.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();

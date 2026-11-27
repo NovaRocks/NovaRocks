@@ -261,7 +261,7 @@ mod validation_error_tests {
             .iter()
             .map(|input_value| {
                 let expression = builder
-                    .define(project, value_type.clone(), ExprKind::Value(*input_value))
+                    .define(project, value_type.clone(), ExprKind::input(*input_value))
                     .unwrap();
                 let expression = builder.root_definition(
                     project,
@@ -501,7 +501,7 @@ mod validation_error_tests {
         for value in source_values.iter().take(256) {
             let project = builder.reserve_node_id().unwrap();
             let expression = builder
-                .define(project, value_type.clone(), ExprKind::Value(*value))
+                .define(project, value_type.clone(), ExprKind::input(*value))
                 .unwrap();
             let expression = builder.root_definition(
                 project,

@@ -409,7 +409,7 @@ fn aggregate_topn_grouped_parent_matches_with(
     let Some(expression) = fragment.root_expression(aggregate.id, producer_expression) else {
         return Ok(false);
     };
-    let crate::ExprKind::Value(input) = expression.kind else {
+    let Some(input) = expression.kind.input_value() else {
         return Ok(false);
     };
     let Some(input_definition) = fragment.values().get(&input) else {
@@ -1047,13 +1047,9 @@ pub(crate) fn trace_topn_reduction_inputs(
                         }
                         dead_end!();
                     };
-                    let Some(source) =
-                        fragment
-                            .root_expression(node.id, *expression)
-                            .and_then(|expression| match expression.kind {
-                                crate::ExprKind::Value(source) => Some(source),
-                                _ => None,
-                            })
+                    let Some(source) = fragment
+                        .root_expression(node.id, *expression)
+                        .and_then(|expression| expression.kind.input_value())
                     else {
                         if traced.key_contract_pending {
                             return false;

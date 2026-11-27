@@ -176,10 +176,10 @@ fn append_broadcast_join(
 ) -> NodeId {
     let node = builder.reserve_node_id().unwrap();
     let left_key = builder
-        .define(node, ty(DataType::Int64, false), ExprKind::Value(left.1))
+        .define(node, ty(DataType::Int64, false), ExprKind::input(left.1))
         .unwrap();
     let right_key = builder
-        .define(node, ty(DataType::Int64, false), ExprKind::Value(right.1))
+        .define(node, ty(DataType::Int64, false), ExprKind::input(right.1))
         .unwrap();
     let left_key = builder.root_definition(
         node,

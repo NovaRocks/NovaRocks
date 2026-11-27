@@ -42,7 +42,7 @@ fn predicate_unit(layout: &StaticLayout, ty: &FunctionValueType) -> Arc<Compiled
     let mut draft = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
     });
-    let definition = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+    let definition = draft.add(None, ty.clone(), ExprKind::input(value)).unwrap();
     let root = draft
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();

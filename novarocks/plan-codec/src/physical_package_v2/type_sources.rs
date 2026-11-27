@@ -127,6 +127,10 @@ pub(crate) enum PackageTypeChannel {
         ordinal: usize,
     },
     LambdaResult(usize),
+    CandidateMember {
+        argument: usize,
+        ordinal: usize,
+    },
     ExpressionLambdaParameter(usize),
     CastTarget,
     WriteInput,
@@ -262,7 +266,8 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
     ) -> Result<(), E> {
         for (argument, ty) in arguments.iter().enumerate() {
             match ty {
-                p::FunctionArgumentType::Value(ty) => {
+                p::FunctionArgumentType::Value(ty)
+                | p::FunctionArgumentType::CandidateGroup { element_type: ty } => {
                     self.value(owner, PackageTypeChannel::Argument(argument), ty)?
                 }
                 p::FunctionArgumentType::Lambda {
@@ -296,6 +301,19 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
             match value {
                 p::StaticFunctionArgument::Value { value_type, .. } => {
                     self.value(owner, PackageTypeChannel::Argument(argument), value_type)?
+                }
+                p::StaticFunctionArgument::CandidateGroup {
+                    element_type,
+                    members,
+                } => {
+                    self.value(owner, PackageTypeChannel::Argument(argument), element_type)?;
+                    for (ordinal, member) in members.iter().enumerate() {
+                        self.value(
+                            owner,
+                            PackageTypeChannel::CandidateMember { argument, ordinal },
+                            &member.value_type,
+                        )?;
+                    }
                 }
                 p::StaticFunctionArgument::Lambda {
                     parameter_types,
@@ -474,18 +492,14 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
                         PackageTypeSource::Carrier,
                     )?,
                     novarocks_expression_contract::ExprKind::Value(_)
+                    | novarocks_expression_contract::ExprKind::Let { .. }
                     | novarocks_expression_contract::ExprKind::LambdaParameter { .. }
                     | novarocks_expression_contract::ExprKind::Constant(_)
-                    | novarocks_expression_contract::ExprKind::Unary { .. }
                     | novarocks_expression_contract::ExprKind::Binary { .. }
                     | novarocks_expression_contract::ExprKind::Conjunction { .. }
                     | novarocks_expression_contract::ExprKind::Disjunction { .. }
                     | novarocks_expression_contract::ExprKind::IsNull { .. }
-                    | novarocks_expression_contract::ExprKind::InList { .. }
-                    | novarocks_expression_contract::ExprKind::Between { .. }
-                    | novarocks_expression_contract::ExprKind::Like { .. }
-                    | novarocks_expression_contract::ExprKind::Case { .. }
-                    | novarocks_expression_contract::ExprKind::IsTruthValue { .. } => {}
+                    | novarocks_expression_contract::ExprKind::Case { .. } => {}
                 }
                 walk.completed()?;
             }

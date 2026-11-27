@@ -38,11 +38,21 @@ use std::{
 pub trait ExpressionDefinitionMembership<D> {
     fn definition_count(&self) -> usize;
     fn contains_definition(&self, definition: D) -> bool;
+    /// A checked expansion moves multiple definitions into one source position.
+    fn control_source_position(&self, _definition: D) -> Option<u32> {
+        None
+    }
+    fn has_control_expansions(&self) -> bool {
+        false
+    }
 }
 
 /// Existing expression-arena and invocation limits, shared by both projections.
 pub const MAX_CONTROL_DEFINITIONS: usize = 262_144;
 pub const MAX_CONTROL_DEPTH: usize = 96;
+/// The checked expansion grammar has at most four physical controls in one
+/// position: an optional wrapper, an optional binding, a branch, and a call.
+pub const MAX_EXPANDED_CONTROL_DEPTH: usize = 4 * MAX_CONTROL_DEPTH;
 pub const MAX_CONTROL_USE_REFERENCES: usize = 65_536;
 
 /// Original zero-based pattern position in every ordered regexp overload.
@@ -60,6 +70,8 @@ pub enum ControlShape {
     /// which inherits the wrapper's demand. A lambda with no locals has one
     /// argument: its body.
     LambdaBody,
+    /// Evaluate the initializer once, then enter the body on successful rows.
+    Let,
     Conjunction,
     Disjunction,
     If,
@@ -74,15 +86,8 @@ pub enum ControlShape {
     /// Demand each next argument on successful rows, applying the selected
     /// overload's NULL policy to the preceding position.
     OrderedNull,
-    /// Four ordered source occurrences and two intervening comparisons.
-    Between {
-        negated: bool,
-    },
-    /// One source followed by ordered candidate comparisons. Matching never
-    /// suppresses a later candidate; an empty invocation skips candidates.
-    Membership {
-        negated: bool,
-    },
+    /// One probe and its ordered candidate group, using the selected owner.
+    CandidateGroup,
     TemporalSource(crate::TemporalSourceShape),
     Case {
         simple: bool,
@@ -108,6 +113,8 @@ pub enum GuardKind {
         arm: u32,
     },
     CaseElse,
+    /// Successful initializer rows enter this body, including SQL NULL.
+    LetBody,
     TryBody,
     /// A successful, non-NULL left value is retained by this invocation.
     NullIfAfterLeft,
@@ -116,12 +123,8 @@ pub enum GuardKind {
     TemporalAfterSource {
         ordinal: u32,
     },
-    /// The preceding source (and completed bound comparison) succeeded.
-    BetweenAfterSource {
-        ordinal: u32,
-    },
-    /// Source/comparison completed and current invocation is nonempty.
-    MembershipAfterSource {
+    /// The previous demand succeeded. After the probe, require its value.
+    CandidateAfterSource {
         ordinal: u32,
     },
     /// The preceding regexp argument supplied a non-NULL value and completed
@@ -160,6 +163,13 @@ pub struct ExpressionControlFlow<D> {
     uses: Arc<ControlFlowOwned<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>>,
     roots: Arc<ControlFlowOwned<Box<[ExpressionUseId]>>>,
     use_references: usize,
+    physical_use_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct UseDepth {
+    source: u32,
+    physical: u32,
 }
 /// Private immutable backing; an independently cloned graph retains only its
 /// own maps/root array and their original creation responsibility.
@@ -252,12 +262,13 @@ impl<D: Copy> ExpressionControlFlow<D> {
             return Err(cause.clone().into());
         }
         work.finish()?;
-        let (regions, uses, roots, references) = parts?;
+        let (regions, uses, roots, references, physical_use_depth) = parts?;
         Ok(Self {
             regions: Arc::new(ControlFlowOwned::pure(regions)),
             uses: Arc::new(ControlFlowOwned::pure(uses)),
             roots: Arc::new(ControlFlowOwned::pure(roots.into_boxed_slice())),
             use_references: references,
+            physical_use_depth,
         })
     }
 
@@ -271,7 +282,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
         admit: &mut impl FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExpressionControlFlowError> {
-        let (regions, uses, roots, references) =
+        let (regions, uses, roots, references, physical_use_depth) =
             Self::parts_in(regions, uses, definitions, admit, true, work)?;
         work.flush()?;
         let regions = Arc::new(ControlFlowOwned::pure(regions));
@@ -288,6 +299,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
             uses,
             roots,
             use_references: references,
+            physical_use_depth,
         })
     }
     /// Actual creation of the same validated graph, with temporary validation
@@ -337,7 +349,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
         // The sole constructor geometry visitor also supplies the existing
         // cumulative pure model. It quotes no input payload or source bytes.
         creation::observe::<D, H>(regions.len(), uses.len(), creation, work)?;
-        let (regions, uses, roots, references) =
+        let (regions, uses, roots, references, physical_use_depth) =
             Self::parts_in(regions, uses, definitions, &mut |_| Ok(()), true, work)
                 .map_err(Failure::from)?;
         work.flush().map_err(Failure::Control)?;
@@ -376,6 +388,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
             uses,
             roots,
             use_references: references,
+            physical_use_depth,
         })
     }
     // Keep the original facade's loop observations; the caller-owned port
@@ -400,6 +413,12 @@ impl<D: Copy> ExpressionControlFlow<D> {
             preflight_flow(&regions, &uses, admit, work)?;
         }
         (|| {
+            let expanded = definitions.has_control_expansions();
+            let physical_limit = if expanded {
+                MAX_EXPANDED_CONTROL_DEPTH
+            } else {
+                MAX_CONTROL_DEPTH
+            };
             let mut region_index = BTreeMap::new();
             for region in regions {
                 if observed {
@@ -493,6 +512,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
                 }
             }
             let mut visited = 0usize;
+            let mut physical_use_depth = 0usize;
             loop {
                 if observed {
                     work.flush()?;
@@ -505,7 +525,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
                 let Some(parent) = next else { break };
                 visited += 1;
                 let depth = depths[&parent];
-                if depth > MAX_CONTROL_DEPTH {
+                if depth > physical_limit {
                     return Err(ExpressionControlFlowError::TooDeep);
                 }
                 for child in children.get(&parent).into_iter().flatten() {
@@ -616,7 +636,13 @@ impl<D: Copy> ExpressionControlFlow<D> {
                 if *degree == 0 {
                     roots.push(*id);
                     ready.push_back(*id);
-                    use_depths.insert(*id, 1usize);
+                    use_depths.insert(
+                        *id,
+                        UseDepth {
+                            source: 1,
+                            physical: 1,
+                        },
+                    );
                 }
                 work.step()?;
                 if observed {
@@ -636,10 +662,17 @@ impl<D: Copy> ExpressionControlFlow<D> {
                 let Some(id) = next else { break };
                 visited += 1;
                 let depth = use_depths[&id];
-                if depth > MAX_CONTROL_DEPTH {
+                if depth.source as usize > MAX_CONTROL_DEPTH
+                    || depth.physical as usize > physical_limit
+                {
                     return Err(ExpressionControlFlowError::TooDeep);
                 }
-                for child in &use_index[&id].arguments {
+                physical_use_depth = physical_use_depth.max(depth.physical as usize);
+                let parent = &use_index[&id];
+                let source = expanded
+                    .then(|| definitions.control_source_position(parent.definition))
+                    .flatten();
+                for child in &parent.arguments {
                     if observed {
                         work.flush()?;
                     }
@@ -647,7 +680,17 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     *degree -= 1;
                     if *degree == 0 {
                         ready.push_back(*child);
-                        use_depths.insert(*child, depth + 1);
+                        let same_source = source.is_some_and(|position| {
+                            definitions.control_source_position(use_index[child].definition)
+                                == Some(position)
+                        });
+                        use_depths.insert(
+                            *child,
+                            UseDepth {
+                                source: depth.source + u32::from(!same_source),
+                                physical: depth.physical + 1,
+                            },
+                        );
                     }
                     work.step()?;
                     if observed {
@@ -662,13 +705,22 @@ impl<D: Copy> ExpressionControlFlow<D> {
             if visited != use_index.len() {
                 return Err(ExpressionControlFlowError::Cycle);
             }
-            Ok((region_index, use_index, roots, references))
+            Ok((
+                region_index,
+                use_index,
+                roots,
+                references,
+                physical_use_depth,
+            ))
         })()
     }
     /// Every invocation with no parent argument edge, in stable ID order.
     /// A physical projection must bind these roots to exact operator sites.
     pub fn root_use_ids(&self) -> &[ExpressionUseId] {
         &self.roots
+    }
+    pub fn physical_use_depth(&self) -> usize {
+        self.physical_use_depth
     }
     pub fn regions(&self) -> &BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion> {
         &self.regions
@@ -686,6 +738,7 @@ type FlowParts<D> = (
     BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>,
     BTreeMap<ExpressionUseId, ExpressionInvocation<D>>,
     Vec<ExpressionUseId>,
+    usize,
     usize,
 );
 impl From<ControlResourceError> for ExpressionControlFlowError {
@@ -799,12 +852,11 @@ fn validate_arity(shape: ControlShape, count: usize) -> Result<(), ExpressionCon
         ControlShape::Conjunction | ControlShape::Disjunction => count > 0,
         ControlShape::If => count == 3,
         ControlShape::Coalesce => count > 0,
-        ControlShape::NullIf => count == 2,
+        ControlShape::NullIf | ControlShape::Let => count == 2,
         ControlShape::Try => count == 1,
         ControlShape::OrderedRegexp => (2..=4).contains(&count),
         ControlShape::OrderedNull => true,
-        ControlShape::Between { .. } => count == 4,
-        ControlShape::Membership { .. } => count > 0,
+        ControlShape::CandidateGroup => count >= 2,
         ControlShape::TemporalSource(shape) => count == shape.source_count(),
         ControlShape::HigherOrder { body_ordinal, .. } => (body_ordinal as usize) < count,
         ControlShape::Case {
@@ -841,6 +893,7 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
             ordinal: ordinal as u32,
         }),
         ControlShape::NullIf => (ordinal == 1).then_some(GuardKind::NullIfAfterLeft),
+        ControlShape::Let => (ordinal == 1).then_some(GuardKind::LetBody),
         ControlShape::Try => Some(GuardKind::TryBody),
         ControlShape::OrderedRegexp => {
             (ordinal > 0).then(|| GuardKind::OrderedRegexpAfterArgument {
@@ -850,14 +903,9 @@ fn control_argument_guard(shape: ControlShape, ordinal: usize) -> Option<GuardKi
         ControlShape::OrderedNull => (ordinal > 0).then(|| GuardKind::OrderedNullAfterArgument {
             ordinal: (ordinal - 1) as u32,
         }),
-        ControlShape::Between { .. } => (ordinal > 0).then(|| GuardKind::BetweenAfterSource {
+        ControlShape::CandidateGroup => (ordinal > 0).then(|| GuardKind::CandidateAfterSource {
             ordinal: (ordinal - 1) as u32,
         }),
-        ControlShape::Membership { .. } => {
-            (ordinal > 0).then(|| GuardKind::MembershipAfterSource {
-                ordinal: (ordinal - 1) as u32,
-            })
-        }
         ControlShape::TemporalSource(source) => {
             if source == crate::TemporalSourceShape::SecondsCastOther && ordinal == 2 {
                 Some(GuardKind::TemporalInvocationNull)
@@ -909,9 +957,10 @@ fn control_argument_demand(
         | ControlShape::OrderedRegexp
         | ControlShape::OrderedNull
         | ControlShape::TemporalSource(_)
-        | ControlShape::Between { .. }
-        | ControlShape::Membership { .. } => Value,
+        | ControlShape::CandidateGroup => Value,
         ControlShape::Conjunction | ControlShape::Disjunction => owner,
+        ControlShape::Let if ordinal == 1 => owner,
+        ControlShape::Let => Value,
         ControlShape::LambdaBody => {
             if ordinal + 1 == count {
                 owner

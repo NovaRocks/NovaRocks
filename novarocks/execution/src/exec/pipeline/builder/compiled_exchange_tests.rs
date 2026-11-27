@@ -1197,7 +1197,7 @@ fn drop_distribution_key_project_plan(
     let selected = consumer
         .unit(project)
         .unwrap()
-        .add(None, int64(), ExprKind::Value(b_import))
+        .add(None, int64(), ExprKind::input(b_import))
         .unwrap();
     let selected = consumer
         .unit(project)

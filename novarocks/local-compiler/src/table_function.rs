@@ -100,13 +100,20 @@ pub(crate) fn admit_table_function(
         ));
     }
     for argument in function.argument_types.iter() {
-        let lambda = matches!(argument, FunctionArgumentType::Lambda { .. });
         work.step()?;
-        if lambda {
-            return Err(FragmentCompileError::Unsupported {
-                node: Some(node.id),
-                feature: "table function with a lambda argument",
-            });
+        match argument {
+            FunctionArgumentType::Value(_) => {}
+            FunctionArgumentType::Lambda { .. } => {
+                return Err(FragmentCompileError::Unsupported {
+                    node: Some(node.id),
+                    feature: "table function with a lambda argument",
+                });
+            }
+            FunctionArgumentType::CandidateGroup { .. } => {
+                return Err(FragmentCompileError::Invalid(
+                    "table function contains a scalar candidate group",
+                ));
+            }
         }
     }
     work.flush()?;

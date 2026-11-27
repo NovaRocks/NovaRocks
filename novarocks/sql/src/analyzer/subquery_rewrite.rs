@@ -2001,13 +2001,7 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: ty.clone(),
             };
             if negated {
-                replacement = TypedExpr {
-                    kind: ExprKind::UnaryOp {
-                        op: UnOp::Not,
-                        expr: novarocks_parser::ast::AstBox::new(replacement),
-                    },
-                    value_type: ty,
-                };
+                replacement = self.analyze_boolean_not(replacement, in_expr_ast.span())?;
             }
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -2604,13 +2598,7 @@ impl<'a> AnalyzerContext<'a> {
             value_type: value_type.clone(),
         };
         if negated {
-            replacement = TypedExpr {
-                kind: ExprKind::UnaryOp {
-                    op: UnOp::Not,
-                    expr: novarocks_parser::ast::AstBox::new(replacement),
-                },
-                value_type,
-            };
+            replacement = self.analyze_boolean_not(replacement, span)?;
         }
         select.apply_specs.push(ApplyScalarSpec {
             mark_probe: Some(lhs),
@@ -3569,6 +3557,28 @@ fn qualify_inner_shadowing_column_refs(
     outer_scope: &AnalyzerScope,
 ) -> TypedExpr {
     match expr.kind {
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => TypedExpr {
+            value_type: expr.value_type,
+            kind: ExprKind::Let {
+                binding,
+                initializer: novarocks_parser::ast::AstBox::new(
+                    qualify_inner_shadowing_column_refs(
+                        initializer.into_inner(),
+                        inner_scope,
+                        outer_scope,
+                    ),
+                ),
+                body: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    body.into_inner(),
+                    inner_scope,
+                    outer_scope,
+                )),
+            },
+        },
         ExprKind::ColumnRef {
             column_id,
             qualifier: None,
@@ -3611,18 +3621,6 @@ fn qualify_inner_shadowing_column_refs(
                     outer_scope,
                 )),
                 decimal_overflow_policy,
-            },
-        },
-        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            value_type: expr.value_type,
-
-            kind: ExprKind::UnaryOp {
-                op,
-                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    inner.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
             },
         },
         ExprKind::FunctionCall {
@@ -3726,74 +3724,6 @@ fn qualify_inner_shadowing_column_refs(
                 negated,
             },
         },
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type,
-
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    inner.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                list: list
-                    .into_iter()
-                    .map(|item| qualify_inner_shadowing_column_refs(item, inner_scope, outer_scope))
-                    .collect(),
-                negated,
-            },
-        },
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type,
-
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    inner.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                low: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    low.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                high: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    high.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                negated,
-            },
-        },
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type,
-
-            kind: ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    inner.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                pattern: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    pattern.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                negated,
-            },
-        },
         ExprKind::Case {
             ieee_float_equality,
             operand,
@@ -3827,23 +3757,6 @@ fn qualify_inner_shadowing_column_refs(
                         outer_scope,
                     ))
                 }),
-            },
-        },
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type,
-
-            kind: ExprKind::IsTruthValue {
-                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
-                    inner.into_inner(),
-                    inner_scope,
-                    outer_scope,
-                )),
-                value,
-                negated,
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
@@ -3913,6 +3826,7 @@ fn qualify_inner_shadowing_column_refs(
             kind: ExprKind::Constant(value),
         },
         kind @ (ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::SubqueryPlaceholder { .. }) => TypedExpr {
@@ -3969,13 +3883,16 @@ fn collect_outer_ref_column_ids(
                 out.push(*column_id);
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_outer_ref_column_ids(left, inner_scope, outer_scope, out);
             collect_outer_ref_column_ids(right, inner_scope, outer_scope, out);
         }
-        ExprKind::UnaryOp { expr: inner, .. }
-        | ExprKind::IsNull { expr: inner, .. }
-        | ExprKind::IsTruthValue { expr: inner, .. }
+        ExprKind::IsNull { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
         | ExprKind::Nested(inner)
         | ExprKind::LambdaFunction { body: inner, .. }
@@ -4020,32 +3937,6 @@ fn collect_outer_ref_column_ids(
                 collect_outer_ref_column_ids(else_expr, inner_scope, outer_scope, out);
             }
         }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
-            for item in list {
-                collect_outer_ref_column_ids(item, inner_scope, outer_scope, out);
-            }
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
-            collect_outer_ref_column_ids(low, inner_scope, outer_scope, out);
-            collect_outer_ref_column_ids(high, inner_scope, outer_scope, out);
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            ..
-        } => {
-            collect_outer_ref_column_ids(inner, inner_scope, outer_scope, out);
-            collect_outer_ref_column_ids(pattern, inner_scope, outer_scope, out);
-        }
         ExprKind::WindowCall {
             args,
             partition_by,
@@ -4065,6 +3956,7 @@ fn collect_outer_ref_column_ids(
         ExprKind::Literal(_)
         | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. } => {}
     }
 }
@@ -4272,13 +4164,16 @@ fn walk_for_outer_ref(
                 *saw_outer = true;
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             walk_for_outer_ref(left, inner_scope, outer_scope, saw_outer);
             walk_for_outer_ref(right, inner_scope, outer_scope, saw_outer);
         }
-        ExprKind::UnaryOp { expr: inner, .. }
-        | ExprKind::IsNull { expr: inner, .. }
-        | ExprKind::IsTruthValue { expr: inner, .. }
+        ExprKind::IsNull { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
         | ExprKind::Nested(inner)
         | ExprKind::LambdaFunction { body: inner, .. }
@@ -4322,32 +4217,6 @@ fn walk_for_outer_ref(
             if let Some(e) = else_expr {
                 walk_for_outer_ref(e, inner_scope, outer_scope, saw_outer);
             }
-        }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
-            for v in list {
-                walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
-            }
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
-            walk_for_outer_ref(low, inner_scope, outer_scope, saw_outer);
-            walk_for_outer_ref(high, inner_scope, outer_scope, saw_outer);
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            ..
-        } => {
-            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
-            walk_for_outer_ref(pattern, inner_scope, outer_scope, saw_outer);
         }
         ExprKind::WindowCall {
             args,
@@ -4474,19 +4343,15 @@ fn collect_column_outer_status(
                 *all_outer_only = false;
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_outer_status(left, inner_scope, outer_scope, saw_column, all_outer_only);
             collect_column_outer_status(
                 right,
-                inner_scope,
-                outer_scope,
-                saw_column,
-                all_outer_only,
-            );
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_column_outer_status(
-                inner,
                 inner_scope,
                 outer_scope,
                 saw_column,
@@ -4530,42 +4395,6 @@ fn collect_column_outer_status(
                     all_outer_only,
                 );
             }
-        }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            collect_column_outer_status(
-                inner,
-                inner_scope,
-                outer_scope,
-                saw_column,
-                all_outer_only,
-            );
-            for item in list {
-                collect_column_outer_status(
-                    item,
-                    inner_scope,
-                    outer_scope,
-                    saw_column,
-                    all_outer_only,
-                );
-            }
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            collect_column_outer_status(
-                inner,
-                inner_scope,
-                outer_scope,
-                saw_column,
-                all_outer_only,
-            );
-            collect_column_outer_status(low, inner_scope, outer_scope, saw_column, all_outer_only);
-            collect_column_outer_status(high, inner_scope, outer_scope, saw_column, all_outer_only);
         }
         ExprKind::Case {
             operand,
@@ -4815,13 +4644,16 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
                     .iter()
                     .any(|item| expr_contains_placeholder(&item.expr, placeholder_id))
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             placeholder_is_aggregate_input(left, placeholder_id)
                 || placeholder_is_aggregate_input(right, placeholder_id)
         }
-        ExprKind::UnaryOp { expr: inner, .. }
-        | ExprKind::IsNull { expr: inner, .. }
-        | ExprKind::IsTruthValue { expr: inner, .. }
+        ExprKind::IsNull { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
         | ExprKind::Nested(inner)
         | ExprKind::LambdaFunction { body: inner, .. }
@@ -4848,32 +4680,6 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
                     .as_ref()
                     .is_some_and(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
         }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            placeholder_is_aggregate_input(inner, placeholder_id)
-                || list
-                    .iter()
-                    .any(|expr| placeholder_is_aggregate_input(expr, placeholder_id))
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            placeholder_is_aggregate_input(inner, placeholder_id)
-                || placeholder_is_aggregate_input(low, placeholder_id)
-                || placeholder_is_aggregate_input(high, placeholder_id)
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            ..
-        } => {
-            placeholder_is_aggregate_input(inner, placeholder_id)
-                || placeholder_is_aggregate_input(pattern, placeholder_id)
-        }
         ExprKind::WindowCall {
             args,
             partition_by,
@@ -4888,6 +4694,7 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
                     .any(|item| placeholder_is_aggregate_input(&item.expr, placeholder_id))
         }
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
@@ -4970,13 +4777,7 @@ impl MarkDemand<'_, '_> {
         if !negated {
             return Ok(equality);
         }
-        Ok(TypedExpr {
-            value_type: equality.value_type.clone(),
-            kind: ExprKind::UnaryOp {
-                op: UnOp::Not,
-                expr: novarocks_parser::ast::AstBox::new(equality),
-            },
-        })
+        self.analyzer.analyze_boolean_not(equality, self.span)
     }
 
     fn bind_condition(
@@ -5096,9 +4897,7 @@ impl MarkDemand<'_, '_> {
                     guard,
                 )
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
+            ExprKind::IsNull { expr, .. }
             | ExprKind::Cast { expr, .. }
             | ExprKind::Nested(expr) => self.visit(expr, guard),
             ExprKind::FunctionCall { args, binding, .. } => {
@@ -5317,12 +5116,14 @@ fn collect_column_ids_in_expr(expr: &TypedExpr, out: &mut Vec<crate::column_id::
         ExprKind::ColumnRef { column_id, .. } => {
             out.push(*column_id);
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_ids_in_expr(left, out);
             collect_column_ids_in_expr(right, out);
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_column_ids_in_expr(inner, out);
         }
         ExprKind::IsNull { expr: inner, .. } => {
             collect_column_ids_in_expr(inner, out);
@@ -5353,11 +5154,15 @@ pub(super) fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize)
         return true;
     }
     match &expr.kind {
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             expr_contains_placeholder(left, placeholder_id)
                 || expr_contains_placeholder(right, placeholder_id)
         }
-        ExprKind::UnaryOp { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::IsNull { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Cast { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Nested(inner) => expr_contains_placeholder(inner, placeholder_id),
@@ -5374,32 +5179,6 @@ pub(super) fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize)
             .chain(order_by.iter().map(|item| &item.expr))
             .chain(filter.as_deref())
             .any(|value| expr_contains_placeholder(value, placeholder_id)),
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            expr_contains_placeholder(inner, placeholder_id)
-                || list
-                    .iter()
-                    .any(|i| expr_contains_placeholder(i, placeholder_id))
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            expr_contains_placeholder(inner, placeholder_id)
-                || expr_contains_placeholder(low, placeholder_id)
-                || expr_contains_placeholder(high, placeholder_id)
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            ..
-        } => {
-            expr_contains_placeholder(inner, placeholder_id)
-                || expr_contains_placeholder(pattern, placeholder_id)
-        }
         ExprKind::Case {
             operand,
             when_then,
@@ -5529,11 +5308,15 @@ fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>
                 out.push(entry);
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_refs(left, out);
             collect_column_refs(right, out);
         }
-        ExprKind::UnaryOp { expr: inner, .. } => collect_column_refs(inner, out),
         ExprKind::IsNull { expr: inner, .. } => collect_column_refs(inner, out),
         ExprKind::Cast { expr: inner, .. } => collect_column_refs(inner, out),
         ExprKind::Nested(inner) => collect_column_refs(inner, out),
@@ -5541,32 +5324,6 @@ fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>
             for a in args {
                 collect_column_refs(a, out);
             }
-        }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            collect_column_refs(inner, out);
-            for i in list {
-                collect_column_refs(i, out);
-            }
-        }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            collect_column_refs(inner, out);
-            collect_column_refs(low, out);
-            collect_column_refs(high, out);
-        }
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            ..
-        } => {
-            collect_column_refs(inner, out);
-            collect_column_refs(pattern, out);
         }
         ExprKind::Case {
             operand,
@@ -5757,6 +5514,26 @@ fn replace_placeholder_in_expr(
     }
 
     match &expr.kind {
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => TypedExpr {
+            value_type: expr.value_type.clone(),
+            kind: ExprKind::Let {
+                binding: *binding,
+                initializer: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
+                    initializer,
+                    placeholder_id,
+                    replacement,
+                )),
+                body: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
+                    body,
+                    placeholder_id,
+                    replacement,
+                )),
+            },
+        },
         ExprKind::BinaryOp {
             left,
             op,
@@ -5778,18 +5555,6 @@ fn replace_placeholder_in_expr(
                     replacement,
                 )),
                 decimal_overflow_policy: *decimal_overflow_policy,
-            },
-        },
-        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::UnaryOp {
-                op: *op,
-                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    inner,
-                    placeholder_id,
-                    replacement,
-                )),
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
@@ -5932,91 +5697,6 @@ fn replace_placeholder_in_expr(
                 },
             }
         }
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    inner,
-                    placeholder_id,
-                    replacement,
-                )),
-                low: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    low,
-                    placeholder_id,
-                    replacement,
-                )),
-                high: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    high,
-                    placeholder_id,
-                    replacement,
-                )),
-                negated: *negated,
-            },
-        },
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    inner,
-                    placeholder_id,
-                    replacement,
-                )),
-                pattern: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    pattern,
-                    placeholder_id,
-                    replacement,
-                )),
-                negated: *negated,
-            },
-        },
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    inner,
-                    placeholder_id,
-                    replacement,
-                )),
-                list: list
-                    .iter()
-                    .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
-                    .collect(),
-                negated: *negated,
-            },
-        },
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::IsTruthValue {
-                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
-                    inner,
-                    placeholder_id,
-                    replacement,
-                )),
-                value: *value,
-                negated: *negated,
-            },
-        },
         ExprKind::WindowCall {
             name,
             args,
@@ -6117,14 +5797,15 @@ fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
             right,
             ..
         } if expr_contains_placeholder(left, id) || expr_contains_placeholder(right, id) => true,
-        ExprKind::BinaryOp { left, right, .. } => {
-            json_placeholder_inside_or(left, id) || json_placeholder_inside_or(right, id)
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => json_placeholder_inside_or(left, id) || json_placeholder_inside_or(right, id),
+        ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
+            json_placeholder_inside_or(expr, id)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::Nested(expr) => json_placeholder_inside_or(expr, id),
         ExprKind::Case {
             operand,
             when_then,
@@ -6172,11 +5853,13 @@ fn has_placeholder(expr: &TypedExpr, id: usize) -> bool {
     }
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { id: pid, .. } => *pid == id,
-        ExprKind::BinaryOp { left, right, .. } => {
-            has_placeholder(left, id) || has_placeholder(right, id)
-        }
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => has_placeholder(left, id) || has_placeholder(right, id),
         ExprKind::Nested(inner) => has_placeholder(inner, id),
-        ExprKind::UnaryOp { expr, .. } => has_placeholder(expr, id),
         ExprKind::IsNull { expr, .. } => has_placeholder(expr, id),
         _ => false,
     }
@@ -6307,10 +5990,6 @@ fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
                 *cast_mode,
             ) && correlation_factor_is_total(expr)
         }
-        ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr,
-        } => correlation_factor_is_total(expr),
         ExprKind::FunctionCall { binding, args, .. } => {
             binding.semantics.volatility.is_replica_deterministic()
                 && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)

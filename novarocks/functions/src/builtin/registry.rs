@@ -129,12 +129,16 @@ const INTEGER_TYPES: &[TypeSpec] = &[
 fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     add(
         m,
-        crate::native_like::ESCAPE_FUNCTION_NAME,
-        Signature::new(
-            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
-            TypeSpec::Boolean,
-        ),
+        super::like_escape_owner::BOOLEAN_NOT,
+        Signature::new(vec![TypeSpec::Boolean], TypeSpec::Boolean).with_argument_coercion(),
     );
+    for count in [2, 3] {
+        add(
+            m,
+            super::like_escape_owner::LIKE,
+            Signature::new(vec![TypeSpec::Utf8; count], TypeSpec::Boolean).with_argument_coercion(),
+        );
+    }
     use super::signature::CharacterWidth;
     use novarocks_type_contract::CharacterKind;
     let varchar_width = |width| TypeSpec::Character(CharacterKind::Varchar, width);

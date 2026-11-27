@@ -134,7 +134,7 @@ fn finish_sort(
         append_exchange_source(&mut builder, 401, distribution_kind, false);
     let node = builder.reserve_node_id().unwrap();
     let order_expression = builder
-        .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
+        .define(node, ty(DataType::Int64, false), ExprKind::input(order))
         .unwrap();
     let order_expression = builder.root_definition(
         node,
@@ -147,7 +147,7 @@ fn finish_sort(
         SortFixtureMode::Global => SortMode::Global,
         SortFixtureMode::Analytic | SortFixtureMode::PartitionTopN(_) => {
             let partition_expression = builder
-                .define(node, ty(DataType::Int64, false), ExprKind::Value(key))
+                .define(node, ty(DataType::Int64, false), ExprKind::input(key))
                 .unwrap();
             let partition_expression = builder.root_definition(
                 node,
@@ -209,7 +209,7 @@ fn finish_topn(
         append_exchange_source(&mut builder, 402, distribution_kind, false);
     let node = builder.reserve_node_id().unwrap();
     let order_expression = builder
-        .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
+        .define(node, ty(DataType::Int64, false), ExprKind::input(order))
         .unwrap();
     let order_expression = builder.root_definition(
         node,
@@ -311,7 +311,7 @@ fn finish_topn_reduction(
         .define(
             partial_topn,
             ty(DataType::Int64, false),
-            ExprKind::Value(partial_value),
+            ExprKind::input(partial_value),
         )
         .unwrap();
     let partial_order = partial_builder.root_definition(
@@ -396,7 +396,7 @@ fn finish_topn_reduction(
         .define(
             final_topn,
             ty(DataType::Int64, false),
-            ExprKind::Value(final_value),
+            ExprKind::input(final_value),
         )
         .unwrap();
     let final_order = final_builder.root_definition(
@@ -549,7 +549,7 @@ fn finish_window(
         append_exchange_source(&mut builder, 403, distribution_kind, child_is_ordered);
     let node = builder.reserve_node_id().unwrap();
     let partition_expression = builder
-        .define(node, ty(DataType::Int64, false), ExprKind::Value(key))
+        .define(node, ty(DataType::Int64, false), ExprKind::input(key))
         .unwrap();
     let partition_expression = builder.root_definition(
         node,
@@ -559,7 +559,7 @@ fn finish_window(
     );
     let order_expression = (!matches!(layout, WindowFixtureLayout::StrongerOrdering)).then(|| {
         let definition = builder
-            .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
+            .define(node, ty(DataType::Int64, false), ExprKind::input(order))
             .unwrap();
         builder.root_definition(
             node,

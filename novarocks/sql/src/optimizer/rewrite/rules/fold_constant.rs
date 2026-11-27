@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::binding::SqlFunctionBinding;
-use crate::common::{BinOp, LiteralValue, UnOp};
+use crate::common::{BinOp, LiteralValue};
 use crate::compiler::SqlAuthoredScalarUnit;
 use novarocks_functions::PureCallLifecycle;
 
@@ -554,17 +554,20 @@ fn fold_scalar_uncached(
     // children and "all children are literals" is decidable locally.
     match &mut node {
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             *left = fold_scalar_id(arena, *left, ctx, memo, work)?;
             *right = fold_scalar_id(arena, *right, ctx, memo, work)?;
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
-        | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. } => {
+        ScalarNode::Cast { child, .. } | ScalarNode::IsNull { child, .. } => {
             *child = fold_scalar_id(arena, *child, ctx, memo, work)?;
         }
         ScalarNode::Nested(child) => {
@@ -610,23 +613,6 @@ fn fold_scalar_uncached(
             for key in function_order_by.iter_mut().chain(order_by) {
                 key.expr = fold_scalar_id(arena, key.expr, ctx, memo, work)?;
             }
-        }
-        ScalarNode::InList { child, list, .. } => {
-            *child = fold_scalar_id(arena, *child, ctx, memo, work)?;
-            for item in list.iter_mut() {
-                *item = fold_scalar_id(arena, *item, ctx, memo, work)?;
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            *child = fold_scalar_id(arena, *child, ctx, memo, work)?;
-            *low = fold_scalar_id(arena, *low, ctx, memo, work)?;
-            *high = fold_scalar_id(arena, *high, ctx, memo, work)?;
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            *child = fold_scalar_id(arena, *child, ctx, memo, work)?;
-            *pattern = fold_scalar_id(arena, *pattern, ctx, memo, work)?;
         }
         ScalarNode::Case {
             operand,
@@ -772,11 +758,7 @@ fn try_fold_node_current(
             }
             &[*left, *right][..]
         }
-        ScalarNode::UnaryOp {
-            op: UnOp::Not,
-            child,
-        }
-        | ScalarNode::Cast { child, .. } => std::slice::from_ref(child),
+        ScalarNode::Cast { child, .. } => std::slice::from_ref(child),
         ScalarNode::FunctionCall {
             name,
             args,

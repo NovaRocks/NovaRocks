@@ -58,7 +58,7 @@ fn node(id: u32, ty: DataType, kind: ExprKind) -> ExprNode {
     }
 }
 fn leaf(id: u32, ty: DataType) -> ExprNode {
-    node(id, ty, ExprKind::Value(ValueId::new(id)))
+    node(id, ty, ExprKind::input(ValueId::new(id)))
 }
 fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Microsecond, None)

@@ -132,7 +132,7 @@ pub(crate) fn read_unit(
         let id = *definitions.entry(*definition).or_insert_with(|| {
             let (value, ty) = &values[*definition];
             builder
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap()
         });
         builder.root(id, *demand, RootScope::Port(0)).unwrap();
@@ -440,7 +440,7 @@ pub(crate) fn large_static_unit(count: usize) -> Arc<novarocks_expression::Compi
         })
         .collect::<Vec<_>>();
     let ids = [
-        b.add(None, source_type.clone(), ExprKind::Value(ValueId::new(1)))
+        b.add(None, source_type.clone(), ExprKind::input(ValueId::new(1)))
             .unwrap(),
         b.add(
             None,

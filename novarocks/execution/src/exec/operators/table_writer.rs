@@ -2715,7 +2715,7 @@ pub(crate) mod tests {
         let read = builder
             .unit(input)
             .unwrap()
-            .add(None, ty.clone(), ExprKind::Value(value))
+            .add(None, ty.clone(), ExprKind::input(value))
             .unwrap();
         let read = builder
             .unit(input)

@@ -313,7 +313,7 @@ pub(super) fn fixture(case: Case) -> Fixture {
                     .fixture_root(
                         projected,
                         ty.clone(),
-                        ExprKind::Value(*value),
+                        ExprKind::input(*value),
                         RootScope::Port(0),
                         EvaluationDemand::Value,
                     )
@@ -395,7 +395,7 @@ pub(super) fn fixture(case: Case) -> Fixture {
             .fixture_root(
                 project,
                 target.clone(),
-                ExprKind::Value(outputs[2]),
+                ExprKind::input(outputs[2]),
                 RootScope::Port(0),
                 EvaluationDemand::Value,
             )
@@ -404,7 +404,7 @@ pub(super) fn fixture(case: Case) -> Fixture {
             .fixture_root(
                 project,
                 target.clone(),
-                ExprKind::Value(outputs[0]),
+                ExprKind::input(outputs[0]),
                 RootScope::Port(0),
                 EvaluationDemand::Value,
             )

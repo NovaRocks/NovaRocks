@@ -91,7 +91,7 @@ fn grouped_stage(
     let node = builder.reserve_node_id().unwrap();
     let unit = builder.unit(node).unwrap();
     let definition = unit
-        .add(None, int64(true), ExprKind::Value(columns[0]))
+        .add(None, int64(true), ExprKind::input(columns[0]))
         .unwrap();
     let group_key = unit
         .root(
@@ -121,7 +121,7 @@ fn grouped_stage(
                 .add(
                     None,
                     bound.intermediate_type(),
-                    ExprKind::Value(columns[ordinal + 1]),
+                    ExprKind::input(columns[ordinal + 1]),
                 )
                 .unwrap();
             builder
@@ -223,7 +223,7 @@ fn final_stage(
         let definition = builder
             .unit(node)
             .unwrap()
-            .add(None, int64(true), ExprKind::Value(columns[0]))
+            .add(None, int64(true), ExprKind::input(columns[0]))
             .unwrap();
         builder
             .unit(node)

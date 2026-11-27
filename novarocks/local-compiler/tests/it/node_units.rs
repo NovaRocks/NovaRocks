@@ -117,12 +117,12 @@ fn node_units_keep_the_actual_column_after_a_repeated_publication() {
     let a = builder
         .unit(duplicate)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(source_values[0]))
+        .add(None, ty.clone(), ExprKind::input(source_values[0]))
         .unwrap();
     let b = builder
         .unit(duplicate)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(source_values[1]))
+        .add(None, ty.clone(), ExprKind::input(source_values[1]))
         .unwrap();
     let mut roots = Vec::new();
     for def in [a, a, b] {
@@ -167,7 +167,7 @@ fn node_units_keep_the_actual_column_after_a_repeated_publication() {
     let def = builder
         .unit(final_node)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(other))
+        .add(None, ty.clone(), ExprKind::input(other))
         .unwrap();
     let root = builder
         .unit(final_node)

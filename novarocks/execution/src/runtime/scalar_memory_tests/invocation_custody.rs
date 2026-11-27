@@ -357,7 +357,7 @@ fn runtime_json_object_rolls_back_capacity_failure_before_publication() {
 
 #[test]
 fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
-    let sql = r#"SELECT n FROM t WHERE flag AND JSON_OBJECT(k VALUE n) = '{"b":3}'"#;
+    let sql = r#"SELECT n FROM t WHERE IF(flag, JSON_OBJECT(k VALUE n) = '{"b":3}', false)"#;
     let mut selected = None;
     for program in programs(sql) {
         for node in program.graph().nodes() {
@@ -366,7 +366,7 @@ fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
                 ProgramNodeKind::Scan { residuals, .. } => residuals.as_slice(),
                 _ => continue,
             };
-            if predicates.len() != 2 {
+            if predicates.len() != 1 {
                 continue;
             }
             let units = predicates
@@ -378,11 +378,11 @@ fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
             let schema = unit.scope(root.scope).unwrap().schema().clone();
             assert!(
                 selected.replace((units, schema)).is_none(),
-                "one ordered pair"
+                "one guarded JSON predicate"
             );
         }
     }
-    let (predicates, schema) = selected.expect("SQL produced an ordered two-predicate Filter/Scan");
+    let (predicates, schema) = selected.expect("SQL produced the guarded Filter/Scan predicate");
     for demanded in [false, true] {
         let memory = demanded.then(super::bound);
         let mut control = super::control(memory.as_ref(), Arc::default());
@@ -450,18 +450,20 @@ fn runtime_json_in_uses_constant_proof_and_keeps_later_rhs_errors() {
                 let unit = program.unit(site.unit).unwrap();
                 let root = unit.root(site.root).unwrap();
                 let definitions = unit.definitions();
-                let StaticExprKind::PreparedInList { values, .. } =
-                    definitions.node(root.definition).unwrap().kind()
+                let Some(call) = unit.calls().get(&root.use_id) else {
+                    continue;
+                };
+                let novarocks_functions::PreparedPureKernel::Membership(prepared) = call.prepared()
                 else {
                     continue;
                 };
-                assert!(
-                    unit.recipes()
-                        .native_inlist(root.use_id)
-                        .unwrap()
-                        .uses_json_keys()
-                );
-                let [constant, dynamic] = values.as_slice() else {
+                assert!(prepared.comparison().uses_json_keys());
+                let StaticExprKind::BoundCall { args, .. } =
+                    definitions.node(root.definition).unwrap().kind()
+                else {
+                    panic!("selected IN call")
+                };
+                let [_, constant, dynamic] = args.as_slice() else {
                     panic!("expected one constant and one dynamic JSON operand");
                 };
                 assert!(matches!(
@@ -529,7 +531,7 @@ fn runtime_json_in_uses_constant_proof_and_keeps_later_rhs_errors() {
         (
             all,
             &[None, None, Some(true), None, Some(true), None][..],
-            &[0, 1][..],
+            &[0][..],
         ),
         (sparse, &[Some(true), None, Some(true), None][..], &[][..]),
     ] {
@@ -561,4 +563,83 @@ fn runtime_json_in_uses_constant_proof_and_keeps_later_rhs_errors() {
             assert_eq!(error.message(), "Invalid JSON input");
         }
     }
+}
+
+#[test]
+fn runtime_in_releases_dynamic_candidate_batches_before_requesting_the_next() {
+    use novarocks_sql_testkit::signed_inlist_source;
+    use novarocks_test_compile_to_execute::programs::compiled_signed_inlist_root;
+
+    let rows = 64;
+    let candidate_count = 512;
+    let candidates = (1..=candidate_count)
+        .map(|offset| format!("k + BIGINT '{offset}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT k IN ({candidates}) FROM t0");
+    let (program, site) = compiled_signed_inlist_root(
+        &signed_inlist_source(&sql, DataType::Int64),
+        &installed_builtin_owner_catalogue(),
+    );
+    let unit = program.unit(site.unit).unwrap();
+    let root = unit.root(site.root).unwrap();
+    let schema = unit.scope(root.scope).unwrap().schema().clone();
+    let input = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
+    )
+    .unwrap();
+
+    let mut config = novarocks_memory::AuthorityConfig::new(1024 * 1024, 128 * 1024, 0);
+    config.max_accounts = 32;
+    config.max_active_owners = 32;
+    // The authority holds stopped funding records until maintenance. Keep
+    // room in its index so the payload budget selects when to reclaim them.
+    config.metadata_budget_bytes = 1024 * 1024;
+    config.top_up = novarocks_memory::TopUpPolicy::uniform(1024);
+    let authority = Arc::new(novarocks_memory::MemoryAuthority::new(config).unwrap());
+    let binding = super::bind(authority);
+    let tracker = MemTracker::new_root("wide-dynamic-in");
+    let mut control = super::control(Some(&binding), Arc::default());
+    control.bind_mem_tracker(tracker.clone());
+    let mut instance = frame(&program, site, &control);
+    let mut journal = RuntimeScalarMemoryJournal::default();
+    let selected = Selection::all(rows);
+    let output = instance
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &input,
+                source: None,
+            },
+            ScalarInvocationScope::new(selected, selected),
+            Activation::Activated,
+            &control,
+            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        )
+        .unwrap();
+    assert!(output.errors().is_empty());
+    let actual = output
+        .values()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(actual.iter().all(|value| value == Some(false)));
+    assert_eq!(actual.len(), rows);
+    assert!(journal.body.settlement.is_some());
+    drop(output);
+    drop(instance);
+
+    // The original account can fund one candidate and its temporary work.
+    // Retaining all admitted value buffers would exceed its configured budget.
+    let retained_all = (rows * candidate_count * size_of::<i64>()) as u64;
+    let snapshot = binding.account().snapshot();
+    assert!(snapshot.peak_committed_bytes > 0);
+    assert!(snapshot.peak_committed_bytes < retained_all);
+    assert_eq!(snapshot.active_scopes, 0);
+    assert_eq!(snapshot.sampled_payload_live_bytes, 0);
+    assert_eq!(tracker.current(), 0);
+    let authority = binding.authority();
+    let maintenance = authority.maintain(authority.maintenance_scan_bound().unwrap());
+    assert!(maintenance.complete);
+    assert_eq!(binding.account().snapshot().granted_bytes, 0);
 }

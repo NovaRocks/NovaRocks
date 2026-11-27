@@ -1061,7 +1061,7 @@ impl FragmentBuilder {
                 return Ok(false);
             };
             match &definition.kind {
-                ExprKind::Value(_) if !allow_values => return Ok(false),
+                kind if !allow_values && kind.input_value().is_some() => return Ok(false),
                 ExprKind::FunctionCall { function, .. }
                     if function.require_legacy_metadata()?.volatility
                         != crate::FunctionVolatility::Immutable =>
@@ -1092,9 +1092,7 @@ impl FragmentBuilder {
             .chain(order)
             .map(|item| {
                 let expression = self.require_owned_expression(node, item.expr).ok()?;
-                let ExprKind::Value(value) = expression.kind else {
-                    return None;
-                };
+                let value = expression.kind.input_value()?;
                 Some(crate::OrderingKey {
                     value,
                     direction: item.direction,

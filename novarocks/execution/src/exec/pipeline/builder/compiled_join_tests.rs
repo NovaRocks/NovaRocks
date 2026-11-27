@@ -339,7 +339,7 @@ fn value_root(
     let definition = builder
         .unit(node)
         .unwrap()
-        .add(None, ty, ExprKind::Value(value))
+        .add(None, ty, ExprKind::input(value))
         .unwrap();
     builder
         .unit(node)
@@ -373,7 +373,7 @@ fn add_join(
         let x = builder
             .unit(join)
             .unwrap()
-            .add(None, int64(true), ExprKind::Value(l[1]))
+            .add(None, int64(true), ExprKind::input(l[1]))
             .unwrap();
         let y = if checked_right {
             overflowing(builder, join, r[1])
@@ -381,7 +381,7 @@ fn add_join(
             builder
                 .unit(join)
                 .unwrap()
-                .add(None, int64(true), ExprKind::Value(r[1]))
+                .add(None, int64(true), ExprKind::input(r[1]))
                 .unwrap()
         };
         builder
@@ -1342,7 +1342,7 @@ fn overflowing(
     let read = builder
         .unit(owner)
         .unwrap()
-        .add(None, int64(true), ExprKind::Value(value))
+        .add(None, int64(true), ExprKind::input(value))
         .unwrap();
     let max = builder.constant(
         owner,
@@ -1396,7 +1396,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
     let join = builder.reserve_node_id().unwrap();
     let read = |builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder, value| {
         builder
-            .unit(join).unwrap().add(None, int64(true), ExprKind::Value(value))
+            .unit(join).unwrap().add(None, int64(true), ExprKind::input(value))
             .unwrap()
     };
     let key = JoinKey {
@@ -3271,7 +3271,7 @@ fn authored_naa_plan(
             let probe = builder
                 .unit(join)
                 .unwrap()
-                .add(None, int64(true), ExprKind::Value(l[1]))
+                .add(None, int64(true), ExprKind::input(l[1]))
                 .unwrap();
             Some(
                 builder
@@ -3728,12 +3728,12 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         let probe = builder
             .unit(join)
             .unwrap()
-            .add(None, key_type.clone(), ExprKind::Value(l))
+            .add(None, key_type.clone(), ExprKind::input(l))
             .unwrap();
         let build = builder
             .unit(join)
             .unwrap()
-            .add(None, key_type.clone(), ExprKind::Value(r))
+            .add(None, key_type.clone(), ExprKind::input(r))
             .unwrap();
         let probe = builder
             .unit(join)

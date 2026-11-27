@@ -781,6 +781,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         &change_stream,
         analyzed.write_mode,
         decimal_overflow_policy,
+        compiled.function_catalog.as_ref(),
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -840,6 +841,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         &change_stream,
         analyzed.write_mode,
         decimal_overflow_policy,
+        compiled.function_catalog.as_ref(),
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -963,6 +965,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         &compiled.change_stream,
         analyzed.write_mode,
         decimal_overflow_policy,
+        compiled.function_catalog.as_ref(),
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -1017,6 +1020,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         &compiled.change_stream,
         analyzed.write_mode,
         decimal_overflow_policy,
+        compiled.function_catalog.as_ref(),
         &control,
     )?;
     let effect_output_ordinal = producer
@@ -1421,11 +1425,14 @@ fn allocate_join_incremental_locator_column_ids(
 /// it, and the predicates are made mutually exclusive rather than ordered: the
 /// expand emits one row per *matching* event, so overlapping predicates would
 /// duplicate a row instead of choosing between them.
+pub(crate) struct BindingAuthority(());
+
 fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     write_mode: SqlMvIncrementalWriteMode,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -1550,15 +1557,39 @@ fn add_join_incremental_change_stream_effect(
                 ),
                 control,
             )?;
-            let is_not_delete = arena.intern_observed(
-                ScalarNode::UnaryOp {
-                    op: crate::common::UnOp::Not,
-                    child: is_delete,
+            let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
+            let arguments = [crate::optimizer::scalar::function_argument(
+                &arena, is_delete, control,
+            )?];
+            let resolved = functions.resolve_scalar_operator_binding(
+                operator,
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
                 },
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Boolean,
-                    action.value_type.nullable(),
-                ),
+                control,
+            )?;
+            let binding = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::MvRefresh(BindingAuthority(())),
+                resolved,
+                decimal_overflow_policy,
+            );
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                return Err("Boolean NOT requires a scalar result".to_owned().into());
+            };
+            let result = result.clone();
+            let is_not_delete = arena.intern_observed(
+                ScalarNode::FunctionCall {
+                    name: operator.catalog_name().to_owned(),
+                    args: vec![is_delete],
+                    distinct: false,
+                    volatility: binding.semantics.volatility,
+                    binding,
+                },
+                result,
                 control,
             )?;
             Ok::<_, crate::compiler::SqlCompileError>((is_delete, is_not_delete))
@@ -3539,6 +3570,7 @@ mod tests {
                 &optimized.change_stream,
                 analyzed.write_mode,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                optimized.function_catalog.as_ref(),
                 crate::optimizer::test_optimizer_control(),
             )
             .unwrap();
@@ -3650,6 +3682,7 @@ mod tests {
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::FastAppend,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::functions::builtin_sql_function_catalog(),
             crate::optimizer::test_optimizer_control(),
         )
         .expect("an append-only producer expands");
@@ -3691,6 +3724,7 @@ mod tests {
             &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
             SqlMvIncrementalWriteMode::RowDelta,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::functions::builtin_sql_function_catalog(),
             crate::optimizer::test_optimizer_control(),
         )
         .expect("a row-delta producer expands");
@@ -4529,6 +4563,7 @@ mod tests {
                     ),
                     SqlMvIncrementalWriteMode::FastAppend,
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    crate::functions::builtin_sql_function_catalog(),
                     &control,
                 );
                 assert!(

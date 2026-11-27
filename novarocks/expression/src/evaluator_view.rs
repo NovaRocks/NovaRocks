@@ -140,12 +140,6 @@ impl UnitRecipes {
                 return Ok(true);
             }
         }
-        for recipe in self.native_inlist.values() {
-            work.step()?;
-            if recipe.requires_comparison_allocator() {
-                return Ok(true);
-            }
-        }
         Ok(false)
     }
 
@@ -180,17 +174,5 @@ impl UnitRecipes {
         id: ExpressionUseId,
     ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
         self.arithmetic.get(&id)
-    }
-    pub fn native_inlist(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedNativeInListRecipe> {
-        self.native_inlist.get(&id)
-    }
-    pub fn native_like(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedNativeLikeRecipe> {
-        self.native_like.get(&id)
     }
 }

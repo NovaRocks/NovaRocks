@@ -531,7 +531,8 @@ fn specialize_aggregate_once_core<
     let aligned = (|| {
         let phase = options.phase;
         let correct = match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. } => false,
+            crate::CallArgumentUses::TemporalSources { .. }
+            | crate::CallArgumentUses::CandidateGroup { .. } => false,
             crate::CallArgumentUses::SelectedChannels(_)
             | crate::CallArgumentUses::MaterializedInput { .. } => {
                 phase.consumes_logical_arguments() && options.state_input_type.is_none()
@@ -550,8 +551,9 @@ fn specialize_aggregate_once_core<
             ));
         }
         match input.argument_uses {
-            crate::CallArgumentUses::TemporalSources { .. } => Err(invalid(
-                "aggregate preparation rejects scalar temporal source channels",
+            crate::CallArgumentUses::TemporalSources { .. }
+            | crate::CallArgumentUses::CandidateGroup { .. } => Err(invalid(
+                "aggregate preparation rejects scalar control channels",
             )),
             crate::CallArgumentUses::SelectedChannels(_)
             | crate::CallArgumentUses::MaterializedInput { .. } => Ok(None),

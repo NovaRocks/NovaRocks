@@ -135,7 +135,7 @@ fn source_columns(
     let port = project_port(values.map(|value| (value, boolean.clone())), source_pools);
     let operands = values.map(|value| {
         builder
-            .add(None, boolean.clone(), ExprKind::Value(value))
+            .add(None, boolean.clone(), ExprKind::input(value))
             .unwrap()
     });
     (port, operands)

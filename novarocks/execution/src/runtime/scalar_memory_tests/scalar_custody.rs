@@ -187,7 +187,7 @@ fn fixture_family(
     let value = builder
         .unit(output)
         .unwrap()
-        .add(None, integer.clone(), ExprKind::Value(columns[0].0))
+        .add(None, integer.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let count = if bitwise && name == "bitwise_not" && !matches!(shape, Shape::Nested) {
         // NOT has no right child. Do not create an unreachable definition.
@@ -196,7 +196,7 @@ fn fixture_family(
         builder
             .unit(output)
             .unwrap()
-            .add(None, count_type.clone(), ExprKind::Value(columns[1].0))
+            .add(None, count_type.clone(), ExprKind::input(columns[1].0))
             .unwrap()
     };
     let flag = if matches!(shape, Shape::IfThen | Shape::IfElse | Shape::Filter) {
@@ -204,7 +204,7 @@ fn fixture_family(
             builder
                 .unit(output)
                 .unwrap()
-                .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
+                .add(None, boolean.clone(), ExprKind::input(columns[2].0))
                 .unwrap(),
         )
     } else {

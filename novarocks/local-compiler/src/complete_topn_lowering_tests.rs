@@ -169,7 +169,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         &[nullable_int64(false)],
     );
     let expression = scan_builder
-        .fixture_value_root(PROJECT, nullable_int64(false), ExprKind::Value(keys[0]))
+        .fixture_value_root(PROJECT, nullable_int64(false), ExprKind::input(keys[0]))
         .unwrap();
     let projected = scan_builder
         .add_value(
@@ -212,7 +212,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .fixture_value_root(
             AGGREGATE,
             nullable_int64(false),
-            ExprKind::Value(imports[0]),
+            ExprKind::input(imports[0]),
         )
         .unwrap();
     aggregate_builder
@@ -230,7 +230,7 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         )
         .unwrap();
     let order_key = aggregate_builder
-        .fixture_value_root(TOPN, nullable_int64(false), ExprKind::Value(imports[0]))
+        .fixture_value_root(TOPN, nullable_int64(false), ExprKind::input(imports[0]))
         .unwrap();
     aggregate_builder
         .add_top_n(
@@ -421,7 +421,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         .unwrap();
     let input = if local_groups {
         let key = builder
-            .fixture_value_root(local, nullable_int64(true), ExprKind::Value(union_key))
+            .fixture_value_root(local, nullable_int64(true), ExprKind::input(union_key))
             .unwrap();
         builder
             .add_row_consuming(
@@ -442,7 +442,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         union
     };
     let key = builder
-        .fixture_value_root(AGGREGATE, nullable_int64(true), ExprKind::Value(union_key))
+        .fixture_value_root(AGGREGATE, nullable_int64(true), ExprKind::input(union_key))
         .unwrap();
     builder
         .add_row_consuming(
@@ -459,7 +459,7 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         )
         .unwrap();
     let order = builder
-        .fixture_value_root(TOPN, nullable_int64(true), ExprKind::Value(union_key))
+        .fixture_value_root(TOPN, nullable_int64(true), ExprKind::input(union_key))
         .unwrap();
     builder
         .add_top_n(

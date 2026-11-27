@@ -77,10 +77,10 @@ fn arithmetic_fixture(
         )
         .unwrap();
     let a = builder
-        .fixture_definition(NodeId::new(0), input.clone(), ExprKind::Value(inputs[0].1))
+        .fixture_definition(NodeId::new(0), input.clone(), ExprKind::input(inputs[0].1))
         .unwrap();
     let b = builder
-        .fixture_definition(NodeId::new(0), input, ExprKind::Value(inputs[1].1))
+        .fixture_definition(NodeId::new(0), input, ExprKind::input(inputs[1].1))
         .unwrap();
     let expression = builder
         .fixture_definition(

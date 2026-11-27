@@ -17,7 +17,7 @@
 
 //! The sole local invocation/region expansion from authenticated definition facts.
 use crate::unit_creation::{UnitValidationCreation, ValidationFailure};
-use crate::{DefinitionControl, ExprId, ExprKind, ExprNode, ExprRoot};
+use crate::{ControlExpansions, DefinitionControl, ExprId, ExprKind, ExprNode, ExprRoot};
 use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_type_contract::{
     CompileCheckpoints, ControlShape, EvaluationDemand, EvaluationRegionId, ExpressionControlFlow,
@@ -29,7 +29,7 @@ use novarocks_type_contract::{
 use std::alloc::Layout;
 use std::collections::BTreeMap;
 
-pub(crate) struct Membership<'a>(pub(crate) &'a [ExprNode]);
+struct Membership<'a>(&'a [ExprNode], &'a ControlExpansions);
 impl ExpressionDefinitionMembership<ExprId> for Membership<'_> {
     fn definition_count(&self) -> usize {
         self.0.len()
@@ -38,6 +38,12 @@ impl ExpressionDefinitionMembership<ExprId> for Membership<'_> {
         self.0
             .get(id.get() as usize)
             .is_some_and(|node| node.id == id)
+    }
+    fn control_source_position(&self, definition: ExprId) -> Option<u32> {
+        self.1.source_position(definition).map(ExprId::get)
+    }
+    fn has_control_expansions(&self) -> bool {
+        !self.1.records().is_empty()
     }
 }
 pub(crate) struct DerivedControl {
@@ -48,6 +54,7 @@ pub(crate) struct DerivedControl {
 struct Author<'s, 'w, 'c, 'a, 'scope, H> {
     definitions: &'s [ExprNode],
     controls: &'s BTreeMap<ExprId, DefinitionControl>,
+    expansions: &'s ControlExpansions,
     work: &'w mut CompileCheckpoints<'c>,
     creation: &'a mut UnitValidationCreation<'scope, H>,
     regions: Vec<ExpressionEvaluationRegion>,
@@ -85,8 +92,11 @@ impl<'s, H> Author<'s, '_, '_, '_, '_, H> {
         region: EvaluationRegionId,
         demand: EvaluationDemand,
         depth: usize,
+        physical_depth: usize,
     ) -> Result<ExpressionUseId, ValidationFailure<'s, H>> {
-        if depth > MAX_CONTROL_DEPTH {
+        if depth > MAX_CONTROL_DEPTH
+            || physical_depth > novarocks_type_contract::MAX_EXPANDED_CONTROL_DEPTH
+        {
             return Err(ExpressionControlFlowError::TooDeep.into());
         }
         self.reference()?;
@@ -190,7 +200,14 @@ impl<'s, H> Author<'s, '_, '_, '_, '_, H> {
             } else {
                 region
             };
-            let child_use = self.invocation(*child, child_region, child_demand, depth + 1)?;
+            let advance = usize::from(!self.expansions.shares_source_position(definition, *child));
+            let child_use = self.invocation(
+                *child,
+                child_region,
+                child_demand,
+                depth + advance,
+                physical_depth + 1,
+            )?;
             arguments.push(child_use);
             self.work.step()?;
         }
@@ -256,6 +273,7 @@ pub(crate) fn derive_created_in<'source, H>(
     definitions: &'source [ExprNode],
     roots: &[ExprRoot],
     controls: &'source BTreeMap<ExprId, DefinitionControl>,
+    expansions: &'source ControlExpansions,
     creation: &mut UnitValidationCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DerivedControl, ValidationFailure<'source, H>> {
@@ -275,6 +293,7 @@ pub(crate) fn derive_created_in<'source, H>(
     let mut author = Author {
         definitions,
         controls,
+        expansions,
         work,
         creation,
         regions: Vec::new(),
@@ -285,7 +304,7 @@ pub(crate) fn derive_created_in<'source, H>(
     let mut root_uses = Vec::new();
     for root in roots {
         let region = author.region(None, None)?;
-        let use_id = author.invocation(root.definition, region, root.demand, 1)?;
+        let use_id = author.invocation(root.definition, region, root.demand, 1, 1)?;
         author
             .creation
             .reserve_push_retained(&mut root_uses, author.work)?;
@@ -298,7 +317,7 @@ pub(crate) fn derive_created_in<'source, H>(
         temporal_sources,
         ..
     } = author;
-    let flow = creation.flow(regions, uses, &Membership(definitions), work)?;
+    let flow = creation.flow(regions, uses, &Membership(definitions, expansions), work)?;
     work.flush()?;
     let root_uses = creation.boxed_retained(root_uses, work)?;
     work.flush()?;

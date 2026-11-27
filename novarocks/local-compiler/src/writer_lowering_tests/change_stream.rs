@@ -230,7 +230,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         .add_root(
             root,
             source_type,
-            ExprKind::Value(source_value),
+            ExprKind::input(source_value),
             RootScope::Port(0),
         )
         .unwrap();

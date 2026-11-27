@@ -208,7 +208,7 @@ fn fixture(
         items.push((definition, value));
         operands.push(
             builder
-                .fixture_definition(root, ty, ExprKind::Value(value))
+                .fixture_definition(root, ty, ExprKind::input(value))
                 .unwrap(),
         );
     }

@@ -115,7 +115,7 @@ fn source(fields: usize) -> Fragment {
         expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
     });
     let definition = builder
-        .add(None, boolean.clone(), ExprKind::Value(predicate))
+        .add(None, boolean.clone(), ExprKind::input(predicate))
         .unwrap();
     let root = builder
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))

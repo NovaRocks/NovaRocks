@@ -459,24 +459,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 lambda.span,
             )),
 
-            // Unary NOT. `NOT NULL` is NULL, so the result admits null
-            // exactly when its operand does.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
                 if let ast::Expr::Exists(exists) = unary.expression.as_ref() {
                     return self.analyze_exists(exists, true);
                 }
-                let inner_typed = self.analyze_expr(&unary.expression, scope)?;
-                let nullable = inner_typed.value_type.nullable();
-                Ok(TypedExpr {
-                    kind: ExprKind::UnaryOp {
-                        op: UnOp::Not,
-                        expr: novarocks_parser::ast::AstBox::new(inner_typed),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        nullable,
-                    ),
-                })
+                let operand = self.analyze_expr(&unary.expression, scope)?;
+                self.analyze_boolean_not(operand, unary.span)
             }
 
             // Unary plus preserves the original producer and exact value type.
@@ -1013,13 +1001,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         if !predicate.negated {
                             return Ok(equality);
                         }
-                        Ok(TypedExpr {
-                            value_type,
-                            kind: ExprKind::UnaryOp {
-                                op: UnOp::Not,
-                                expr: novarocks_parser::ast::AstBox::new(equality),
-                            },
-                        })
+                        self.analyze_boolean_not(equality, span)
                     }
                 }
             }
@@ -1128,36 +1110,18 @@ impl<'a> super::AnalyzerContext<'a> {
             self.check_control()?;
             coerced_list.push(self.coerce_common_value(item, &common_type, span)?);
         }
-        let list_typed = coerced_list;
-        let nullable = if PreparedCompositeComparisonRecipe::is_composite(&common_type) {
-            let mut nullable = false;
-            for candidate in &list_typed {
-                nullable |= self
-                    .prepare_composite_equality(
-                        &expr_typed.value_type,
-                        &candidate.value_type,
-                        span,
-                    )?
-                    .nullable_result();
-            }
-            nullable
+        let operator = novarocks_type_contract::OperatorFunction::InList;
+        let mut operands = Vec::with_capacity(coerced_list.len() + 1);
+        operands.push(expr_typed);
+        operands.extend(coerced_list);
+        let call = self.type_scalar_call(NodeShape::InList, operands, span)?;
+        let positive =
+            crate::common::binary_operator::typed_call(operator, call.binding, call.args);
+        if negated {
+            self.analyze_boolean_not(positive, span)
         } else {
-            expr_typed.value_type.nullable()
-                || list_typed
-                    .iter()
-                    .any(|candidate| candidate.value_type.nullable())
-        };
-        Ok(TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(expr_typed),
-                list: (list_typed).into(),
-                negated,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-        })
+            Ok(positive)
+        }
     }
     fn prepare_composite_equality(
         &self,
@@ -1218,24 +1182,64 @@ impl<'a> super::AnalyzerContext<'a> {
         let expr_typed = cast(expr_typed)?;
         let low_typed = cast(low_typed)?;
         let high_typed = cast(high_typed)?;
-        // A comparison against NULL is NULL, so the result admits
-        // null whenever any operand does. A filter treating null as
-        // not-matching is the filter's own semantics, not this type's.
-        let nullable = expr_typed.value_type.nullable()
-            || low_typed.value_type.nullable()
-            || high_typed.value_type.nullable();
-        Ok(TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(expr_typed),
-                low: novarocks_parser::ast::AstBox::new(low_typed),
-                high: novarocks_parser::ast::AstBox::new(high_typed),
-                negated: predicate.negated,
+        let direct = matches!(
+            expr_typed.kind,
+            ExprKind::ColumnRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_)
+        );
+        let (probe, binding) = if direct {
+            (expr_typed.clone(), None)
+        } else {
+            let binding = self
+                .factory
+                .borrow_mut()
+                .create_local_binding()
+                .ok_or_else(|| AnalyzeError::internal("lexical binding identities exhausted"))?;
+            (
+                TypedExpr {
+                    kind: ExprKind::LocalValue(binding),
+                    value_type: expr_typed.value_type.clone(),
+                },
+                Some(binding),
+            )
+        };
+        let compare = novarocks_type_contract::OperatorFunction::LessThanOrEqual;
+        let left =
+            self.analyze_binary_operator(compare, low_typed, probe.clone(), predicate.min.span())?;
+        let right =
+            self.analyze_binary_operator(compare, probe, high_typed, predicate.max.span())?;
+        let value_type = novarocks_type_contract::FunctionValueType::new(
+            DataType::Boolean,
+            left.value_type.nullable() || right.value_type.nullable(),
+        );
+        let conjunction = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(left),
+                right: novarocks_parser::ast::AstBox::new(right),
+                op: if predicate.negated {
+                    BinOp::ExpandedNegatedConjunction
+                } else {
+                    BinOp::ExpandedConjunction
+                },
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-        })
+            value_type: value_type.clone(),
+        };
+        let result = match binding {
+            Some(binding) => TypedExpr {
+                value_type,
+                kind: ExprKind::Let {
+                    binding,
+                    initializer: novarocks_parser::ast::AstBox::new(expr_typed),
+                    body: novarocks_parser::ast::AstBox::new(conjunction),
+                },
+            },
+            None => conjunction,
+        };
+        if predicate.negated {
+            self.analyze_boolean_not(result, span)
+        } else {
+            Ok(result)
+        }
     }
     fn analyze_like_predicate(
         &self,
@@ -1290,69 +1294,38 @@ impl<'a> super::AnalyzerContext<'a> {
             )?;
         }
         let pattern_typed = operand(&predicate.pattern)?;
+        let mut args = vec![
+            self.coerce_common_value(expr_typed, &varchar, value.span())?,
+            self.coerce_common_value(pattern_typed, &varchar, predicate.pattern.span())?,
+        ];
         if let Some(escape) = &predicate.escape {
-            let args = vec![
-                self.coerce_common_value(expr_typed, &varchar, value.span())?,
-                self.coerce_common_value(pattern_typed, &varchar, predicate.pattern.span())?,
-                self.coerce_common_value(operand(escape)?, &varchar, escape.span())?,
-            ];
-            let arguments = args
-                .iter()
-                .map(|arg| {
-                    crate::analysis::function_argument(arg, self.constant_policy, self.control)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    AnalyzeError::function_binding(error).at_type_mismatch(predicate.span)
-                })?;
-            let binding = self
-                .function_catalog
-                .resolve_like_with_escape_binding(&arguments, self.control)
-                .map_err(|error| {
-                    AnalyzeError::function_binding(error).at_type_mismatch(predicate.span)
-                })?;
-            let novarocks_functions::FunctionResultType::Scalar(value_type) =
-                &binding.selected.result_type
-            else {
-                return Err(AnalyzeError::internal("LIKE selected a non-scalar result"));
-            };
-            let value_type = value_type.clone();
-            let mut result = TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: binding.semantics.volatility,
-                    name: novarocks_functions::native_like::ESCAPE_FUNCTION_NAME.to_owned(),
-                    binding: self
-                        .binding_finalizer()
-                        .finish(binding, "LIKE", predicate.span)?,
-                    args: args.into(),
-                    distinct: false,
-                },
-                value_type: value_type.clone(),
-            };
-            if predicate.negated {
-                result = TypedExpr {
-                    kind: ExprKind::UnaryOp {
-                        op: UnOp::Not,
-                        expr: novarocks_parser::ast::AstBox::new(result),
-                    },
-                    value_type,
-                };
-            }
-            return Ok(result);
+            args.push(self.coerce_common_value(operand(escape)?, &varchar, escape.span())?);
         }
-        let nullable = expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();
-        Ok(TypedExpr {
-            kind: ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(expr_typed),
-                pattern: novarocks_parser::ast::AstBox::new(pattern_typed),
-                negated: predicate.negated,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-        })
+        let operator = novarocks_type_contract::OperatorFunction::Like;
+        let call = self.type_scalar_call(NodeShape::Operator(operator), args, predicate.span)?;
+        let positive =
+            crate::common::binary_operator::typed_call(operator, call.binding, call.args);
+        if predicate.negated {
+            self.analyze_boolean_not(positive, predicate.span)
+        } else {
+            Ok(positive)
+        }
     }
+
+    pub(super) fn analyze_boolean_not(
+        &self,
+        operand: TypedExpr,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
+        let call = self.type_scalar_call(NodeShape::Operator(operator), vec![operand], span)?;
+        Ok(crate::common::binary_operator::typed_call(
+            operator,
+            call.binding,
+            call.args,
+        ))
+    }
+
     /// Borrow only the old positional tuple profile; field names never grant
     /// multi-column IN or higher-order map coercion.
     pub(super) fn anonymous_row<'e>(
@@ -1609,14 +1582,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
         };
         if operator == OperatorFunction::Distinct {
-            let value_type = equality.value_type.clone();
-            Ok(TypedExpr {
-                kind: ExprKind::UnaryOp {
-                    op: UnOp::Not,
-                    expr: novarocks_parser::ast::AstBox::new(equality),
-                },
-                value_type,
-            })
+            self.analyze_boolean_not(equality, left.span())
         } else {
             Ok(equality)
         }
@@ -2754,7 +2720,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     .iter()
                     .map(|target| match target {
                         novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
-                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                        novarocks_functions::FunctionArgumentType::Lambda { .. }
+                        | novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => None,
                     }),
             )?;
             if window_only {
@@ -2957,7 +2924,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     .iter()
                     .map(|target| match target {
                         novarocks_functions::FunctionArgumentType::Value(value) => Some(value),
-                        novarocks_functions::FunctionArgumentType::Lambda { .. } => None,
+                        novarocks_functions::FunctionArgumentType::Lambda { .. }
+                        | novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => None,
                     }),
             )?;
             let value_type = crate::functions::aggregate_result_type(&signature).clone();
@@ -3797,6 +3765,9 @@ pub(super) fn resolved_scalar_call_at(
             {
                 Ok(argument)
             }
+            novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => Err(
+                AnalyzeError::internal("ordinary syntax selected a grouped IN argument"),
+            ),
             novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                 Err(AnalyzeError::type_mismatch(
                     format!("function `{name}` selected a lambda target for a value argument"),
@@ -4130,7 +4101,11 @@ fn rebound_call_matches_observed(
                         return Ok(false);
                     }
                 }
-                (novarocks_functions::FunctionArgumentType::Lambda { .. }, _) => return Ok(false),
+                (
+                    novarocks_functions::FunctionArgumentType::Lambda { .. }
+                    | novarocks_functions::FunctionArgumentType::CandidateGroup { .. },
+                    _,
+                ) => return Ok(false),
             }
         }
         Ok(true)
@@ -4218,6 +4193,9 @@ fn bind_window_call(
             novarocks_functions::FunctionArgumentType::Value(value) => {
                 coerce_selected_function_argument(finalizer, arg, value, constant_policy, span)
             }
+            novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => Err(
+                AnalyzeError::internal("ordinary syntax selected a grouped IN argument"),
+            ),
             novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                 Err(AnalyzeError::type_mismatch(
                     format!(
@@ -4316,6 +4294,9 @@ fn bind_legacy_scalar_call(
                     {
                         Ok(arg)
                     }
+                    novarocks_functions::FunctionArgumentType::CandidateGroup { .. } => Err(
+                        AnalyzeError::internal("ordinary syntax selected a grouped IN argument"),
+                    ),
                     novarocks_functions::FunctionArgumentType::Lambda { .. } => {
                         Err(AnalyzeError::internal(format!(
                             "function `{name}` selected a lambda target for a value argument"
@@ -6872,13 +6853,36 @@ mod tests {
         {
             return vec![left, right];
         }
+        if let Some((probe, candidates)) = crate::common::binary_operator::typed_in_list(expression)
+        {
+            return std::iter::once(probe).chain(candidates).collect();
+        }
+        let (initializer, body) = match &expression.kind {
+            ExprKind::Let {
+                initializer, body, ..
+            } => (Some(initializer.as_ref()), body.as_ref()),
+            _ => (None, expression),
+        };
+        if let ExprKind::BinaryOp {
+            left,
+            op: BinOp::ExpandedConjunction,
+            right,
+            ..
+        } = &body.kind
+        {
+            let Some((BinOp::Le, [low, probe])) =
+                crate::common::binary_operator::typed_comparison(left)
+            else {
+                panic!("expected the original lower comparison");
+            };
+            let Some((BinOp::Le, [_, high])) =
+                crate::common::binary_operator::typed_comparison(right)
+            else {
+                panic!("expected the original upper comparison");
+            };
+            return vec![initializer.unwrap_or(probe), low, high];
+        }
         match &expression.kind {
-            ExprKind::InList { expr, list, .. } => {
-                std::iter::once(expr.as_ref()).chain(list.iter()).collect()
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => vec![expr, low, high],
             ExprKind::Case {
                 operand: Some(operand),
                 when_then,
@@ -9686,22 +9690,7 @@ mod tests {
                 panic!("SELECT")
             };
             let output = &select.projection[0].expr;
-            let coerced = match &output.kind {
-                ExprKind::FunctionCall { binding, args, .. }
-                    if binding.function_id
-                        == novarocks_type_contract::OperatorFunction::Equal.function_id() =>
-                {
-                    &args[0]
-                }
-                ExprKind::InList { expr: left, .. } | ExprKind::Between { expr: left, .. } => {
-                    left.as_ref()
-                }
-                ExprKind::Case {
-                    operand: Some(left),
-                    ..
-                } => left.as_ref(),
-                other => panic!("actual common-type consumer: {other:?}"),
-            };
+            let coerced = comparison_operands(output)[0];
             if !matches!(output.kind, ExprKind::Case { .. }) {
                 assert!(!output.value_type.nullable(), "{sql}");
             }

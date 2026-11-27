@@ -23,7 +23,7 @@ use crate::fixtures::{
 use crate::fold_observation::FoldProbe;
 use arrow::array::Decimal128Array;
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{ExprId, ExprKind, UnaryOperator};
+use novarocks_expression_contract::{ExprId, ExprKind};
 use novarocks_functions::ConstantValue;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
@@ -217,11 +217,10 @@ fn folds_successful_negation_and_keeps_the_overflowing_call() {
         .iter()
         .find(|receipt| {
             matches!(
-                receipt.root().kind,
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
-                    ..
-                }
+                &receipt.root().kind,
+                ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str()
+                        == novarocks_type_contract::OperatorFunction::BooleanNot.function_id_text()
             )
         })
         .unwrap();

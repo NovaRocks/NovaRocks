@@ -539,6 +539,8 @@ fn catalog(owner: Arc<Owner>) -> PureEngineFunctionCatalog {
         Some("try")
     } else if owner.implementations[0].overload == oid(HIGHER) {
         Some("rand")
+    } else if owner.implementations[0].overload == oid(TYPE_ONLY) {
+        Some(OperatorFunction::InList.catalog_name())
     } else {
         None
     };
@@ -617,10 +619,10 @@ pub(super) fn lambda_compilation_fixture() -> (
 fn unit(owner: &Owner, control: ArgumentControl, hidden_call: bool) -> BoundExprSet {
     let mut builder = builder();
     let a = builder
-        .add(None, input_type(), ExprKind::Value(ValueId::new(1)))
+        .add(None, input_type(), ExprKind::input(ValueId::new(1)))
         .unwrap();
     let b = builder
-        .add(None, input_type(), ExprKind::Value(ValueId::new(2)))
+        .add(None, input_type(), ExprKind::input(ValueId::new(2)))
         .unwrap();
     let a = if hidden_call {
         let call = builder
@@ -1022,7 +1024,7 @@ fn intrinsic_controller_keeps_hand_checked_branch_guards_without_scalar_instance
     let owner = Arc::new(Owner::for_overload(IF));
     let mut b = builder();
     let leaf = b
-        .add(None, result_type(), ExprKind::Value(ValueId::new(9)))
+        .add(None, result_type(), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let arguments = owner.arguments(&oid(IF));
     let selected = FunctionBindingSelection {
@@ -1315,165 +1317,128 @@ pub(super) fn type_only_fixture(
     (unit, catalog(owner))
 }
 
-type HiddenNativeFixture = (BoundExprSet, Arc<Owner>, Vec<(ValueId, ValueType)>);
-
-fn type_only_hidden_native_fixture(kind: &str) -> Result<HiddenNativeFixture, UnitError> {
-    let mut b = builder();
-    let input_type = match kind {
-        "in_float" => FunctionValueType::new(DataType::Float64, false),
-        "in_text_array" => FunctionValueType::new(
+#[test]
+fn type_only_grouped_membership_types_its_actual_sources_without_demanding_them() {
+    use novarocks_expression::testkit::add_catalogue_predicate;
+    for value_type in [
+        FunctionValueType::new(DataType::Float64, false),
+        FunctionValueType::new(
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             false,
         ),
-        "like_json" | "between_json" => FunctionValueType::try_with_logical_type(
-            DataType::LargeBinary,
-            false,
-            ValueLogicalType::Json,
+    ] {
+        let mut draft = builder();
+        let mut pools = ConstantPools::empty();
+        let ports = [
+            (ValueId::new(10), value_type.clone()),
+            (ValueId::new(20), result_type()),
+        ];
+        let input = draft
+            .add(None, value_type.clone(), ExprKind::input(ports[0].0))
+            .unwrap();
+        let other = draft
+            .add(None, result_type(), ExprKind::input(ports[1].0))
+            .unwrap();
+        let membership = add_catalogue_predicate(
+            &mut draft,
+            &mut pools,
+            OperatorFunction::InList,
+            vec![input, input],
         )
-        .unwrap(),
-        _ => unreachable!(),
-    };
-    let mut ports = vec![
-        (ValueId::new(10), input_type.clone()),
-        (ValueId::new(20), result_type()),
-    ];
-    let input = b
-        .add(None, input_type.clone(), ExprKind::Value(ValueId::new(10)))
         .unwrap();
-    let other = b
-        .add(None, result_type(), ExprKind::Value(ValueId::new(20)))
+        let membership_type = draft.definition(membership).unwrap().ty.clone();
+        draft
+            .definition_control(
+                membership,
+                DefinitionControl {
+                    shape: ControlShape::CandidateGroup,
+                    temporal_sources: None,
+                },
+            )
+            .unwrap();
+        let (unit, owner) = seal_type_only_fixture(
+            draft,
+            [(membership, membership_type), (other, result_type())],
+            vec![ExprPort {
+                values: Box::new(ports.clone()),
+            }],
+        )
         .unwrap();
-    let hidden_kind = match kind {
-        "like_json" => {
-            let pattern_type = FunctionValueType::new(DataType::Utf8, false);
-            ports.push((ValueId::new(30), pattern_type.clone()));
-            let pattern = b
-                .add(None, pattern_type, ExprKind::Value(ValueId::new(30)))
-                .unwrap();
-            ExprKind::Like {
-                expr: input,
-                pattern,
-                negated: false,
-            }
-        }
-        "in_float" | "in_text_array" => ExprKind::InList {
-            expr: input,
-            list: Box::from([input]),
-            negated: false,
-        },
-        "between_json" => ExprKind::Between {
-            expr: input,
-            low: input,
-            high: input,
-            negated: false,
-        },
-        _ => unreachable!(),
-    };
-    let hidden = b.add(None, result_type(), hidden_kind).unwrap();
-    let (unit, owner) = seal_type_only_fixture(
-        b,
-        [(hidden, result_type()), (other, result_type())],
-        vec![ExprPort {
-            values: ports.clone().into_boxed_slice(),
-        }],
-    )?;
-    Ok((unit, owner, ports))
-}
-
-fn compile_type_only_hidden_native_profile(
-    kind: &str,
-) -> Result<Arc<CompiledExprSet>, ExprCompileError> {
-    let (unit, owner, ports) = type_only_hidden_native_fixture(kind).unwrap();
-    let catalogue = catalog(owner.clone());
-    let c = Control::good();
-    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
-    let layout = layouts(&ports);
-    let parameters = SemanticParameters::try_new([]).unwrap();
-    let compiled = compile_expr_set_pure(
-        &unit,
-        EvaluationEnvironment {
-            constants: &ConstantPools::empty(),
-            parameters: &parameters,
-        },
-        ScopeLayouts {
-            ports: &[layout],
-            all_ports: None,
-        },
-        policy(),
-        &catalogue,
-        &mut work,
-    );
-    work.finish().unwrap();
-    assert_eq!(owner.instances.load(Ordering::SeqCst), 0);
-    compiled
-}
-
-fn check_type_only_hidden_native_profile_refusal(kind: &str) {
-    let error = compile_type_only_hidden_native_profile(kind).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            ExprCompileError::Comparison(ComparisonPrepareError::Unsupported)
-        ),
-        "{kind}: {error:?}"
-    );
-    assert_eq!(error.failure_fact().class(), FailureClass::Unsupported);
+        let functions = catalog(owner.clone());
+        let control = Control::good();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let compiled = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: &pools,
+                parameters: &SemanticParameters::default(),
+            },
+            ScopeLayouts {
+                ports: &[layouts(&ports)],
+                all_ports: None,
+            },
+            policy(),
+            &functions,
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let [root] = compiled.roots() else {
+            panic!("one type-only root")
+        };
+        let uses = compiled.control_flow().uses();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[&root.use_id].control, ControlShape::TypeOnly);
+        assert!(uses[&root.use_id].arguments.is_empty());
+        let definitions = compiled.definitions();
+        let StaticExprKind::BoundCall { args, .. } =
+            definitions.node(root.definition).unwrap().kind()
+        else {
+            panic!("type-only binding");
+        };
+        let StaticExprKind::BoundCall { args, .. } = definitions.node(args[0]).unwrap().kind()
+        else {
+            panic!("IN binding");
+        };
+        assert_eq!(args.as_slice(), &[args[0]; 2]);
+        assert_eq!(
+            definitions.node(args[0]).unwrap().value_type(),
+            Some(&value_type)
+        );
+        assert_eq!(owner.instances.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]
-fn type_only_hidden_json_like_is_rejected_by_the_unit_verifier() {
-    let Err(error) = type_only_hidden_native_fixture("like_json") else {
-        panic!("a JSON operand is not UTF-8 text");
-    };
-    assert!(matches!(
-        error,
-        UnitError::Invalid { definition: Some(_), root: None, message }
-            if message.ends_with("LIKE operands must use a UTF-8 type")
-    ));
-}
-#[test]
-fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {
-    let compiled = compile_type_only_hidden_native_profile("in_float").unwrap();
-    let [root] = compiled.roots() else {
-        panic!("expected one type-only root");
-    };
-    let uses = compiled.control_flow().uses();
-    assert_eq!(uses.len(), 1);
-    let invocation = &uses[&root.use_id];
-    assert_eq!(invocation.control, ControlShape::TypeOnly);
-    assert!(invocation.arguments.is_empty());
-
-    let definitions = compiled.definitions();
-    let StaticExprKind::BoundCall { args, .. } = definitions.node(root.definition).unwrap().kind()
-    else {
-        panic!("expected the original bound call");
-    };
-    let StaticExprKind::PreparedInList { child, values, .. } =
-        definitions.node(args[0]).unwrap().kind()
-    else {
-        panic!("expected the original floating-point membership definition");
-    };
-    assert_eq!(values.as_slice(), &[*child]);
-    assert_eq!(
-        definitions.node(*child).unwrap().value_type(),
-        Some(&FunctionValueType::new(DataType::Float64, false))
-    );
-}
-#[test]
-fn type_only_hidden_text_array_in_compiles_without_evaluating_arguments() {
-    let compiled = compile_type_only_hidden_native_profile("in_text_array").unwrap();
-    let [root] = compiled.roots() else {
-        panic!("expected one type-only root");
-    };
-    let uses = compiled.control_flow().uses();
-    assert_eq!(uses.len(), 1);
-    let invocation = &uses[&root.use_id];
-    assert_eq!(invocation.control, ControlShape::TypeOnly);
-    assert!(invocation.arguments.is_empty());
-}
-#[test]
-fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {
-    check_type_only_hidden_native_profile_refusal("between_json");
+fn catalogue_rejects_json_text_matching_and_ordering() {
+    use novarocks_expression::testkit::add_catalogue_predicate;
+    let mut draft = builder();
+    let mut pools = ConstantPools::empty();
+    let json_type = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        false,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let json = draft
+        .add(None, json_type, ExprKind::input(ValueId::new(10)))
+        .unwrap();
+    let text = draft
+        .add(
+            None,
+            FunctionValueType::new(DataType::Utf8, false),
+            ExprKind::input(ValueId::new(11)),
+        )
+        .unwrap();
+    for (operator, right) in [
+        (OperatorFunction::Like, text),
+        (OperatorFunction::LessThanOrEqual, json),
+    ] {
+        assert!(matches!(
+            add_catalogue_predicate(&mut draft, &mut pools, operator, vec![json, right]),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+    }
 }
 
 #[test]

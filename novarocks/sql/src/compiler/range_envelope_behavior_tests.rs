@@ -133,17 +133,49 @@ fn score_origin(arena: &ScalarArena, id: ScalarId) -> Option<ScoreOrigin> {
     }
 }
 fn interval(arena: &ScalarArena, id: ScalarId) -> Option<ScoreInterval> {
-    let ScalarNode::Between {
-        child,
-        low,
-        high,
-        negated: false,
-    } = arena.node(unwrap_nested(arena, id))
-    else {
-        return None;
-    };
-    let (alias, casts) = score_origin(arena, *child)?;
-    Some((alias, casts, integer(arena, *low)?, integer(arena, *high)?))
+    let (probe, lower, upper) =
+        crate::common::binary_operator::scalar_inclusive_range(arena, unwrap_nested(arena, id))?;
+    let (alias, casts) = score_origin(arena, probe)?;
+    Some((alias, casts, integer(arena, lower)?, integer(arena, upper)?))
+}
+fn scan_intervals(arena: &ScalarArena, predicates: &[ScalarId]) -> Vec<ScoreInterval> {
+    let mut conjuncts = Vec::new();
+    for &predicate in predicates {
+        crate::optimizer::scalar_expr::split_conjuncts(arena, predicate, &mut conjuncts);
+    }
+    let mut intervals = Vec::new();
+    let mut lower = Vec::new();
+    let mut upper = Vec::new();
+    for id in conjuncts {
+        if let Some(range) = interval(arena, id) {
+            intervals.push(range);
+            continue;
+        }
+        let Some((op, [left, right])) =
+            crate::common::binary_operator::scalar_comparison(arena, unwrap_nested(arena, id))
+        else {
+            continue;
+        };
+        let (low, high) = match op {
+            BinOp::Le => (left, right),
+            BinOp::Ge => (right, left),
+            _ => continue,
+        };
+        if let (Some(bound), Some(origin)) = (integer(arena, low), score_origin(arena, high)) {
+            lower.push((origin, bound));
+        }
+        if let (Some(origin), Some(bound)) = (score_origin(arena, low), integer(arena, high)) {
+            upper.push((origin, bound));
+        }
+    }
+    for ((alias, casts), lo) in lower {
+        for ((top_alias, top_casts), hi) in &upper {
+            if &alias == top_alias && &casts == top_casts {
+                intervals.push((alias.clone(), casts.clone(), lo, *hi));
+            }
+        }
+    }
+    intervals
 }
 fn visit(node: &OptimizedOperatorNode, run: &mut impl FnMut(&OptimizedOperatorNode, &ScalarArena)) {
     run(
@@ -163,18 +195,14 @@ fn scan_envelopes(tree: &OptimizedOperatorNode) -> Vec<(String, Vec<(DataType, D
         let Operator::PhysicalScan(scan) = &node.op else {
             return;
         };
-        for &predicate in &scan.predicates {
-            let mut conjuncts = Vec::new();
-            crate::optimizer::scalar_expr::split_conjuncts(arena, predicate, &mut conjuncts);
-            for id in conjuncts {
-                if let Some((alias, casts, 10, 40)) = interval(arena, id) {
-                    assert_eq!(
-                        scan.alias.as_deref(),
-                        Some(alias.as_str()),
-                        "envelope remains on its own scan axis"
-                    );
-                    found.push((alias, casts));
-                }
+        for range in scan_intervals(arena, &scan.predicates) {
+            if let (alias, casts, 10, 40) = range {
+                assert_eq!(
+                    scan.alias.as_deref(),
+                    Some(alias.as_str()),
+                    "envelope remains on its own scan axis"
+                );
+                found.push((alias, casts));
             }
         }
     });
@@ -188,19 +216,7 @@ fn top_level_scan_interval_count(tree: &OptimizedOperatorNode) -> usize {
         let Operator::PhysicalScan(scan) = &node.op else {
             return;
         };
-        for &predicate in &scan.predicates {
-            let mut terms = Vec::new();
-            crate::optimizer::scalar_expr::split_conjuncts(arena, predicate, &mut terms);
-            count += terms
-                .iter()
-                .filter(|id| {
-                    matches!(
-                        arena.node(unwrap_nested(arena, **id)),
-                        ScalarNode::Between { negated: false, .. }
-                    )
-                })
-                .count();
-        }
+        count += scan_intervals(arena, &scan.predicates).len();
     });
     count
 }

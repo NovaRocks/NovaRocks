@@ -222,21 +222,19 @@ fn as_range_conjunct(
             _ => None,
         });
     }
-    let ScalarNode::Between {
-        child,
-        low,
-        high,
-        negated: false,
-    } = arena.node(expr)
+    let Some((probe, lower, upper)) =
+        crate::common::binary_operator::scalar_inclusive_range(arena, expr)
     else {
         return Ok(None);
     };
-    let Some(col) = col_of(*child) else {
+    let Some(col) = col_of(probe).filter(|_| {
+        crate::common::binary_operator::permits_equality_substitution(arena.data_type(probe))
+    }) else {
         return Ok(None);
     };
     let (Some(lo), Some(hi)) = (
-        range_literal(arena, *low, work)?,
-        range_literal(arena, *high, work)?,
+        range_literal(arena, lower, work)?,
+        range_literal(arena, upper, work)?,
     ) else {
         return Ok(None);
     };
@@ -509,27 +507,21 @@ mod tests {
 
     /// `a LIKE 'pat'`
     fn like_a(pat: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Like {
-                expr: novarocks_parser::ast::AstBox::new(col_ref(&a())),
-                pattern: novarocks_parser::ast::AstBox::new(string_lit(pat)),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        let mut source = col_ref(&a());
+        source.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::Like,
+            vec![source, string_lit(pat)],
+        )
     }
 
     /// `a BETWEEN lo AND hi`
     fn between_a(lo: i64, hi: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(col_ref(&a())),
-                low: novarocks_parser::ast::AstBox::new(int_lit(lo)),
-                high: novarocks_parser::ast::AstBox::new(int_lit(hi)),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_inclusive_range(
+            col_ref(&a()),
+            int_lit(lo),
+            int_lit(hi),
+        )
     }
 
     /// Base-name map `{ c1 -> "a" }`, used for BOTH sides in single-column cases.
@@ -738,14 +730,12 @@ mod tests {
                 .compensation
                 .is_empty()
         );
-        let between = |upper: &str| TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(col_ref(&column)),
-                low: novarocks_parser::ast::AstBox::new(folded("2021-08-05")),
-                high: novarocks_parser::ast::AstBox::new(folded(upper)),
-                negated: false,
-            },
-            value_type: FunctionValueType::new(DataType::Boolean, true),
+        let between = |upper: &str| {
+            crate::common::binary_operator::test_inclusive_range(
+                col_ref(&column),
+                folded("2021-08-05"),
+                folded(upper),
+            )
         };
         assert_eq!(
             check_containment(&[between("2021-08-20")], &mv, &n, &n)
@@ -762,5 +752,41 @@ mod tests {
         let n = names();
         // MV: a >= 5 (Int)   query: a >= 'x' (String) -> cannot compare -> fail
         assert!(check_containment(&[ge_a_str("x")], &[ge_a(5)], &n, &n).is_none());
+    }
+
+    #[test]
+    fn membership_containment_keeps_later_errors_and_cannot_bypass_an_earlier_error() {
+        use crate::common::binary_operator::test_predicate;
+        use novarocks_type_contract::OperatorFunction;
+
+        let column = col_ref(&a());
+        let membership = test_predicate(
+            OperatorFunction::InList,
+            vec![column.clone(), int_lit(1), int_lit(2)],
+        );
+        let division = test_predicate(OperatorFunction::Divide, vec![int_lit(10), column]);
+        let required = test_predicate(OperatorFunction::GreaterThan, vec![division, int_lit(0)]);
+        let base = names();
+        assert!(
+            check_containment(
+                &[required.clone(), membership.clone()],
+                std::slice::from_ref(&membership),
+                &base,
+                &base,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            check_containment(
+                &[membership.clone(), required],
+                std::slice::from_ref(&membership),
+                &base,
+                &base,
+            )
+            .unwrap()
+            .compensation
+            .len(),
+            1,
+        );
     }
 }

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, LiteralValue, UnOp};
+use crate::common::{BinOp, LiteralValue};
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::statistics::{
     ColumnStatistic, Confidence, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER,
@@ -37,6 +37,17 @@ pub(crate) fn estimate_selectivity(
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
+    if let Some(operand) = crate::common::negation::scalar_boolean_operand(arena, expr) {
+        return 1.0 - estimate_selectivity(arena, operand, column_stats);
+    }
+    if let Some((probe, candidates)) = crate::common::binary_operator::scalar_in_list(arena, expr) {
+        let ndv = extract_column_id(arena, probe)
+            .and_then(|column_id| column_stats.get(&column_id))
+            .and_then(ColumnStatistic::trusted_ndv_value);
+        return ndv.map_or(IN_PREDICATE_DEFAULT_FILTER, |ndv| {
+            (candidates.len() as f64 / ndv).min(1.0)
+        });
+    }
     if let Some((operator, [left, right])) =
         crate::common::binary_operator::scalar_comparison(arena, expr)
     {
@@ -64,6 +75,10 @@ pub(crate) fn estimate_selectivity(
                     .collect();
                 damped_conjunction(&sels)
             }
+            BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
+                estimate_selectivity(arena, *left, column_stats)
+                    * estimate_selectivity(arena, *right, column_stats)
+            }
             BinOp::Or => {
                 let l = estimate_selectivity(arena, *left, column_stats);
                 let r = estimate_selectivity(arena, *right, column_stats);
@@ -84,50 +99,6 @@ pub(crate) fn estimate_selectivity(
                 })
                 .unwrap_or(IS_NULL_FILTER);
             if *negated { 1.0 - null_frac } else { null_frac }
-        }
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let col_id = extract_column_id(arena, *child);
-            let ndv = col_id
-                .and_then(|column_id| column_stats.get(&column_id))
-                .and_then(ColumnStatistic::trusted_ndv_value);
-
-            let sel = if let Some(ndv) = ndv {
-                (list.len() as f64 / ndv).min(1.0)
-            } else {
-                IN_PREDICATE_DEFAULT_FILTER
-            };
-            if *negated { 1.0 - sel } else { sel }
-        }
-        ScalarNode::Between {
-            negated,
-            child,
-            low,
-            high,
-        } => {
-            // a BETWEEN low AND high  ==  a >= low AND a <= high
-            // Keep BETWEEN as a direct range-bound product; generic AND
-            // conjunctions use damped_conjunction to avoid collapse.
-            let ge = estimate_range_selectivity(arena, *child, *low, BinOp::Ge, column_stats);
-            let le = estimate_range_selectivity(arena, *child, *high, BinOp::Le, column_stats);
-            let sel = ge * le;
-            if *negated { 1.0 - sel } else { sel }
-        }
-        ScalarNode::Like { negated, .. } => {
-            let sel = PREDICATE_UNKNOWN_FILTER;
-            if *negated { 1.0 - sel } else { sel }
-        }
-        ScalarNode::UnaryOp {
-            op: UnOp::Not,
-            child,
-        } => 1.0 - estimate_selectivity(arena, *child, column_stats),
-        ScalarNode::IsTruthValue { negated, .. } => {
-            // IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE
-            let base = 0.5;
-            if *negated { 1.0 - base } else { base }
         }
         ScalarNode::Nested(inner) => estimate_selectivity(arena, *inner, column_stats),
         _ => PREDICATE_UNKNOWN_FILTER,
@@ -489,14 +460,12 @@ mod tests {
                 ..ColumnStatistic::for_test_with_ndv(10_000.0, Confidence::Fallback)
             },
         );
-        let predicate = TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(col("c", 1)),
-                list: (vec![int_lit(1), int_lit(2), int_lit(3)]).into(),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        };
+        let predicate = crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::InList,
+            std::iter::once(col("c", 1))
+                .chain(vec![int_lit(1), int_lit(2), int_lit(3)])
+                .collect(),
+        );
 
         assert_eq!(
             estimate_typed(&predicate, &stats),

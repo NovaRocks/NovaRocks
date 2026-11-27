@@ -32,7 +32,7 @@ use crate::{
 use novarocks_constant_contract::{ConstantError, ConstantTableError};
 use novarocks_expression_contract::{
     BinaryOperator, CallRequestMaterializationError, ExprId, ExprKind, ExprNode,
-    ExpressionCallClaim, SealedUnit, TemporalSourceProjectionError, UnaryOperator,
+    ExpressionCallClaim, SealedUnit, TemporalSourceProjectionError,
 };
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, PreparedArithmeticRecipe, PreparedCastRecipe,
@@ -82,6 +82,9 @@ fn compose(
     validate_static_shapes(unit, inputs, work)?;
     let requests = materialize_requests(unit, inputs, work)?;
     let flow = unit.control_flow();
+    let depth_limit = flow
+        .physical_use_depth()
+        .max(novarocks_type_contract::MAX_CONTROL_DEPTH);
     let mut summaries = BTreeMap::new();
     let mut claims = BTreeMap::new();
     let mut lexical_references = LexicalReferences::default();
@@ -90,7 +93,7 @@ fn compose(
     let mut stack = Vec::new();
     work.flush()?;
     stack
-        .try_reserve_exact(novarocks_type_contract::MAX_CONTROL_DEPTH)
+        .try_reserve_exact(depth_limit)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     for &root in unit.root_use_ids() {
         active.insert(root);
@@ -113,7 +116,7 @@ fn compose(
                         "actual use edges contain a shared or cyclic invocation",
                     ));
                 }
-                if stack.len() == novarocks_type_contract::MAX_CONTROL_DEPTH {
+                if stack.len() == depth_limit {
                     return Err(CallAuthorError::effects_invalid(
                         "actual use depth exceeds the checked control bound",
                     ));
@@ -175,58 +178,6 @@ fn validate_static_shapes(
 ) -> Result<(), CallAuthorError> {
     for source in unit.definitions() {
         work.step()?;
-        match &source.kind {
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } => {
-                work.flush()?;
-                novarocks_functions::PreparedNativeLikeRecipe::try_new(
-                    *negated,
-                    &definition(unit, *expr)?.ty,
-                    &definition(unit, *pattern)?.ty,
-                    &source.ty,
-                    work.control(),
-                )
-                .map_err(comparison_author_error)?;
-                work.flush()?;
-            }
-            ExprKind::InList { expr, list, .. } => {
-                work.flush()?;
-                novarocks_functions::PreparedNativeInListRecipe::validate_borrowed_profile(
-                    &definition(unit, *expr)?.ty,
-                    list.iter().map(|id| {
-                        unit.definition(*id)
-                            .map(|node| &node.ty)
-                            .expect("checked static IN candidate")
-                    }),
-                    &source.ty,
-                    work.control(),
-                )
-                .map_err(comparison_author_error)?;
-                work.flush()?;
-            }
-            ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                work.flush()?;
-                novarocks_functions::PreparedNativeBetweenRecipe::try_new(
-                    novarocks_type_contract::NativeBetweenPlan::new(*negated),
-                    &definition(unit, *expr)?.ty,
-                    &definition(unit, *low)?.ty,
-                    &definition(unit, *high)?.ty,
-                    &source.ty,
-                    work.control(),
-                )
-                .map_err(comparison_author_error)?;
-                work.flush()?;
-            }
-            _ => {}
-        }
         if !matches!(
             source.kind,
             ExprKind::Conjunction { .. } | ExprKind::Disjunction { .. }
@@ -476,7 +427,9 @@ fn author_call(
                     value_type: &node.ty,
                 });
             }
-            argument_uses.push(Some(child_id));
+            if shape != ControlShape::CandidateGroup {
+                argument_uses.push(Some(child_id));
+            }
         }
         work.step()?;
     }
@@ -485,6 +438,16 @@ fn author_call(
             facts: &source.facts,
             channels: &source_channels,
         },
+        None if shape == ControlShape::CandidateGroup => {
+            let (&probe, candidates) =
+                invocation
+                    .arguments
+                    .split_first()
+                    .ok_or(CallAuthorError::scalar_invalid(
+                        "candidate group has no probe",
+                    ))?;
+            CallArgumentUses::CandidateGroup { probe, candidates }
+        }
         None => CallArgumentUses::SelectedChannels(&argument_uses),
     };
     let preparation = if let Some(ordinal) = body_ordinal {
@@ -648,9 +611,10 @@ fn own_effects(
     };
     work.step()?;
     Ok(match &source.kind {
-        ExprKind::Value(_) | ExprKind::Lambda { .. } | ExprKind::LambdaParameter { .. } => {
-            ScopedExpressionEffects::pure_value(context)
-        }
+        ExprKind::Value(_)
+        | ExprKind::Let { .. }
+        | ExprKind::Lambda { .. }
+        | ExprKind::LambdaParameter { .. } => ScopedExpressionEffects::pure_value(context),
         ExprKind::Constant(reference) => {
             inputs
                 .environment
@@ -658,58 +622,6 @@ fn own_effects(
                 .resolve_observed(*reference, &source.ty, work)
                 .map_err(table_error)?;
             ScopedExpressionEffects::pure_value(context)
-        }
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated,
-        } => {
-            let recipe = novarocks_functions::PreparedNativeLikeRecipe::try_new(
-                *negated,
-                &definition(unit, *expr)?.ty,
-                &definition(unit, *pattern)?.ty,
-                &source.ty,
-                work.control(),
-            )
-            .map_err(comparison_author_error)?;
-            recipe.own_effects(context)
-        }
-        ExprKind::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let mut candidates = Vec::with_capacity(list.len());
-            for id in list {
-                candidates.push(&definition(unit, *id)?.ty);
-                work.step()?;
-            }
-            let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
-                *negated,
-                &definition(unit, *expr)?.ty,
-                &candidates,
-                &source.ty,
-                work.control(),
-            )
-            .map_err(comparison_author_error)?;
-            recipe.own_effects(context)
-        }
-        ExprKind::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            let recipe = novarocks_functions::PreparedNativeBetweenRecipe::try_new(
-                novarocks_type_contract::NativeBetweenPlan::new(*negated),
-                &definition(unit, *expr)?.ty,
-                &definition(unit, *low)?.ty,
-                &definition(unit, *high)?.ty,
-                &source.ty,
-                work.control(),
-            )
-            .map_err(comparison_author_error)?;
-            recipe.own_effects(context)
         }
         ExprKind::Case {
             operand, when_then, ..
@@ -724,13 +636,9 @@ fn own_effects(
             work,
             comparison_author_error,
         )?,
-        ExprKind::Unary {
-            op: UnaryOperator::Not,
-            ..
+        ExprKind::IsNull { .. } | ExprKind::Conjunction { .. } | ExprKind::Disjunction { .. } => {
+            ScopedExpressionEffects::pure_value(context)
         }
-        | ExprKind::IsNull { .. }
-        | ExprKind::Conjunction { .. }
-        | ExprKind::Disjunction { .. } => ScopedExpressionEffects::pure_value(context),
         ExprKind::Cast {
             expr,
             target,
@@ -822,10 +730,7 @@ fn own_effects(
 fn expression_kind_label(kind: &ExprKind) -> String {
     let debug = format!("{kind:?}");
     let end = debug.find([' ', '{', '(']).unwrap_or(debug.len());
-    match kind {
-        ExprKind::Unary { op, .. } => format!("Unary({op:?})"),
-        _ => debug[..end].to_string(),
-    }
+    debug[..end].to_string()
 }
 
 fn definition(unit: &SealedUnit, id: ExprId) -> Result<&ExprNode, CallAuthorError> {

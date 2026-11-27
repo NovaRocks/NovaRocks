@@ -197,7 +197,7 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                 };
                 let input = unit.definition(input).unwrap();
                 assert_eq!(input.ty.data_type(), &ty);
-                let ExprKind::Value(value) = input.kind else {
+                let Some(value) = input.kind.input_value() else {
                     panic!("the original typed SQL column remains a Value leaf")
                 };
                 let scan = fragment

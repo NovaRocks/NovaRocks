@@ -248,6 +248,7 @@ pub enum NodeShape<'a> {
     RowField,
     MapSubscript,
     Operator(OperatorFunction),
+    InList,
     Coalesce,
     UnaryPlus,
     And,
@@ -728,12 +729,38 @@ pub fn type_node(
             )?;
             type_selected_call(context, binding, None, children, work)?
         }
+        NodeShape::InList => {
+            let arguments = in_list_arguments(children, work)?;
+            work.flush()?;
+            let binding = context.catalog.select_operator(
+                OperatorFunction::InList,
+                request(&arguments, None),
+                work.control(),
+            )?;
+            check_shape(&binding, 2)?;
+            NodeTyping::Call {
+                selected: SelectedCall {
+                    binding,
+                    expected_result: None,
+                },
+                conversions: (0..children.len()).map(|_| Conversion::Keep).collect(),
+            }
+        }
         NodeShape::Operator(operator) => {
             let unary = matches!(
                 operator,
-                OperatorFunction::Negation | OperatorFunction::TemporalNegation
+                OperatorFunction::Negation
+                    | OperatorFunction::TemporalNegation
+                    | OperatorFunction::BooleanNot
             );
-            if children.len() != if unary { 1 } else { 2 } {
+            let arity = if unary {
+                1..=1
+            } else if operator == OperatorFunction::Like {
+                2..=3
+            } else {
+                2..=2
+            };
+            if !arity.contains(&children.len()) {
                 return Err(TypingError::InvalidShape(
                     "operator has the wrong number of operands",
                 ));
@@ -743,7 +770,19 @@ pub fn type_node(
             {
                 return Err(FunctionBindingError::AmbiguousOverload.into());
             }
-            let arguments = arguments(children, work)?;
+            let arguments = if operator == OperatorFunction::BooleanNot {
+                boolean_operand(context, &children[0], "NOT", work)?;
+                if children[0].value_type.data_type() == &DataType::Null {
+                    vec![FunctionArgument::Value {
+                        value_type: boolean(true),
+                        constant: None,
+                    }]
+                } else {
+                    arguments(children, work)?
+                }
+            } else {
+                arguments(children, work)?
+            };
             work.flush()?;
             let binding = match context.catalog.select_operator(
                 operator,
@@ -875,6 +914,40 @@ fn arguments(
         .collect()
 }
 
+pub fn in_list_arguments(
+    children: &[ChildTyping],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<[FunctionArgument; 2], TypingError> {
+    let Some((probe, candidates)) = children
+        .split_first()
+        .filter(|(_, candidates)| !candidates.is_empty())
+    else {
+        return Err(TypingError::InvalidShape(
+            "IN requires a probe and a nonempty candidate group",
+        ));
+    };
+    let mut nullable = false;
+    let members = candidates
+        .iter()
+        .map(|candidate| {
+            work.step()?;
+            nullable |= candidate.value_type.nullable();
+            Ok(novarocks_functions::FunctionCandidate {
+                value_type: candidate.value_type.clone(),
+                constant: candidate.constant.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, TypingError>>()?;
+    let element_type = probe.value_type.with_nullable(nullable)?;
+    Ok([
+        probe.argument(),
+        FunctionArgument::CandidateGroup {
+            element_type,
+            members: members.into_boxed_slice(),
+        },
+    ])
+}
+
 fn request<'a>(
     arguments: &'a [FunctionArgument],
     expected_result_type: Option<&'a FunctionValueType>,
@@ -999,6 +1072,28 @@ pub fn finish_call(
     converted: &[ChildTyping],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ResolvedFunctionBinding, TypingError> {
+    if OperatorFunction::from_function_id(&selected.binding.function_id)
+        == Some(OperatorFunction::InList)
+    {
+        let arguments = in_list_arguments(converted, work)?;
+        let first = &selected.binding;
+        work.flush()?;
+        let exact = context.catalog.select_exact_scalar(
+            &first.function_id,
+            &first.selected.overload,
+            request(&arguments, None),
+            work.control(),
+        )?;
+        check_shape(&exact, 2)?;
+        if exact.function_id != first.function_id
+            || exact.selected.overload != first.selected.overload
+        {
+            return Err(TypingError::InvalidShape(
+                "IN binding changed its selected overload",
+            ));
+        }
+        return Ok(exact);
+    }
     check_shape(&selected.binding, converted.len())?;
     let arguments = arguments(converted, work)?;
     work.flush()?;

@@ -673,7 +673,7 @@ fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation()
             .add(
                 None,
                 FunctionValueType::new(DataType::Int64, true),
-                ExprKind::Value(values[1]),
+                ExprKind::input(values[1]),
             )
             .unwrap();
         let seven = builder.constant(
@@ -830,7 +830,7 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
             .add(
                 None,
                 FunctionValueType::new(DataType::Int64, true),
-                ExprKind::Value(values[1]),
+                ExprKind::input(values[1]),
             )
             .unwrap();
         let zero = builder.constant(

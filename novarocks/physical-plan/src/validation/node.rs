@@ -898,13 +898,13 @@ pub(crate) fn validate_node_semantics(
                                     if owner == node.id
                                         && fragment.root_expression(owner, source)
                                             .is_some_and(|canonical| canonical.id == expression_node.id)
-                            ) || matches!(
-                                expression_node.kind,
-                                ExprKind::Value(source)
-                                    if source == *value
+                            ) || expression_node.kind.input_value().is_some_and(
+                                |source| {
+                                    source == *value
                                         && input_values
                                             .as_ref()
                                             .is_some_and(|input| input.contains(&source))
+                                },
                             )) => {}
                     (Some(_), Some(_)) => errors.push(ValidationError::new(
                         path,
@@ -2570,7 +2570,11 @@ pub(crate) fn validate_writer_aggregates(
             AggregatePhase::Single | AggregatePhase::Partial { .. } => {
                 match call.binding.function.argument_types.first() {
                     Some(crate::FunctionArgumentType::Value(value)) => Some(value),
-                    Some(crate::FunctionArgumentType::Lambda { .. }) | None => {
+                    Some(
+                        crate::FunctionArgumentType::Lambda { .. }
+                        | crate::FunctionArgumentType::CandidateGroup { .. },
+                    )
+                    | None => {
                         errors.push(ValidationError::new(
                             path,
                             "writer aggregate requires one scalar value argument",
@@ -3522,7 +3526,7 @@ fn validate_aggregate_contract(
         ) {
             (Some(expression_node), Some(value))
                 if expression_node.ty == value.ty
-                    && (matches!(expression_node.kind, ExprKind::Value(source) if source == *output)
+                    && (expression_node.kind.input_value() == Some(*output)
                         || matches!(
                             value.origin,
                             ValueOrigin::Expr { node: owner, root:expr }
@@ -3585,7 +3589,7 @@ fn validate_aggregate_contract(
             if !fragment
                 .root_expression(node.id, root)
                 .is_some_and(|expression| {
-                    matches!(expression.kind, ExprKind::Value(_))
+                    expression.kind.input_value().is_some()
                         && expression.ty.data_type() == &arrow_schema::DataType::Boolean
                 })
             {
@@ -3662,7 +3666,7 @@ fn validate_grouped_topn(
         let valid = fragment
             .root_expression(node.id, *expression)
             .is_some_and(|expr| {
-                matches!(expr.kind, ExprKind::Value(source) if source == *output)
+                expr.kind.input_value() == Some(*output)
                     && crate::grouped_state_topn_key_supported(comparator, &expr.ty)
             });
         if !valid || !keys.insert(*output) {

@@ -20,7 +20,9 @@
 use crate::physical_node_v2::{
     Model, NodeCodecError as E, NodeProjectionFacts, NodeProjectionLimits, add, bytes,
 };
-use novarocks_expression_contract::{BoundExprSet, ExprPort, ExprRoot, ValueId, ValueType};
+use novarocks_expression_contract::{
+    BoundExprSet, ControlExpansion, ExprId, ExprPort, ExprRoot, ValueId, ValueType,
+};
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, ExpressionUseId};
 use std::mem::size_of;
@@ -40,9 +42,10 @@ pub(super) fn encode(
     admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, E> {
+    let expansions = unit.control_expansions().records().len();
     let mut model = Model {
-        items: add(unit.ports().len(), unit.roots().len())?,
-        refs: unit.roots().len(),
+        items: add(add(unit.ports().len(), unit.roots().len())?, expansions)?,
+        refs: add(unit.roots().len(), expansion_references(expansions)?)?,
         ..Model::default()
     };
     let mut known = add(
@@ -57,6 +60,12 @@ pub(super) fn encode(
     )?;
     model.request::<wire::ExpressionPort>(unit.ports().len(), 1)?;
     model.request::<wire::ExpressionRoot>(unit.roots().len(), 1)?;
+    model.request::<wire::SourceControlExpansion>(expansions, 1)?;
+    known = add(known, bytes::<ControlExpansion>(expansions)?)?;
+    known = add(
+        known,
+        expansion_index_bytes(expansions, unit.definitions().len())?,
+    )?;
     if limits.is_some() {
         floor(source, known)?;
     }
@@ -82,9 +91,15 @@ pub(super) fn decode<H>(
     mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    let expansions = unit.control_expansions.len();
+    if expansions > unit.definitions.len() / 3 {
+        return Err(
+            E::InvalidShape("control expansion extent exceeds its physical definitions").into(),
+        );
+    }
     let mut model = Model {
-        items: add(unit.ports.len(), unit.roots.len())?,
-        refs: unit.roots.len(),
+        items: add(add(unit.ports.len(), unit.roots.len())?, expansions)?,
+        refs: add(unit.roots.len(), expansion_references(expansions)?)?,
         ..Model::default()
     };
     let mut known = add(
@@ -97,6 +112,11 @@ pub(super) fn decode<H>(
     model.request::<ExprPort>(unit.ports.len(), 2)?;
     model.request::<ExprRoot>(unit.roots.len(), 2)?;
     model.request::<ExpressionUseId>(unit.roots.len(), 2)?;
+    model.request::<ControlExpansion>(expansions, 2)?;
+    known = add(
+        known,
+        bytes::<wire::SourceControlExpansion>(unit.control_expansions.capacity())?,
+    )?;
     let arc =
         novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
             BoundExprSet,
@@ -141,6 +161,16 @@ pub(super) fn decode<H>(
         work.step().map_err(E::from)?;
     }
     Ok(model.numerical_facts(source.max(known), 0, limits)?)
+}
+
+fn expansion_references(records: usize) -> Result<usize, E> {
+    records
+        .checked_mul(5)
+        .ok_or(E::Control(CompileControlError::ResourceExhausted))
+}
+
+pub(super) fn expansion_index_bytes(records: usize, definitions: usize) -> Result<usize, E> {
+    bytes::<Option<ExprId>>(if records == 0 { 0 } else { definitions })
 }
 
 fn observe_decode<H>(

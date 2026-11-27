@@ -134,7 +134,7 @@ fn cast_fixture(
     let child = builder
         .unit(output_node)
         .unwrap()
-        .add(None, source_type, ExprKind::Value(columns[0].0))
+        .add(None, source_type, ExprKind::input(columns[0].0))
         .unwrap();
     let cast = builder
         .unit(output_node)
@@ -236,12 +236,12 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
     let left = builder
         .unit(output)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(ids[0]))
+        .add(None, ty.clone(), ExprKind::input(ids[0]))
         .unwrap();
     let right = builder
         .unit(output)
         .unwrap()
-        .add(None, ty, ExprKind::Value(ids[1]))
+        .add(None, ty, ExprKind::input(ids[1]))
         .unwrap();
     let result_type = FunctionValueType::new(DataType::Boolean, false);
     let expr = builder

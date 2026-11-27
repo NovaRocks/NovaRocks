@@ -181,9 +181,12 @@ impl PureKernelAbi {
                             | ArgumentControl::SearchedCase
                             | ArgumentControl::TemporalSource(_)
                             | ArgumentControl::OrderedRegexp
+                            | ArgumentControl::CandidateGroup
                     )
                     && match base.argument_control {
-                        ArgumentControl::OrderedRegexp | ArgumentControl::NullIf => {
+                        ArgumentControl::OrderedRegexp
+                        | ArgumentControl::NullIf
+                        | ArgumentControl::CandidateGroup => {
                             base.own_row_error == FunctionIntrinsicRowError::MayRaise
                         }
                         ArgumentControl::TemporalSource(_) => matches!(
@@ -544,6 +547,7 @@ pub enum PreparedPureKernel {
     ControlIntrinsic(Arc<FunctionCallContract>),
     OrderedRegexp(crate::PreparedRegexp),
     NullIf(crate::builtin::nullif::PreparedNullIf),
+    Membership(crate::native_inlist::PreparedMembership),
 }
 impl PreparedPureKernel {
     /// Borrow the exact call owned by this resolved lifecycle implementation.
@@ -560,6 +564,7 @@ impl PreparedPureKernel {
             Self::ControlIntrinsic(call) => call,
             Self::OrderedRegexp(prepared) => prepared.call(),
             Self::NullIf(prepared) => prepared.call(),
+            Self::Membership(prepared) => prepared.call(),
         }
     }
 }
@@ -1663,10 +1668,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionSpecializationFailure::Control)?;
-        Ok(PreparedPureCallDraft {
-            effects: effects.into(),
-            prepared: prepared_control_call(call, control)?,
-        })
+        Ok(prepared_control_draft(call, effects, control)?)
     }
 
     fn prepare_checked(
@@ -1697,10 +1699,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionSpecializationFailure::Control)?;
-        Ok(PreparedPureCallDraft {
-            effects: effects.into(),
-            prepared: prepared_control_call(call, control)?,
-        })
+        Ok(prepared_control_draft(call, effects, control)?)
     }
 }
 
@@ -1715,7 +1714,28 @@ fn prepared_control_call(
         return crate::builtin::nullif::PreparedNullIf::from_call(call, control)
             .map(PreparedPureKernel::NullIf);
     }
+    if call.effects().argument_control == ArgumentControl::CandidateGroup {
+        return crate::native_inlist::PreparedMembership::from_call(call, control)
+            .map(PreparedPureKernel::Membership);
+    }
     Ok(PreparedPureKernel::ControlIntrinsic(call))
+}
+
+fn prepared_control_draft(
+    call: Arc<FunctionCallContract>,
+    mut effects: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure> {
+    let prepared = prepared_control_call(call, control)?;
+    if matches!(&prepared, PreparedPureKernel::Membership(membership)
+        if membership.comparison_effects().may_raise_invocation_data)
+    {
+        effects = effects.with_invocation_data_capability();
+    }
+    Ok(PreparedPureCallDraft {
+        effects: effects.into(),
+        prepared,
+    })
 }
 
 type RegisteredParts<O> = (

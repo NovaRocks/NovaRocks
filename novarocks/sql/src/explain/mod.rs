@@ -765,17 +765,12 @@ mod tests {
         }
         let many = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::InList {
-                        expr: novarocks_parser::ast::AstBox::new(column_expr(1, None, "k")),
-                        list: (0..1024).map(int_literal).collect(),
-                        negated: true,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                predicate: crate::common::binary_operator::test_predicate(
+                    novarocks_type_contract::OperatorFunction::InList,
+                    std::iter::once(column_expr(1, None, "k"))
+                        .chain((0..1024).map(int_literal))
+                        .collect(),
+                ),
             }),
             vec![empty_values_for_test()],
             None,

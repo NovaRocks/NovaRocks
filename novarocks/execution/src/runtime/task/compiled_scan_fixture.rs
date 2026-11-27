@@ -365,7 +365,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         let column = builder
             .unit(SCAN)
             .unwrap()
-            .add(None, int64(), ExprKind::Value(provider[0]))
+            .add(None, int64(), ExprKind::input(provider[0]))
             .unwrap();
         let literal = builder.constant(
             SCAN,
@@ -452,7 +452,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         let expr = builder
             .unit(PROJECT)
             .unwrap()
-            .add(None, int64(), ExprKind::Value(input))
+            .add(None, int64(), ExprKind::input(input))
             .unwrap();
         let expr = builder
             .unit(PROJECT)

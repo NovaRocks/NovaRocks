@@ -376,7 +376,6 @@ fn preflight(
             K::Conjunction(v) | K::Disjunction(v) => {
                 list::<p::ExprId>(&mut model, v.expr_ids.len(), bl)?
             }
-            K::InList(v) => list::<p::ExprId>(&mut model, v.list_expr_ids.len(), bl)?,
             K::CaseExpression(v) => list::<(p::ExprId, p::ExprId)>(&mut model, v.arms.len(), bl)?,
             K::Lambda(v) => {
                 model.facts.type_reference_count = add(
@@ -391,14 +390,12 @@ fn preflight(
             K::FunctionCall(v) => list::<p::ExprId>(&mut model, v.argument_expr_ids.len(), bl)?,
 
             K::ValueId(_)
+            | K::LocalValueExprId(_)
+            | K::LetExpression(_)
             | K::Constant(_)
             | K::LambdaParameter(_)
-            | K::Unary(_)
             | K::Binary(_)
-            | K::IsNull(_)
-            | K::Between(_)
-            | K::Like(_)
-            | K::IsTruthValue(_) => {}
+            | K::IsNull(_) => {}
         }
         check_model(&mut model, refs, bl, admission)?;
         if admission.observed() {
@@ -475,18 +472,15 @@ fn preflight(
             }
 
             K::ValueId(_)
+            | K::LocalValueExprId(_)
+            | K::LetExpression(_)
             | K::Constant(_)
             | K::LambdaParameter(_)
-            | K::Unary(_)
             | K::Binary(_)
             | K::Conjunction(_)
             | K::Disjunction(_)
             | K::IsNull(_)
-            | K::InList(_)
-            | K::Between(_)
-            | K::Like(_)
-            | K::CaseExpression(_)
-            | K::IsTruthValue(_) => {}
+            | K::CaseExpression(_) => {}
         }
         check_model(&mut model, refs, bl, admission)?;
         w.step()?;
@@ -629,7 +623,14 @@ fn owned_kind(
                 .ok_or_else(|| shape("owned expression kind is absent")),
             w,
         )? {
-            K::ValueId(id) => novarocks_expression_contract::ExprKind::Value(p::ValueId::new(*id)),
+            K::ValueId(id) => novarocks_expression_contract::ExprKind::input(p::ValueId::new(*id)),
+            K::LocalValueExprId(id) => novarocks_expression_contract::ExprKind::Value(
+                novarocks_expression_contract::ValueAddress::Local(p::ExprId::new(*id)),
+            ),
+            K::LetExpression(v) => novarocks_expression_contract::ExprKind::Let {
+                value: expr(v.value_expr_id, "Let initializer is absent", w)?,
+                body: expr(v.body_expr_id, "Let body is absent", w)?,
+            },
             K::Constant(v) => {
                 novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
                     pool: p::ConstantPoolId::new(required(
@@ -643,10 +644,6 @@ fn owned_kind(
             K::LambdaParameter(v) => novarocks_expression_contract::ExprKind::LambdaParameter {
                 lambda: expr(v.lambda_expr_id, "lambda parameter owner is absent", w)?,
                 ordinal: v.ordinal,
-            },
-            K::Unary(v) => novarocks_expression_contract::ExprKind::Unary {
-                op: completed(receiving_grammar::decode_unary(v.op), w)?,
-                expr: expr(v.expr_id, "unary operand is absent", w)?,
             },
             K::Binary(v) => novarocks_expression_contract::ExprKind::Binary {
                 left: expr(v.left_expr_id, "binary left operand is absent", w)?,
@@ -695,22 +692,6 @@ fn owned_kind(
                 expr: expr(v.expr_id, "null-test operand is absent", w)?,
                 negated: v.negated,
             },
-            K::InList(v) => novarocks_expression_contract::ExprKind::InList {
-                expr: expr(v.expr_id, "in-list operand is absent", w)?,
-                list: ids(&v.list_expr_ids, w)?,
-                negated: v.negated,
-            },
-            K::Between(v) => novarocks_expression_contract::ExprKind::Between {
-                expr: expr(v.expr_id, "between operand is absent", w)?,
-                low: expr(v.low_expr_id, "between low operand is absent", w)?,
-                high: expr(v.high_expr_id, "between high operand is absent", w)?,
-                negated: v.negated,
-            },
-            K::Like(v) => novarocks_expression_contract::ExprKind::Like {
-                expr: expr(v.expr_id, "like operand is absent", w)?,
-                pattern: expr(v.pattern_expr_id, "like pattern is absent", w)?,
-                negated: v.negated,
-            },
             K::CaseExpression(v) => {
                 let mut arms = reserve(v.arms.len(), w)?;
                 for arm in &v.arms {
@@ -729,11 +710,6 @@ fn owned_kind(
                     else_expr: v.else_expr_id.map(p::ExprId::new),
                 }
             }
-            K::IsTruthValue(v) => novarocks_expression_contract::ExprKind::IsTruthValue {
-                expr: expr(v.expr_id, "truth-test operand is absent", w)?,
-                value: v.value,
-                negated: v.negated,
-            },
         },
     )
 }

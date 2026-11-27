@@ -138,28 +138,20 @@ fn options() -> LocalCompileOptions {
 
 #[derive(Clone, Copy, Debug)]
 enum Operation {
-    Not,
     IsNull,
     IsNotNull,
 }
 impl Operation {
     fn kind(self, expr: ExprId) -> ExprKind {
         match self {
-            Self::Not => ExprKind::Unary {
-                op: UnaryOperator::Not,
-                expr,
-            },
             Self::IsNull | Self::IsNotNull => ExprKind::IsNull {
                 expr,
                 negated: matches!(self, Self::IsNotNull),
             },
         }
     }
-    fn result(self, input: &FunctionValueType) -> FunctionValueType {
-        FunctionValueType::new(
-            DataType::Boolean,
-            matches!(self, Self::Not) && input.nullable(),
-        )
+    fn result(self, _input: &FunctionValueType) -> FunctionValueType {
+        FunctionValueType::new(DataType::Boolean, false)
     }
 }
 #[derive(Clone, Copy)]
@@ -214,6 +206,9 @@ fn original_request_sources(
             .arguments
             .iter()
             .map(|argument| match argument {
+                FunctionArgument::CandidateGroup { .. } => {
+                    panic!("IF fixture has scalar value branches")
+                }
                 FunctionArgument::Value {
                     value_type,
                     constant,
@@ -310,7 +305,7 @@ fn fixture(
         )
         .unwrap();
     let reference = builder
-        .fixture_definition(root, input_type.clone(), ExprKind::Value(value))
+        .fixture_definition(root, input_type.clone(), ExprKind::input(value))
         .unwrap();
     let mut result_type = operation.result(&input_type);
     if matches!(claim, Claim::WrongResult) {
@@ -480,9 +475,7 @@ fn uses(fixture: &Fixture, claim: Flow) -> Result<BoundExprSet, UnitError> {
                 .unwrap()
                 .kind
             {
-                ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
-                    (ControlShape::Eager, std::slice::from_ref(expr))
-                }
+                ExprKind::IsNull { expr, .. } => (ControlShape::Eager, std::slice::from_ref(expr)),
                 ExprKind::FunctionCall { args, .. } => (ControlShape::If, args.as_ref()),
                 ExprKind::Value(_) | ExprKind::Constant(_) => (ControlShape::Eager, &[][..]),
                 other => panic!("fixture has no exact control projection for {other:?}"),
@@ -644,8 +637,7 @@ fn unary_child(
     kind: &StaticExprKind,
 ) -> novarocks_expression::CompiledExprId {
     match (operation, kind) {
-        (Operation::Not, StaticExprKind::Not(child))
-        | (Operation::IsNull, StaticExprKind::IsNull(child))
+        (Operation::IsNull, StaticExprKind::IsNull(child))
         | (Operation::IsNotNull, StaticExprKind::IsNotNull(child)) => *child,
         _ => panic!("the exact unary opcode must survive lowering"),
     }
@@ -654,7 +646,7 @@ fn unary_child(
 #[test]
 fn unary_project_and_filter_keep_exact_slots_and_value_child_demand_without_call_tokens() {
     let functions = functions();
-    for operation in [Operation::Not, Operation::IsNull, Operation::IsNotNull] {
+    for operation in [Operation::IsNull, Operation::IsNotNull] {
         for mode in [Mode::Project, Mode::Filter] {
             let input_type = FunctionValueType::new(DataType::Boolean, true);
             let fixture = fixture(
@@ -774,7 +766,7 @@ fn unary_project_and_filter_keep_exact_slots_and_value_child_demand_without_call
 #[test]
 fn actual_if_arguments_keep_distinct_unary_occurrences_and_guarded_value_children() {
     let functions = functions();
-    for operation in [Operation::Not, Operation::IsNull, Operation::IsNotNull] {
+    for operation in [Operation::IsNull, Operation::IsNotNull] {
         let fixture = fixture(
             &functions,
             operation,
@@ -923,30 +915,7 @@ fn null_predicates_preserve_authored_uuid_and_variant_operand_domains_in_exact_c
 #[test]
 fn physical_unary_type_and_control_contradictions_cannot_publish_a_local_program() {
     let functions = functions();
-    // Numeric physical NOT is supported; raw text and nominal JSON are not.
-    for input_type in [
-        FunctionValueType::new(DataType::Utf8, true),
-        FunctionValueType::try_with_logical_type(
-            DataType::LargeBinary,
-            true,
-            ValueLogicalType::Json,
-        )
-        .unwrap(),
-    ] {
-        assert!(match fixture(
-            &functions,
-            Operation::Not,
-            Mode::Project,
-            input_type,
-            Claim::Accurate
-        ) {
-            Err(error) => error
-                .downcast_ref::<UnitError>()
-                .is_some_and(|error| error.failure_fact().class() == FailureClass::Invariant),
-            Ok(_) => false,
-        });
-    }
-    for operation in [Operation::Not, Operation::IsNull, Operation::IsNotNull] {
+    for operation in [Operation::IsNull, Operation::IsNotNull] {
         assert!(match fixture(
             &functions,
             operation,

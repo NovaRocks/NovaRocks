@@ -17,9 +17,11 @@
 
 //! Exact correspondence of rooted control, call claims and original requests.
 use crate::unit_creation::{UnitMessage, UnitValidationCreation, ValidationFailure};
-use crate::{ExprKind, RootOrdinal, UnitError, UnitParts};
+use crate::{ConstantReference, ExprKind, ExprNode, RootOrdinal, UnitError, UnitParts, ValueType};
+use novarocks_function_contract::FunctionArgument;
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, ControlShape, EffectContractError, FunctionKind,
+    CallProofScope, CompileCheckpoints, ControlShape, EffectContractError,
+    ExpressionControlFlowError, FunctionKind, MAX_CONTROL_DEPTH, OperatorFunction,
 };
 use std::collections::BTreeSet;
 
@@ -34,6 +36,9 @@ pub(crate) fn validate_core<'a, H>(
             None,
             "root-use count differs from roots",
         ));
+    }
+    if parts.control.physical_use_depth() > MAX_CONTROL_DEPTH {
+        check_expanded_depth(parts, creation, work)?;
     }
     let mut roots = BTreeSet::new();
     for (ordinal, (root, &id)) in parts.roots.iter().zip(&parts.root_uses).enumerate() {
@@ -120,13 +125,22 @@ pub(crate) fn validate_core<'a, H>(
                 Ok::<_, ValidationFailure<'a, H>>(())
             })?;
         } else {
-            let ExprKind::FunctionCall { args, .. } = &node.kind else {
+            let ExprKind::FunctionCall { function, args } = &node.kind else {
                 return Err(ValidationFailure::invalid(
                     Some(node.id),
                     None,
                     "control names an unknown scalar definition",
                 ));
             };
+            let is_in_list =
+                function.function_id.as_str() == OperatorFunction::InList.function_id_text();
+            if (invocation.control == ControlShape::CandidateGroup) != is_in_list {
+                return Err(ValidationFailure::invalid(
+                    Some(node.id),
+                    None,
+                    "candidate group control differs from the installed scalar identity",
+                ));
+            }
             let claim = parts.claims.get(&use_id).ok_or_else(|| {
                 ValidationFailure::invalid(Some(node.id), None, UnitMessage::MissingClaim(use_id))
             })?;
@@ -305,7 +319,7 @@ pub(crate) fn validate_core<'a, H>(
     let mut requests = 0usize;
     for node in &parts.definitions {
         work.step()?;
-        let ExprKind::FunctionCall { function, .. } = &node.kind else {
+        let ExprKind::FunctionCall { function, args } = &node.kind else {
             continue;
         };
         requests += 1;
@@ -335,6 +349,59 @@ pub(crate) fn validate_core<'a, H>(
             }
             work.step()?;
         }
+        if function.function_id.as_str() == OperatorFunction::InList.function_id_text() {
+            let (
+                [
+                    FunctionArgument::Value {
+                        value_type,
+                        constant,
+                    },
+                    FunctionArgument::CandidateGroup { members, .. },
+                ],
+                [probe, candidates @ ..],
+            ) = (&*request.arguments, &**args)
+            else {
+                return Err(ValidationFailure::invalid(
+                    Some(node.id),
+                    None,
+                    "IN request requires a probe and an ordered candidate group",
+                ));
+            };
+            if !matches_value_source(
+                parts.definitions.get(probe.get() as usize),
+                value_type,
+                *constant,
+                work,
+            )? {
+                return Err(ValidationFailure::invalid(
+                    Some(node.id),
+                    None,
+                    "IN request probe differs from its source occurrence",
+                ));
+            }
+            if members.is_empty() || members.len() != candidates.len() {
+                return Err(ValidationFailure::invalid(
+                    Some(node.id),
+                    None,
+                    "candidate group member count differs from source occurrences",
+                ));
+            }
+            for (member, candidate) in members.iter().zip(candidates) {
+                if !matches_value_source(
+                    parts.definitions.get(candidate.get() as usize),
+                    &member.value_type,
+                    member.constant,
+                    work,
+                )? {
+                    return Err(ValidationFailure::invalid(
+                        Some(node.id),
+                        None,
+                        "candidate group member differs from its source occurrence",
+                    ));
+                }
+                work.step()?;
+            }
+        }
     }
     if requests != parts.requests.len() {
         return Err(ValidationFailure::invalid(
@@ -344,6 +411,62 @@ pub(crate) fn validate_core<'a, H>(
         ));
     }
     Ok(())
+}
+
+fn check_expanded_depth<'a, H>(
+    parts: &'a UnitParts,
+    creation: &mut UnitValidationCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ValidationFailure<'a, H>> {
+    if parts.expansions.records().is_empty() {
+        return Err(ExpressionControlFlowError::TooDeep.into());
+    }
+    let uses = parts.control.uses();
+    let mut stack = Vec::new();
+    creation.reserve(&mut stack, parts.control.physical_use_depth(), work)?;
+    for &root in &parts.root_uses {
+        let invocation = uses
+            .get(&root)
+            .ok_or(ExpressionControlFlowError::InvalidReference)?;
+        stack.push((invocation, 0usize, 1usize));
+        while let Some((parent, next, depth)) = stack.last_mut() {
+            work.step()?;
+            let Some(child) = parent.arguments.get(*next) else {
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            let child = &uses[child];
+            let advance = usize::from(
+                !parts
+                    .expansions
+                    .shares_source_position(parent.definition, child.definition),
+            );
+            let depth = *depth + advance;
+            if depth > MAX_CONTROL_DEPTH {
+                return Err(ExpressionControlFlowError::TooDeep.into());
+            }
+            stack.push((child, 0, depth));
+        }
+    }
+    Ok(())
+}
+
+fn matches_value_source<'a, H>(
+    source: Option<&ExprNode>,
+    value_type: &ValueType,
+    constant: Option<ConstantReference>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ValidationFailure<'a, H>> {
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    Ok(
+        constant.is_none_or(|reference| source.kind == ExprKind::Constant(reference))
+            && value_type.exactly_equals_observed(&source.ty, || {
+                work.step().map_err(ValidationFailure::from)
+            })?,
+    )
 }
 
 pub(crate) fn validate(

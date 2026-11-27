@@ -14,7 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::{ExprId, ExprNode, ExpressionCallClaim, PhysicalCallRequest, ValueId, ValueType};
+use crate::{
+    ControlExpansions, ExprId, ExprNode, ExpressionCallClaim, PhysicalCallRequest, ValueId,
+    ValueType,
+};
 use novarocks_type_contract::{
     ControlShape, EvaluationDemand, ExpressionControlFlow, ExpressionUseId,
     TemporalSourceDefinitions,
@@ -66,6 +69,7 @@ pub struct UnitParts {
     pub roots: Box<[ExprRoot]>,
     pub root_uses: Box<[ExpressionUseId]>,
     pub control: ExpressionControlFlow<ExprId>,
+    pub(crate) expansions: ControlExpansions,
     pub claims: BTreeMap<ExpressionUseId, ExpressionCallClaim>,
     pub requests: BTreeMap<ExprId, PhysicalCallRequest>,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
@@ -77,6 +81,7 @@ pub struct BoundExprSet {
     roots: Box<[ExprRoot]>,
     root_uses: Box<[ExpressionUseId]>,
     control: ExpressionControlFlow<ExprId>,
+    expansions: ControlExpansions,
     claims: BTreeMap<ExpressionUseId, ExpressionCallClaim>,
     requests: BTreeMap<ExprId, PhysicalCallRequest>,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
@@ -106,6 +111,9 @@ impl BoundExprSet {
     pub fn control_flow(&self) -> &ExpressionControlFlow<ExprId> {
         &self.control
     }
+    pub fn control_expansions(&self) -> &ControlExpansions {
+        &self.expansions
+    }
     pub fn claims(&self) -> &BTreeMap<ExpressionUseId, ExpressionCallClaim> {
         &self.claims
     }
@@ -123,7 +131,14 @@ impl BoundExprSet {
         limits: UnitLimits,
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<Self, crate::UnitError> {
-        crate::validation::validate(&parts.ports, &parts.definitions, &parts.roots, limits, work)?;
+        crate::validation::validate(
+            &parts.ports,
+            &parts.definitions,
+            &parts.roots,
+            &parts.expansions,
+            limits,
+            work,
+        )?;
         Self::finish_sealed_parts(parts, work)
     }
     pub(crate) fn finish_sealed_parts(
@@ -140,6 +155,7 @@ impl BoundExprSet {
             roots: parts.roots,
             root_uses: parts.root_uses,
             control: parts.control,
+            expansions: parts.expansions,
             claims: parts.claims,
             requests: parts.requests,
             storage: parts.storage,
@@ -221,6 +237,7 @@ impl BoundExprSet {
             &parts.ports,
             &parts.definitions,
             &parts.roots,
+            &parts.expansions,
             limits,
             creation,
             work,
@@ -261,6 +278,7 @@ impl UnitParts {
             roots,
             root_uses,
             control,
+            expansions: ControlExpansions::default(),
             claims,
             requests,
             storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
@@ -280,6 +298,10 @@ impl UnitParts {
         self.storage = storage;
         Ok(self)
     }
+    pub fn with_control_expansions(mut self, expansions: ControlExpansions) -> Self {
+        self.expansions = expansions;
+        self
+    }
 }
 impl BoundExprSet {
     /// Moving parts preserves their actual construction lifetime.
@@ -290,6 +312,7 @@ impl BoundExprSet {
             roots: self.roots,
             root_uses: self.root_uses,
             control: self.control,
+            expansions: self.expansions,
             claims: self.claims,
             requests: self.requests,
             storage: self.storage,
@@ -304,6 +327,7 @@ impl PartialEq for BoundExprSet {
             && self.roots == other.roots
             && self.root_uses == other.root_uses
             && self.control == other.control
+            && self.expansions.records() == other.expansions.records()
             && self.claims == other.claims
             && self.requests == other.requests
     }
@@ -317,7 +341,14 @@ impl BoundExprSet {
         limits: crate::UnitLimits,
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<(), crate::UnitError> {
-        crate::validation::validate(&self.ports, &self.definitions, &self.roots, limits, work)
+        crate::validation::validate(
+            &self.ports,
+            &self.definitions,
+            &self.roots,
+            &self.expansions,
+            limits,
+            work,
+        )
     }
 }
 // Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
@@ -337,6 +368,7 @@ impl BoundExprSet {
             &self.ports,
             &self.definitions,
             &self.roots,
+            &self.expansions,
             limits,
             &mut creation,
             work,

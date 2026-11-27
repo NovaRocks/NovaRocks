@@ -244,6 +244,43 @@ fn constant(text: &str, context: &TextContext<'_>) -> CheckedRows {
 }
 
 #[test]
+fn boolean_not_preserves_value_nulls_and_refuses_numeric_operands_at_typing() {
+    let functions = fixture();
+    let parameters = parameters();
+    let context = context(&functions, &parameters);
+    for (text, expected) in [
+        ("NOT TRUE", Some(false)),
+        ("NOT FALSE", Some(true)),
+        ("NOT NULL", None),
+    ] {
+        assert_eq!(
+            constant(text, &context).batch.values.to_data(),
+            BooleanArray::from(vec![expected]).to_data()
+        );
+    }
+    for text in [
+        "NOT CAST(0 AS TINYINT)",
+        "NOT CAST(0 AS SMALLINT)",
+        "NOT 0",
+        "NOT BIGINT '0'",
+        "NOT REAL 'NaN'",
+        "NOT DOUBLE '-0.0'",
+        "NOT DECIMAL '0.0'",
+    ] {
+        assert!(
+            matches!(
+                type_expression_text(text, &[], &context, &HarnessControl),
+                Err(TextError::Typing {
+                    cause: TypingError::TypeMismatch(_),
+                    ..
+                })
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn shared_call_keeps_port_order_and_repeated_references() {
     let functions = fixture();
     let parameters = parameters();
@@ -265,10 +302,7 @@ fn shared_call_keeps_port_order_and_repeated_references() {
         .unit()
         .definitions()
         .iter()
-        .filter_map(|definition| match definition.kind {
-            ExprKind::Value(id) => Some(id),
-            _ => None,
-        })
+        .filter_map(|definition| definition.kind.input_value())
         .collect::<Vec<_>>();
     assert_eq!(
         occurrences,

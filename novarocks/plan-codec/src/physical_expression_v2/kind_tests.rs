@@ -68,6 +68,31 @@ fn encoded(kind: ExprKind) -> wire::expression_definition::Kind {
 }
 
 #[test]
+fn lexical_value_and_input_have_distinct_wire_addresses() {
+    use wire::expression_definition::Kind;
+    assert_eq!(
+        encoded(ExprKind::input(
+            novarocks_expression_contract::ValueId::new(0)
+        )),
+        Kind::ValueId(0),
+    );
+    assert_eq!(
+        encoded(ExprKind::Value(ValueAddress::Local(ExprId::new(0)))),
+        Kind::LocalValueExprId(0),
+    );
+    assert_eq!(
+        encoded(ExprKind::Let {
+            value: ExprId::new(1),
+            body: ExprId::new(u32::MAX)
+        }),
+        Kind::LetExpression(wire::LetExpression {
+            value_expr_id: Some(1),
+            body_expr_id: Some(u32::MAX),
+        }),
+    );
+}
+
+#[test]
 fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
     use wire::expression_definition::Kind;
     assert_eq!(
@@ -81,12 +106,12 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
         })
     );
     assert_eq!(
-        encoded(ExprKind::Unary {
-            op: UnaryOperator::Not,
+        encoded(ExprKind::IsNull {
+            negated: true,
             expr: ExprId::new(0)
         }),
-        Kind::Unary(wire::UnaryExpression {
-            op: wire::UnaryOperator::Not as i32,
+        Kind::IsNull(wire::IsNullExpression {
+            negated: true,
             expr_id: Some(0)
         })
     );

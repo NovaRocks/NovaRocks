@@ -542,6 +542,7 @@ pub(super) fn assert_borrowed_call(
         PreparedPureKernel::ControlIntrinsic(call) => call.as_ref(),
         PreparedPureKernel::OrderedRegexp(prepared) => prepared.call(),
         PreparedPureKernel::NullIf(prepared) => prepared.call(),
+        PreparedPureKernel::Membership(prepared) => prepared.call(),
     };
     let borrowed = specialization.call_contract();
     assert!(std::ptr::eq(borrowed, direct));

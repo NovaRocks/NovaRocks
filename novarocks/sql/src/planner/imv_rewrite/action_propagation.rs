@@ -230,26 +230,14 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
             func.eq_ignore_ascii_case(name)
                 || args.iter().any(|arg| expr_contains_function(arg, name))
         }
-        ExprKind::BinaryOp { left, right, .. } => {
-            expr_contains_function(left, name) || expr_contains_function(right, name)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => expr_contains_function(expr, name),
-        ExprKind::InList { expr, list, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => expr_contains_function(left, name) || expr_contains_function(right, name),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
             expr_contains_function(expr, name)
-                || list.iter().any(|item| expr_contains_function(item, name))
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            expr_contains_function(expr, name)
-                || expr_contains_function(low, name)
-                || expr_contains_function(high, name)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            expr_contains_function(expr, name) || expr_contains_function(pattern, name)
         }
         ExprKind::Case {
             operand,
@@ -287,6 +275,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
                     .any(|item| expr_contains_function(&item.expr, name))
         }
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)

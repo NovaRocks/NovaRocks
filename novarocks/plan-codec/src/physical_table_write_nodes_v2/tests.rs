@@ -731,7 +731,7 @@ impl Fixture {
             ),
             (
                 1,
-                novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+                novarocks_expression_contract::ExprKind::input(p::ValueId::new(0)),
             ),
             (
                 2,
@@ -819,6 +819,9 @@ impl Fixture {
                     .iter()
                     .map(|arg| match arg {
                         FunctionArgumentType::Value(_) => vec![],
+                        FunctionArgumentType::CandidateGroup { .. } => {
+                            panic!("relational fixture cannot bind a scalar candidate group")
+                        }
                         FunctionArgumentType::Lambda {
                             parameter_types, ..
                         } => parameter_types
@@ -844,6 +847,9 @@ impl Fixture {
                     .enumerate()
                     .map(|(j, arg)| match arg {
                         FunctionArgumentType::Value(_) => ArgumentTypeIds::Value(1),
+                        FunctionArgumentType::CandidateGroup { .. } => {
+                            panic!("relational fixture cannot bind a scalar candidate group")
+                        }
                         FunctionArgumentType::Lambda { .. } => ArgumentTypeIds::Lambda {
                             parameters: &parameter_ids[i][j],
                             result: 3,

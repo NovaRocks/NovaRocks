@@ -142,37 +142,32 @@ fn extract_column_literal_constraint(
             return build_binary_constraint(right, reverse_comparison(operator)?, left);
         }
     }
+    if let Some((probe, candidates)) = crate::common::binary_operator::scalar_in_list(arena, expr)
+        && is_constraint_operand(arena, probe)
+        && crate::common::binary_operator::permits_equality_substitution(arena.data_type(probe))
+        && candidates
+            .iter()
+            .all(|candidate| is_literal(arena, *candidate))
+    {
+        return Some(ColumnConstraint {
+            column: probe,
+            kind: ConstraintKind::InList(candidates.to_vec()),
+        });
+    }
+    if let Some((probe, low, high)) =
+        crate::common::binary_operator::scalar_inclusive_range(arena, expr)
+        && is_constraint_operand(arena, probe)
+        && crate::common::binary_operator::permits_equality_substitution(arena.data_type(probe))
+        && is_literal(arena, low)
+        && is_literal(arena, high)
+    {
+        return Some(ColumnConstraint {
+            column: probe,
+            kind: ConstraintKind::Between { low, high },
+        });
+    }
     match arena.node(expr) {
         ScalarNode::Nested(inner) => extract_column_literal_constraint(arena, *inner),
-        ScalarNode::InList {
-            child,
-            list,
-            negated: false,
-        } if is_constraint_operand(arena, *child)
-            && list.iter().all(|item| is_literal(arena, *item)) =>
-        {
-            Some(ColumnConstraint {
-                column: *child,
-                kind: ConstraintKind::InList(list.clone()),
-            })
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated: false,
-        } if is_constraint_operand(arena, *child)
-            && is_literal(arena, *low)
-            && is_literal(arena, *high) =>
-        {
-            Some(ColumnConstraint {
-                column: *child,
-                kind: ConstraintKind::Between {
-                    low: *low,
-                    high: *high,
-                },
-            })
-        }
         _ => None,
     }
 }
@@ -203,34 +198,23 @@ fn substitute_constraint_column(
     let expr = match &constraint.kind {
         ConstraintKind::Eq(value) => binary_bool(arena, target_column, BinOp::Eq, *value, control)?,
         ConstraintKind::InList(list) => {
-            let nullable =
-                arena.nullable(target_column) || list.iter().any(|expr| arena.nullable(*expr));
-            arena.intern_observed(
-                ScalarNode::InList {
-                    child: target_column,
-                    list: list.clone(),
-                    negated: false,
-                },
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-                control,
-            )?
+            let equalities = list
+                .iter()
+                .map(|&candidate| binary_bool(arena, target_column, BinOp::Eq, candidate, control))
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(disjunction) = scalar_expr::combine_disjuncts(arena, equalities, control)?
+            else {
+                return Ok(None);
+            };
+            disjunction
         }
         ConstraintKind::Lower { op, value } | ConstraintKind::Upper { op, value } => {
             binary_bool(arena, target_column, *op, *value, control)?
         }
         ConstraintKind::Between { low, high } => {
-            let nullable =
-                arena.nullable(target_column) || arena.nullable(*low) || arena.nullable(*high);
-            arena.intern_observed(
-                ScalarNode::Between {
-                    child: target_column,
-                    low: *low,
-                    high: *high,
-                    negated: false,
-                },
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
-                control,
-            )?
+            let lower = binary_bool(arena, *low, BinOp::Le, target_column, control)?;
+            let upper = binary_bool(arena, target_column, BinOp::Le, *high, control)?;
+            binary_bool(arena, lower, BinOp::And, upper, control)?
         }
     };
     Ok(Some(PredicateGroup::new(
@@ -1382,31 +1366,17 @@ mod tests {
     fn derives_range_envelope_from_or_branches() {
         let mut arena = ScalarArena::new();
         let or_pred = bool_expr(
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(int_lit(100)),
-                    high: novarocks_parser::ast::AstBox::new(int_lit(150)),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                int_lit(100),
+                int_lit(150),
+            ),
             BinOp::Or,
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(int_lit(50)),
-                    high: novarocks_parser::ast::AstBox::new(int_lit(200)),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                int_lit(50),
+                int_lit(200),
+            ),
         );
 
         let or_group = group(&mut arena, or_pred);
@@ -1430,31 +1400,17 @@ mod tests {
     fn range_envelope_compares_large_int_bounds_exactly() {
         let mut arena = ScalarArena::new();
         let or_pred = bool_expr(
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_740_993)),
-                    high: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_741_500)),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                large_int_lit(9_007_199_254_740_993),
+                large_int_lit(9_007_199_254_741_500),
+            ),
             BinOp::Or,
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_740_992)),
-                    high: novarocks_parser::ast::AstBox::new(large_int_lit(9_007_199_254_741_600)),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                large_int_lit(9_007_199_254_740_992),
+                large_int_lit(9_007_199_254_741_600),
+            ),
         );
 
         let or_group = group(&mut arena, or_pred);
@@ -1477,31 +1433,17 @@ mod tests {
     fn range_envelope_compares_decimal_bounds_exactly() {
         let mut arena = ScalarArena::new();
         let or_pred = bool_expr(
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(decimal_lit("10.25")),
-                    high: novarocks_parser::ast::AstBox::new(decimal_lit("20.00")),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                decimal_lit("10.25"),
+                decimal_lit("20.00"),
+            ),
             BinOp::Or,
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(decimal_lit("9.50")),
-                    high: novarocks_parser::ast::AstBox::new(decimal_lit("30.00")),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                decimal_lit("9.50"),
+                decimal_lit("30.00"),
+            ),
         );
 
         let or_group = group(&mut arena, or_pred);
@@ -1523,31 +1465,17 @@ mod tests {
     fn unsupported_range_literal_skips_range_envelope() {
         let mut arena = ScalarArena::new();
         let or_pred = bool_expr(
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(string_lit("a")),
-                    high: novarocks_parser::ast::AstBox::new(string_lit("z")),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                string_lit("a"),
+                string_lit("z"),
+            ),
             BinOp::Or,
-            TypedExpr {
-                kind: ExprKind::Between {
-                    expr: novarocks_parser::ast::AstBox::new(col("s", "price", 3)),
-                    low: novarocks_parser::ast::AstBox::new(string_lit("b")),
-                    high: novarocks_parser::ast::AstBox::new(string_lit("y")),
-                    negated: false,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            },
+            crate::common::binary_operator::test_inclusive_range(
+                col("s", "price", 3),
+                string_lit("b"),
+                string_lit("y"),
+            ),
         );
 
         let or_group = group(&mut arena, or_pred);

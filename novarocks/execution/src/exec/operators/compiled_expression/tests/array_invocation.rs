@@ -177,7 +177,7 @@ fn original_source_program(field_name: &str, source_mode: SourceMode) -> Arc<Loc
     let mut data = builder
         .unit(output)
         .unwrap()
-        .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
+        .add(None, source_type.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let name_type = FunctionValueType::new(DataType::Utf8, false);
     let name = if source_mode == SourceMode::Slot {
@@ -220,7 +220,7 @@ fn original_source_program(field_name: &str, source_mode: SourceMode) -> Arc<Loc
         let flag = builder
             .unit(output)
             .unwrap()
-            .add(None, flag_type.clone(), ExprKind::Value(columns[1].0))
+            .add(None, flag_type.clone(), ExprKind::input(columns[1].0))
             .unwrap();
         let null = builder
             .unit(output)

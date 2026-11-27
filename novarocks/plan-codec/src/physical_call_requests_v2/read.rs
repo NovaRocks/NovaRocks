@@ -432,6 +432,84 @@ fn capture_arguments<F: ReadFailure, W: RequestWire>(
     }
     Ok(())
 }
+fn preflight_value_argument<F: ReadFailure>(
+    input: &wire::OriginalValueArgument,
+    types: CallRequestTypeOwner<'_>,
+    pools: &ConstantPools,
+    model: &mut Model,
+    limits: Profile,
+    parent: &mut Option<&mut Parent<'_, F>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), F> {
+    model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+    observed(model.admit(limits, parent), w)?;
+    let id = required(
+        input.value_type_id,
+        "request argument value type ID is absent",
+    );
+    w.step()?;
+    let ty = model.value(types, id?, limits, parent, w)?;
+    if let Some(input) = &input.constant {
+        let address = observed(reference(input), w)?;
+        let matches = if parent.is_some() {
+            w.flush()?;
+            let mut matches = false;
+            let found = pools.resolve_source_captured_observed(
+                address,
+                &mut |found, w| {
+                    matches = model.compare(ty, found.value_type(), limits, parent, w)?;
+                    Ok::<_, F>(())
+                },
+                w,
+            );
+            let found = observed(found, w)?;
+            w.flush()?;
+            // Selected handles share the admitted original pool.
+            // No literal factory or replacement backing is used.
+            let _ = found;
+            matches
+        } else {
+            w.flush()?;
+            let found = pools.resolve_source_observed(address, w).map_err(F::from);
+            let found = observed(found, w);
+            if found
+                .as_ref()
+                .is_err_and(|error| error.is_primary_refusal())
+            {
+                return found.map(|_| ());
+            }
+            w.flush()?;
+            let found = found?;
+            let remaining = limits.remaining_work(model.facts.cumulative_work_upper_bound)?;
+            let compared = match remaining {
+                Some(maximum) => {
+                    verify_type_binding(ty, found.value_type(), model.source, maximum, w)?
+                }
+                None => crate::borrowed_type_resources::verify_type_binding_optional_work_in::<
+                    TypeCodecError,
+                >(
+                    ty,
+                    found.value_type(),
+                    model.source,
+                    None,
+                    &mut |_| Ok(()),
+                    w,
+                )?,
+            };
+            model.comparisons = add(model.comparisons, compared.work_upper_bound())?;
+            observed(model.admit(limits, parent), w)?;
+            compared.matches()
+        };
+        w.step()?;
+        if !matches {
+            return Err(novarocks_physical_plan::ConstantReferenceError::Table(
+                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(address),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
 fn preflight<F: ReadFailure, W: RequestWire>(
     source: &[W],
     source_capacity: usize,
@@ -542,70 +620,50 @@ fn preflight<F: ReadFailure, W: RequestWire>(
             capture_arguments(entry, &mut model, limits, parent)?;
         }
         observed(model.admit(limits, parent), w)?;
-        for argument in entry.arguments() {
+        for (ordinal, argument) in entry.arguments().iter().enumerate() {
             match argument.kind.as_ref() {
                 Some(wire::original_function_argument::Kind::Value(input)) => {
+                    preflight_value_argument(input, types, pools, &mut model, limits, parent, w)?;
+                }
+                Some(wire::original_function_argument::Kind::CandidateGroup(input)) => {
+                    if !W::ALLOWS_CANDIDATE_GROUP
+                        || ordinal != 1
+                        || logical != 2
+                        || !matches!(
+                            entry.arguments().as_slice(),
+                            [
+                                wire::OriginalFunctionArgument {
+                                    kind: Some(wire::original_function_argument::Kind::Value(_)),
+                                },
+                                _
+                            ]
+                        )
+                        || input.members.is_empty()
+                    {
+                        return Err(invalid("invalid scalar candidate group request").into());
+                    }
+                    model.arguments = add(model.arguments, input.members.len())?;
+                    model.known = add(
+                        model.known,
+                        bytes::<wire::OriginalValueArgument>(input.members.capacity())?,
+                    )?;
+                    model.request::<novarocks_physical_plan::StaticFunctionCandidate<ConstantReference>>(
+                        input.members.len(),
+                        2,
+                    )?;
                     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
                     observed(model.admit(limits, parent), w)?;
                     let id = required(
-                        input.value_type_id,
-                        "request argument value type ID is absent",
+                        input.element_value_type_id,
+                        "request candidate element type ID is absent",
                     );
                     w.step()?;
-                    let ty = model.value(types, id?, limits, parent, w)?;
-                    if let Some(input) = &input.constant {
-                        let address = observed(reference(input), w)?;
-                        let matches = if parent.is_some() {
-                            w.flush()?;
-                            let mut matches = false;
-                            let found = pools.resolve_source_captured_observed(
-                                address,
-                                &mut |found, w| {
-                                    matches =
-                                        model.compare(ty, found.value_type(), limits, parent, w)?;
-                                    Ok::<_, F>(())
-                                },
-                                w,
-                            );
-                            let found = observed(found, w)?;
-                            w.flush()?;
-                            // Selected handles share the admitted original pool.
-                            // No literal factory or replacement backing is used.
-                            let _ = found;
-                            matches
-                        } else {
-                            w.flush()?;
-                            let found = pools.resolve_source_observed(address, w).map_err(F::from);
-                            let found = observed(found, w);
-                            if found
-                                .as_ref()
-                                .is_err_and(|error| error.is_primary_refusal())
-                            {
-                                return found.map(|_| model.facts);
-                            }
-                            w.flush()?;
-                            let found = found?;
-                            let remaining =
-                                limits.remaining_work(model.facts.cumulative_work_upper_bound)?;
-                            let compared = match remaining {
-                                Some(maximum) => verify_type_binding(ty,found.value_type(),invoice,maximum,w)?,
-                                None => crate::borrowed_type_resources::verify_type_binding_optional_work_in::<TypeCodecError>(
-                                    ty,found.value_type(),invoice,None,&mut |_| Ok(()),w)?,
-                            };
-                            model.comparisons =
-                                add(model.comparisons, compared.work_upper_bound())?;
-                            observed(model.admit(limits, parent), w)?;
-                            compared.matches()
-                        };
+                    model.value(types, id?, limits, parent, w)?;
+                    for member in &input.members {
+                        preflight_value_argument(
+                            member, types, pools, &mut model, limits, parent, w,
+                        )?;
                         w.step()?;
-                        if !matches {
-                            return Err(novarocks_physical_plan::ConstantReferenceError::Table(
-                                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(
-                                    address,
-                                ),
-                            )
-                            .into());
-                        }
                     }
                 }
                 Some(wire::original_function_argument::Kind::Lambda(input)) => {
@@ -865,6 +923,31 @@ fn prepare_with_creator_core<'loan, 'control: 'loan, H>(
     Ok(token)
 }
 
+fn decode_value_argument(
+    input: &wire::OriginalValueArgument,
+    types: CallRequestTypeOwner<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_physical_plan::StaticFunctionCandidate<ConstantReference>, E> {
+    let id = required(
+        input.value_type_id,
+        "request argument value type ID is absent",
+    );
+    work.step()?;
+    let value_type = clone_value_type_observed(value(types, id?, work)?, work)?;
+    let constant = match &input.constant {
+        Some(input) => {
+            let address = reference(input);
+            work.step()?;
+            Some(address?)
+        }
+        None => None,
+    };
+    Ok(novarocks_physical_plan::StaticFunctionCandidate {
+        value_type,
+        constant,
+    })
+}
+
 fn decode_core<W: RequestWire>(
     token: PreparedCallRequestsDecode<'_, W>,
     work: &mut CompileCheckpoints<'_>,
@@ -878,23 +961,28 @@ fn decode_core<W: RequestWire>(
         for argument in entry.arguments() {
             let argument = match argument.kind.as_ref() {
                 Some(wire::original_function_argument::Kind::Value(input)) => {
+                    let value = decode_value_argument(input, token.types, work)?;
+                    StaticFunctionArgument::Value {
+                        value_type: value.value_type,
+                        constant: value.constant,
+                    }
+                }
+                Some(wire::original_function_argument::Kind::CandidateGroup(input)) => {
                     let id = required(
-                        input.value_type_id,
-                        "request argument value type ID is absent",
+                        input.element_value_type_id,
+                        "request candidate element type ID is absent",
                     );
                     work.step()?;
-                    let ty = clone_value_type_observed(value(token.types, id?, work)?, work)?;
-                    let constant = match &input.constant {
-                        Some(input) => {
-                            let address = reference(input);
-                            work.step()?;
-                            Some(address?)
-                        }
-                        None => None,
-                    };
-                    StaticFunctionArgument::Value {
-                        value_type: ty,
-                        constant,
+                    let element_type =
+                        clone_value_type_observed(value(token.types, id?, work)?, work)?;
+                    let mut members = reserve(input.members.len(), work)?;
+                    for member in &input.members {
+                        members.push(decode_value_argument(member, token.types, work)?);
+                        work.step()?;
+                    }
+                    StaticFunctionArgument::CandidateGroup {
+                        element_type,
+                        members: boxed(members, work)?,
                     }
                 }
                 Some(wire::original_function_argument::Kind::Lambda(input)) => {
@@ -1033,6 +1121,7 @@ mod tests;
 pub trait RequestWire {
     type Key: Copy + Ord;
     const MAP_OUTPUT: bool;
+    const ALLOWS_CANDIDATE_GROUP: bool;
     fn definition(&self) -> Result<Self::Key, E>;
     fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument>;
     fn logical_argument_count(&self) -> Option<u32>;
@@ -1041,6 +1130,7 @@ pub trait RequestWire {
 impl RequestWire for wire::OriginalCallRequest {
     type Key = PhysicalCallSite;
     const MAP_OUTPUT: bool = false;
+    const ALLOWS_CANDIDATE_GROUP: bool = false;
     fn definition(&self) -> Result<Self::Key, E> {
         relation_definition(self)
     }
@@ -1057,6 +1147,7 @@ impl RequestWire for wire::OriginalCallRequest {
 impl RequestWire for wire::UnitCallRequest {
     type Key = novarocks_expression_contract::ExprId;
     const MAP_OUTPUT: bool = true;
+    const ALLOWS_CANDIDATE_GROUP: bool = true;
     fn definition(&self) -> Result<Self::Key, E> {
         Ok(Self::Key::new(required(
             self.definition_id,

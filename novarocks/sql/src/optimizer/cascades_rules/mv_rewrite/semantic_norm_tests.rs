@@ -200,7 +200,7 @@ fn coarse_constant_collisions_require_exact_field_identity_and_last_exact_overwr
 }
 
 #[test]
-fn normalized_multisets_preserve_duplicates_in_head_and_case_arm_order() {
+fn normalization_preserves_membership_multiplicity_and_candidate_and_case_arm_order() {
     let mut arena = ScalarArena::new();
     let one = scalar_constant(&mut arena, selected("source", "same", vec![Some(1)], 0));
     let two = scalar_constant(&mut arena, selected("source", "same", vec![Some(2)], 0));
@@ -225,20 +225,16 @@ fn normalized_multisets_preserve_duplicates_in_head_and_case_arm_order() {
         &normalized(&arena, flipped, &HashMap::new())
     ));
     let ins = |arena: &mut ScalarArena, child, list| {
-        intern(
+        crate::common::binary_operator::intern_test_predicate(
             arena,
-            ScalarNode::InList {
-                child,
-                list,
-                negated: false,
-            },
-            boolean.clone(),
+            novarocks_type_contract::OperatorFunction::InList,
+            std::iter::once(child).chain(list).collect(),
         )
     };
     let a = ins(&mut arena, one, vec![one, one, two]);
     let b = ins(&mut arena, one, vec![two, one, one]);
     let changed = ins(&mut arena, one, vec![two, two, one]);
-    assert!(same(
+    assert!(!same(
         &normalized(&arena, a, &HashMap::new()),
         &normalized(&arena, b, &HashMap::new())
     ));

@@ -21,7 +21,7 @@
 //! must be checked by the FE before a validated pruning consumer can exist.
 
 use crate::{
-    ExprKind, FragmentId, FragmentPackage, NodeId, NodeKind, PredicateConjunctSource,
+    FragmentId, FragmentPackage, NodeId, NodeKind, PredicateConjunctSource,
     PredicateResponsibilityRef, PredicateSourceError, ProviderReadOccurrenceId, ValueId,
     ValueOrigin,
 };
@@ -513,9 +513,13 @@ fn actual_transport(
     if let NodeKind::Project { expressions } = &parent.kind {
         for (expression, value) in expressions {
             work.step()?;
-            if *value == output && fragment.root_expression(parent.id,*expression)
-                .is_some_and(|expression| matches!(expression.kind, ExprKind::Value(value) if value == input))
-            { return Ok(true); }
+            if *value == output
+                && fragment
+                    .root_expression(parent.id, *expression)
+                    .is_some_and(|expression| expression.kind.input_value() == Some(input))
+            {
+                return Ok(true);
+            }
         }
         return Ok(false);
     }

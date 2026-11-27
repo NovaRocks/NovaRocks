@@ -84,13 +84,11 @@ fn invalid_frozen_type_is_fatal_in_the_real_fold_rule() {
         ))),
         FunctionValueType::new(DataType::Boolean, false),
     );
-    let root = fixture.intern(
-        ScalarNode::UnaryOp {
-            op: UnOp::Not,
-            child: malformed,
-        },
+    let valid = fixture.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
         FunctionValueType::new(DataType::Boolean, false),
     );
+    let root = fixture.binary_typed(BinOp::Eq, malformed, valid, DataType::Boolean, false);
     let failure = FoldConstant
         .apply(project(root), &mut fixture.ctx)
         .unwrap_err();

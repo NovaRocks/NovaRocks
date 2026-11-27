@@ -16,7 +16,7 @@
 // under the License.
 use crate::fixtures::{compile_table_free, expression_sources, session};
 use arrow::datatypes::{DataType, Field};
-use novarocks_expression_contract::{ExprKind, ExprNode, UnaryOperator};
+use novarocks_expression_contract::{ExprKind, ExprNode};
 use novarocks_sql::{
     analyze_error::AnalyzeErrorKind,
     compiler::{
@@ -59,12 +59,6 @@ fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
             };
             assert_eq!(result.ty.data_type(), &DataType::Boolean, "{sql}");
             assert!(!result.ty.nullable(), "{sql}");
-            assert!(
-                !expression_sources(&plan)
-                    .any(|(_, _, node)| matches!(node.kind, ExprKind::IsTruthValue { .. })),
-                "{sql}"
-            );
-
             let (unit, root) = plan
                 .plan()
                 .fragments()
@@ -77,14 +71,9 @@ fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
                     matches!(
                         &node.kind,
                         ExprKind::FunctionCall { function, .. }
-                            if function.function_id == OperatorFunction::Identical.function_id()
-                    ) || matches!(
-                        node.kind,
-                        ExprKind::Unary {
-                            op: UnaryOperator::Not,
-                            ..
-                        } | ExprKind::IsNull { .. }
-                    )
+                            if [OperatorFunction::Identical, OperatorFunction::BooleanNot].into_iter()
+                                .any(|operator| function.function_id == operator.function_id())
+                    ) || matches!(node.kind, ExprKind::IsNull { .. })
                 })
                 .unwrap_or_else(|| panic!("missing expanded predicate: {sql}"));
             assert!(!root.ty.nullable(), "{sql}");
@@ -92,14 +81,17 @@ fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
             // The expanded predicate has exactly one edge to the operand.
             let operand = if let Some(expected) = truth {
                 let comparison = if negated {
-                    let ExprKind::Unary {
-                        op: UnaryOperator::Not,
-                        expr,
-                    } = root.kind
-                    else {
-                        panic!("expected NOT: {sql}");
+                    let ExprKind::FunctionCall { function, args } = &root.kind else {
+                        panic!("expected NOT: {sql}")
                     };
-                    unit.definition(expr).unwrap()
+                    assert_eq!(
+                        function.function_id,
+                        OperatorFunction::BooleanNot.function_id()
+                    );
+                    let [expr] = args.as_ref() else {
+                        panic!("NOT requires one value")
+                    };
+                    unit.definition(*expr).unwrap()
                 } else {
                     root
                 };

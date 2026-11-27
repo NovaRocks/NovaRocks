@@ -65,7 +65,7 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
             .add(
                 None,
                 columns[index].1.clone(),
-                ExprKind::Value(columns[index].0),
+                ExprKind::input(columns[index].0),
             )
             .unwrap()
     };

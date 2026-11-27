@@ -54,18 +54,20 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> CompiledInSource {
     let bytes = encode_sql_fixture_package(&package);
     let tracker = MemTracker::new_root("actual expression source");
     let actual = NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
-    if scratch_len != 0 {
-        actual
+    let scratch_owner = (scratch_len != 0).then(|| {
+        let owner = NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+        owner
             .request_layout(Layout::array::<u64>(scratch_len).unwrap())
             .unwrap();
-    }
+        owner
+    });
     let mut scratch = Vec::<u64>::with_capacity(scratch_len);
     scratch.resize(scratch_len, 37);
     let scopes = CompiledTypeScopes::new(&actual);
     let mut exact = |layout| actual.request_layout(layout);
     let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
     let mut creation = ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
-    let functions = Arc::new(sealed_rand_subset());
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let compiled = interpreter_with_functions(Arc::clone(&functions))
         .compile(
             &bytes,
@@ -82,6 +84,7 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> CompiledInSource {
         let _scopes = scopes;
     }
     drop(scratch);
+    drop(scratch_owner);
     drop(actual);
     CompiledInSource {
         package,
@@ -97,13 +100,17 @@ struct InSite {
     use_id: ExpressionUseId,
 }
 impl InSite {
-    fn recipe(self, program: &LocalProgram) -> &novarocks_functions::PreparedNativeInListRecipe {
-        program
-            .unit(self.unit)
-            .unwrap()
-            .recipes()
-            .native_inlist(self.use_id)
-            .unwrap()
+    fn recipe(
+        self,
+        program: &LocalProgram,
+    ) -> &novarocks_functions::native_inlist::PreparedMembership {
+        let unit = program.unit(self.unit).unwrap();
+        let novarocks_functions::PreparedPureKernel::Membership(prepared) =
+            unit.calls()[&self.use_id].prepared()
+        else {
+            panic!("selected native membership owner")
+        };
+        prepared
     }
 }
 
@@ -114,35 +121,55 @@ fn actual_in_sites(program: &LocalProgram) -> Vec<InSite> {
             let Some(node) = unit.definitions().node(invocation.definition) else {
                 panic!("real definition");
             };
-            let StaticExprKind::PreparedInList { child, values, .. } = node.kind() else {
+            if invocation.control != novarocks_type_contract::ControlShape::CandidateGroup {
                 continue;
+            }
+            let StaticExprKind::BoundCall { args, .. } = node.kind() else {
+                panic!("exact membership call")
             };
+            let (probe, members) = args.split_first().expect("probe and ordered candidates");
+            assert!(!members.is_empty());
             let site = InSite {
                 unit: ProgramUnitId::new(index),
                 use_id,
             };
-            let recipe = site.recipe(program);
-            let novarocks_functions::FunctionArgumentType::Value(source) =
-                unit.types().get(child.index()).unwrap()
+            let selected = site.recipe(program).call().selected();
+            let [
+                novarocks_functions::FunctionArgumentType::Value(source),
+                novarocks_functions::FunctionArgumentType::CandidateGroup { element_type },
+            ] = selected.argument_types.as_ref()
             else {
-                panic!("complete IN source");
+                panic!("exact IN two-slot signature")
             };
-            assert_eq!(recipe.source_type(), source);
-            assert_eq!(recipe.candidate_types().len(), values.len());
-            for (candidate, definition) in recipe.candidate_types().iter().zip(values) {
-                let novarocks_functions::FunctionArgumentType::Value(expected) =
-                    unit.types().get(definition.index()).unwrap()
+            assert_eq!(
+                unit.types().get(probe.index()),
+                Some(&novarocks_functions::FunctionArgumentType::Value(
+                    source.clone()
+                ))
+            );
+            for member in members {
+                let novarocks_functions::FunctionArgumentType::Value(actual) = unit
+                    .types()
+                    .get(member.index())
+                    .expect("complete candidate declaration")
                 else {
-                    panic!("complete IN candidate");
+                    panic!("candidate is a value")
                 };
-                assert_eq!(candidate, expected);
+                assert!(
+                    actual
+                        .same_physical_binding_ignoring_root_nullability_observed(
+                            element_type,
+                            || Ok::<_, std::convert::Infallible>(()),
+                        )
+                        .unwrap()
+                );
             }
-            let novarocks_functions::FunctionArgumentType::Value(result) =
-                unit.types().get(invocation.definition.index()).unwrap()
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &site.recipe(program).call().selected().result_type
             else {
-                panic!("complete IN result");
+                panic!("selected membership is scalar");
             };
-            assert_eq!(recipe.result_type(), result);
+            assert_eq!(node.value_type(), Some(result));
             sites.push(site);
         }
     }
@@ -154,7 +181,7 @@ fn late_in(
     scratch: usize,
     expected_calls: usize,
 ) -> (
-    novarocks_functions::PreparedNativeInListRecipe,
+    novarocks_functions::native_inlist::PreparedMembership,
     Arc<MemTracker>,
 ) {
     let CompiledInSource {
@@ -164,31 +191,40 @@ fn late_in(
     assert_eq!(
         sites.len(),
         expected_calls,
-        "SQL must actually retain PreparedInList, not fold it away"
+        "SQL retains the actual installed membership call"
     );
     let late = sites[0].recipe(compiled.program()).clone();
+    let active = tracker.current();
     drop(compiled);
     assert!(
         tracker.current() > 0,
         "the independently owned parameter/type holders remain live"
     );
+    assert!(
+        tracker.current() < active,
+        "the retired program releases its independent construction scopes"
+    );
     (late, tracker)
 }
 #[test]
-fn actual_host_late_in_recipe_keeps_no_unrelated_main_or_other_call_charge() {
+fn actual_host_membership_retains_its_selected_source_and_releases_last_alias() {
     let (minimal, minimal_tracker) = late_in(ONE_IN, 0, 1);
+    let (scratch, scratch_tracker) = late_in(ONE_IN, 512, 1);
     let (wide, wide_tracker) = late_in(TWO_IN, 512, 2);
-    assert_eq!(minimal.source_type(), wide.source_type());
-    assert_eq!(minimal.candidate_types(), wide.candidate_types());
-    assert_eq!(minimal.result_type(), wide.result_type());
     assert_eq!(
-        wide_tracker.current(),
+        scratch_tracker.current(),
         minimal_tracker.current(),
-        "late parameters retain neither the actual unrelated Vec nor the other IN call/map/program"
+        "an independently charged scratch allocation is retired"
     );
+    drop(scratch);
+    assert_eq!(scratch_tracker.current(), 0);
+    assert_eq!(minimal.call().selected(), wide.call().selected());
+    // These bindings borrow their exact, potentially shared package type
+    // source. Its charge remains while a selected call can still reach it.
+    let retained = wide_tracker.current();
     let independent = wide.clone();
     drop(wide);
-    assert_eq!(wide_tracker.current(), minimal_tracker.current());
+    assert_eq!(wide_tracker.current(), retained);
     drop(independent);
     assert_eq!(wide_tracker.current(), 0);
     drop(minimal);
@@ -488,40 +524,20 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
         .root_of_use(sites[0].use_id)
         .unwrap();
     assert_eq!(unit.root_of_use(sites[0].use_id), Some(original_root));
-    let late_recipe = unit
-        .recipes()
-        .native_inlist(sites[0].use_id)
-        .unwrap()
-        .clone();
+    let novarocks_functions::PreparedPureKernel::Membership(late_recipe) =
+        unit.calls()[&sites[0].use_id].prepared()
+    else {
+        panic!("selected membership")
+    };
+    let late_recipe = late_recipe.clone();
     let events = trace.events.lock().unwrap().clone();
-    // One unit scope owns the final Arc, six scopes own the ordered recipe
-    // maps, and one independent scope owns the actual IN parameters.
-    let expected_scopes = 8;
-    assert_eq!(trace.scopes.load(Ordering::SeqCst), expected_scopes);
     assert_eq!(
+        trace.scopes.load(Ordering::SeqCst),
         events.iter().filter(|event| event.kind == "scope").count(),
-        expected_scopes
     );
     assert!(
         events.iter().any(|event| event.kind == "temporary"),
-        "the actual IN candidate reference Vec is separately temporary"
-    );
-    let recipe_scope = events
-        .iter()
-        .find(|event| event.scope == 3 && event.kind == "layout")
-        .expect("the actual IN parameter scope has constructor requests")
-        .scope;
-    let recipe_charge = events
-        .iter()
-        .filter(|event| event.scope == recipe_scope)
-        .map(|event| i64::try_from(event.bytes).unwrap())
-        .sum::<i64>();
-    assert!(recipe_charge > 0);
-    assert!(
-        events
-            .iter()
-            .any(|event| event.scope == 2 && event.kind == "opaque"),
-        "IN map insertion uses its separate family scope"
+        "the actual checked call and occurrence work uses the original temporary scope"
     );
     let final_arc_bytes = arc_layout(Layout::new::<CompiledExprSet>()).unwrap().size();
     assert!(
@@ -539,16 +555,10 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
         let _factory = factory;
     }
     drop(actual);
-    assert!(
-        tracker.current() > recipe_charge,
-        "the recipe map and final Arc owners remain with the late entity"
-    );
+    let unit_charge = tracker.current();
+    assert!(unit_charge > 0);
     drop(late_unit);
-    assert_eq!(
-        tracker.current(),
-        recipe_charge,
-        "only the independent IN parameter collection remains"
-    );
+    assert!(tracker.current() < unit_charge);
     drop(late_recipe);
     assert_eq!(tracker.current(), 0);
     assert_eq!(source_tracker.current(), 0);

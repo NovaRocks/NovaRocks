@@ -44,7 +44,7 @@ pub(crate) fn typed_expr_semantically_eq(
 /// Whether a separately written occurrence can share evaluation in the same row domain.
 #[recursive::recursive]
 pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
-    use super::{BinOp, UnOp};
+    use super::BinOp;
     use novarocks_functions::PreparedCompositeComparisonRecipe;
     let comparison_can_fail = |value: &TypedExpr| {
         PreparedCompositeComparisonRecipe::equal_may_raise_row_error(&value.value_type)
@@ -53,9 +53,13 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
     let result_type = &expr.value_type;
     match &expr.kind {
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_) => true,
+        ExprKind::Let {
+            initializer, body, ..
+        } => share(initializer) && share(body),
         ExprKind::FunctionCall { binding, args, .. } => {
             binding.semantics.volatility.is_replica_deterministic()
                 && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)
@@ -67,6 +71,8 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
             matches!(
                 op,
                 BinOp::And
+                    | BinOp::ExpandedConjunction
+                    | BinOp::ExpandedNegatedConjunction
                     | BinOp::Or
                     | BinOp::Eq
                     | BinOp::Ne
@@ -77,13 +83,8 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
             ) && share(left)
                 && share(right)
         }
-        ExprKind::UnaryOp {
-            op: UnOp::Not,
-            expr,
-        }
-        | ExprKind::Nested(expr)
+        ExprKind::Nested(expr)
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::LambdaFunction { body: expr, .. }
         | ExprKind::Lambda { body: expr, .. } => share(expr),
         ExprKind::Cast {
@@ -105,17 +106,6 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
             filter,
             ..
         } => aggregate_inputs_can_share_evaluation(args, order_by, filter.as_deref()),
-        ExprKind::InList { expr, list, .. } => {
-            expr.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Json
-                && !comparison_can_fail(expr)
-                && share(expr)
-                && list
-                    .iter()
-                    .all(|item| !comparison_can_fail(item) && share(item))
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => share(expr) && share(low) && share(high),
         ExprKind::Case {
             operand,
             when_then,
@@ -130,9 +120,7 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
                     (operand.is_none() || !comparison_can_fail(when)) && share(when) && share(then)
                 })
         }
-        ExprKind::Like { .. }
-        | ExprKind::WindowCall { .. }
-        | ExprKind::SubqueryPlaceholder { .. } => false,
+        ExprKind::WindowCall { .. } | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
 
@@ -196,6 +184,23 @@ fn typed_expr_semantically_eq_with(
                 slot_id: right_slot,
             },
         ) => left_slot == right_slot && left_name.eq_ignore_ascii_case(right_name),
+        (ExprKind::LocalValue(left), ExprKind::LocalValue(right)) => left == right,
+        (
+            ExprKind::Let {
+                binding: a,
+                initializer: left_init,
+                body: left_body,
+            },
+            ExprKind::Let {
+                binding: b,
+                initializer: right_init,
+                body: right_body,
+            },
+        ) => {
+            a == b
+                && typed_expr_semantically_eq_with(left_init, right_init, work)?
+                && typed_expr_semantically_eq_with(left_body, right_body, work)?
+        }
         (ExprKind::Literal(left), ExprKind::Literal(right)) => left == right,
         (ExprKind::Constant(left_value), ExprKind::Constant(right_value)) => {
             for (declared, source) in [
@@ -233,16 +238,6 @@ fn typed_expr_semantically_eq_with(
                 && typed_expr_semantically_eq_with(left_left, right_left, work)?
                 && typed_expr_semantically_eq_with(left_right, right_right, work)?
         }
-        (
-            ExprKind::UnaryOp {
-                op: left_op,
-                expr: left_expr,
-            },
-            ExprKind::UnaryOp {
-                op: right_op,
-                expr: right_expr,
-            },
-        ) => left_op == right_op && typed_expr_semantically_eq_with(left_expr, right_expr, work)?,
         (
             ExprKind::FunctionCall {
                 name: left_name,
@@ -349,57 +344,6 @@ fn typed_expr_semantically_eq_with(
                 && typed_expr_semantically_eq_with(left_expr, right_expr, work)?
         }
         (
-            ExprKind::InList {
-                expr: left_expr,
-                list: left_list,
-                negated: left_negated,
-            },
-            ExprKind::InList {
-                expr: right_expr,
-                list: right_list,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_semantically_eq_with(left_expr, right_expr, work)?
-                && typed_expr_slices_semantically_eq_with(left_list, right_list, work)?
-        }
-        (
-            ExprKind::Between {
-                expr: left_expr,
-                low: left_low,
-                high: left_high,
-                negated: left_negated,
-            },
-            ExprKind::Between {
-                expr: right_expr,
-                low: right_low,
-                high: right_high,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_semantically_eq_with(left_expr, right_expr, work)?
-                && typed_expr_semantically_eq_with(left_low, right_low, work)?
-                && typed_expr_semantically_eq_with(left_high, right_high, work)?
-        }
-        (
-            ExprKind::Like {
-                expr: left_expr,
-                pattern: left_pattern,
-                negated: left_negated,
-            },
-            ExprKind::Like {
-                expr: right_expr,
-                pattern: right_pattern,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_semantically_eq_with(left_expr, right_expr, work)?
-                && typed_expr_semantically_eq_with(left_pattern, right_pattern, work)?
-        }
-        (
             ExprKind::Case {
                 ieee_float_equality: left_ieee,
                 operand: left_operand,
@@ -435,22 +379,6 @@ fn typed_expr_semantically_eq_with(
                     right_else.as_deref(),
                     work,
                 )?
-        }
-        (
-            ExprKind::IsTruthValue {
-                expr: left_expr,
-                value: left_value,
-                negated: left_negated,
-            },
-            ExprKind::IsTruthValue {
-                expr: right_expr,
-                value: right_value,
-                negated: right_negated,
-            },
-        ) => {
-            left_value == right_value
-                && left_negated == right_negated
-                && typed_expr_semantically_eq_with(left_expr, right_expr, work)?
         }
         (ExprKind::Nested(left), ExprKind::Nested(right)) => {
             typed_expr_semantically_eq_with(left, right, work)?

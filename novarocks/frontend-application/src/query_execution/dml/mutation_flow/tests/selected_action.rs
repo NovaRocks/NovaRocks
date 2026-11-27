@@ -95,7 +95,12 @@ fn selected_action_author(plan: &PhysicalPlan) -> (FragmentId, NodeId, RootOrdin
         let owner = &plan.fragments()[&fragment];
         match &owner.values()[&value].origin {
             ValueOrigin::Expr { node, root } => {
-                if let ExprKind::Value(next) = owner.root_expression(*node, *root).unwrap().kind {
+                if let Some(next) = owner
+                    .root_expression(*node, *root)
+                    .unwrap()
+                    .kind
+                    .input_value()
+                {
                     value = next;
                 } else {
                     return (fragment, *node, *root);

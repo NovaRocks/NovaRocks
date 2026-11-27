@@ -568,7 +568,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         .define(
             result_node,
             ty(DataType::Int64, false),
-            ExprKind::Value(destination_value),
+            ExprKind::input(destination_value),
         )
         .unwrap();
     let result_root_0 = destination_builder.root_definition(
@@ -1972,7 +1972,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .unwrap();
     let sort = builder.reserve_node_id().unwrap();
     let sort_key = builder
-        .define(sort, ty(DataType::Int64, false), ExprKind::Value(a))
+        .define(sort, ty(DataType::Int64, false), ExprKind::input(a))
         .unwrap();
     let sort_key = builder.root_definition(
         sort,
@@ -2016,7 +2016,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .unwrap();
     let project = builder.reserve_node_id().unwrap();
     let project_b = builder
-        .define(project, ty(DataType::Int64, false), ExprKind::Value(b))
+        .define(project, ty(DataType::Int64, false), ExprKind::input(b))
         .unwrap();
     let project_b = builder.root_definition(
         project,

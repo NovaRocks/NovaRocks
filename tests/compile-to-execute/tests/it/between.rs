@@ -30,7 +30,8 @@ use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, PureCompileControl,
+    CompileControlError, CompilePhase, ControlShape, ExpressionUseId, OperatorFunction,
+    PureCompileControl,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -59,8 +60,9 @@ fn compiled(sql: &str) -> (Arc<CompiledExprSet>, RootOrdinal) {
     let mut found = None;
     for unit in programs.values().flat_map(|program| program.units()) {
         for (ordinal, root) in unit.roots().iter().enumerate() {
-            let definition = unit.definitions().node(root.definition).unwrap();
-            if matches!(definition.kind(), StaticExprKind::PreparedBetween { .. }) {
+            if let Some(conjunction) = range_conjunction(unit, root.use_id)
+                && unit.control_flow().uses()[&conjunction].arguments.len() == 2
+            {
                 assert!(found.is_none(), "one actual predicate root");
                 found = Some((
                     unit.clone(),
@@ -70,6 +72,23 @@ fn compiled(sql: &str) -> (Arc<CompiledExprSet>, RootOrdinal) {
         }
     }
     found.expect("actual SQL BETWEEN root survived lowering")
+}
+fn range_conjunction(unit: &CompiledExprSet, root: ExpressionUseId) -> Option<ExpressionUseId> {
+    let uses = unit.control_flow().uses();
+    let use_id = if unit.calls().get(&root).is_some_and(|call| {
+        call.call_contract().function_id().as_str()
+            == OperatorFunction::BooleanNot.function_id_text()
+    }) {
+        *uses[&root].arguments.first()?
+    } else {
+        root
+    };
+    let use_id = if uses[&use_id].control == ControlShape::Let {
+        *uses[&use_id].arguments.get(1)?
+    } else {
+        use_id
+    };
+    (uses[&use_id].control == ControlShape::Conjunction).then_some(use_id)
 }
 fn batch(unit: &CompiledExprSet, root: RootOrdinal, input: ArrayRef) -> RecordBatch {
     let scope = unit.root(root).unwrap().scope;
@@ -88,43 +107,37 @@ fn values(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
         .collect()
 }
 #[test]
-fn between_actual_after_four_ordered_uses_original_three_definitions() {
+fn between_materializes_two_ordered_comparisons_of_the_same_input_port() {
     let (program, site) = compiled("SELECT k BETWEEN 1 AND 5 FROM fixture.source");
     let flow = program.control_flow();
-    let use_id = program.root(site).unwrap().use_id;
-    let invocation = &flow.uses()[&use_id];
-    assert_eq!(invocation.control, ControlShape::Between { negated: false });
-    assert_eq!(invocation.arguments.len(), 4);
-    assert_ne!(invocation.arguments[0], invocation.arguments[2]);
-    assert_eq!(
-        flow.uses()[&invocation.arguments[0]].definition,
-        flow.uses()[&invocation.arguments[2]].definition
-    );
-    for ordinal in 1..4 {
-        let child = &flow.uses()[&invocation.arguments[ordinal]];
+    let root = program.root(site).unwrap().use_id;
+    let invocation = &flow.uses()[&root];
+    assert_eq!(invocation.control, ControlShape::Conjunction);
+    let [lower, upper] = invocation.arguments.as_ref() else {
+        panic!("two comparison calls")
+    };
+    let lower_probe = flow.uses()[lower].arguments[1];
+    let upper_probe = flow.uses()[upper].arguments[0];
+    assert_ne!(lower_probe, upper_probe);
+    let lower_port = program
+        .input(lower_probe)
+        .expect("first direct probe input");
+    let upper_port = program
+        .input(upper_probe)
+        .expect("second direct probe input");
+    assert_eq!(lower_port.scope, upper_port.scope);
+    assert_eq!(lower_port.ordinal, upper_port.ordinal);
+    for comparison in [lower, upper] {
         assert_eq!(
-            flow.regions()[&child.context.region].guard.unwrap().kind,
-            novarocks_type_contract::GuardKind::BetweenAfterSource {
-                ordinal: (ordinal - 1) as u32
-            }
+            program.calls()[comparison]
+                .call_contract()
+                .function_id()
+                .as_str(),
+            OperatorFunction::LessThanOrEqual.function_id_text()
         );
     }
-    let definition = program.definitions().node(invocation.definition).unwrap();
-    let StaticExprKind::PreparedBetween {
-        operand, low, high, ..
-    } = definition.kind()
-    else {
-        panic!("exact recipe")
-    };
-    assert_eq!(
-        [*operand, *low, *high],
-        [
-            flow.uses()[&invocation.arguments[0]].definition,
-            flow.uses()[&invocation.arguments[1]].definition,
-            flow.uses()[&invocation.arguments[3]].definition
-        ]
-    );
 }
+
 #[test]
 fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_output() {
     for (sql, expected) in [
@@ -169,19 +182,19 @@ fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_outpu
 // original offending decimal value; no evaluator manufactures this expectation.
 const NEGATE_MIN_ERROR: &str = "bigint negation overflow: -9223372036854775808";
 #[test]
-fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower_error_is_first() {
-    for (sql, expected) in [
+fn between_skips_upper_work_after_false_lower_and_keeps_the_first_error() {
+    for (sql, expected, error) in [
         (
             "SELECT k BETWEEN 9223372036854775807 AND -k FROM fixture.source",
-            // A false lower comparison never suppresses the required upper
-            // NEGATE error at MIN. For 0 and MAX the conjunction is false.
-            vec![None, Some(false), Some(false)],
+            vec![Some(false); 3],
+            false,
         ),
         (
             "SELECT k BETWEEN -k AND -k FROM fixture.source",
             // At MIN the lower error is retained once. At 0 both comparisons
             // are true; MAX <= -MAX is false for the final row.
             vec![None, Some(true), Some(false)],
+            true,
         ),
     ] {
         let (program, site) = compiled(sql);
@@ -204,33 +217,48 @@ fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower
                 &mut PassThroughCallHost,
             )
             .unwrap();
-        assert_eq!(out.errors().len(), 1);
-        assert_eq!(out.errors()[0].selected_ordinal(), 0);
-        assert_eq!(out.errors()[0].message(), NEGATE_MIN_ERROR);
+        assert_eq!(out.errors().len(), usize::from(error));
+        if error {
+            assert_eq!(out.errors()[0].selected_ordinal(), 0);
+            assert_eq!(out.errors()[0].message(), NEGATE_MIN_ERROR);
+        }
         assert_eq!(values(&out), expected);
         assert!(!out.values().is_null(1));
     }
 }
 #[test]
-fn between_actual_after_bounded_rand_keeps_two_observable_uses_of_one_operand_definition() {
+fn between_evaluates_the_rand_initializer_once_and_reads_its_local_value_twice() {
     let (program, site) =
         compiled("SELECT rand(k) BETWEEN BIGINT '-1' AND BIGINT '42' FROM fixture.source");
     let flow = program.control_flow();
     let root = &flow.uses()[&program.root(site).unwrap().use_id];
-    assert_ne!(root.arguments[0], root.arguments[2]);
-    assert_eq!(
-        flow.uses()[&root.arguments[0]].definition,
-        flow.uses()[&root.arguments[2]].definition
+    assert_eq!(root.control, ControlShape::Let);
+    let [initializer, body] = root.arguments.as_ref() else {
+        panic!("Let initializer and body")
+    };
+    let effects = &program.effects()[initializer];
+    assert!(
+        effects
+            .for_use(flow.uses()[initializer].context)
+            .unwrap()
+            .observable_effects
+            .rng_sampling
     );
-    for use_id in [root.arguments[0], root.arguments[2]] {
-        let effects = &program.effects()[&use_id];
-        assert!(
-            effects
-                .for_use(flow.uses()[&use_id].context)
+    let [lower, upper] = flow.uses()[body].arguments.as_ref() else {
+        panic!("two ordered comparisons")
+    };
+    for reference in [
+        flow.uses()[lower].arguments[1],
+        flow.uses()[upper].arguments[0],
+    ] {
+        assert!(matches!(
+            program
+                .definitions()
+                .node(flow.uses()[&reference].definition)
                 .unwrap()
-                .observable_effects
-                .rng_sampling
-        );
+                .kind(),
+            StaticExprKind::LocalValue { .. }
+        ));
     }
     let data = batch(&program, site, Arc::new(Int64Array::from(vec![17, 23, 41])));
     let mut frame = CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
@@ -364,10 +392,10 @@ fn between_actual_after_every_constructor_and_phase_callback_seven_causes_no_foo
 }
 
 #[test]
-fn between_actual_after_original_control_codec_roundtrip_and_invalid_four_use_receipt() {
-    for (sql, negated) in [
-        ("SELECT k BETWEEN 1 AND 5 FROM fixture.source", false),
-        ("SELECT k NOT BETWEEN 1 AND 5 FROM fixture.source", true),
+fn between_control_roundtrips_and_refuses_a_dangling_comparison() {
+    for sql in [
+        "SELECT k BETWEEN 1 AND 5 FROM fixture.source",
+        "SELECT k NOT BETWEEN 1 AND 5 FROM fixture.source",
     ] {
         let source = sql_source(sql, DataType::Int64);
         let mut seen = 0;
@@ -397,14 +425,14 @@ fn between_actual_after_original_control_codec_roundtrip_and_invalid_four_use_re
             }
             let before_count = seen;
             for (&id, invocation) in unit.control_flow().uses() {
-                if invocation.control == (ControlShape::Between { negated }) {
+                if invocation.control == ControlShape::Conjunction {
                     let emitted = encoded
                         .uses
                         .iter_mut()
                         .find(|entry| entry.id == id.get())
                         .unwrap();
-                    assert_eq!(emitted.argument_use_ids.len(), 4);
-                    emitted.argument_use_ids.pop();
+                    assert_eq!(emitted.argument_use_ids.len(), 2);
+                    emitted.argument_use_ids[1] = u32::MAX;
                     seen += 1;
                 }
             }

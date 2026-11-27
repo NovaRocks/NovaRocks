@@ -994,7 +994,7 @@ mod tests {
         let expression = builder
             .unit(project)
             .unwrap()
-            .add(None, declared.clone(), ExprKind::Value(input))
+            .add(None, declared.clone(), ExprKind::input(input))
             .unwrap();
         let root = builder
             .unit(project)
@@ -1036,7 +1036,7 @@ mod tests {
                 .expression_semantic_depth,
         });
         let definition = draft
-            .add(None, value_type.clone(), ExprKind::Value(rf_value))
+            .add(None, value_type.clone(), ExprKind::input(rf_value))
             .unwrap();
         let root = draft
             .root(definition, EvaluationDemand::Value, RootScope::Port(0))

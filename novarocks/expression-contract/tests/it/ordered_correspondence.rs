@@ -55,12 +55,12 @@ fn invalid(parts: UnitParts, message: &str) {
 fn arithmetic(repeated: bool) -> BoundExprSet {
     let mut b = BoundExprSetBuilder::new(limits());
     let left = b
-        .add(None, integer(true), ExprKind::Value(ValueId::new(0)))
+        .add(None, integer(true), ExprKind::input(ValueId::new(0)))
         .unwrap();
     let right = if repeated {
         left
     } else {
-        b.add(None, integer(true), ExprKind::Value(ValueId::new(1)))
+        b.add(None, integer(true), ExprKind::input(ValueId::new(1)))
             .unwrap()
     };
     let expression = b
@@ -173,7 +173,7 @@ fn case_unit() -> BoundExprSet {
     let mut b = BoundExprSetBuilder::new(limits());
     let ids = (0..5)
         .map(|id| {
-            b.add(None, boolean(true), ExprKind::Value(ValueId::new(id)))
+            b.add(None, boolean(true), ExprKind::input(ValueId::new(id)))
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -269,7 +269,7 @@ fn case_metadata_and_ordered_when_then_occurrences_match_the_real_definition() {
 fn structure_recheck_success_and_real_depth_error_keep_every_borrowed_prefix() {
     let mut b = BoundExprSetBuilder::new(limits());
     let leaf = b
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(0)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(0)))
         .unwrap();
     let parent = b
         .add(
@@ -379,7 +379,7 @@ fn higher_unit(body_ordinal: u32) -> Result<BoundExprSet, UnitError> {
             body,
         },
     )?;
-    let ordinary = b.add(None, boolean(true), ExprKind::Value(ValueId::new(0)))?;
+    let ordinary = b.add(None, boolean(true), ExprKind::input(ValueId::new(0)))?;
     let f = function(
         "fixture/unit/ordered-lambda",
         vec![

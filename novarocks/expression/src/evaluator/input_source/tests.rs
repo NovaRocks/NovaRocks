@@ -117,7 +117,7 @@ fn fixed_binary_case_unit() -> (Arc<CompiledExprSet>, [RootOrdinal; 2]) {
     let mut constants = ConstantPools::empty();
     let (_, integer) = &values[2];
     let input = builder
-        .add(None, integer.clone(), ExprKind::Value(values[2].0))
+        .add(None, integer.clone(), ExprKind::input(values[2].0))
         .unwrap();
     let ten = ConstantValue::from_i32(
         Arc::new(integer.try_to_field("fixture").unwrap()),
@@ -152,7 +152,7 @@ fn fixed_binary_case_unit() -> (Arc<CompiledExprSet>, [RootOrdinal; 2]) {
         let (value, input_ty) = &values[i];
         let result_ty = input_ty.clone().with_nullable(true).unwrap();
         let input = builder
-            .add(None, input_ty.clone(), ExprKind::Value(*value))
+            .add(None, input_ty.clone(), ExprKind::input(*value))
             .unwrap();
         let null = checked_constants::null(&result_ty, fixture_constant_policy());
         let null = builder

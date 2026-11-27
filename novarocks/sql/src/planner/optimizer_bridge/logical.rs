@@ -1359,9 +1359,7 @@ mod tests {
     }
     #[test]
     fn actual_typed_filter_bridge_preserves_interner_control_errors() {
-        use novarocks_type_contract::{
-            CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-        };
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
         use std::sync::Mutex;
         struct StopInterner {
             reason: CompileControlError,
@@ -1396,14 +1394,12 @@ mod tests {
             },
             value_type: output.value_type.clone(),
         };
-        let predicate = TypedExpr {
-            kind: ExprKind::InList {
-                expr: novarocks_parser::ast::AstBox::new(child.clone()),
-                list: (vec![child; 320]).into(),
-                negated: false,
-            },
-            value_type: FunctionValueType::new(DataType::Boolean, false),
-        };
+        let predicate = crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::InList,
+            std::iter::once(child.clone())
+                .chain(vec![child; 320])
+                .collect(),
+        );
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![values_with_columns(vec![output])],

@@ -104,13 +104,17 @@ impl HigherOrderCallContract {
             FunctionArgumentType::Lambda {
                 parameter_types, ..
             } => parameter_types,
-            FunctionArgumentType::Value(_) => unreachable!("refinement checked the lambda channel"),
+            FunctionArgumentType::Value(_) | FunctionArgumentType::CandidateGroup { .. } => {
+                unreachable!("refinement checked the lambda channel")
+            }
         }
     }
     pub fn body_result_type(&self) -> &FunctionValueType {
         match &self.call.selected().argument_types[self.body_ordinal] {
             FunctionArgumentType::Lambda { result_type, .. } => result_type,
-            FunctionArgumentType::Value(_) => unreachable!("refinement checked the lambda channel"),
+            FunctionArgumentType::Value(_) | FunctionArgumentType::CandidateGroup { .. } => {
+                unreachable!("refinement checked the lambda channel")
+            }
         }
     }
     pub fn result_type(&self) -> &FunctionValueType {

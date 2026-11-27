@@ -206,7 +206,11 @@ fn preflight<H>(
         }
         for (argument, ids) in args.iter().zip(input.arguments) {
             let references = match (argument, ids) {
-                (FunctionArgumentType::Value(_), ArgumentTypeIds::Value(_)) => 1,
+                (FunctionArgumentType::Value(_), ArgumentTypeIds::Value(_))
+                | (
+                    FunctionArgumentType::CandidateGroup { .. },
+                    ArgumentTypeIds::CandidateGroup { members: [], .. },
+                ) => 1,
                 (
                     FunctionArgumentType::Lambda {
                         parameter_types, ..
@@ -394,9 +398,16 @@ fn validate<H>(
     for input in inputs {
         for (argument, ids) in arguments(input.source).iter().zip(input.arguments) {
             match (argument, ids) {
-                (FunctionArgumentType::Value(value), ArgumentTypeIds::Value(id)) => {
-                    verify_id(types, *id, value, envelope, facts, admit, work)?
-                }
+                (FunctionArgumentType::Value(value), ArgumentTypeIds::Value(id))
+                | (
+                    FunctionArgumentType::CandidateGroup {
+                        element_type: value,
+                    },
+                    ArgumentTypeIds::CandidateGroup {
+                        element: id,
+                        members: [],
+                    },
+                ) => verify_id(types, *id, value, envelope, facts, admit, work)?,
                 (
                     FunctionArgumentType::Lambda {
                         parameter_types,
@@ -600,6 +611,10 @@ pub(crate) fn emit_binding_definition<P: BindingEmission>(
     for ids in input.arguments {
         let kind = match ids {
             ArgumentTypeIds::Value(id) => wire::function_argument_type::Kind::ValueTypeId(*id),
+            ArgumentTypeIds::CandidateGroup { element, .. } => {
+                wire::function_argument_type::Kind::CandidateGroupElementValueTypeId(*element)
+            }
+
             ArgumentTypeIds::Lambda { parameters, result } => {
                 let mut ids = emission.vector(parameters.len())?;
                 for id in *parameters {
@@ -751,7 +766,7 @@ fn verify_signature_inner(
         .chain(right.argument_types.iter())
     {
         let count = match argument {
-            FunctionArgumentType::Value(_) => 1,
+            FunctionArgumentType::Value(_) | FunctionArgumentType::CandidateGroup { .. } => 1,
             FunctionArgumentType::Lambda {
                 parameter_types, ..
             } => add(parameter_types.len(), 1)?,
@@ -818,7 +833,13 @@ fn verify_signature_inner(
         };
     for (left, right) in left.argument_types.iter().zip(&right.argument_types) {
         match (left, right) {
-            (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
+            (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right))
+            | (
+                FunctionArgumentType::CandidateGroup { element_type: left },
+                FunctionArgumentType::CandidateGroup {
+                    element_type: right,
+                },
+            ) => {
                 if !compare(left, right)? {
                     return Ok(facts);
                 }

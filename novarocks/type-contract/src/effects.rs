@@ -64,6 +64,9 @@ pub enum ArgumentControl {
     /// Demand each argument only after all earlier arguments succeed and no
     /// earlier strict position produces NULL.
     OrderedNull,
+    /// Demand a probe and its ordered candidate group under the installed
+    /// membership owner. The candidate group is not a scalar array argument.
+    CandidateGroup,
     /// The exact installed owner demands original emitted source occurrences.
     TemporalSource(crate::TemporalSourceKind),
     SimpleCase,
@@ -98,6 +101,7 @@ impl ArgumentControl {
             | (Self::Try, ControlShape::Try)
             | (Self::OrderedRegexp, ControlShape::OrderedRegexp)
             | (Self::OrderedNull, ControlShape::OrderedNull)
+            | (Self::CandidateGroup, ControlShape::CandidateGroup)
             | (Self::SimpleCase, ControlShape::Case { simple: true, .. })
             | (Self::SearchedCase, ControlShape::Case { simple: false, .. }) => true,
             (
@@ -324,6 +328,7 @@ fn validate_control(
                     | ArgumentControl::Try
                     | ArgumentControl::OrderedRegexp
                     | ArgumentControl::OrderedNull
+                    | ArgumentControl::CandidateGroup
                     | ArgumentControl::TemporalSource(_)
                     | ArgumentControl::SimpleCase
                     | ArgumentControl::SearchedCase
@@ -356,6 +361,7 @@ fn validate_control(
             | ArgumentControl::NullIf
             | ArgumentControl::Try
             | ArgumentControl::OrderedRegexp
+            | ArgumentControl::CandidateGroup
             | ArgumentControl::TemporalSource(_)
             | ArgumentControl::SimpleCase
             | ArgumentControl::SearchedCase

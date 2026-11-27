@@ -252,7 +252,7 @@ fn package_with_dictionary(
     let predicate = builder
         .unit(filter)
         .unwrap()
-        .add(None, bool_type, ExprKind::Value(bool_value))
+        .add(None, bool_type, ExprKind::input(bool_value))
         .unwrap();
     let predicate = builder
         .unit(filter)
@@ -267,7 +267,7 @@ fn package_with_dictionary(
         RandArgument::Input | RandArgument::DirectConstant => {
             let argument = match constant {
                 Some(value) => checked_source(&mut constants, &value),
-                None => ExprKind::Value(bound_value),
+                None => ExprKind::input(bound_value),
             };
             vec![
                 builder
@@ -308,12 +308,12 @@ fn package_with_dictionary(
     let identity_a = builder
         .unit(second_project)
         .unwrap()
-        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
+        .add(None, bound_type.clone(), ExprKind::input(bound_value))
         .unwrap();
     let identity_b = builder
         .unit(second_project)
         .unwrap()
-        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
+        .add(None, bound_type.clone(), ExprKind::input(bound_value))
         .unwrap();
     let mut project_expressions = vec![(call_root, sample_value)];
     let mut project_output = vec![sample_value];

@@ -52,15 +52,21 @@ fn collect_scalar_column_id_refs_strict_inner(
             }
             out.insert(*column_id);
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::LocalValue(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_scalar_column_id_refs_strict_inner(arena, *left, out)?;
             collect_scalar_column_id_refs_strict_inner(arena, *right, out)?;
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => {
             collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
         }
@@ -76,23 +82,6 @@ fn collect_scalar_column_id_refs_strict_inner(
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_scalar_column_id_refs_strict_inner(arena, *body, out)?;
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
-            for item in list {
-                collect_scalar_column_id_refs_strict_inner(arena, *item, out)?;
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
-            collect_scalar_column_id_refs_strict_inner(arena, *low, out)?;
-            collect_scalar_column_id_refs_strict_inner(arena, *high, out)?;
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
-            collect_scalar_column_id_refs_strict_inner(arena, *pattern, out)?;
         }
         ScalarNode::Case {
             operand,
@@ -563,15 +552,21 @@ mod typed_legacy {
                     out.insert(*column_id);
                 }
             }
-            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {}
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::LocalValue(_)
+            | ExprKind::LambdaParamRef { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::Constant(_) => {}
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 collect_column_id_refs_inner(left, out);
                 collect_column_id_refs_inner(right, out);
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr) => collect_column_id_refs_inner(expr, out),
             ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
                 for arg in args {
@@ -585,23 +580,6 @@ mod typed_legacy {
             }
             ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
                 collect_column_id_refs_inner(body, out);
-            }
-            ExprKind::InList { expr, list, .. } => {
-                collect_column_id_refs_inner(expr, out);
-                for item in list {
-                    collect_column_id_refs_inner(item, out);
-                }
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                collect_column_id_refs_inner(expr, out);
-                collect_column_id_refs_inner(low, out);
-                collect_column_id_refs_inner(high, out);
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                collect_column_id_refs_inner(expr, out);
-                collect_column_id_refs_inner(pattern, out);
             }
             ExprKind::Case {
                 operand,

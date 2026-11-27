@@ -23,16 +23,12 @@ use novarocks_type_contract::ExpressionUseId;
 #[derive(Clone, Copy)]
 pub(super) enum ComparisonPosition {
     Binary,
-    BetweenLower,
-    BetweenUpper,
 }
 
 pub(super) trait NodeRecipes {
     fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe>;
     fn case_comparison(&self, arm: u32) -> Option<&crate::primitives::PreparedNodeComparison>;
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe>;
-    fn native_like_recipe(&self) -> Option<&PreparedNativeLikeRecipe>;
-    fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe>;
     fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe>;
     fn cast_recipe(&self) -> Option<&PreparedCastRecipe>;
     fn prepared_call(&self) -> Option<&PreparedPureKernel>;
@@ -46,8 +42,6 @@ impl NodeRecipes for UnitNodeRecipes<'_> {
     fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe> {
         let site = match position {
             ComparisonPosition::Binary => ComparisonSite::Binary(self.occurrence),
-            ComparisonPosition::BetweenLower => ComparisonSite::BetweenLower(self.occurrence),
-            ComparisonPosition::BetweenUpper => ComparisonSite::BetweenUpper(self.occurrence),
         };
         self.unit.recipes().comparison(site)
     }
@@ -56,12 +50,6 @@ impl NodeRecipes for UnitNodeRecipes<'_> {
     }
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe> {
         self.unit.recipes().null_safe_comparison(self.occurrence)
-    }
-    fn native_like_recipe(&self) -> Option<&PreparedNativeLikeRecipe> {
-        self.unit.recipes().native_like(self.occurrence)
-    }
-    fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe> {
-        self.unit.recipes().native_inlist(self.occurrence)
     }
     fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe> {
         self.unit.recipes().arithmetic(self.occurrence)

@@ -38,7 +38,7 @@ use super::estimate::selectivity::apply_filter;
 use super::memo::{GroupId, JoinTree, MExpr, Memo};
 use super::operator::Operator;
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, JoinKind, LiteralValue, OutputColumn, UnOp};
+use crate::common::{BinOp, JoinKind, LiteralValue, OutputColumn};
 use crate::optimizer::estimate::arith::{damped_conjunction, sat_add};
 use crate::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
@@ -875,6 +875,17 @@ fn estimate_selectivity_scalar(
 ) -> Result<f64, SqlCompileError> {
     let node = arena.node(expr);
     work.step()?;
+    if let Some(operand) = crate::common::negation::scalar_boolean_operand(arena, expr) {
+        return Ok(1.0 - estimate_selectivity_scalar(arena, operand, column_stats, work)?);
+    }
+    if let Some((probe, candidates)) = crate::common::binary_operator::scalar_in_list(arena, expr) {
+        let ndv = extract_column_id_scalar(arena, probe)
+            .and_then(|column_id| column_stats.get(&column_id))
+            .and_then(ColumnStatistic::trusted_ndv_value);
+        return Ok(ndv.map_or(IN_PREDICATE_DEFAULT_FILTER, |ndv| {
+            (candidates.len() as f64 / ndv).min(1.0)
+        }));
+    }
     if let Some((op, [left, right])) =
         crate::common::binary_operator::scalar_comparison(arena, expr)
     {
@@ -910,6 +921,10 @@ fn estimate_selectivity_scalar(
                 }
                 observed_damped_conjunction(&sels, work)?
             }
+            BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
+                estimate_selectivity_scalar(arena, *left, column_stats, work)?
+                    * estimate_selectivity_scalar(arena, *right, column_stats, work)?
+            }
             BinOp::Or => {
                 let l = estimate_selectivity_scalar(arena, *left, column_stats, work)?;
                 let r = estimate_selectivity_scalar(arena, *right, column_stats, work)?;
@@ -931,59 +946,6 @@ fn estimate_selectivity_scalar(
                 .unwrap_or(IS_NULL_FILTER);
             if *negated { 1.0 - null_frac } else { null_frac }
         }
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let col_id = extract_column_id_scalar(arena, *child);
-            let ndv = col_id
-                .and_then(|column_id| column_stats.get(&column_id))
-                .and_then(ColumnStatistic::trusted_ndv_value);
-            let sel = if let Some(ndv) = ndv {
-                (list.len() as f64 / ndv).min(1.0)
-            } else {
-                IN_PREDICATE_DEFAULT_FILTER
-            };
-            if *negated { 1.0 - sel } else { sel }
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => {
-            let ge = estimate_range_selectivity_scalar(
-                arena,
-                *child,
-                *low,
-                BinOp::Ge,
-                column_stats,
-                work,
-            )?;
-            let le = estimate_range_selectivity_scalar(
-                arena,
-                *child,
-                *high,
-                BinOp::Le,
-                column_stats,
-                work,
-            )?;
-            let sel = ge * le;
-            if *negated { 1.0 - sel } else { sel }
-        }
-        ScalarNode::Like { negated, .. } => {
-            if *negated {
-                1.0 - PREDICATE_UNKNOWN_FILTER
-            } else {
-                PREDICATE_UNKNOWN_FILTER
-            }
-        }
-        ScalarNode::UnaryOp {
-            op: UnOp::Not,
-            child,
-        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats, work)?,
-        ScalarNode::IsTruthValue { .. } => 0.5,
         ScalarNode::Nested(inner) => {
             estimate_selectivity_scalar(arena, *inner, column_stats, work)?
         }
@@ -6407,16 +6369,7 @@ mod tests {
     }
 
     fn between_expr(expr: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(expr),
-                low: novarocks_parser::ast::AstBox::new(low),
-                high: novarocks_parser::ast::AstBox::new(high),
-                negated: false,
-            },
-        }
+        crate::common::binary_operator::test_inclusive_range(expr, low, high)
     }
 
     #[test]
@@ -6441,16 +6394,14 @@ mod tests {
         //   NOT BETWEEN sel = 1 - 0.109 ≈ 0.891
         // The negated value (~0.89) is clearly distinct from the positive (~0.11),
         // so this test genuinely exercises the negated branch.
-        let pred = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(col_ref("a")),
-                low: novarocks_parser::ast::AstBox::new(int_lit(0)),
-                high: novarocks_parser::ast::AstBox::new(int_lit(10)),
-                negated: true,
-            },
-        };
+        let pred = crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::BooleanNot,
+            vec![crate::common::binary_operator::test_inclusive_range(
+                col_ref("a"),
+                int_lit(0),
+                int_lit(10),
+            )],
+        );
         let sel = estimate_selectivity_for_test(&pred, &cs);
         assert!(
             sel > 0.85 && sel < 0.93,

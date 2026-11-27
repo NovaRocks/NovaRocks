@@ -27,7 +27,7 @@ fn value_must_be_declared_in_every_root_scope_with_its_exact_type() {
     for (port, ty) in [(1, boolean(true)), (0, boolean(false))] {
         let mut builder = BoundExprSetBuilder::new(limits());
         let id = builder
-            .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+            .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
             .unwrap();
         builder
             .root(id, EvaluationDemand::Value, RootScope::Port(port))
@@ -52,7 +52,7 @@ fn value_must_be_declared_in_every_root_scope_with_its_exact_type() {
     }
     let mut builder = BoundExprSetBuilder::new(limits());
     let id = builder
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(123)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(123)))
         .unwrap();
     builder
         .root(id, EvaluationDemand::Value, RootScope::AllPorts)
@@ -63,7 +63,7 @@ fn value_must_be_declared_in_every_root_scope_with_its_exact_type() {
 fn same_definition_cannot_hide_a_second_narrower_root_scope() {
     let mut builder = BoundExprSetBuilder::new(limits());
     let id = builder
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
     builder
         .root(id, EvaluationDemand::Value, RootScope::AllPorts)
@@ -86,16 +86,241 @@ fn same_definition_cannot_hide_a_second_narrower_root_scope() {
     .unwrap_err();
     assert!(matches!(error,UnitError::Invalid {root:Some(actual),..} if actual==wrong));
 }
+
+#[test]
+fn let_body_dominates_every_incoming_local_use() {
+    enum Placement {
+        BodyOnly,
+        SecondRoot,
+        Sibling,
+        Initializer,
+    }
+
+    for placement in [
+        Placement::BodyOnly,
+        Placement::SecondRoot,
+        Placement::Sibling,
+        Placement::Initializer,
+    ] {
+        let mut builder = BoundExprSetBuilder::new(limits());
+        let binding = builder.reserve().unwrap();
+        let input = ValueId::new(9);
+        let value = builder
+            .add(None, boolean(true), ExprKind::input(input))
+            .unwrap();
+        let local = builder
+            .add(
+                None,
+                boolean(true),
+                ExprKind::Value(ValueAddress::Local(binding)),
+            )
+            .unwrap();
+        let body = builder
+            .add(
+                None,
+                boolean(true),
+                ExprKind::Conjunction {
+                    args: Box::from([local, local]),
+                },
+            )
+            .unwrap();
+        let value = if matches!(placement, Placement::Initializer) {
+            body
+        } else {
+            value
+        };
+        builder
+            .insert(binding, None, boolean(true), ExprKind::Let { value, body })
+            .unwrap();
+        let root = if matches!(placement, Placement::Sibling) {
+            builder
+                .add(
+                    None,
+                    boolean(true),
+                    ExprKind::Conjunction {
+                        args: Box::from([binding, body]),
+                    },
+                )
+                .unwrap()
+        } else {
+            binding
+        };
+        builder
+            .root(root, EvaluationDemand::TruthOnly, RootScope::AllPorts)
+            .unwrap();
+        if matches!(placement, Placement::SecondRoot) {
+            builder
+                .root(body, EvaluationDemand::Value, RootScope::AllPorts)
+                .unwrap();
+        }
+        let result = no_calls(
+            builder,
+            vec![ExprPort {
+                values: Box::from([(input, boolean(true))]),
+            }],
+            &Control::good(),
+        );
+        if matches!(placement, Placement::BodyOnly) {
+            let unit = result.unwrap();
+            let root = unit.control_flow().root_use_ids()[0];
+            let invocation = &unit.control_flow().uses()[&root];
+            let uses = unit.control_flow().uses();
+            assert_eq!(invocation.control, ControlShape::Let);
+            assert_eq!(
+                uses[&invocation.arguments[0]].context.demand,
+                EvaluationDemand::Value
+            );
+            assert_eq!(
+                uses[&invocation.arguments[1]].context.demand,
+                EvaluationDemand::TruthOnly
+            );
+            let body = &uses[&invocation.arguments[1]];
+            let region = unit.control_flow().regions()[&body.context.region];
+            assert_eq!(
+                region.guard,
+                Some(RegionGuard {
+                    owner: root,
+                    kind: GuardKind::LetBody,
+                })
+            );
+            assert_eq!(region.parent, Some(invocation.context.region));
+            assert_ne!(body.arguments[0], body.arguments[1]);
+            assert_eq!(
+                uses[&body.arguments[0]].definition,
+                uses[&body.arguments[1]].definition
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("outside its Let body"),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn same_carrier_local_value_cannot_change_its_initializer_nullability() {
+    let mut builder = BoundExprSetBuilder::new(limits());
+    let binder = builder.reserve().unwrap();
+    let input = ValueId::new(9);
+    let value = builder
+        .add(None, boolean(true), ExprKind::input(input))
+        .unwrap();
+    let body = builder
+        .add(
+            None,
+            boolean(false),
+            ExprKind::Value(ValueAddress::Local(binder)),
+        )
+        .unwrap();
+    builder
+        .insert(binder, None, boolean(false), ExprKind::Let { value, body })
+        .unwrap();
+    builder
+        .root(binder, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let error = no_calls(
+        builder,
+        vec![ExprPort {
+            values: Box::from([(input, boolean(true))]),
+        }],
+        &Control::good(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("matching Let initializer"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn control_expansion_requires_exact_wrappers_and_ownership() {
+    let id = ExprId::new;
+    let node = |ordinal, kind| ExprNode {
+        id: id(ordinal),
+        lambda_scope: None,
+        ty: boolean(false),
+        kind,
+    };
+    let comparison = OperatorFunction::LessThanOrEqual;
+    let branch = |left, right| ExprKind::FunctionCall {
+        function: BoundFunction::from_exact_signature(
+            comparison.function_id(),
+            FunctionOverloadId::try_new(comparison.comparison_overload_text().unwrap()).unwrap(),
+            FunctionKind::Scalar,
+            TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(boolean(false)),
+                FunctionArgumentType::Value(boolean(false)),
+            ])),
+            boolean(false),
+        ),
+        args: Box::from([id(left), id(right)]),
+    };
+    let mut definitions = vec![
+        node(0, ExprKind::input(ValueId::new(9))),
+        node(1, branch(0, 0)),
+        node(2, branch(0, 0)),
+        node(
+            3,
+            ExprKind::Conjunction {
+                args: Box::from([id(1), id(2)]),
+            },
+        ),
+        node(
+            4,
+            ExprKind::Let {
+                value: id(0),
+                body: id(3),
+            },
+        ),
+    ];
+    let expansion = ControlExpansion {
+        root: id(4),
+        positive: id(4),
+        conjunction: id(3),
+        branches: [id(1), id(2)],
+    };
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let checked =
+        ControlExpansions::try_new_observed(Box::from([expansion]), &definitions, &mut work)
+            .unwrap();
+    assert_eq!(checked.records(), &[expansion]);
+    assert!(checked.shares_source_position(id(4), id(3)));
+    assert!(checked.shares_source_position(id(3), id(1)));
+    assert!(!checked.shares_source_position(id(4), id(0)));
+
+    definitions[2].kind = branch(1, 0);
+    assert!(
+        ControlExpansions::try_new_observed(Box::from([expansion]), &definitions, &mut work)
+            .is_err()
+    );
+    definitions[2].kind = branch(0, 0);
+    definitions.push(node(
+        5,
+        ExprKind::IsNull {
+            expr: id(2),
+            negated: false,
+        },
+    ));
+    assert!(
+        ControlExpansions::try_new_observed(Box::from([expansion]), &definitions, &mut work)
+            .is_err()
+    );
+    work.finish().unwrap();
+}
+
 #[test]
 fn reservation_refuses_duplicate_fill_and_seal_refuses_holes_cycles_and_unreachable_definitions() {
     let mut builder = BoundExprSetBuilder::new(limits());
     let id = builder.reserve().unwrap();
     builder
-        .insert(id, None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .insert(id, None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
     assert!(
         builder
-            .insert(id, None, integer(false), ExprKind::Value(ValueId::new(8)))
+            .insert(id, None, integer(false), ExprKind::input(ValueId::new(8)))
             .is_err()
     );
     assert_eq!(builder.definition(id).unwrap().ty, boolean(true));
@@ -111,8 +336,8 @@ fn reservation_refuses_duplicate_fill_and_seal_refuses_holes_cycles_and_unreacha
             id,
             None,
             boolean(true),
-            ExprKind::Unary {
-                op: UnaryOperator::Not,
+            ExprKind::IsNull {
+                negated: true,
                 expr: id,
             },
         )
@@ -123,9 +348,9 @@ fn reservation_refuses_duplicate_fill_and_seal_refuses_holes_cycles_and_unreacha
     assert!(no_calls(cycle, vec![], &Control::good()).is_err());
     let mut dead = BoundExprSetBuilder::new(limits());
     let first = dead
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
-    dead.add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+    dead.add(None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
     dead.root(first, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -204,9 +429,9 @@ fn semantic_depth_keeps_resource_class_and_truth_only_keeps_boolean_contract() {
         id = builder
             .add(
                 None,
-                boolean(true),
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
+                boolean(false),
+                ExprKind::IsNull {
+                    negated: true,
                     expr: id,
                 },
             )
@@ -234,9 +459,9 @@ fn semantic_depth_keeps_resource_class_and_truth_only_keeps_boolean_contract() {
         id = fresh
             .add(
                 None,
-                boolean(true),
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
+                boolean(false),
+                ExprKind::IsNull {
+                    negated: true,
                     expr: id,
                 },
             )
@@ -349,10 +574,10 @@ fn largeint(nullable: bool) -> ValueType {
 fn binary_valid(left: ValueType, op: BinaryOperator, right: ValueType, output: ValueType) -> bool {
     let mut b = BoundExprSetBuilder::new(limits());
     let a = b
-        .add(None, left.clone(), ExprKind::Value(ValueId::new(0)))
+        .add(None, left.clone(), ExprKind::input(ValueId::new(0)))
         .unwrap();
     let c = b
-        .add(None, right.clone(), ExprKind::Value(ValueId::new(1)))
+        .add(None, right.clone(), ExprKind::input(ValueId::new(1)))
         .unwrap();
     let id = b
         .add(
@@ -461,25 +686,51 @@ fn not_unit(
     let (pools, reference) = null_source(&input);
     let mut b = BoundExprSetBuilder::new(limits());
     let child = b.add(None, input, ExprKind::Constant(reference)).unwrap();
+    let function = BoundFunction::from_exact_signature(
+        OperatorFunction::BooleanNot.function_id(),
+        FunctionOverloadId::try_new("fixture/boolean-not").unwrap(),
+        FunctionKind::Scalar,
+        TypedFactSlice::from_pure_boxed(Box::from([FunctionArgumentType::Value(boolean(true))])),
+        output.clone(),
+    );
+    let original = request(&function);
     let id = b
         .add(
             None,
             output,
-            ExprKind::Unary {
-                op: UnaryOperator::Not,
-                expr: child,
+            ExprKind::FunctionCall {
+                function,
+                args: Box::from([child]),
             },
         )
         .unwrap();
+    b.request(id, original).unwrap();
+    b.definition_control(
+        id,
+        DefinitionControl {
+            shape: ControlShape::OrderedNull,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
     b.root(id, EvaluationDemand::Value, RootScope::AllPorts)
         .unwrap();
-    Ok((no_calls(b, vec![], &Control::good())?, pools))
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+    let sealed = b.seal(vec![], &mut work)?;
+    let use_id = sealed.root_use_ids()[0];
+    let mut binding_claim = claim(sealed.uses()[&use_id].context, ArgumentControl::OrderedNull);
+    binding_claim.effects.null_behavior = FunctionNullBehavior::Strict;
+    let unit = sealed.finish(BTreeMap::from([(use_id, binding_claim)]), &mut work)?;
+    work.finish()?;
+    Ok((unit, pools))
 }
 
 #[test]
-fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
+fn boolean_not_requires_boolean_input_and_keeps_successful_nullability() {
+    assert!(not_unit(boolean(true), boolean(true)).is_ok());
+    assert!(not_unit(boolean(true), boolean(false)).is_err());
     for carrier in [
-        DataType::Boolean,
         DataType::Int8,
         DataType::Int16,
         DataType::Int32,
@@ -487,11 +738,6 @@ fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
         DataType::Float32,
         DataType::Float64,
         DataType::Decimal128(18, 4),
-    ] {
-        assert!(not_unit(ValueType::new(carrier.clone(), true), boolean(true)).is_ok());
-        assert!(not_unit(ValueType::new(carrier, true), boolean(false)).is_err());
-    }
-    for carrier in [
         DataType::UInt64,
         DataType::Decimal256(50, 4),
         DataType::Date32,
@@ -672,7 +918,7 @@ fn deciding_boolean_source_uses_the_actual_pool_and_preserves_every_control_pref
     pools.insert(reference.pool, value.pool().clone()).unwrap();
     let mut b = BoundExprSetBuilder::new(limits());
     let input = b
-        .add(None, boolean(true), ExprKind::Value(ValueId::new(9)))
+        .add(None, boolean(true), ExprKind::input(ValueId::new(9)))
         .unwrap();
     let literal = b
         .add(None, boolean(true), ExprKind::Constant(reference))
@@ -751,7 +997,7 @@ fn ordinary_comparisons_keep_successful_null_even_for_required_null_carriers() {
                 let source = ValueType::new(DataType::Null, false);
                 let mut b = BoundExprSetBuilder::new(limits());
                 let input = b
-                    .add(None, source.clone(), ExprKind::Value(ValueId::new(7)))
+                    .add(None, source.clone(), ExprKind::input(ValueId::new(7)))
                     .unwrap();
                 let comparison = b
                     .add(

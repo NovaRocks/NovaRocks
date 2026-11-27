@@ -51,7 +51,7 @@ use crate::{
         prepare_constant_namespace_input_derived_with_creator_in,
         prepare_constant_namespace_input_derived_with_factory_in,
     },
-    physical_control_v2::{ControlCodecError, decode_expression_control_observed},
+    physical_control_v2::{ControlCodecError, decode_expanded_expression_control_observed},
     physical_cuts_v2::{CutsProjectionLimits, decode_fragment_cuts_observed},
     physical_expression_v2::{
         ExpressionCodecError, decode_expression_definitions_in, materialize_expressions_in,
@@ -398,6 +398,54 @@ fn array_bytes<T>(n: usize) -> Result<usize, Error> {
 }
 fn required<T>(value: Option<T>, message: &'static str) -> Result<T, Error> {
     value.ok_or(Error::Invalid(message))
+}
+
+fn read_control_expansions<H>(
+    unit: &wire::ExpressionUnit,
+    definitions: &[novarocks_expression_contract::ExprNode],
+    creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_expression_contract::ControlExpansions, ProjectionFailure<Error, H>> {
+    use novarocks_expression_contract::{
+        ControlExpansion, ControlExpansions, UnitConstructionFailure,
+    };
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(unit.control_expansions.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for expansion in &unit.control_expansions {
+        let id =
+            |value| required(value, "expanded control definition ID is absent").map(p::ExprId::new);
+        records.push(ControlExpansion {
+            root: id(expansion.root_expr_id)?,
+            positive: id(expansion.positive_expr_id)?,
+            conjunction: id(expansion.conjunction_expr_id)?,
+            branches: [
+                id(expansion.first_branch_expr_id)?,
+                id(expansion.second_branch_expr_id)?,
+            ],
+        });
+        work.step()?;
+    }
+    let records = records.into_boxed_slice();
+    match creation {
+        Some(creation) => {
+            ControlExpansions::try_new_with_creator_in(records, definitions, creation, work)
+                .map_err(|error| match error {
+                    UnitConstructionFailure::Control(error) => error.into(),
+                    UnitConstructionFailure::Creator(error)
+                    | UnitConstructionFailure::Observer(error) => ProjectionFailure::Host(error),
+                    UnitConstructionFailure::Resource(error) => {
+                        ExpressionCodecError::UnitResource(error).into()
+                    }
+                    UnitConstructionFailure::Owner(error) => {
+                        ExpressionCodecError::ConstructedUnit(error).into()
+                    }
+                })
+        }
+        None => ControlExpansions::try_new_observed(records, definitions, work)
+            .map_err(|error| ExpressionCodecError::from(error).into()),
+    }
 }
 /// A known numerical refusal precedes the first insertion into a new map.
 fn admit_count(count: usize, maximum: usize) -> Result<(), Error> {
@@ -1305,6 +1353,13 @@ fn decode_fragment_package_factory_core<
                 })?;
                 invoice = add(invoice, header_facts.allocation_request_bytes_upper_bound)?;
                 let definitions = materialized.into_definitions();
+                let expansions =
+                    read_control_expansions(raw_unit, &definitions, creation.as_deref_mut(), work)?;
+                let index_bytes = super::unit_headers::expansion_index_bytes(
+                    expansions.records().len(),
+                    definitions.len(),
+                )?;
+                invoice = add(invoice, add(index_bytes, index_bytes)?)?;
                 let control_wire = required(
                     raw_unit.control.as_ref(),
                     "unit expression control is absent",
@@ -1312,6 +1367,7 @@ fn decode_fragment_package_factory_core<
                 let (flow, flow_facts) = if let Some(creator) = creation.as_deref_mut() {
                     crate::physical_control_v2::decode_expression_control_with_creator_observed_in(
                         &definitions,
+                        &expansions,
                         control_wire,
                         invoice,
                         None,
@@ -1327,12 +1383,11 @@ fn decode_fragment_package_factory_core<
                         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
                     })?
                 } else {
-                    decode_expression_control_observed(
+                    decode_expanded_expression_control_observed(
                         &definitions,
+                        &expansions,
                         control_wire,
                         invoice,
-                        None,
-                        &mut |_| Ok(()),
                         work,
                     )?
                 };
@@ -1449,6 +1504,7 @@ fn decode_fragment_package_factory_core<
                     claims,
                     requests,
                 )
+                .with_control_expansions(expansions)
                 .with_storage_lifetime(storage)
                 .map_err(ExpressionCodecError::from)?;
                 work.step()?;

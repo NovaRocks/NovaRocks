@@ -21,9 +21,7 @@ use super::super::expression_component_test_fixture::{
 use super::*;
 use crate::test_constants as checked;
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{
-    BoundFunction, ExprId, ExprKind, RootOrdinal, UnaryOperator, UnitError,
-};
+use novarocks_expression_contract::{BoundFunction, ExprId, ExprKind, RootOrdinal, UnitError};
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionBindingError, FunctionKind,
     FunctionResultType, FunctionValueType,
@@ -446,8 +444,8 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
         let false_ = boolean(&mut b, false);
         let not = b.add(
             ty(DataType::Boolean, false),
-            ExprKind::Unary {
-                op: UnaryOperator::Not,
+            ExprKind::IsNull {
+                negated: true,
                 expr: a,
             },
         );

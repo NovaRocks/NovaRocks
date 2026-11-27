@@ -198,7 +198,7 @@ fn read_unit_like(program: &LocalProgram, like: ProgramRootRef) -> AuthoredInput
         expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
     });
     let definition = draft
-        .add(None, column.ty.clone(), ExprKind::Value(column.value))
+        .add(None, column.ty.clone(), ExprKind::input(column.value))
         .unwrap();
     let root = draft
         .root(definition, EvaluationDemand::Value, root.scope)
@@ -273,7 +273,7 @@ fn read_join_output_unit(
     let mut draft = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: novarocks_type_contract::MAX_CONTROL_DEPTH,
     });
-    let definition = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
+    let definition = draft.add(None, ty.clone(), ExprKind::input(value)).unwrap();
     let root = draft
         .root(definition, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();

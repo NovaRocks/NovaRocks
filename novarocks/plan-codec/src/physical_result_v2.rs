@@ -242,6 +242,27 @@ fn physical_floor(input: &p::ResultPort, ids: &[u32]) -> Result<usize, Error> {
         )?,
     )
 }
+fn result_field_text_bytes(field: &p::ResultField) -> Result<usize, Error> {
+    add(
+        field.name.len(),
+        field.alias.as_ref().map_or(0, |alias| alias.len()),
+    )
+}
+
+/// Original ResultPort backing retained beside newly created wire namespaces.
+/// The package's borrowed type-view budget owns the separately collected IDs.
+pub(crate) fn result_source_backing(
+    result: Option<&p::ResultPort>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, Error> {
+    let Some(result) = result else { return Ok(0) };
+    let mut backing = physical_floor(result, &[])?;
+    for field in &result.fields {
+        backing = add(backing, result_field_text_bytes(field)?)?;
+        work.step()?;
+    }
+    Ok(backing)
+}
 fn wire_floor(input: &wire::ResultPort, output: &wire::OutputPort) -> Result<usize, Error> {
     add(
         size_of::<wire::ResultPort>(),
@@ -349,13 +370,7 @@ fn preflight_encode(
     }
     admission.facts(&model, w)?;
     for field in &input.fields {
-        known = add(
-            known,
-            add(
-                field.name.len(),
-                field.alias.as_ref().map_or(0, |v| v.len()),
-            )?,
-        )?;
+        known = add(known, result_field_text_bytes(field)?)?;
         if admission.observed() {
             model.request::<u8>(field.name.len(), 1)?;
             if let Some(alias) = &field.alias {

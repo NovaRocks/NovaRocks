@@ -28,9 +28,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_constant_contract::ConstantPools;
-use novarocks_expression_contract::{
-    BoundExprSetBuilder, ExprId, ExprKind, RootScope, UnaryOperator, ValueId,
-};
+use novarocks_expression_contract::{BoundExprSetBuilder, ExprId, ExprKind, RootScope, ValueId};
 use novarocks_type_contract::{
     ControlShape, EvaluationDemand, FunctionValueType, SemanticParameters,
 };
@@ -61,7 +59,11 @@ fn unary(builder: &mut BoundExprSetBuilder, child: ExprId, negated: bool) -> Exp
 
 pub fn unary_program(case: UnaryCase) -> Fixture {
     let mut source_pools = ConstantPools::empty();
-    let functions = catalogue(Shape::Decimal);
+    let functions = if matches!(case, UnaryCase::NotFilter) {
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
+    } else {
+        Arc::new(catalogue(Shape::Decimal))
+    };
     let flag = ValueId::new(901);
     let decimal_value = ValueId::new(71);
     let bool_type = FunctionValueType::new(DataType::Boolean, true);
@@ -75,7 +77,7 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
     } else {
         Some(
             builder
-                .add(None, bool_type.clone(), ExprKind::Value(flag))
+                .add(None, bool_type.clone(), ExprKind::input(flag))
                 .unwrap(),
         )
     };
@@ -104,19 +106,19 @@ pub fn unary_program(case: UnaryCase) -> Fixture {
                 },
             )
             .unwrap();
-        builder
-            .add(
-                None,
-                bool_type.clone(),
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
-                    expr: conjunction,
-                },
-            )
-            .unwrap()
+        let owner = crate::testkit::ClaimAuthor::with_legacy_binding(
+            &functions,
+            novarocks_type_contract::OperatorFunction::BooleanNot.catalog_name(),
+            vec![super::argument(bool_type.clone(), None)],
+            ControlShape::OrderedNull,
+            Some(bool_type.clone()),
+            fixture_constant_policy(),
+            &crate::testkit::HarnessControl,
+        );
+        add_call(&mut builder, &mut authors, owner, vec![conjunction])
     } else {
         let value = builder
-            .add(None, decimal.clone(), ExprKind::Value(decimal_value))
+            .add(None, decimal.clone(), ExprKind::input(decimal_value))
             .unwrap();
         let round = round_value(
             &mut builder,

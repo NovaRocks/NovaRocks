@@ -27,7 +27,8 @@ use {
     novarocks_expression_contract::PhysicalCallRequest,
     novarocks_physical_plan::{
         ConstantReference, FragmentId, MAX_FRAGMENT_DYNAMIC_BYTES, MAX_FRAGMENT_DYNAMIC_ITEMS,
-        MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS, StaticFunctionArgument, ValueType,
+        MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS, StaticFunctionArgument,
+        StaticFunctionCandidate, ValueType,
     },
 };
 
@@ -326,22 +327,29 @@ fn transfer_request(
         .ok_or(CompileControlError::ResourceExhausted)?;
     for argument in request.arguments {
         work.step()?;
-        if let FunctionArgument::Lambda {
-            parameter_types, ..
-        } = argument
-        {
-            items = items
-                .checked_add(parameter_types.len())
-                .ok_or(CompileControlError::ResourceExhausted)?;
-            let layout = Layout::array::<ValueType>(parameter_types.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
-            bytes = bytes
-                .checked_add(layout.size())
-                .ok_or(CompileControlError::ResourceExhausted)?;
-            work.step()?;
-            if items > MAX_FRAGMENT_DYNAMIC_ITEMS || bytes > MAX_FRAGMENT_DYNAMIC_BYTES {
-                return Err(CompileControlError::ResourceExhausted.into());
-            }
+        let (nested, layout) = match argument {
+            FunctionArgument::Value { .. } => continue,
+            FunctionArgument::Lambda {
+                parameter_types, ..
+            } => (
+                parameter_types.len(),
+                Layout::array::<ValueType>(parameter_types.len()),
+            ),
+            FunctionArgument::CandidateGroup { members, .. } => (
+                members.len(),
+                Layout::array::<StaticFunctionCandidate<ConstantReference>>(members.len()),
+            ),
+        };
+        items = items
+            .checked_add(nested)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        let layout = layout.map_err(|_| CompileControlError::ResourceExhausted)?;
+        bytes = bytes
+            .checked_add(layout.size())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        work.step()?;
+        if items > MAX_FRAGMENT_DYNAMIC_ITEMS || bytes > MAX_FRAGMENT_DYNAMIC_BYTES {
+            return Err(CompileControlError::ResourceExhausted.into());
         }
     }
     if items > MAX_FRAGMENT_DYNAMIC_ITEMS || bytes > MAX_FRAGMENT_DYNAMIC_BYTES {
@@ -368,6 +376,35 @@ fn transfer_request(
                 StaticFunctionArgument::Value {
                     value_type: clone_type(value_type, work)?,
                     constant,
+                }
+            }
+            FunctionArgument::CandidateGroup {
+                element_type,
+                members,
+            } => {
+                let mut transferred = Vec::new();
+                work.flush()?;
+                transferred
+                    .try_reserve_exact(members.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                work.step()?;
+                work.flush()?;
+                for member in members {
+                    let constant = member
+                        .constant
+                        .as_ref()
+                        .map(|value| register(value, work))
+                        .transpose()?;
+                    transferred.push(StaticFunctionCandidate {
+                        value_type: clone_type(&member.value_type, work)?,
+                        constant,
+                    });
+                    work.step()?;
+                }
+                work.flush()?;
+                StaticFunctionArgument::CandidateGroup {
+                    element_type: clone_type(element_type, work)?,
+                    members: transferred.into_boxed_slice(),
                 }
             }
             FunctionArgument::Lambda {

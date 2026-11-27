@@ -81,7 +81,7 @@ fn filter(demand: EvaluationDemand, scope: RootScope) -> (FragmentBuilder, NodeI
     let node = builder.reserve_node_id().unwrap();
     let draft = builder.unit(node).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     let root = draft.root(definition, demand, scope).unwrap();
     builder
@@ -143,7 +143,7 @@ fn fragment_rejects_valid_unit_reading_a_different_input_value() {
     let foreign = ValueId::new(value.get() + 100);
     let draft = builder.unit(node).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(foreign))
+        .add(None, boolean(false), ExprKind::input(foreign))
         .unwrap();
     draft
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
@@ -162,7 +162,7 @@ fn fragment_rejects_root_not_referenced_by_any_node_field() {
     let (mut builder, node, value) = filter(EvaluationDemand::TruthOnly, RootScope::Port(0));
     let draft = builder.unit(node).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     draft
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
@@ -191,7 +191,7 @@ fn units_in_different_nodes_keep_independent_dense_definition_ids() {
     let input_value = builder.construction_node(first).unwrap().output.columns[0];
     let draft = builder.unit(second).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(input_value))
+        .add(None, boolean(false), ExprKind::input(input_value))
         .unwrap();
     let root = draft
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
@@ -428,7 +428,7 @@ fn scan_with_guarantee(residual: bool, scope: RootScope) -> (FragmentBuilder, No
         .unwrap();
     let draft = builder.unit(node).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     let root = draft
         .root(definition, EvaluationDemand::TruthOnly, scope)
@@ -566,22 +566,21 @@ fn complete_pure_plan(builder: FragmentBuilder, node: NodeId) -> PhysicalPlan {
 }
 #[test]
 fn fragment_checks_the_callers_semantic_depth_against_an_already_sealed_unit() {
-    use novarocks_expression_contract::UnaryOperator;
     let mut builder = FragmentBuilder::new(FragmentId::new(0));
     let input = builder.reserve_node_id().unwrap();
     let value = source(&mut builder, input, &[boolean(false)])[0];
     let node = builder.reserve_node_id().unwrap();
     let draft = builder.unit(node).unwrap();
     let mut definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     for _ in 0..2 {
         definition = draft
             .add(
                 None,
                 boolean(false),
-                ExprKind::Unary {
-                    op: UnaryOperator::Not,
+                ExprKind::IsNull {
+                    negated: true,
                     expr: definition,
                 },
             )
@@ -615,7 +614,7 @@ fn fragment_definition_limit_is_the_sum_of_its_node_units() {
     let second = builder.reserve_node_id().unwrap();
     let draft = builder.unit(second).unwrap();
     let definition = draft
-        .add(None, boolean(false), ExprKind::Value(value))
+        .add(None, boolean(false), ExprKind::input(value))
         .unwrap();
     let root = draft
         .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))
@@ -717,7 +716,7 @@ fn window_request_keeps_logical_arguments_separate_from_function_order_channels(
         .iter()
         .map(|value| {
             let definition = draft
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap();
             draft
                 .root(definition, EvaluationDemand::Value, RootScope::Port(0))

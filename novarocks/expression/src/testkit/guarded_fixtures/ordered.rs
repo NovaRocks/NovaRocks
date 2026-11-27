@@ -71,7 +71,7 @@ pub fn ordered_value_program(
     let mut authors = BTreeMap::new();
     let (left, right) = if matches!(source_kind, Source::Random) {
         let condition = builder
-            .add(None, flag.clone(), ExprKind::Value(flag_input))
+            .add(None, flag.clone(), ExprKind::input(flag_input))
             .unwrap();
         let left_rand = random(&mut builder, &mut authors, &functions, &mut source_pools);
         let null = literal(
@@ -101,10 +101,10 @@ pub fn ordered_value_program(
         )
     } else {
         let left = builder
-            .add(None, scalar.clone(), ExprKind::Value(left_input))
+            .add(None, scalar.clone(), ExprKind::input(left_input))
             .unwrap();
         let right = builder
-            .add(None, scalar.clone(), ExprKind::Value(right_input))
+            .add(None, scalar.clone(), ExprKind::input(right_input))
             .unwrap();
         if matches!(source_kind, Source::Rounded) {
             (

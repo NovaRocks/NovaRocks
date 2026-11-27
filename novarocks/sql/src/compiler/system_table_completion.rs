@@ -105,18 +105,16 @@ fn lower_varchar_literal(expression: &TypedExpr) -> Option<ConnectorValue> {
 
 fn like_operands(expression: &TypedExpr) -> Option<(&TypedExpr, &TypedExpr, Option<&TypedExpr>)> {
     match &expression.kind {
-        ExprKind::Like {
-            expr,
-            pattern,
-            negated: false,
-        } => Some((expr, pattern, None)),
         ExprKind::FunctionCall { binding, args, .. }
-            if binding.function_id.as_str() == native_like::ESCAPE_FUNCTION_ID =>
+            if novarocks_type_contract::OperatorFunction::from_function_id(
+                &binding.function_id,
+            ) == Some(novarocks_type_contract::OperatorFunction::Like) =>
         {
-            let [input, pattern, escape] = &args[..] else {
-                return None;
-            };
-            Some((input, pattern, Some(escape)))
+            match &args[..] {
+                [input, pattern] => Some((input, pattern, None)),
+                [input, pattern, escape] => Some((input, pattern, Some(escape))),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -319,7 +317,7 @@ pub(super) fn collect(
                         continue;
                     }
                     if !matches!(typed_comparison(expression), Some((BinOp::Eq, _)))
-                        && !matches!(&expression.kind, ExprKind::InList { negated: false, .. })
+                        && crate::common::binary_operator::typed_in_list(expression).is_none()
                     {
                         break;
                     }

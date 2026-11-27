@@ -135,20 +135,7 @@ fn evaluate(
                 .collect::<Vec<_>>(),
         );
         let expected = arrow::compute::take(expected_full.as_ref(), &indices, None).unwrap();
-        let wanted = if truth {
-            Arc::new(BooleanArray::from(
-                expected
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.unwrap_or(false))
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef
-        } else {
-            expected
-        };
-        assert_eq!(out.values().to_data(), wanted.to_data());
+        assert_eq!(out.values().to_data(), expected.to_data());
     }
 }
 

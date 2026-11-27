@@ -899,7 +899,17 @@ pub(crate) fn substitute_scalar(
     }
     let original = arena.node(expr).clone();
     let rewritten = match original {
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => ScalarNode::Let {
+            binding,
+            initializer: substitute_scalar(arena, initializer, defs, control)?,
+            body: substitute_scalar(arena, body, defs, control)?,
+        },
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {
@@ -915,10 +925,6 @@ pub(crate) fn substitute_scalar(
             left: substitute_scalar(arena, left, defs, control)?,
             right: substitute_scalar(arena, right, defs, control)?,
             decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
-            op,
-            child: substitute_scalar(arena, child, defs, control)?,
         },
         ScalarNode::FunctionCall {
             name,
@@ -976,38 +982,6 @@ pub(crate) fn substitute_scalar(
             child: substitute_scalar(arena, child, defs, control)?,
             negated,
         },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: substitute_scalar(arena, child, defs, control)?,
-            list: list
-                .into_iter()
-                .map(|item| substitute_scalar(arena, item, defs, control))
-                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
-            negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: substitute_scalar(arena, child, defs, control)?,
-            low: substitute_scalar(arena, low, defs, control)?,
-            high: substitute_scalar(arena, high, defs, control)?,
-            negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: substitute_scalar(arena, child, defs, control)?,
-            pattern: substitute_scalar(arena, pattern, defs, control)?,
-            negated,
-        },
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -1030,15 +1004,6 @@ pub(crate) fn substitute_scalar(
             else_expr: else_expr
                 .map(|item| substitute_scalar(arena, item, defs, control))
                 .transpose()?,
-        },
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => ScalarNode::IsTruthValue {
-            child: substitute_scalar(arena, child, defs, control)?,
-            value,
-            negated,
         },
         ScalarNode::Nested(inner) => {
             ScalarNode::Nested(substitute_scalar(arena, inner, defs, control)?)
@@ -1093,31 +1058,25 @@ pub(crate) fn substitute_scalar(
 fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
     match node {
         ScalarNode::ColumnRef(_)
+        | ScalarNode::LocalValue(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {
             vec![]
         }
-        ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => vec![*left, *right],
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::Nested(child)
-        | ScalarNode::IsTruthValue { child, .. } => vec![*child],
+        | ScalarNode::Nested(child) => vec![*child],
         ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
             args.clone()
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => vec![*body],
-        ScalarNode::InList { child, list, .. } => {
-            let mut out = Vec::with_capacity(1 + list.len());
-            out.push(*child);
-            out.extend(list.iter().copied());
-            out
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => vec![*child, *low, *high],
-        ScalarNode::Like { child, pattern, .. } => vec![*child, *pattern],
         ScalarNode::Case {
             operand,
             when_then,

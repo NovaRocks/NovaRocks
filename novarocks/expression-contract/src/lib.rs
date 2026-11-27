@@ -61,6 +61,8 @@ mod validation_types;
 mod validation;
 
 mod control;
+mod control_expansion;
+pub use control_expansion::{ControlExpansion, ControlExpansions};
 
 mod validation_calls;
 

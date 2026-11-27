@@ -713,6 +713,7 @@ fn validate_scalar(
             .map_err(AnalyzeError::control)?;
         match &expression.kind {
             ExprKind::ColumnRef { .. }
+            | ExprKind::LocalValue(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::AggregateCall { .. }
             | ExprKind::WindowCall { .. }
@@ -742,30 +743,18 @@ fn validate_scalar(
                 }
                 pending.extend(args);
             }
-            ExprKind::BinaryOp { left, right, .. } => {
+            ExprKind::BinaryOp { left, right, .. }
+            | ExprKind::Let {
+                initializer: left,
+                body: right,
+                ..
+            } => {
                 pending.push(right);
                 pending.push(left);
             }
-            ExprKind::UnaryOp { expr, .. }
-            | ExprKind::Cast { expr, .. }
+            ExprKind::Cast { expr, .. }
             | ExprKind::IsNull { expr, .. }
-            | ExprKind::IsTruthValue { expr, .. }
             | ExprKind::Nested(expr) => pending.push(expr),
-            ExprKind::InList { expr, list, .. } => {
-                pending.extend(list);
-                pending.push(expr);
-            }
-            ExprKind::Between {
-                expr, low, high, ..
-            } => {
-                pending.push(high);
-                pending.push(low);
-                pending.push(expr);
-            }
-            ExprKind::Like { expr, pattern, .. } => {
-                pending.push(pattern);
-                pending.push(expr);
-            }
             ExprKind::Case {
                 operand,
                 when_then,

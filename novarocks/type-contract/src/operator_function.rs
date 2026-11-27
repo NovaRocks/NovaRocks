@@ -21,6 +21,9 @@ use crate::{ArithmeticOperator, ComparisonOperator, FunctionId};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OperatorFunction {
     Negation,
+    BooleanNot,
+    Like,
+    InList,
     ArraySubscript,
     Add,
     Subtract,
@@ -43,8 +46,11 @@ pub enum OperatorFunction {
 }
 
 impl OperatorFunction {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 23] = [
         Self::Negation,
+        Self::BooleanNot,
+        Self::Like,
+        Self::InList,
         Self::Add,
         Self::Subtract,
         Self::Multiply,
@@ -69,6 +75,9 @@ impl OperatorFunction {
     pub const fn catalog_name(self) -> &'static str {
         match self {
             Self::Negation => "__negate",
+            Self::BooleanNot => "__operator_not",
+            Self::Like => "__operator_like",
+            Self::InList => "__operator_in",
             Self::ArraySubscript => "__array_subscript",
             Self::Add => "__operator_add",
             Self::Subtract => "__operator_subtract",
@@ -94,6 +103,9 @@ impl OperatorFunction {
     pub const fn function_id_text(self) -> &'static str {
         match self {
             Self::Negation => "builtin.scalar/__negate/v1",
+            Self::BooleanNot => "builtin.scalar/__operator_not/v1",
+            Self::Like => "builtin.scalar/__operator_like/v1",
+            Self::InList => "builtin.scalar/__operator_in/v1",
             Self::ArraySubscript => "builtin.scalar/__array_subscript/v1",
             Self::Add => "builtin.scalar/__operator_add/v1",
             Self::Subtract => "builtin.scalar/__operator_subtract/v1",
@@ -115,6 +127,8 @@ impl OperatorFunction {
             Self::TemporalNegation => "builtin.scalar/__temporal_negate/v1",
         }
     }
+
+    pub const IN_LIST_OVERLOAD: &str = "builtin.scalar/__operator_in/candidate-group-v1";
 
     /// The fixed overload identity of each private comparison owner.
     pub const fn comparison_overload_text(self) -> Option<&'static str> {
@@ -163,13 +177,20 @@ impl OperatorFunction {
     pub const fn is_infix(self) -> bool {
         !matches!(
             self,
-            Self::Negation | Self::ArraySubscript | Self::TemporalNegation
+            Self::Negation
+                | Self::BooleanNot
+                | Self::InList
+                | Self::ArraySubscript
+                | Self::TemporalNegation
         )
     }
 
     pub const fn sql(self) -> &'static str {
         match self {
             Self::Negation | Self::TemporalNegation => "-",
+            Self::BooleanNot => "NOT",
+            Self::Like => "LIKE",
+            Self::InList => "IN",
             Self::Add | Self::TemporalAdd => "+",
             Self::Subtract | Self::TemporalSubtract => "-",
             Self::Multiply | Self::TemporalMultiply => "*",

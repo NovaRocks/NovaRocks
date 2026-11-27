@@ -747,7 +747,7 @@ fn change_program() -> Arc<LocalProgram> {
     let flag = builder
         .unit(expand)
         .unwrap()
-        .add(None, boolean(true), ExprKind::Value(columns[2]))
+        .add(None, boolean(true), ExprKind::input(columns[2]))
         .unwrap();
     let flag = builder
         .unit(expand)
@@ -757,7 +757,7 @@ fn change_program() -> Arc<LocalProgram> {
     let delete_k = builder
         .unit(expand)
         .unwrap()
-        .add(None, int64(false), ExprKind::Value(columns[0]))
+        .add(None, int64(false), ExprKind::input(columns[0]))
         .unwrap();
     let delete_k = builder
         .unit(expand)
@@ -767,7 +767,7 @@ fn change_program() -> Arc<LocalProgram> {
     let insert_k = builder
         .unit(expand)
         .unwrap()
-        .add(None, int64(false), ExprKind::Value(columns[0]))
+        .add(None, int64(false), ExprKind::input(columns[0]))
         .unwrap();
     let insert_k = builder
         .unit(expand)
@@ -777,7 +777,7 @@ fn change_program() -> Arc<LocalProgram> {
     let insert_v = builder
         .unit(expand)
         .unwrap()
-        .add(None, int64(true), ExprKind::Value(columns[1]))
+        .add(None, int64(true), ExprKind::input(columns[1]))
         .unwrap();
     let insert_v = builder
         .unit(expand)
@@ -1036,7 +1036,7 @@ fn nested_change_program(
     let predicate = builder
         .unit(expand)
         .unwrap()
-        .add(None, boolean(false), ExprKind::Value(flag))
+        .add(None, boolean(false), ExprKind::input(flag))
         .unwrap();
     let predicate = builder
         .unit(expand)
@@ -1046,7 +1046,7 @@ fn nested_change_program(
     let assignment = builder
         .unit(expand)
         .unwrap()
-        .add(None, source_ty, ExprKind::Value(value))
+        .add(None, source_ty, ExprKind::input(value))
         .unwrap();
     let assignment = builder
         .unit(expand)
@@ -1275,7 +1275,7 @@ fn licensed_change_program(
     let predicate = builder
         .unit(expand)
         .unwrap()
-        .add(None, boolean(false), ExprKind::Value(flag))
+        .add(None, boolean(false), ExprKind::input(flag))
         .unwrap();
     let predicate = builder
         .unit(expand)
@@ -1285,7 +1285,7 @@ fn licensed_change_program(
     let assignment = builder
         .unit(expand)
         .unwrap()
-        .add(None, source_ty, ExprKind::Value(value))
+        .add(None, source_ty, ExprKind::input(value))
         .unwrap();
     let assignment = builder
         .unit(expand)

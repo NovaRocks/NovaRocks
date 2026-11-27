@@ -25,7 +25,7 @@ use crate::{
     ScopeLayout, ScopeLayouts,
 };
 use novarocks_constant_contract::{ConstantPools, ConstantValidation};
-use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal, RootScope};
+use novarocks_expression_contract::{BoundExprSet, ExprId, RootOrdinal, RootScope};
 use novarocks_functions::{
     PureCallSpecialization, PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
@@ -61,10 +61,6 @@ pub(crate) struct CompiledParts {
 }
 #[derive(Debug)]
 pub struct UnitRecipes {
-    native_like:
-        CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeLikeRecipe>,
-    native_inlist:
-        CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNativeInListRecipe>,
     arithmetic: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
     casts: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedCastRecipe>,
     comparisons: CreatedPrimitiveMap<ComparisonSite, PreparedNodeComparison>,
@@ -276,10 +272,11 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
                 .uses()
                 .get(&id)
                 .ok_or(ExprCompileError::Invalid("unit input use is absent"))?;
-            if let ExprKind::Value(value) = unit
+            if let Some(value) = unit
                 .definition(use_.definition)
                 .ok_or(ExprCompileError::Invalid("unit input definition is absent"))?
                 .kind
+                .input_value()
             {
                 let index = match root.scope {
                     RootScope::Port(i) => indexes.get(i as usize),
@@ -330,15 +327,22 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
             arguments: u.arguments.clone(),
         })
         .collect();
-    struct Definitions(usize);
-    impl novarocks_type_contract::ExpressionDefinitionMembership<CompiledExprId> for Definitions {
+    struct Definitions<'a>(usize, &'a [Option<u32>]);
+    impl novarocks_type_contract::ExpressionDefinitionMembership<CompiledExprId> for Definitions<'_> {
         fn definition_count(&self) -> usize {
             self.0
         }
         fn contains_definition(&self, id: CompiledExprId) -> bool {
             id.index() < self.0
         }
+        fn control_source_position(&self, id: CompiledExprId) -> Option<u32> {
+            self.1.get(id.index()).copied().flatten()
+        }
+        fn has_control_expansions(&self) -> bool {
+            !self.1.is_empty()
+        }
     }
+    let definitions = Definitions(lowered.arena.nodes().len(), &lowered.source_positions);
     let regions = unit.control_flow().regions().values().cloned().collect();
     let flow = match (
         crate::creation::borrow_scope(&mut temporary),
@@ -347,7 +351,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         (Some(temporary), Some(retained)) => ExpressionControlFlow::try_new_with_creator_in(
             regions,
             uses,
-            &Definitions(lowered.arena.nodes().len()),
+            &definitions,
             temporary,
             retained,
             work,
@@ -366,14 +370,10 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
                 ExprCompileError::from(e).into()
             }
         })?,
-        (None, None) => ExpressionControlFlow::try_new_in(
-            regions,
-            uses,
-            &Definitions(lowered.arena.nodes().len()),
-            &mut |_| Ok(()),
-            work,
-        )
-        .map_err(ExprCompileError::from)?,
+        (None, None) => {
+            ExpressionControlFlow::try_new_in(regions, uses, &definitions, &mut |_| Ok(()), work)
+                .map_err(ExprCompileError::from)?
+        }
         _ => {
             return Err(ExprCompileError::Invalid(
                 "unit construction owners must be supplied together",
@@ -386,16 +386,6 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         flow,
         types: lowered.types,
     };
-    let native_like =
-        crate::primitives::compile_native_like_with_factory(&parts, None, factory, control)
-            .map_err(publication)?;
-    let native_inlist = crate::primitives::compile_native_inlist_with_factory(
-        &parts,
-        crate::creation::borrow_scope(&mut temporary),
-        factory,
-        control,
-    )
-    .map_err(publication)?;
     let arithmetic =
         crate::primitives::compile_arithmetic_with_factory(&parts, None, factory, control)
             .map_err(publication)?;
@@ -428,8 +418,6 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         parts,
         calls: calls.into_iter().collect(),
         recipes: UnitRecipes {
-            native_like,
-            native_inlist,
             arithmetic,
             casts,
             comparisons,
@@ -509,6 +497,14 @@ fn charge_structure<H>(
     let mut scratch = ProgramCreation {
         creator: crate::creation::borrow_scope(temporary),
     };
+    if !unit.control_expansions().records().is_empty() {
+        scratch
+            .request::<ProgramPrimitiveError>(
+                Layout::array::<Option<u32>>(n).map_err(resource)?,
+                work,
+            )
+            .map_err(publication)?;
+    }
     for layout in [
         Layout::array::<(ExprId, usize)>(n).map_err(resource)?,
         Layout::array::<ExpressionUseId>(m).map_err(resource)?,

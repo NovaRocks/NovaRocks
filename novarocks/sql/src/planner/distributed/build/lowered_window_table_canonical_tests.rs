@@ -679,7 +679,7 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         .unwrap()
         .definition(receipt.arguments()[0])
         .unwrap();
-    let ContractExprKind::Value(value) = child.kind else {
+    let Some(value) = child.kind.input_value() else {
         unreachable!()
     };
     assert!(matches!(
@@ -751,7 +751,7 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         .unwrap()
         .definition(receipt.arguments()[0])
         .unwrap();
-    let ContractExprKind::Value(value) = child.kind else {
+    let Some(value) = child.kind.input_value() else {
         unreachable!()
     };
     assert!(matches!(

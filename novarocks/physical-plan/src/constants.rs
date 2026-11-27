@@ -21,6 +21,7 @@ use novarocks_constant_contract::ConstantPool;
 use novarocks_constant_contract::{
     ConstantError, ConstantPoolId, ConstantPools, ConstantReference, ConstantTableError,
 };
+use novarocks_function_contract::FunctionArgument;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError, FunctionValueType};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -102,12 +103,23 @@ fn visit_typed_constant_references_observed(
         work.step()?;
         for argument in &request.arguments {
             work.step()?;
-            if let novarocks_function_contract::FunctionArgument::Value {
-                value_type,
-                constant: Some(reference),
-            } = argument
-            {
-                visit(*reference, value_type, work)?;
+            match argument {
+                FunctionArgument::Value {
+                    value_type,
+                    constant: Some(reference),
+                } => {
+                    visit(*reference, value_type, work)?;
+                }
+                FunctionArgument::CandidateGroup { members, .. } => {
+                    for member in members {
+                        work.step()?;
+                        if let Some(reference) = member.constant {
+                            visit(reference, &member.value_type, work)?;
+                        }
+                    }
+                }
+                FunctionArgument::Value { constant: None, .. }
+                | FunctionArgument::Lambda { .. } => {}
             }
         }
         Ok(())

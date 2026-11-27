@@ -30,7 +30,8 @@ use novarocks_functions::{
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
     EffectContractError, ExpressionUseId, FunctionArgumentType, FunctionKind,
-    MAX_CONTROL_DEFINITIONS, MAX_CONTROL_DEPTH, PureCompileControl, ValueTypeError,
+    MAX_CONTROL_DEFINITIONS, MAX_CONTROL_DEPTH, OperatorFunction, PureCompileControl,
+    ValueTypeError,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -44,6 +45,7 @@ pub(crate) struct LoweredExpressions {
     pub arena: Arc<ImmutableExpressions>,
     pub ids: BTreeMap<ExprId, CompiledExprId>,
     pub types: novarocks_type_contract::FunctionArgumentTypes,
+    pub source_positions: Vec<Option<u32>>,
 }
 #[derive(Debug)]
 pub enum ExprCompileError {
@@ -590,6 +592,14 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
     // At most one frame per dependency depth. Child lists are borrowed and
     // walked one edge at a time, rather than cloned or enqueued wholesale.
     let mut stack = Vec::new();
+    let expansions = source.control_expansions();
+    let expanded = !expansions.records().is_empty();
+    let mut source_positions = Vec::new();
+    if expanded {
+        source_positions
+            .try_reserve_exact(count)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+    }
     for definition in source.definitions() {
         let root = definition.id;
         if ids.contains_key(&root) {
@@ -598,6 +608,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
         }
         active.insert(root);
         stack.push((root, 0usize));
+        let mut source_depth = 1usize;
         work.step()?;
         while let Some(&(id, next)) = stack.last() {
             let node = source
@@ -613,34 +624,20 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     None
                 }
                 ExprKind::Lambda { body, .. } => (next == 0).then_some(*body),
+                ExprKind::Let { value, body } => [*value, *body].get(next).copied(),
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Not,
-                    expr,
+                ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr, .. } => {
+                    (next == 0).then_some(*expr)
                 }
-                | ExprKind::IsNull { expr, .. }
-                | ExprKind::Cast { expr, .. } => (next == 0).then_some(*expr),
                 ExprKind::Binary { left, right, .. } => [*left, *right].get(next).copied(),
-                ExprKind::Like { expr, pattern, .. } => [*expr, *pattern].get(next).copied(),
-                ExprKind::Between {
-                    expr, low, high, ..
-                } => [*expr, *low, *high].get(next).copied(),
-                ExprKind::InList { expr, list, .. } => {
-                    if next == 0 {
-                        Some(*expr)
-                    } else {
-                        list.get(next - 1).copied()
-                    }
-                }
                 ExprKind::Case {
                     operand,
                     when_then,
                     else_expr,
                     ..
                 } => case_child(*operand, when_then, *else_expr, next),
-                _ => return Err(ExprCompileError::UnsupportedExpression(id).into()),
             };
             if let Some(child) = child {
                 let frame = stack
@@ -651,7 +648,10 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     if !active.insert(child) {
                         return Err(ExprCompileError::Invalid("cyclic physical expression").into());
                     }
-                    if stack.len() >= MAX_CONTROL_DEPTH {
+                    source_depth += usize::from(!expansions.shares_source_position(id, child));
+                    if source_depth > MAX_CONTROL_DEPTH
+                        || stack.len() >= novarocks_type_contract::MAX_EXPANDED_CONTROL_DEPTH
+                    {
                         return Err(ExprCompileError::Invalid(
                             "expression dependency depth exceeded",
                         )
@@ -663,7 +663,21 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 continue;
             }
             let kind = match &node.kind {
-                ExprKind::Value(_) => StaticExprKind::Input,
+                ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(_)) => {
+                    StaticExprKind::Input
+                }
+                ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(binder)) => {
+                    StaticExprKind::LocalValue { binder: *binder }
+                }
+                ExprKind::Let { value, body } => StaticExprKind::Let {
+                    binder: node.id,
+                    value: *ids
+                        .get(value)
+                        .ok_or(ExprCompileError::Invalid("Let initializer was not lowered"))?,
+                    body: *ids
+                        .get(body)
+                        .ok_or(ExprCompileError::Invalid("Let body was not lowered"))?,
+                },
                 ExprKind::Lambda { body, .. } => StaticExprKind::Lambda {
                     body: *ids
                         .get(body)
@@ -716,19 +730,14 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         StaticExprKind::NaryOr { args: local_args }
                     }
                 }
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Not,
-                    expr,
-                }
-                | ExprKind::IsNull { expr, .. } => {
-                    let child = *ids
-                        .get(expr)
-                        .ok_or(ExprCompileError::Invalid("unary operand was not lowered"))?;
-                    match &node.kind {
-                        ExprKind::Unary { .. } => StaticExprKind::Not(child),
-                        ExprKind::IsNull { negated: false, .. } => StaticExprKind::IsNull(child),
-                        ExprKind::IsNull { negated: true, .. } => StaticExprKind::IsNotNull(child),
-                        _ => unreachable!("checked unary kind"),
+                ExprKind::IsNull { expr, negated } => {
+                    let child = *ids.get(expr).ok_or(ExprCompileError::Invalid(
+                        "null test operand was not lowered",
+                    ))?;
+                    if *negated {
+                        StaticExprKind::IsNotNull(child)
+                    } else {
+                        StaticExprKind::IsNull(child)
                     }
                 }
                 ExprKind::Cast {
@@ -889,111 +898,6 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         right,
                     )
                 }
-                ExprKind::Like {
-                    expr,
-                    pattern,
-                    negated,
-                } => {
-                    work.flush()?;
-                    novarocks_functions::PreparedNativeLikeRecipe::try_new(
-                        *negated,
-                        &source
-                            .definition(*expr)
-                            .expect("checked LIKE text source")
-                            .ty,
-                        &source
-                            .definition(*pattern)
-                            .expect("checked LIKE pattern source")
-                            .ty,
-                        &node.ty,
-                        control,
-                    )?;
-
-                    let text = *ids
-                        .get(expr)
-                        .ok_or(ExprCompileError::Invalid("LIKE source was not lowered"))?;
-                    let pattern = *ids
-                        .get(pattern)
-                        .ok_or(ExprCompileError::Invalid("LIKE pattern was not lowered"))?;
-                    StaticExprKind::PreparedLike {
-                        text,
-                        pattern,
-                        negated: *negated,
-                    }
-                }
-                ExprKind::InList {
-                    expr,
-                    list,
-                    negated,
-                } => {
-                    work.flush()?;
-                    novarocks_functions::PreparedNativeInListRecipe::validate_borrowed_profile(
-                        &source.definition(*expr).expect("checked IN source").ty,
-                        list.iter().map(|id| {
-                            &source
-                                .definition(*id)
-                                .expect("checked IN candidate source")
-                                .ty
-                        }),
-                        &node.ty,
-                        control,
-                    )?;
-
-                    let child = *ids
-                        .get(expr)
-                        .ok_or(ExprCompileError::Invalid("IN source was not lowered"))?;
-                    let mut values = Vec::with_capacity(list.len());
-                    for id in list {
-                        values
-                            .push(*ids.get(id).ok_or(ExprCompileError::Invalid(
-                                "IN candidate was not lowered",
-                            ))?);
-                        work.step()?;
-                    }
-                    StaticExprKind::PreparedInList {
-                        child,
-                        values,
-                        is_not_in: *negated,
-                    }
-                }
-                ExprKind::Between {
-                    expr,
-                    low,
-                    high,
-                    negated,
-                } => {
-                    work.flush()?;
-                    novarocks_functions::PreparedNativeBetweenRecipe::try_new(
-                        novarocks_type_contract::NativeBetweenPlan::new(*negated),
-                        &source.definition(*expr).expect("checked BETWEEN source").ty,
-                        &source
-                            .definition(*low)
-                            .expect("checked BETWEEN lower source")
-                            .ty,
-                        &source
-                            .definition(*high)
-                            .expect("checked BETWEEN upper source")
-                            .ty,
-                        &node.ty,
-                        control,
-                    )?;
-
-                    let operand = *ids
-                        .get(expr)
-                        .ok_or(ExprCompileError::Invalid("BETWEEN operand was not lowered"))?;
-                    let low = *ids
-                        .get(low)
-                        .ok_or(ExprCompileError::Invalid("BETWEEN lower was not lowered"))?;
-                    let high = *ids
-                        .get(high)
-                        .ok_or(ExprCompileError::Invalid("BETWEEN upper was not lowered"))?;
-                    StaticExprKind::PreparedBetween {
-                        plan: novarocks_type_contract::NativeBetweenPlan::new(*negated),
-                        operand,
-                        low,
-                        high,
-                    }
-                }
                 ExprKind::Case {
                     ieee_float_equality,
                     operand,
@@ -1062,10 +966,16 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 _ => FunctionArgumentType::Value(ty),
             };
             types.push(argument_type);
+            if expanded {
+                source_positions.push(expansions.source_position(id).map(ExprId::get));
+            }
             work.flush()?;
             ids.insert(id, CompiledExprId::new(nodes.len() - 1));
             active.remove(&id);
             stack.pop();
+            if let Some(&(parent, _)) = stack.last() {
+                source_depth -= usize::from(!expansions.shares_source_position(parent, id));
+            }
             work.step()?;
         }
     }
@@ -1077,7 +987,8 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
         .map(|owner| owner.storage_lifetime())
         .unwrap_or_else(novarocks_type_contract::ValueTypeStorageLifetime::pure);
     let arena = Arc::new(
-        ImmutableExpressions::try_new_for_compile(nodes, control)?.with_storage_lifetime(storage),
+        ImmutableExpressions::try_new_for_lowering(nodes, &source_positions, control)?
+            .with_storage_lifetime(storage),
     );
     work.flush()?;
     let types = crate::creation::publish_argument_types(
@@ -1097,7 +1008,12 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
             Failure::Owner(never) => match never {},
         }
     })?;
-    Ok(LoweredExpressions { arena, ids, types })
+    Ok(LoweredExpressions {
+        arena,
+        ids,
+        types,
+        source_positions,
+    })
 }
 
 pub(crate) type PreparedUnitCalls = (
@@ -1232,7 +1148,18 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
     for definition in unit.definitions() {
         let id = definition.id;
         if let ExprKind::FunctionCall { function, args } = &definition.kind {
-            if args.len() > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
+            let group_type = match &*function.argument_types {
+                [
+                    FunctionArgumentType::Value(_),
+                    FunctionArgumentType::CandidateGroup { element_type },
+                ] if function.function_id.as_str()
+                    == OperatorFunction::InList.function_id_text() =>
+                {
+                    Some(element_type)
+                }
+                _ => None,
+            };
+            if group_type.is_none() && args.len() > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
                 return Err(CompileControlError::ResourceExhausted.into());
             }
             if function.kind != FunctionKind::Scalar {
@@ -1247,7 +1174,12 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
             else {
                 return Err(ExprCompileError::Invalid("lowered call shape differs").into());
             };
-            if args.len() != local_args.len() || args.len() != function.argument_types.len() {
+            let matches_arity = if group_type.is_some() {
+                args.len() >= 2
+            } else {
+                args.len() == function.argument_types.len()
+            };
+            if args.len() != local_args.len() || !matches_arity {
                 return Err(ExprCompileError::Invalid("static call arity differs").into());
             }
             work.flush()?;
@@ -1287,13 +1219,23 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         .ok_or(ExprCompileError::Invalid(
                             "missing lowered static argument type",
                         ))?;
-                if matches!(argument_type, FunctionArgumentType::Lambda { .. })
-                    && !argument_types_equal(
-                        argument_type,
-                        &function.argument_types[ordinal],
-                        work,
-                    )?
+                let matches_type = if ordinal > 0
+                    && let Some(element_type) = group_type
                 {
+                    match argument_type {
+                        FunctionArgumentType::Value(actual) => actual
+                            .same_physical_binding_ignoring_root_nullability_observed(
+                                element_type,
+                                || work.step().map_err(ExprCompileError::from),
+                            )?,
+                        _ => false,
+                    }
+                } else if matches!(argument_type, FunctionArgumentType::Lambda { .. }) {
+                    argument_types_equal(argument_type, &function.argument_types[ordinal], work)?
+                } else {
+                    true
+                };
+                if !matches_type {
                     return Err(
                         ExprCompileError::Invalid("lowered static argument type differs").into(),
                     );
@@ -1339,6 +1281,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
         work.step()?;
     }
     let flow = unit.control_flow();
+    let use_depth_limit = flow.physical_use_depth().max(MAX_CONTROL_DEPTH);
     let mut effects = BTreeMap::<ExpressionUseId, ScopedExpressionEffects>::new();
     let mut tokens = BTreeMap::new();
     let mut lambdas = lambda::CompiledLambdas::default();
@@ -1371,7 +1314,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             ExprCompileError::Invalid("cyclic expression occurrence").into()
                         );
                     }
-                    if stack.len() >= MAX_CONTROL_DEPTH {
+                    if stack.len() >= use_depth_limit {
                         return Err(ExprCompileError::Invalid(
                             "expression occurrence depth exceeded",
                         )
@@ -1396,7 +1339,10 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                 .node(local_id)
                 .ok_or(ExprCompileError::Invalid("missing local definition"))?;
             let scoped = match (&source.kind, local.kind()) {
-                (ExprKind::Value(_), StaticExprKind::Input) => {
+                (
+                    ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(_)),
+                    StaticExprKind::Input,
+                ) => {
                     if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
                     {
                         return Err(ExprCompileError::Invalid(
@@ -1405,6 +1351,60 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         .into());
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(original)),
+                    StaticExprKind::LocalValue { binder },
+                ) if original == binder => {
+                    if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
+                    {
+                        return Err(ExprCompileError::Invalid(
+                            "local value occurrence has arguments or control",
+                        )
+                        .into());
+                    }
+                    ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::Let { value, body },
+                    StaticExprKind::Let {
+                        binder,
+                        value: lowered_value,
+                        body: lowered_body,
+                    },
+                ) => {
+                    let [value_use, body_use] = invocation.arguments.as_ref() else {
+                        return Err(ExprCompileError::Invalid(
+                            "Let must have exactly one initializer and body use",
+                        )
+                        .into());
+                    };
+                    if invocation.control != ControlShape::Let
+                        || *binder != source.id
+                        || flow
+                            .uses()
+                            .get(value_use)
+                            .is_none_or(|actual| actual.definition != *value)
+                        || flow
+                            .uses()
+                            .get(body_use)
+                            .is_none_or(|actual| actual.definition != *body)
+                        || lowered.ids.get(value) != Some(lowered_value)
+                        || lowered.ids.get(body) != Some(lowered_body)
+                    {
+                        return Err(ExprCompileError::Invalid(
+                            "Let occurrence differs from its original binding",
+                        )
+                        .into());
+                    }
+                    let mut scoped = ScopedExpressionEffects::pure_value(invocation.context);
+                    for (ordinal, use_id) in [value_use, body_use].into_iter().enumerate() {
+                        let child = *effects.get(use_id).ok_or(ExprCompileError::Invalid(
+                            "Let child does not have an effect summary",
+                        ))?;
+                        scoped = scoped.join_control_argument(child, flow, ordinal)?;
+                    }
+                    scoped
                 }
                 (
                     ExprKind::LambdaParameter { lambda, ordinal },
@@ -1464,214 +1464,6 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
                 (
-                    ExprKind::Like {
-                        expr,
-                        pattern,
-                        negated,
-                    },
-                    StaticExprKind::PreparedLike {
-                        text,
-                        pattern: local_pattern,
-                        negated: local_negated,
-                    },
-                ) => {
-                    if negated != local_negated
-                        || invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 2
-                        || lowered.ids.get(expr) != Some(text)
-                        || lowered.ids.get(pattern) != Some(local_pattern)
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "LIKE differs from original Eager2 source",
-                        )
-                        .into());
-                    }
-                    let definitions = unit;
-                    let ty = |id| {
-                        definitions
-                            .definition(id)
-                            .map(|node| &node.ty)
-                            .ok_or(ExprCompileError::Invalid("missing original LIKE source"))
-                    };
-                    work.flush()?;
-                    let recipe = novarocks_functions::PreparedNativeLikeRecipe::try_new(
-                        *negated,
-                        ty(*expr)?,
-                        ty(*pattern)?,
-                        &source.ty,
-                        control,
-                    )?;
-                    work.flush()?;
-                    let mut combined = recipe.own_effects(invocation.context);
-                    for (ordinal, definition) in [expr, pattern].into_iter().enumerate() {
-                        let child = invocation.arguments[ordinal];
-                        if flow.uses()[&child].definition != *definition {
-                            return Err(ExprCompileError::Invalid("LIKE source use differs").into());
-                        }
-                        combined = combined.join_control_argument(
-                            *effects.get(&child).ok_or(ExprCompileError::Invalid(
-                                "LIKE child effects were not prepared",
-                            ))?,
-                            flow,
-                            ordinal,
-                        )?;
-                        work.step()?;
-                    }
-                    combined
-                }
-                (
-                    ExprKind::InList {
-                        expr,
-                        list,
-                        negated,
-                    },
-                    StaticExprKind::PreparedInList {
-                        child,
-                        values,
-                        is_not_in,
-                    },
-                ) => {
-                    if *is_not_in != *negated
-                        || invocation.control != (ControlShape::Membership { negated: *negated })
-                        || invocation.arguments.len() != list.len() + 1
-                        || lowered.ids.get(expr) != Some(child)
-                        || list.len() != values.len()
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "IN differs from its original ordered source",
-                        )
-                        .into());
-                    }
-                    let definitions = unit;
-                    let source_type = |id| {
-                        definitions
-                            .definition(id)
-                            .map(|n| &n.ty)
-                            .ok_or(ExprCompileError::Invalid("missing IN source"))
-                    };
-                    for (ordinal, id) in std::iter::once(expr).chain(list.iter()).enumerate() {
-                        let local = lowered
-                            .ids
-                            .get(id)
-                            .ok_or(ExprCompileError::Invalid("missing lowered IN source"))?;
-                        if flow.uses()[&invocation.arguments[ordinal]].definition != *id {
-                            return Err(
-                                ExprCompileError::Invalid("IN source occurrence differs").into()
-                            );
-                        }
-                        if ordinal > 0 {
-                            if values[ordinal - 1] != *local {
-                                return Err(ExprCompileError::Invalid(
-                                    "IN candidate definition differs",
-                                )
-                                .into());
-                            }
-                            source_type(*id)?;
-                        }
-                        work.step()?;
-                    }
-                    work.flush()?;
-                    let mut combined =
-                        novarocks_functions::PreparedNativeInListRecipe::refine_borrowed_profile(
-                            source_type(*expr)?,
-                            list.iter()
-                                .map(|id| source_type(*id).expect("checked immutable IN source")),
-                            &source.ty,
-                            invocation.context,
-                            control,
-                        )?;
-                    work.flush()?;
-                    for (ordinal, use_id) in invocation.arguments.iter().enumerate() {
-                        let child = *effects
-                            .get(use_id)
-                            .ok_or(ExprCompileError::Invalid("missing IN candidate effects"))?;
-                        combined = combined
-                            .join_control_argument(child, flow, ordinal)
-                            .map_err(|_| {
-                                ExprCompileError::Invalid(
-                                    "IN candidate effects differ from ordered domain",
-                                )
-                            })?;
-                        work.step()?;
-                    }
-                    combined
-                }
-                (
-                    ExprKind::Between {
-                        expr,
-                        low,
-                        high,
-                        negated,
-                    },
-                    StaticExprKind::PreparedBetween {
-                        plan,
-                        operand,
-                        low: local_low,
-                        high: local_high,
-                    },
-                ) => {
-                    if plan.negated() != *negated
-                        || invocation.control != (ControlShape::Between { negated: *negated })
-                        || invocation.arguments.len() != 4
-                        || lowered.ids.get(expr) != Some(operand)
-                        || lowered.ids.get(low) != Some(local_low)
-                        || lowered.ids.get(high) != Some(local_high)
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "BETWEEN differs from its frozen source",
-                        )
-                        .into());
-                    }
-                    let definitions = unit;
-                    let source_type = |id| {
-                        definitions
-                            .definition(id)
-                            .map(|node| &node.ty)
-                            .ok_or(ExprCompileError::Invalid("missing BETWEEN source"))
-                    };
-                    work.flush()?;
-                    let recipe = novarocks_functions::PreparedNativeBetweenRecipe::try_new(
-                        *plan,
-                        source_type(*expr)?,
-                        source_type(*low)?,
-                        source_type(*high)?,
-                        &source.ty,
-                        control,
-                    )?;
-                    work.flush()?;
-                    let mut combined = recipe.own_effects(invocation.context);
-                    for (ordinal, role) in plan.sources().into_iter().enumerate() {
-                        let expected = match role {
-                            novarocks_type_contract::BetweenSourceRole::Operand => *expr,
-                            novarocks_type_contract::BetweenSourceRole::Lower => *low,
-                            novarocks_type_contract::BetweenSourceRole::Upper => *high,
-                        };
-                        let child_use = invocation.arguments[ordinal];
-                        if flow.uses()[&child_use].definition != expected {
-                            return Err(ExprCompileError::Invalid(
-                                "BETWEEN ordered source use differs",
-                            )
-                            .into());
-                        }
-                        combined = combined.join_control_argument(
-                            *effects.get(&child_use).ok_or(ExprCompileError::Invalid(
-                                "BETWEEN child effects were not prepared",
-                            ))?,
-                            flow,
-                            ordinal,
-                        )?;
-                        work.step()?;
-                    }
-                    combined
-                }
-                (
-                    ExprKind::Unary {
-                        op: novarocks_expression_contract::UnaryOperator::Not,
-                        expr,
-                    },
-                    StaticExprKind::Not(local_child),
-                )
-                | (
                     ExprKind::IsNull {
                         expr,
                         negated: false,
@@ -2074,7 +1866,8 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             | (ControlShape::Coalesce, ArgumentControl::Coalesce)
                             | (ControlShape::Try, ArgumentControl::Try)
                             | (ControlShape::NullIf, ArgumentControl::NullIf)
-                            | (ControlShape::OrderedRegexp, ArgumentControl::OrderedRegexp) => {
+                            | (ControlShape::OrderedRegexp, ArgumentControl::OrderedRegexp)
+                            | (ControlShape::CandidateGroup, ArgumentControl::CandidateGroup) => {
                                 (false, true, None)
                             }
                             (
@@ -2088,8 +1881,10 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             }
                             _ => return Err(ExprCompileError::UnsupportedCall(site).into()),
                         };
+                    let candidate_group = invocation.control == ControlShape::CandidateGroup;
+                    let formal_count = if candidate_group { 2 } else { args.len() };
                     if args.len() != local_args.len()
-                        || function.argument_types.len() != args.len()
+                        || function.argument_types.len() != formal_count
                         || invocation.arguments.len()
                             != if type_only {
                                 0
@@ -2108,7 +1903,11 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                     let selection = selected.get(&source.id).ok_or(ExprCompileError::Invalid(
                         "call selection was not statically validated",
                     ))?;
-                    let mut argument_uses = Vec::with_capacity(args.len());
+                    let mut argument_uses = if candidate_group {
+                        Vec::new()
+                    } else {
+                        Vec::with_capacity(args.len())
+                    };
                     let mut source_channels = Vec::new();
                     if let Some(source) = &frozen.temporal_source {
                         source_channels
@@ -2168,7 +1967,9 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                                     value_type: &source_node.ty,
                                 });
                             }
-                            argument_uses.push(Some(child_use));
+                            if !candidate_group {
+                                argument_uses.push(Some(child_use));
+                            }
                         }
                         work.step()?;
                     }
@@ -2179,6 +1980,16 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                                 novarocks_functions::CallArgumentUses::TemporalSources {
                                     facts: &source.facts,
                                     channels: &source_channels,
+                                }
+                            }
+                            None if candidate_group => {
+                                let (&probe, candidates) =
+                                    invocation.arguments.split_first().ok_or(
+                                        ExprCompileError::Invalid("candidate group has no probe"),
+                                    )?;
+                                novarocks_functions::CallArgumentUses::CandidateGroup {
+                                    probe,
+                                    candidates,
                                 }
                             }
                             None => novarocks_functions::CallArgumentUses::SelectedChannels(
@@ -2230,7 +2041,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         creation,
                     )?;
                     work.flush()?;
-                    validate_prepared_call(&token, invocation, function, args.len(), work)?;
+                    validate_prepared_call(&token, invocation, function, formal_count, work)?;
                     if let Some(edge) = body_edge {
                         let novarocks_functions::PreparedPureKernel::HigherOrder(prepared) =
                             token.prepared()
@@ -2337,7 +2148,15 @@ fn literal_argument(
             (ExprKind::Constant(_), StaticExprKind::Constant(value)) => Ok(Some(value.clone())),
             // A resolved input is not a constant, even if this particular runtime
             // batch happens to broadcast one scalar value (notably RAND seeds).
-            (ExprKind::Value(_), StaticExprKind::Input)
+            (
+                ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(_)),
+                StaticExprKind::Input,
+            )
+            | (
+                ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(_)),
+                StaticExprKind::LocalValue { .. },
+            )
+            | (ExprKind::Let { .. }, StaticExprKind::Let { .. })
             | (ExprKind::Lambda { .. }, StaticExprKind::Lambda { .. })
             | (ExprKind::LambdaParameter { .. }, StaticExprKind::LambdaParameter { .. }) => {
                 Ok(None)
@@ -2345,18 +2164,8 @@ fn literal_argument(
             (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
             (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
             | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
-            (
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Not,
-                    ..
-                },
-                StaticExprKind::Not(_),
-            )
-            | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
+            (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
             | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
-            (ExprKind::Between { .. }, StaticExprKind::PreparedBetween { .. }) => Ok(None),
-            (ExprKind::InList { .. }, StaticExprKind::PreparedInList { .. }) => Ok(None),
-            (ExprKind::Like { .. }, StaticExprKind::PreparedLike { .. }) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
             (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
@@ -2448,6 +2257,8 @@ fn validate_prepared_call(
         || match (invocation.control, token.prepared()) {
             (ControlShape::HigherOrder { .. }, PreparedPureKernel::HigherOrder(_)) => false,
             (ControlShape::HigherOrder { .. }, _) => true,
+            (ControlShape::CandidateGroup, PreparedPureKernel::Membership(_)) => false,
+            (ControlShape::CandidateGroup, _) => true,
             (
                 _,
                 PreparedPureKernel::Scalar(_)
@@ -2505,6 +2316,10 @@ fn argument_types_equal(
         (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => {
             a.exactly_equals_observed(b, || work.step().map_err(Into::into))
         }
+        (
+            FunctionArgumentType::CandidateGroup { element_type: a },
+            FunctionArgumentType::CandidateGroup { element_type: b },
+        ) => a.exactly_equals_observed(b, || work.step().map_err(Into::into)),
         (
             FunctionArgumentType::Lambda {
                 parameter_types: a,

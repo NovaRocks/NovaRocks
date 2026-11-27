@@ -107,7 +107,11 @@ pub(crate) fn validate_function_arguments(
                         actual_parameters.as_ref() == parameter_types.as_slice()
                             && &actual.ty == result_type
                     }
-                    (crate::FunctionArgumentType::Lambda { .. }, _) => false,
+                    (
+                        crate::FunctionArgumentType::Lambda { .. }
+                        | crate::FunctionArgumentType::CandidateGroup { .. },
+                        _,
+                    ) => false,
                 }
             });
         if !valid {
@@ -148,7 +152,7 @@ pub(crate) fn validate_aggregate_arguments(
             } else {
                 if binding.function.argument_types[logical_count..]
                     .iter()
-                    .any(|argument| matches!(argument, crate::FunctionArgumentType::Lambda { .. }))
+                    .any(|argument| !matches!(argument, crate::FunctionArgumentType::Value(_)))
                 {
                     errors.push(ValidationError::new(
                         path,

@@ -331,7 +331,10 @@ impl<'owner> Call<'owner> {
                     value_type: value_type.clone(),
                     constant: None,
                 },
-                FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
+                FunctionArgumentType::Lambda { .. }
+                | FunctionArgumentType::CandidateGroup { .. } => {
+                    unreachable!("typed fixture uses ordinary values")
+                }
             })
             .collect();
         Self {

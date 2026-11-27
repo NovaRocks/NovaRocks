@@ -870,13 +870,13 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let definition = crate::expressions::bound_root(package, node, key)?;
     // The checked Physical endpoint author requires this exact direct Value.
     // No expression is inferred from a matching datatype or from SQL text.
-    let novarocks_expression_contract::ExprKind::Value(value) = &definition.kind else {
+    let Some(value) = definition.kind.input_value() else {
         return Err(FragmentCompileError::Invalid(
             "join probe endpoint is not its checked direct value key",
         )
         .into());
     };
-    if consumer.endpoint.values.as_ref() != [*value] {
+    if consumer.endpoint.values.as_ref() != [value] {
         return Err(FragmentCompileError::Invalid(
             "join probe endpoint differs from its equality key",
         )
@@ -923,7 +923,7 @@ fn plan_join_consumer<H, F: ValueSchemaCreationFactory<H>>(
             requirement,
             key_ordinal,
             key,
-            value: *value,
+            value,
             consumer,
         });
     work.step()?;

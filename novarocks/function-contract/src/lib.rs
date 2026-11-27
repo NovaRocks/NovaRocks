@@ -42,10 +42,21 @@ pub enum FunctionArgument<C = ConstantValue> {
         value_type: FunctionValueType,
         constant: Option<C>,
     },
+    CandidateGroup {
+        element_type: FunctionValueType,
+        members: Box<[FunctionCandidate<C>]>,
+    },
     Lambda {
         parameter_types: novarocks_type_contract::FunctionParameterTypes,
         result_type: FunctionValueType,
     },
+}
+
+/// One original occurrence in an ordered scalar candidate group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCandidate<C = ConstantValue> {
+    pub value_type: FunctionValueType,
+    pub constant: Option<C>,
 }
 
 impl FunctionArgument {
@@ -68,22 +79,45 @@ impl FunctionArgument {
                     value_type: right,
                     constant: right_constant,
                 },
+            ) => same_value_argument(
+                left,
+                left_constant.as_ref(),
+                right,
+                right_constant.as_ref(),
+                phase,
+                &mut work,
+            ),
+            (
+                Self::CandidateGroup {
+                    element_type: left_element,
+                    members: left,
+                },
+                Self::CandidateGroup {
+                    element_type: right_element,
+                    members: right,
+                },
             ) => {
-                if !left.exactly_equals_observed(right, || {
-                    work.step().map_err(FunctionBindingError::from)
-                })? {
+                if left.len() != right.len()
+                    || !left_element.exactly_equals_observed(right_element, || {
+                        work.step().map_err(FunctionBindingError::from)
+                    })?
+                {
                     return Ok(false);
                 }
-                match (left_constant, right_constant) {
-                    (None, None) => Ok(true),
-                    (Some(left), Some(right)) => {
-                        work.flush()?;
-                        let equal = left.equals_observed(right, phase, work.control())?;
-                        work.flush()?;
-                        Ok(equal)
+                for (left, right) in left.iter().zip(right) {
+                    work.step()?;
+                    if !same_value_argument(
+                        &left.value_type,
+                        left.constant.as_ref(),
+                        &right.value_type,
+                        right.constant.as_ref(),
+                        phase,
+                        &mut work,
+                    )? {
+                        return Ok(false);
                     }
-                    _ => Ok(false),
                 }
+                Ok(true)
             }
             (
                 Self::Lambda {
@@ -115,10 +149,36 @@ impl FunctionArgument {
     }
 }
 
+fn same_value_argument(
+    left: &FunctionValueType,
+    left_constant: Option<&ConstantValue>,
+    right: &FunctionValueType,
+    right_constant: Option<&ConstantValue>,
+    phase: CompilePhase,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FunctionBindingError> {
+    if !left.exactly_equals_observed(right, || work.step().map_err(FunctionBindingError::from))? {
+        return Ok(false);
+    }
+    match (left_constant, right_constant) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) => {
+            work.flush()?;
+            let equal = left.equals_observed(right, phase, work.control())?;
+            work.flush()?;
+            Ok(equal)
+        }
+        _ => Ok(false),
+    }
+}
+
 impl<C> FunctionArgument<C> {
     pub fn argument_type(&self) -> FunctionArgumentType {
         match self {
             Self::Value { value_type, .. } => FunctionArgumentType::Value(value_type.clone()),
+            Self::CandidateGroup { element_type, .. } => FunctionArgumentType::CandidateGroup {
+                element_type: element_type.clone(),
+            },
             Self::Lambda {
                 parameter_types,
                 result_type,
@@ -144,6 +204,14 @@ impl<C> FunctionArgument<C> {
                     work.step().map_err(FunctionBindingError::from)
                 })
             }
+            (
+                Self::CandidateGroup { element_type, .. },
+                FunctionArgumentType::CandidateGroup {
+                    element_type: expected,
+                },
+            ) => element_type.exactly_equals_observed(expected, || {
+                work.step().map_err(FunctionBindingError::from)
+            }),
             (
                 Self::Lambda {
                     parameter_types,

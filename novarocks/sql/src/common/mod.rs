@@ -32,9 +32,7 @@ pub(crate) use change_stream::{
     ROW_MUTATION_EFFECT_COLUMN,
 };
 pub use expr::LiteralValue;
-pub(crate) use expr::{
-    BinOp, JoinKind, LambdaParam, UnOp, WindowBound, WindowFrame, WindowFrameType,
-};
+pub(crate) use expr::{BinOp, JoinKind, LambdaParam, WindowBound, WindowFrame, WindowFrameType};
 pub(crate) use imv::{ImvVersionRef, ImvVersionRole};
 pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn, SqlTopNType};
 pub(crate) use row_lineage::{

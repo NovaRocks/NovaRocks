@@ -117,8 +117,56 @@ pub(crate) fn scalar_operands(
     ))
 }
 
-/// Borrow the original operands and operator for optimizer facts. Distinct
-/// has no equivalent in the legacy binary vocabulary.
+pub(crate) fn typed_in_list(expression: &TypedExpr) -> Option<(&TypedExpr, &[TypedExpr])> {
+    let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+        return None;
+    };
+    if OperatorFunction::from_function_id(&binding.function_id) != Some(OperatorFunction::InList) {
+        return None;
+    }
+    args.split_first()
+        .filter(|(_, candidates)| !candidates.is_empty())
+}
+
+/// Read an expanded inclusive range only when both comparisons use the same
+/// explicit probe. A local value under Let is outside this proof.
+pub(crate) fn scalar_inclusive_range(
+    arena: &ScalarArena,
+    expression: ScalarId,
+) -> Option<(ScalarId, ScalarId, ScalarId)> {
+    let ScalarNode::BinaryOp {
+        left,
+        op: BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction,
+        right,
+        ..
+    } = arena.node(expression)
+    else {
+        return None;
+    };
+    let (BinOp::Le, [lower, probe]) = scalar_comparison(arena, *left)? else {
+        return None;
+    };
+    let (BinOp::Le, [other_probe, upper]) = scalar_comparison(arena, *right)? else {
+        return None;
+    };
+    (probe == other_probe).then_some((probe, lower, upper))
+}
+
+pub(crate) fn scalar_in_list(
+    arena: &ScalarArena,
+    expression: ScalarId,
+) -> Option<(ScalarId, &[ScalarId])> {
+    let ScalarNode::FunctionCall { binding, args, .. } = arena.node(expression) else {
+        return None;
+    };
+    if OperatorFunction::from_function_id(&binding.function_id) != Some(OperatorFunction::InList) {
+        return None;
+    }
+    args.split_first()
+        .filter(|(_, candidates)| !candidates.is_empty())
+        .map(|(probe, candidates)| (*probe, candidates))
+}
+
 pub(crate) fn typed_comparison(expression: &TypedExpr) -> Option<(BinOp, [&TypedExpr; 2])> {
     if let Some((operator, operands)) = typed_operands(expression) {
         return comparison_kind(operator).map(|op| (op, operands));
@@ -164,5 +212,131 @@ pub(crate) fn permits_equality_substitution(data_type: &DataType) -> bool {
     !matches!(
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_predicate(operator: OperatorFunction, operands: Vec<TypedExpr>) -> TypedExpr {
+    use novarocks_functions::{FunctionArgument, FunctionBindingRequest, FunctionCandidate};
+
+    let control = crate::optimizer::test_optimizer_control();
+    let policy = crate::constant::test_constant_policy();
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    let overflow = novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
+    let binding = if operator == OperatorFunction::InList {
+        let (probe, candidates) = operands.split_first().expect("test IN probe");
+        let members = candidates
+            .iter()
+            .map(|candidate| {
+                let FunctionArgument::Value {
+                    value_type,
+                    constant,
+                } = crate::analysis::function_argument(candidate, policy, control).unwrap()
+                else {
+                    panic!("test IN candidate value");
+                };
+                FunctionCandidate {
+                    value_type,
+                    constant,
+                }
+            })
+            .collect::<Box<[_]>>();
+        let nullable = members.iter().any(|member| member.value_type.nullable());
+        let arguments = [
+            crate::analysis::function_argument(probe, policy, control).unwrap(),
+            FunctionArgument::CandidateGroup {
+                element_type: probe.value_type.with_nullable(nullable).unwrap(),
+                members,
+            },
+        ];
+        let binding = catalog
+            .resolve_scalar_operator_binding(
+                operator,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                    expected_result_type: None,
+                },
+                control,
+            )
+            .unwrap();
+        SqlFunctionBinding::from_test(binding, overflow)
+    } else {
+        SqlFunctionBinding::resolve_operator_for_plan(
+            crate::binding::PlanBindingAuthority::Test,
+            catalog,
+            operator,
+            &operands,
+            overflow,
+            policy,
+            control,
+        )
+        .unwrap()
+    };
+    typed_call(operator, binding, operands)
+}
+
+#[cfg(test)]
+pub(crate) fn test_inclusive_range(probe: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
+    use novarocks_parser::ast::AstBox;
+    use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+
+    // These optimizer fixtures include synthetic comparisons outside the
+    // catalogue so that unrelated comparison-domain safeguards can be tested.
+    let comparison = |left: TypedExpr, right: TypedExpr| TypedExpr {
+        value_type: FunctionValueType::new(
+            DataType::Boolean,
+            left.value_type.nullable() || right.value_type.nullable(),
+        ),
+        kind: ExprKind::BinaryOp {
+            left: AstBox::new(left),
+            op: BinOp::Le,
+            right: AstBox::new(right),
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        },
+    };
+    let left = comparison(low, probe.clone());
+    let right = comparison(probe, high);
+    TypedExpr {
+        value_type: FunctionValueType::new(
+            DataType::Boolean,
+            left.value_type.nullable() || right.value_type.nullable(),
+        ),
+        kind: ExprKind::BinaryOp {
+            left: AstBox::new(left),
+            op: BinOp::ExpandedConjunction,
+            right: AstBox::new(right),
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn intern_test_predicate(
+    arena: &mut ScalarArena,
+    operator: OperatorFunction,
+    operands: Vec<ScalarId>,
+) -> ScalarId {
+    let typed = crate::planner::optimizer_bridge::scalar::materialize_exprs(arena, &operands);
+    let typed = test_predicate(operator, typed);
+    let ExprKind::FunctionCall {
+        name,
+        binding,
+        volatility,
+        distinct,
+        ..
+    } = typed.kind
+    else {
+        unreachable!("selected test predicate");
+    };
+    arena.intern(
+        ScalarNode::FunctionCall {
+            name,
+            args: operands,
+            binding,
+            volatility,
+            distinct,
+        },
+        typed.value_type,
     )
 }

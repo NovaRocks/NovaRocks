@@ -461,7 +461,7 @@ impl ScanMembershipKey {
             expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
         });
         let definition = draft
-            .add(None, key.ty.clone(), ExprKind::Value(key.value))
+            .add(None, key.ty.clone(), ExprKind::input(key.value))
             .unwrap();
         let root = draft
             .root(definition, EvaluationDemand::Value, RootScope::Port(0))
@@ -867,7 +867,7 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         .collect::<Vec<_>>();
     let unit = builder.unit(SCAN).unwrap();
     let column = unit
-        .add(None, int64(), ExprKind::Value(provider[0]))
+        .add(None, int64(), ExprKind::input(provider[0]))
         .unwrap();
     // The v2 encoder publishes literals only as checked constants: `7` is
     // the one row of its own pool.

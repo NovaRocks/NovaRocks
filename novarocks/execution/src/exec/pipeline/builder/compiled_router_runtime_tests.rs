@@ -146,7 +146,7 @@ mod router_runtime_tests {
         let assignment = builder
             .unit(expand)
             .unwrap()
-            .add(None, int64(), ExprKind::Value(input))
+            .add(None, int64(), ExprKind::input(input))
             .unwrap();
         let events = [Effect::Insert, Effect::Replace, Effect::Delete].map(|effect| {
             let root = builder

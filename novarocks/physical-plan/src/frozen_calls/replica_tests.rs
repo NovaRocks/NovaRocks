@@ -512,7 +512,7 @@ fn table_source(
     let mut unit_builder = BoundExprSetBuilder::new(unit_limits());
     let arguments = if scalar_input {
         let def = unit_builder
-            .add(None, input_type.clone(), ExprKind::Value(input_value))
+            .add(None, input_type.clone(), ExprKind::input(input_value))
             .unwrap();
         // Value leaves use their intrinsic Eager flow; no function control record.
         Box::from([unit_builder

@@ -258,9 +258,11 @@ impl TypedText<'_> {
         for definition in self.unit.definitions() {
             work.step()?;
             let kind = match &definition.kind {
-                ExprKind::Value(value) => ExprKind::Constant(*supplied.get(value).ok_or(
-                    TextError::Layout("constant substitution has no value for an input occurrence"),
-                )?),
+                ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(value)) => {
+                    ExprKind::Constant(*supplied.get(value).ok_or(TextError::Layout(
+                        "constant substitution has no value for an input occurrence",
+                    ))?)
+                }
                 kind => kind.clone(),
             };
             let id = draft.add(definition.lambda_scope, definition.ty.clone(), kind)?;

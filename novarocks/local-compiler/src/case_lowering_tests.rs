@@ -179,6 +179,9 @@ fn original_request_sources(
             .arguments
             .iter()
             .map(|argument| match argument {
+                FunctionArgument::CandidateGroup { .. } => {
+                    panic!("CASE fixture has scalar branches")
+                }
                 FunctionArgument::Value {
                     value_type,
                     constant,
@@ -417,7 +420,7 @@ fn fixture(
     let flag_reference = if matches!(form, Form::Searched) || matches!(mode, Mode::IfArgument) {
         Some(
             builder
-                .fixture_definition(NodeId::new(0), boolean.clone(), ExprKind::Value(flag_value))
+                .fixture_definition(NodeId::new(0), boolean.clone(), ExprKind::input(flag_value))
                 .unwrap(),
         )
     } else {
@@ -428,7 +431,7 @@ fn fixture(
             .fixture_definition(
                 NodeId::new(0),
                 ty.clone(),
-                ExprKind::Value(operand_value.unwrap()),
+                ExprKind::input(operand_value.unwrap()),
             )
             .unwrap();
         let values = if matches!(form, Form::SimpleInteger) {
@@ -542,7 +545,7 @@ fn fixture(
                 .fixture_definition(
                     NodeId::new(0),
                     decimal.clone(),
-                    ExprKind::Value(decimal_value.unwrap()),
+                    ExprKind::input(decimal_value.unwrap()),
                 )
                 .unwrap();
             let integer = FunctionValueType::new(DataType::Int32, false);

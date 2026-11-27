@@ -60,14 +60,14 @@ pub fn byte_program(carrier: DataType, required_error: bool) -> Fixture {
     let port = project_port(columns.clone(), &mut source_pools);
     let mut authors = BTreeMap::new();
     let left = builder
-        .add(None, bytes.clone(), ExprKind::Value(columns[1].0))
+        .add(None, bytes.clone(), ExprKind::input(columns[1].0))
         .unwrap();
     let right = builder
-        .add(None, bytes.clone(), ExprKind::Value(columns[2].0))
+        .add(None, bytes.clone(), ExprKind::input(columns[2].0))
         .unwrap();
     let (condition, matched, otherwise) = if required_error {
         let value = builder
-            .add(None, decimal.clone(), ExprKind::Value(columns[3].0))
+            .add(None, decimal.clone(), ExprKind::input(columns[3].0))
             .unwrap();
         let rounded = round_value(
             &mut builder,
@@ -89,7 +89,7 @@ pub fn byte_program(carrier: DataType, required_error: bool) -> Fixture {
         (condition, left, right)
     } else {
         let flag = builder
-            .add(None, boolean.clone(), ExprKind::Value(columns[0].0))
+            .add(None, boolean.clone(), ExprKind::input(columns[0].0))
             .unwrap();
         let matched = add_call(
             &mut builder,

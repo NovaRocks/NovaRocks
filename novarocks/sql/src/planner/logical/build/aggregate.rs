@@ -899,20 +899,18 @@ fn any_expression(expr: &TypedExpr, matches_expr: &dyn Fn(&TypedExpr) -> bool) -
             .chain(order_by.iter().map(|item| &item.expr))
             .chain(filter.as_deref())
             .any(contains),
-        ExprKind::BinaryOp { left, right, .. } => contains(left) || contains(right),
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => contains(left) || contains(right),
+        ExprKind::Cast { expr, .. }
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::Nested(expr)
         | ExprKind::LambdaFunction { body: expr, .. }
         | ExprKind::Lambda { body: expr, .. } => contains(expr),
         ExprKind::FunctionCall { args, .. } => args.iter().any(contains),
-        ExprKind::InList { expr, list, .. } => contains(expr) || list.iter().any(contains),
-        ExprKind::Between {
-            expr, low, high, ..
-        } => contains(expr) || contains(low) || contains(high),
-        ExprKind::Like { expr, pattern, .. } => contains(expr) || contains(pattern),
         ExprKind::Case {
             operand,
             when_then,
@@ -942,6 +940,7 @@ fn any_expression(expr: &TypedExpr, matches_expr: &dyn Fn(&TypedExpr) -> bool) -
             )
             .any(contains),
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
@@ -954,6 +953,15 @@ fn rewrite_expr_children_with<E>(
     mut rewrite_child: impl FnMut(&TypedExpr) -> Result<TypedExpr, E>,
 ) -> Result<TypedExpr, E> {
     let kind = match &expr.kind {
+        ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } => ExprKind::Let {
+            binding: *binding,
+            initializer: novarocks_parser::ast::AstBox::new(rewrite_child(initializer)?),
+            body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
+        },
         ExprKind::BinaryOp {
             left,
             op,
@@ -964,10 +972,6 @@ fn rewrite_expr_children_with<E>(
             op: *op,
             right: novarocks_parser::ast::AstBox::new(rewrite_child(right)?),
             decimal_overflow_policy: *decimal_overflow_policy,
-        },
-        ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
-            op: *op,
-            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
         },
         ExprKind::FunctionCall {
             name,
@@ -1008,39 +1012,6 @@ fn rewrite_expr_children_with<E>(
             expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
             negated: *negated,
         },
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => ExprKind::InList {
-            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
-            list: (list
-                .iter()
-                .map(&mut rewrite_child)
-                .collect::<Result<Vec<_>, _>>()?)
-            .into(),
-            negated: *negated,
-        },
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => ExprKind::Between {
-            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
-            low: novarocks_parser::ast::AstBox::new(rewrite_child(low)?),
-            high: novarocks_parser::ast::AstBox::new(rewrite_child(high)?),
-            negated: *negated,
-        },
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => ExprKind::Like {
-            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
-            pattern: novarocks_parser::ast::AstBox::new(rewrite_child(pattern)?),
-            negated: *negated,
-        },
         ExprKind::Case {
             ieee_float_equality,
             operand,
@@ -1061,15 +1032,6 @@ fn rewrite_expr_children_with<E>(
                 .as_ref()
                 .map(|else_expr| rewrite_child(else_expr).map(novarocks_parser::ast::AstBox::new))
                 .transpose()?,
-        },
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => ExprKind::IsTruthValue {
-            expr: novarocks_parser::ast::AstBox::new(rewrite_child(inner)?),
-            value: *value,
-            negated: *negated,
         },
         ExprKind::Nested(inner) => {
             ExprKind::Nested(novarocks_parser::ast::AstBox::new(rewrite_child(inner)?))
@@ -1131,6 +1093,7 @@ fn rewrite_expr_children_with<E>(
         },
         ExprKind::AggregateCall { .. }
         | ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_)
@@ -1248,11 +1211,15 @@ pub(super) fn collect_aggregates(
                 source,
             });
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_aggregates(left, out, factory, control)?;
             collect_aggregates(right, out, factory, control)?;
         }
-        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out, factory, control)?,
         ExprKind::FunctionCall { args, .. } => {
             for arg in args {
                 collect_aggregates(arg, out, factory, control)?;
@@ -1279,28 +1246,9 @@ pub(super) fn collect_aggregates(
         }
         ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out, factory, control)?,
         ExprKind::Nested(inner) => collect_aggregates(inner, out, factory, control)?,
-        ExprKind::InList { expr, list, .. } => {
-            collect_aggregates(expr, out, factory, control)?;
-            for item in list {
-                collect_aggregates(item, out, factory, control)?;
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_aggregates(expr, out, factory, control)?;
-            collect_aggregates(low, out, factory, control)?;
-            collect_aggregates(high, out, factory, control)?;
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_aggregates(expr, out, factory, control)?;
-            collect_aggregates(pattern, out, factory, control)?;
-        }
-        ExprKind::IsTruthValue { expr: inner, .. } => {
-            collect_aggregates(inner, out, factory, control)?;
-        }
         // Leaves
         ExprKind::ColumnRef { .. }
+        | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_) => {}
@@ -1385,12 +1333,14 @@ fn collect_non_agg_column_refs_inner(
                 }
             }
         }
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_non_agg_column_refs_inner(left, group_by, out, inside_agg, control)?;
             collect_non_agg_column_refs_inner(right, group_by, out, inside_agg, control)?;
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg, control)?;
         }
         ExprKind::FunctionCall { args, .. } => {
             for arg in args {

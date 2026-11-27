@@ -126,8 +126,8 @@ impl ScalarCallContract {
         };
         arguments.iter().map(|argument| match argument {
             FunctionArgumentType::Value(value) => value,
-            FunctionArgumentType::Lambda { .. } => {
-                unreachable!("type-only calls have no runtime value arguments")
+            FunctionArgumentType::Lambda { .. } | FunctionArgumentType::CandidateGroup { .. } => {
+                unreachable!("checked scalar runtime value channels")
             }
         })
     }

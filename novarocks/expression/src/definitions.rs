@@ -46,6 +46,14 @@ pub enum StaticExprKind {
     /// A checked value retaining its complete field/type and pool ordinal.
     Constant(novarocks_functions::ConstantValue),
     Input,
+    LocalValue {
+        binder: novarocks_expression_contract::ExprId,
+    },
+    Let {
+        binder: novarocks_expression_contract::ExprId,
+        value: CompiledExprId,
+        body: CompiledExprId,
+    },
     /// A syntax-only wrapper. Its use identifies the guarded body edge.
     Lambda {
         body: CompiledExprId,
@@ -89,28 +97,8 @@ pub enum StaticExprKind {
     NaryOr {
         args: Vec<CompiledExprId>,
     },
-    /// One checked original Eager2 LIKE source; negative expansion is explicit.
-    PreparedLike {
-        text: CompiledExprId,
-        pattern: CompiledExprId,
-        negated: bool,
-    },
-    /// Three checked definitions, four distinct ordered invocation edges.
-    PreparedBetween {
-        plan: novarocks_type_contract::NativeBetweenPlan,
-        operand: CompiledExprId,
-        low: CompiledExprId,
-        high: CompiledExprId,
-    },
-    Not(CompiledExprId),
     IsNull(CompiledExprId),
     IsNotNull(CompiledExprId),
-    /// Checked ordered native IN with a mandatory per-use recipe.
-    PreparedInList {
-        child: CompiledExprId,
-        values: Vec<CompiledExprId>,
-        is_not_in: bool,
-    },
     Case {
         ieee_float_equality: bool,
         has_case_expr: bool,
@@ -177,16 +165,16 @@ impl StaticExprKind {
         mut visit: impl FnMut(CompiledExprId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Constant(_) | Self::Input | Self::LambdaParameter { .. } => {}
+            Self::Constant(_)
+            | Self::Input
+            | Self::LocalValue { .. }
+            | Self::LambdaParameter { .. } => {}
             Self::Lambda { body: child }
             | Self::PreparedCast { child, .. }
-            | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child) => visit(*child)?,
-            Self::PreparedLike {
-                text: a,
-                pattern: b,
-                ..
+            Self::Let {
+                value: a, body: b, ..
             }
             | Self::PreparedArithmetic {
                 left: a, right: b, ..
@@ -200,19 +188,6 @@ impl StaticExprKind {
             | Self::Ge(a, b) => {
                 visit(*a)?;
                 visit(*b)?;
-            }
-            Self::PreparedBetween {
-                operand, low, high, ..
-            } => {
-                visit(*operand)?;
-                visit(*low)?;
-                visit(*high)?;
-            }
-            Self::PreparedInList { child, values, .. } => {
-                visit(*child)?;
-                for id in values {
-                    visit(*id)?;
-                }
             }
             Self::NaryAnd { args: children }
             | Self::NaryOr { args: children }
@@ -317,8 +292,18 @@ impl ImmutableExpressions {
         nodes: Vec<StaticExprNode>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ExpressionsCompileError> {
+        Self::try_new_for_lowering(nodes, &[], control)
+    }
+    pub(crate) fn try_new_for_lowering(
+        nodes: Vec<StaticExprNode>,
+        source_positions: &[Option<u32>],
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ExpressionsCompileError> {
+        if !source_positions.is_empty() && source_positions.len() != nodes.len() {
+            return Err(StaticExpressionError::InvalidReference.into());
+        }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = Self::try_new_core(nodes, |operation| match operation {
+        let result = Self::try_new_core(nodes, source_positions, |operation| match operation {
             ExpressionObservation::Step => work.step().map_err(ExpressionsCompileError::Control),
             ExpressionObservation::OpaqueBoundary => {
                 work.flush().map_err(ExpressionsCompileError::Control)
@@ -332,6 +317,7 @@ impl ImmutableExpressions {
     }
     fn try_new_core<E: From<StaticExpressionError>>(
         nodes: Vec<StaticExprNode>,
+        source_positions: &[Option<u32>],
         mut observe: impl FnMut(ExpressionObservation) -> Result<(), E>,
     ) -> Result<Self, E> {
         let too_many = nodes.len() > MAX_STATIC_EXPRESSIONS;
@@ -352,7 +338,14 @@ impl ImmutableExpressions {
             node.kind.try_for_each_reference(|child| -> Result<(), E> {
                 let valid = child.index() < index;
                 if valid {
-                    depth = depth.max(depths[child.index()] + 1);
+                    let shared_position = source_positions
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|position| {
+                            source_positions.get(child.index()) == Some(&Some(position))
+                        });
+                    depth = depth.max(depths[child.index()] + usize::from(!shared_position));
                 }
                 observe(ExpressionObservation::Step)?;
                 if !valid {

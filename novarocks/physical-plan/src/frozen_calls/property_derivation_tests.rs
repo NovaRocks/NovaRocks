@@ -179,7 +179,7 @@ fn fixture(
     let child = if ordered {
         let sort = builder.reserve_node_id().unwrap();
         let expression = builder
-            .define(sort, integer(), ExprKind::Value(input_value))
+            .define(sort, integer(), ExprKind::input(input_value))
             .unwrap();
         let expression = builder.root_definition(
             sort,
@@ -274,7 +274,7 @@ fn fixture(
                 )
                 .unwrap();
             let passthrough = builder
-                .define(target, integer(), ExprKind::Value(input_value))
+                .define(target, integer(), ExprKind::input(input_value))
                 .unwrap();
             let repeated = builder.root_definition(
                 target,

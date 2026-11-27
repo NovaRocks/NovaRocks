@@ -641,7 +641,7 @@ pub fn cast_fixture_in_mode(
         }
     } else {
         builder
-            .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
+            .add(None, source_type.clone(), ExprKind::input(columns[0].0))
             .unwrap()
     };
     if matches!(source, Source::Add) {
@@ -700,7 +700,7 @@ pub fn cast_fixture_in_mode(
             } else {
                 let flag = if matches!(source, Source::RandCondition) {
                     let bound = builder
-                        .add(None, bound_type.clone(), ExprKind::Value(columns[1].0))
+                        .add(None, bound_type.clone(), ExprKind::input(columns[1].0))
                         .unwrap();
                     let random = add_call(
                         &mut builder,
@@ -725,7 +725,7 @@ pub fn cast_fixture_in_mode(
                         .unwrap()
                 } else {
                     builder
-                        .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
+                        .add(None, boolean.clone(), ExprKind::input(columns[2].0))
                         .unwrap()
                 };
                 let flag_type = if matches!(source, Source::RandCondition) {
@@ -892,7 +892,7 @@ pub fn build_program(
     }
     let mut builder = unit_draft();
     let left = builder
-        .add(None, left_type.clone(), ExprKind::Value(columns[0].0))
+        .add(None, left_type.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let right = if matches!(wrap, Wrap::ConstantRight) {
         literal(
@@ -903,7 +903,7 @@ pub fn build_program(
         )
     } else {
         builder
-            .add(None, right_type.clone(), ExprKind::Value(columns[1].0))
+            .add(None, right_type.clone(), ExprKind::input(columns[1].0))
             .unwrap()
     };
     let mut result_type =
@@ -939,7 +939,7 @@ pub fn build_program(
             );
             let (name, shape, arguments, defs) = if matches!(wrap, Wrap::If) {
                 let flag = builder
-                    .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
+                    .add(None, boolean.clone(), ExprKind::input(columns[2].0))
                     .unwrap();
                 (
                     "if",
@@ -1075,13 +1075,13 @@ pub fn typed_program(
     }
     let mut builder = unit_draft();
     let left = builder
-        .add(None, left_type.clone(), ExprKind::Value(columns[0].0))
+        .add(None, left_type.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let right = if let Some(value) = right_literal {
         literal(&mut builder, &right_type, value, &mut source_pools)
     } else {
         builder
-            .add(None, right_type.clone(), ExprKind::Value(columns[1].0))
+            .add(None, right_type.clone(), ExprKind::input(columns[1].0))
             .unwrap()
     };
     let mut result_type =
@@ -1115,7 +1115,7 @@ pub fn typed_program(
             );
             let (name, shape, arguments, defs) = if matches!(wrap, Wrap::If) {
                 let flag = builder
-                    .add(None, boolean.clone(), ExprKind::Value(columns[2].0))
+                    .add(None, boolean.clone(), ExprKind::input(columns[2].0))
                     .unwrap();
                 (
                     "if",
@@ -1223,7 +1223,7 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
     }
     let mut builder = unit_draft();
     let decimal_expr = builder
-        .add(None, decimal.clone(), ExprKind::Value(inputs[1].0))
+        .add(None, decimal.clone(), ExprKind::input(inputs[1].0))
         .unwrap();
     let (digits_type, places) = round_digits();
     let digits = literal(
@@ -1256,10 +1256,10 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
         )
         .unwrap();
     let left = builder
-        .add(None, float.clone(), ExprKind::Value(inputs[0].0))
+        .add(None, float.clone(), ExprKind::input(inputs[0].0))
         .unwrap();
     let right = builder
-        .add(None, float.clone(), ExprKind::Value(inputs[0].0))
+        .add(None, float.clone(), ExprKind::input(inputs[0].0))
         .unwrap();
     let child = add_call(
         &mut builder,
@@ -1327,11 +1327,11 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
     let mut builder = unit_draft();
     let mut authors = BTreeMap::new();
     let left = builder
-        .add(None, ty.clone(), ExprKind::Value(ids[0]))
+        .add(None, ty.clone(), ExprKind::input(ids[0]))
         .unwrap();
     let right = match right_kind {
         NullSafeRight::Column => builder
-            .add(None, ty.clone(), ExprKind::Value(ids[1]))
+            .add(None, ty.clone(), ExprKind::input(ids[1]))
             .unwrap(),
         NullSafeRight::Random => add_call(
             &mut builder,
@@ -1341,7 +1341,7 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
         ),
         NullSafeRight::Round => {
             let source = builder
-                .add(None, ty.clone(), ExprKind::Value(ids[1]))
+                .add(None, ty.clone(), ExprKind::input(ids[1]))
                 .unwrap();
             let (digits_type, places) = round_digits();
             let digits = literal(

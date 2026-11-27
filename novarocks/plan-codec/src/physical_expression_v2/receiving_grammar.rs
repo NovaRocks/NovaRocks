@@ -27,18 +27,6 @@ fn shape(message: &'static str) -> ExpressionCodecError {
 }
 
 /// Constant-size closed projections. The caller owns observation and scope.
-pub(super) fn decode_unary(
-    op: i32,
-) -> Result<novarocks_expression_contract::UnaryOperator, ExpressionCodecError> {
-    use wire::UnaryOperator as W;
-    Ok(match W::try_from(op) {
-        Ok(W::Not) => novarocks_expression_contract::UnaryOperator::Not,
-        Ok(W::Unspecified) | Err(_) => {
-            return Err(shape("unary operator is unknown or unspecified"));
-        }
-    })
-}
-
 pub(super) fn decode_binary(
     op: i32,
 ) -> Result<novarocks_expression_contract::BinaryOperator, ExpressionCodecError> {
@@ -166,9 +154,8 @@ mod tests {
 
     #[test]
     fn receiving_operators_cover_every_closed_variant_and_original_error_categories() {
-        use novarocks_expression_contract::{BinaryOperator as B, UnaryOperator as P};
-        use wire::{BinaryOperator as V, UnaryOperator as W};
-        assert_eq!(decode_unary(W::Not as i32).unwrap(), P::Not);
+        use novarocks_expression_contract::BinaryOperator as B;
+        use wire::BinaryOperator as V;
         for (wire, expected) in [
             (V::Add, B::Add),
             (V::Subtract, B::Subtract),
@@ -186,12 +173,6 @@ mod tests {
             assert_eq!(decode_binary(wire as i32).unwrap(), expected);
         }
         // Former operation numbers are reserved and follow the unknown-value path.
-        for raw in [0, 1, 2, 4, -1, i32::MAX] {
-            error(
-                decode_unary(raw),
-                "unary operator is unknown or unspecified",
-            );
-        }
         error(decode_binary(0), "binary operator is unspecified");
         for raw in [13, 14, 15, -1, i32::MAX] {
             error(decode_binary(raw), "binary operator is unknown");

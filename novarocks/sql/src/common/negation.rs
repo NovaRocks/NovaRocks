@@ -62,6 +62,33 @@ pub(crate) fn scalar_operand(arena: &ScalarArena, expression: ScalarId) -> Optio
     is_negation(&binding.function_id).then_some(*operand)
 }
 
+pub(crate) fn typed_boolean_operand(expression: &TypedExpr) -> Option<&TypedExpr> {
+    let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+        return None;
+    };
+    let [operand] = &args[..] else {
+        return None;
+    };
+    is_boolean_not(&binding.function_id).then_some(operand)
+}
+
+pub(crate) fn scalar_boolean_operand(
+    arena: &ScalarArena,
+    expression: ScalarId,
+) -> Option<ScalarId> {
+    let ScalarNode::FunctionCall { binding, args, .. } = arena.node(expression) else {
+        return None;
+    };
+    let [operand] = args.as_slice() else {
+        return None;
+    };
+    is_boolean_not(&binding.function_id).then_some(*operand)
+}
+
+pub(crate) fn is_boolean_not(function: &novarocks_type_contract::FunctionId) -> bool {
+    OperatorFunction::from_function_id(function) == Some(OperatorFunction::BooleanNot)
+}
+
 pub(crate) fn is_negation(function: &novarocks_type_contract::FunctionId) -> bool {
     use novarocks_type_contract::OperatorFunction;
 
@@ -75,15 +102,12 @@ pub(crate) fn typed_operand_has_lower_precedence(operand: &crate::analysis::Type
     use crate::analysis::ExprKind;
 
     crate::common::binary_operator::typed_operands(operand).is_some()
+        || typed_boolean_operand(operand).is_some()
         || matches!(
             operand.kind,
             ExprKind::BinaryOp { .. }
-                | ExprKind::UnaryOp { .. }
                 | ExprKind::IsNull { .. }
-                | ExprKind::IsTruthValue { .. }
-                | ExprKind::InList { .. }
-                | ExprKind::Between { .. }
-                | ExprKind::Like { .. }
+                | ExprKind::Let { .. }
                 | ExprKind::LambdaFunction { .. }
                 | ExprKind::Lambda { .. }
         )

@@ -122,7 +122,7 @@ fn input_unit(types: &[FunctionValueType]) -> (BoundExprSetBuilder, ExprPort, Ve
         .iter()
         .map(|(value, ty)| {
             draft
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap()
         })
         .collect();

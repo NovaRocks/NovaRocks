@@ -281,7 +281,7 @@ fn add_aggregate_with_grouping(
                 .define(
                     node,
                     builder.value(*value).unwrap().ty.clone(),
-                    ExprKind::Value(*value),
+                    ExprKind::input(*value),
                 )
                 .unwrap();
             let root = builder.root_definition(
@@ -299,7 +299,7 @@ fn add_aggregate_with_grouping(
         ty(DataType::Binary, false)
     };
     let argument_expression = builder
-        .define(node, argument_type, ExprKind::Value(argument))
+        .define(node, argument_type, ExprKind::input(argument))
         .unwrap();
     let argument_expression = builder.root_definition(
         node,
@@ -620,7 +620,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         .define(
             final_node,
             ty(DataType::Binary, false),
-            ExprKind::Value(imports[0]),
+            ExprKind::input(imports[0]),
         )
         .unwrap();
     let calls = [AggregateCallId::new(12), AggregateCallId::new(13)]
@@ -1147,13 +1147,13 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         values = vec![values[0], *values.last().unwrap()];
         let projection = b.reserve_node_id().unwrap();
         let key = b
-            .define(projection, key_type.clone(), ExprKind::Value(values[0]))
+            .define(projection, key_type.clone(), ExprKind::input(values[0]))
             .unwrap();
         let state = b
             .define(
                 projection,
                 ty(DataType::Binary, false),
-                ExprKind::Value(values[1]),
+                ExprKind::input(values[1]),
             )
             .unwrap();
         let key = b.root_definition(
@@ -1202,7 +1202,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     };
     let topn = b.reserve_node_id().unwrap();
     let key_expr = b
-        .define(topn, key_type.clone(), ExprKind::Value(values[0]))
+        .define(topn, key_type.clone(), ExprKind::input(values[0]))
         .unwrap();
     // MissingState intentionally has no consuming call, so do not author an
     // unreachable scalar definition that would mask the relation-path fault.
@@ -1212,7 +1212,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         b.define(
             topn,
             ty(DataType::Binary, false),
-            ExprKind::Value(values[1]),
+            ExprKind::input(values[1]),
         )
         .unwrap()
     };
@@ -1345,7 +1345,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     let topn = if matches!(fixture, GroupedReductionFixture::StagedRowBudget) {
         let rows = b.reserve_node_id().unwrap();
         let order = b
-            .define(rows, key_type.clone(), ExprKind::Value(values[0]))
+            .define(rows, key_type.clone(), ExprKind::input(values[0]))
             .unwrap();
         let order = b.root_definition(
             rows,
@@ -1385,7 +1385,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     );
     let final_topn = b.reserve_node_id().unwrap();
     let order = b
-        .define(final_topn, key_type.clone(), ExprKind::Value(outputs[0]))
+        .define(final_topn, key_type.clone(), ExprKind::input(outputs[0]))
         .unwrap();
     let order = b.root_definition(
         final_topn,

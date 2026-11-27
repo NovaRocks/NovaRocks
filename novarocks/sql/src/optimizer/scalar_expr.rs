@@ -22,7 +22,7 @@ use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
 use crate::common::negation::{render_negation, scalar_operand};
-use crate::common::{BinOp, LiteralValue, UnOp};
+use crate::common::{BinOp, LiteralValue};
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
 pub(crate) fn column_id(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
@@ -53,15 +53,21 @@ fn collect_column_ids_strict_inner(
             }
             out.insert(*id);
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_)
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_column_ids_strict_inner(arena, *left, out)?;
             collect_column_ids_strict_inner(arena, *right, out)?;
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => collect_column_ids_strict_inner(arena, *child, out)?,
         ScalarNode::FunctionCall { args, .. } => {
             for arg in args {
@@ -86,23 +92,6 @@ fn collect_column_ids_strict_inner(
             for item in order_by {
                 collect_column_ids_strict_inner(arena, item.expr, out)?;
             }
-        }
-        ScalarNode::InList { child, list, .. } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
-            for item in list {
-                collect_column_ids_strict_inner(arena, *item, out)?;
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
-            collect_column_ids_strict_inner(arena, *low, out)?;
-            collect_column_ids_strict_inner(arena, *high, out)?;
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
-            collect_column_ids_strict_inner(arena, *pattern, out)?;
         }
         ScalarNode::Case {
             operand,
@@ -375,33 +364,20 @@ pub(crate) fn literal_count_value(
 pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
     match arena.node(expr) {
         ScalarNode::AggregateCall { .. } => true,
-        ScalarNode::BinaryOp { left, right, .. } => {
-            contains_aggregate(arena, *left) || contains_aggregate(arena, *right)
-        }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => contains_aggregate(arena, *left) || contains_aggregate(arena, *right),
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => contains_aggregate(arena, *child),
         ScalarNode::FunctionCall { args, .. } => {
             args.iter().any(|arg| contains_aggregate(arena, *arg))
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             contains_aggregate(arena, *body)
-        }
-        ScalarNode::InList { child, list, .. } => {
-            contains_aggregate(arena, *child)
-                || list.iter().any(|item| contains_aggregate(arena, *item))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            contains_aggregate(arena, *child)
-                || contains_aggregate(arena, *low)
-                || contains_aggregate(arena, *high)
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            contains_aggregate(arena, *child) || contains_aggregate(arena, *pattern)
         }
         ScalarNode::Case {
             operand,
@@ -431,6 +407,7 @@ pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
         }
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => false,
     }
@@ -450,6 +427,9 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
             operator.sql(),
             scalar_display_name_with_parens(arena, right)
         );
+    }
+    if let Some(operand) = crate::common::negation::scalar_boolean_operand(arena, expr) {
+        return format!("NOT ({})", scalar_display_name(arena, operand));
     }
     if let Some(operand) = scalar_operand(arena, expr) {
         let needs_parentheses = crate::common::binary_operator::scalar_operands(arena, operand)
@@ -477,6 +457,17 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
             }
             format!("col{}", column_id.0)
         }
+        ScalarNode::Let {
+            binding,
+            initializer,
+            body,
+        } => format!(
+            "LET v{} = {} IN ({})",
+            binding.0,
+            scalar_display_name(arena, *initializer),
+            scalar_display_name(arena, *body),
+        ),
+        ScalarNode::LocalValue(binding) => format!("v{}", binding.0),
         ScalarNode::LambdaParamRef { name, .. } => name.clone(),
         ScalarNode::Literal(HashableLiteral(value)) => literal_display_name(value),
         ScalarNode::FunctionCall { name, args, .. } if name == "__array_literal" => {
@@ -564,9 +555,6 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
                 scalar_display_name_with_parens(arena, *right)
             )
         }
-        ScalarNode::UnaryOp { op, child } => match op {
-            UnOp::Not => format!("NOT {}", scalar_display_name_with_parens(arena, *child)),
-        },
         ScalarNode::Nested(child) => scalar_display_name(arena, *child),
         other => format!("{:?}", other),
     }
@@ -653,6 +641,7 @@ fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> Strin
     match arena.node(expr) {
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_)
         | ScalarNode::FunctionCall { .. }
@@ -675,7 +664,7 @@ fn bin_op_display(op: BinOp) -> &'static str {
         BinOp::Gt => ">",
         BinOp::Ge => ">=",
         BinOp::EqForNull => "<=>",
-        BinOp::And => "AND",
+        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => "AND",
         BinOp::Or => "OR",
     }
 }
@@ -806,32 +795,18 @@ fn contains_function_matching(
                     .iter()
                     .any(|item| contains_function_matching(arena, item.expr, matches))
         }
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             contains_function_matching(arena, *left, matches)
                 || contains_function_matching(arena, *right, matches)
         }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => contains_function_matching(arena, *child, matches),
-        ScalarNode::InList { child, list, .. } => {
-            contains_function_matching(arena, *child, matches)
-                || list
-                    .iter()
-                    .any(|item| contains_function_matching(arena, *item, matches))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            contains_function_matching(arena, *child, matches)
-                || contains_function_matching(arena, *low, matches)
-                || contains_function_matching(arena, *high, matches)
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            contains_function_matching(arena, *child, matches)
-                || contains_function_matching(arena, *pattern, matches)
-        }
         ScalarNode::Case {
             operand,
             when_then,
@@ -850,6 +825,7 @@ fn contains_function_matching(
         }
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => false,
     }
@@ -1164,7 +1140,7 @@ fn prove_signed_integer_operator_total(
 /// This effect is independent from function volatility.
 pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
     use novarocks_functions::PreparedCompositeComparisonRecipe;
-    use novarocks_type_contract::{DecimalOverflowPolicy, ValueLogicalType};
+    use novarocks_type_contract::DecimalOverflowPolicy;
     let comparison_can_fail = |value| {
         PreparedCompositeComparisonRecipe::equal_may_raise_row_error(arena.value_type(value))
     };
@@ -1176,7 +1152,13 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
     };
     let own_error = match arena.node(expr) {
         ScalarNode::FunctionCall { binding, args, .. } => {
-            scalar_call_can_fail(binding)
+            let streaming_membership = binding.function_id.as_str()
+                == novarocks_type_contract::OperatorFunction::InList.function_id_text()
+                && novarocks_functions::native_inlist::selection_has_streaming_equality(
+                    &binding.selected,
+                );
+            !streaming_membership
+                && scalar_call_can_fail(binding)
                 && (scalar_invocation_can_fail(binding)
                     || prove_signed_integer_operator_total(arena, expr, binding, args).is_none())
         }
@@ -1235,34 +1217,17 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 || partition_by.iter().any(|expr| can_fail(arena, *expr))
                 || order_by.iter().any(|item| can_fail(arena, item.expr))
         }
-        ScalarNode::BinaryOp { left, right, .. } => {
-            can_fail(arena, *left) || can_fail(arena, *right)
-        }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => can_fail(arena, *left) || can_fail(arena, *right),
+        ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
         | ScalarNode::Nested(child) => can_fail(arena, *child),
-        ScalarNode::InList { child, list, .. } => {
-            arena.value_type(*child).logical_type() == ValueLogicalType::Json
-                || comparison_can_fail(*child)
-                || can_fail(arena, *child)
-                || list
-                    .iter()
-                    .any(|item| comparison_can_fail(*item) || can_fail(arena, *item))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => can_fail(arena, *child) || can_fail(arena, *low) || can_fail(arena, *high),
         // An unbound pattern requires an actual runtime matcher. A known
         // unescaped pattern has no row failure after its operands succeed.
-        ScalarNode::Like { child, pattern, .. } => {
-            !matches!(
-                arena.node(*pattern),
-                ScalarNode::Literal(_) | ScalarNode::Constant(_)
-            ) || can_fail(arena, *child)
-                || can_fail(arena, *pattern)
-        }
         ScalarNode::Case {
             operand,
             when_then,
@@ -1285,6 +1250,7 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
         }
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::LocalValue(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => false,
     }

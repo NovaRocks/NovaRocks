@@ -27,20 +27,23 @@ use novarocks_expression::{
     CompiledExprSet, CompiledExpressionInstance, EvaluationEnvironment, EvaluationInput,
     ExprEvaluationFailure, ScopeLayouts,
     testkit::{
-        CallbackControl, HarnessControl, PassThroughCallHost, callback_causes, checked_constants,
-        compile_fixture_unit, fixture_scope,
+        CallbackControl, HarnessControl, PassThroughCallHost, add_catalogue_predicate,
+        callback_causes, checked_constants, compile_fixture_unit, declare_call_controls,
+        finish_unit, fixture_scope,
     },
 };
 use novarocks_expression_contract::{
-    BoundExprSetBuilder, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
+    BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits,
+    ValueAddress, ValueId,
 };
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
     Selection, testkit::installed_builtin_owner_catalogue,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, OperatorFunction,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -83,7 +86,7 @@ where
         &mut BoundExprSetBuilder,
         &mut ConstantPools,
         novarocks_expression_contract::ExprId,
-    ) -> ExprKind,
+    ) -> ExprId,
 {
     let mut draft = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: 256,
@@ -91,11 +94,8 @@ where
     let mut constants = ConstantPools::empty();
     let ty = FunctionValueType::new(source_type.clone(), true);
     let value = ValueId::new(0);
-    let source = draft.add(None, ty.clone(), ExprKind::Value(value)).unwrap();
-    let kind = expression(&mut draft, &mut constants, source);
-    let comparison = draft
-        .add(None, FunctionValueType::new(DataType::Boolean, true), kind)
-        .unwrap();
+    let source = draft.add(None, ty.clone(), ExprKind::input(value)).unwrap();
+    let comparison = expression(&mut draft, &mut constants, source);
     let root = draft
         .root(comparison, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -127,26 +127,32 @@ where
 }
 
 fn compile_ownerless_fixture(
-    draft: BoundExprSetBuilder,
+    mut draft: BoundExprSetBuilder,
     ports: Vec<ExprPort>,
     environment: EvaluationEnvironment<'_>,
     layouts: ScopeLayouts<'_>,
     policy: ConstantValidation,
 ) -> Arc<CompiledExprSet> {
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    let unit = draft
-        .seal(ports, &mut work)
-        .unwrap()
-        .finish(BTreeMap::new(), &mut work)
-        .unwrap();
+    let functions = installed_builtin_owner_catalogue();
+    declare_call_controls(
+        &mut draft,
+        &functions,
+        environment.constants,
+        environment.parameters,
+        &mut work,
+    );
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let unit = finish_unit(
+        &functions,
+        sealed,
+        &BTreeMap::new(),
+        environment.constants,
+        environment.parameters,
+        &mut work,
+    );
     work.finish().unwrap();
-    compile_fixture_unit(
-        &unit,
-        environment,
-        layouts,
-        policy,
-        &installed_builtin_owner_catalogue(),
-    )
+    compile_fixture_unit(&unit, environment, layouts, policy, &functions)
 }
 
 fn signed_in_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
@@ -207,11 +213,8 @@ fn signed_in_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
                 .add(None, nullable, checked_constants::kind(pools, null))
                 .unwrap(),
         );
-        ExprKind::InList {
-            expr: source,
-            list: list.into_boxed_slice(),
-            negated: false,
-        }
+        let arguments = std::iter::once(source).chain(list).collect();
+        add_catalogue_predicate(draft, pools, OperatorFunction::InList, arguments).unwrap()
     })
 }
 
@@ -235,11 +238,8 @@ fn like_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
             let pattern = draft
                 .add(None, ty, checked_constants::kind(pools, constant))
                 .unwrap();
-            ExprKind::Like {
-                expr: source,
-                pattern,
-                negated: false,
-            }
+            add_catalogue_predicate(draft, pools, OperatorFunction::Like, vec![source, pattern])
+                .unwrap()
         },
     )
 }
@@ -252,10 +252,10 @@ fn join_probe_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
         expression_semantic_depth: 256,
     });
     let left_key = draft
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(0)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(0)))
         .unwrap();
     let right_key = draft
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(2)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(2)))
         .unwrap();
     let root = draft
         .root(left_key, EvaluationDemand::Value, RootScope::Port(0))
@@ -805,13 +805,12 @@ fn text_lists(values: &[&str]) -> ArrayRef {
 fn evaluate_sparse_composite_guard(
     inputs: &[(&str, ArrayRef)],
     rows: &[usize],
-    result: FunctionValueType,
     author: impl FnOnce(
         &mut BoundExprSetBuilder,
         &mut ConstantPools,
         &[novarocks_expression_contract::ExprId],
         &[FunctionValueType],
-    ) -> ExprKind,
+    ) -> ExprId,
 ) -> (ArrayRef, Box<[novarocks_functions::RowDataError]>) {
     let mut draft = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: 256,
@@ -829,13 +828,12 @@ fn evaluate_sparse_composite_guard(
         .iter()
         .map(|(value, ty)| {
             draft
-                .add(None, ty.clone(), ExprKind::Value(*value))
+                .add(None, ty.clone(), ExprKind::input(*value))
                 .unwrap()
         })
         .collect::<Vec<_>>();
     let mut constants = ConstantPools::empty();
-    let kind = author(&mut draft, &mut constants, &sources, &types);
-    let expr = draft.add(None, result, kind).unwrap();
+    let expr = author(&mut draft, &mut constants, &sources, &types);
     let root = draft
         .root(expr, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
@@ -907,6 +905,120 @@ fn explicit_guard_cast(
 }
 
 #[test]
+fn let_body_receives_successful_null_and_original_sparse_initializer_rows() {
+    use arrow::array::BooleanArray;
+    use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
+    use novarocks_functions::DataFailureReason;
+
+    let mut draft = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: 16,
+    });
+    let source_id = ValueId::new(0);
+    let source_type = FunctionValueType::new(DataType::Utf8, true);
+    let initializer_type = FunctionValueType::new(DataType::Int64, true);
+    let result_type = FunctionValueType::new(DataType::Boolean, false);
+    let source = draft
+        .add(None, source_type.clone(), ExprKind::input(source_id))
+        .unwrap();
+    let initializer = explicit_guard_cast(&mut draft, source, &initializer_type);
+    let binding = draft.reserve().unwrap();
+    let local = draft
+        .add(
+            None,
+            initializer_type,
+            ExprKind::Value(ValueAddress::Local(binding)),
+        )
+        .unwrap();
+    let body = draft
+        .add(
+            None,
+            result_type.clone(),
+            ExprKind::IsNull {
+                expr: local,
+                negated: false,
+            },
+        )
+        .unwrap();
+    draft
+        .insert(
+            binding,
+            None,
+            result_type,
+            ExprKind::Let {
+                value: initializer,
+                body,
+            },
+        )
+        .unwrap();
+    let root = draft
+        .root(binding, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        source_type.try_to_field("source").unwrap(),
+    ]));
+    let port = ExprPort {
+        values: Box::from([(source_id, source_type)]),
+    };
+    let scope = fixture_scope(&port, Arc::clone(&schema));
+    let program = compile_ownerless_fixture(
+        draft,
+        vec![port],
+        EvaluationEnvironment {
+            constants: &ConstantPools::empty(),
+            parameters: &SemanticParameters::try_new([]).unwrap(),
+        },
+        ScopeLayouts {
+            ports: std::slice::from_ref(&scope),
+            all_ports: Some(&scope),
+        },
+        SQL_LITERAL_POLICY,
+    );
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![
+            Some("unselected"),
+            Some("5"),
+            Some("unselected"),
+            None,
+            Some("bad"),
+            Some("9"),
+        ]))],
+    )
+    .unwrap();
+    let rows = [1, 3, 4, 5];
+    let selection = Selection::try_sparse(batch.num_rows(), &rows).unwrap();
+    let output = CompiledExpressionInstance::try_new(program, root, &HarnessControl)
+        .unwrap()
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &HarnessControl,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert_eq!(output.selection(), selection);
+    let (_, values, errors) = output.into_parts();
+    let values = values.as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some(false), Some(true), None, Some(false)]
+    );
+    let [error] = errors.as_ref() else {
+        panic!("only the selected invalid cast should fail");
+    };
+    assert_eq!(error.selected_ordinal(), 2);
+    assert_eq!(rows[error.selected_ordinal()], 4);
+    assert_eq!(
+        error.reason(),
+        DataFailureReason::Domain(INVALID_CAST_ARGUMENT)
+    );
+}
+
+#[test]
 fn simple_case_composite_selected_rows_keep_unknown_and_demanded_label_errors_separate() {
     use arrow::array::Int32Array;
     use novarocks_failure_contract::kernel_reason::INVALID_CAST_ARGUMENT;
@@ -940,11 +1052,8 @@ fn simple_case_composite_selected_rows_keep_unknown_and_demanded_label_errors_se
     ];
     let rows = [1, 3, 5, 6, 7];
     let result_type = FunctionValueType::new(DataType::Int32, false);
-    let (output, errors) = evaluate_sparse_composite_guard(
-        &inputs,
-        &rows,
-        result_type.clone(),
-        |draft, pools, sources, types| {
+    let (output, errors) =
+        evaluate_sparse_composite_guard(&inputs, &rows, |draft, pools, sources, types| {
             let mut integer = |draft: &mut BoundExprSetBuilder, value| {
                 let value = ConstantValue::from_i32(
                     Arc::new(Field::new("literal", DataType::Int32, false)),
@@ -967,14 +1076,22 @@ fn simple_case_composite_selected_rows_keep_unknown_and_demanded_label_errors_se
             let second_result = integer(draft, 20);
             let second_label = explicit_guard_cast(draft, sources[2], &types[0]);
             let fallback = explicit_guard_cast(draft, sources[3], &result_type);
-            ExprKind::Case {
-                ieee_float_equality: false,
-                operand: Some(sources[0]),
-                when_then: Box::new([(sources[1], first_result), (second_label, second_result)]),
-                else_expr: Some(fallback),
-            }
-        },
-    );
+            draft
+                .add(
+                    None,
+                    result_type.clone(),
+                    ExprKind::Case {
+                        ieee_float_equality: false,
+                        operand: Some(sources[0]),
+                        when_then: Box::new([
+                            (sources[1], first_result),
+                            (second_label, second_result),
+                        ]),
+                        else_expr: Some(fallback),
+                    },
+                )
+                .unwrap()
+        });
     assert_eq!(
         output
             .as_any()
@@ -1035,19 +1152,28 @@ fn inlist_composite_selected_rows_keep_true_over_unknown_and_report_later_demand
     ];
     let rows = [1, 3, 5, 6, 7];
     for negated in [false, true] {
-        let (output, errors) = evaluate_sparse_composite_guard(
-            &inputs,
-            &rows,
-            FunctionValueType::new(DataType::Boolean, true),
-            |draft, _, sources, types| ExprKind::InList {
-                expr: sources[0],
-                list: Box::new([
-                    sources[1],
-                    explicit_guard_cast(draft, sources[2], &types[0]),
-                ]),
-                negated,
-            },
-        );
+        let (output, errors) =
+            evaluate_sparse_composite_guard(&inputs, &rows, |draft, pools, sources, types| {
+                let second = explicit_guard_cast(draft, sources[2], &types[0]);
+                let positive = add_catalogue_predicate(
+                    draft,
+                    pools,
+                    OperatorFunction::InList,
+                    vec![sources[0], sources[1], second],
+                )
+                .unwrap();
+                if negated {
+                    add_catalogue_predicate(
+                        draft,
+                        pools,
+                        OperatorFunction::BooleanNot,
+                        vec![positive],
+                    )
+                    .unwrap()
+                } else {
+                    positive
+                }
+            });
         let actual = output.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(
             actual.iter().collect::<Vec<_>>(),

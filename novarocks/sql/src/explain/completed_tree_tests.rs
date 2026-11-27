@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::test_constants::{self as checked, FragmentBuilder};
-use novarocks_expression_contract::{RootScope, UnaryOperator};
+use novarocks_expression_contract::RootScope;
 use novarocks_physical_plan::{
     OutputPort, PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
     ResultValueDomain, ValueOrigin, ValueType,
@@ -337,8 +337,8 @@ fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
                     .add(
                         None,
                         ty.clone(),
-                        ExprKind::Unary {
-                            op: UnaryOperator::Not,
+                        ExprKind::IsNull {
+                            negated: true,
                             expr: expression,
                         },
                     )

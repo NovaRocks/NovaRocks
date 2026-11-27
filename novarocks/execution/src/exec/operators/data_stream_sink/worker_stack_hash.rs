@@ -276,7 +276,7 @@ pub(super) fn id_key(deep: &FunctionValueType) -> (Arc<LocalProgram>, ProgramRoo
         let expression = consumer
             .unit(output)
             .unwrap()
-            .add(None, ty.clone(), ExprKind::Value(input))
+            .add(None, ty.clone(), ExprKind::input(input))
             .unwrap();
         let root = consumer
             .unit(output)

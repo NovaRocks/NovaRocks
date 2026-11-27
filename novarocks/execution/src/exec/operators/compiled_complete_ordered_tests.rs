@@ -174,7 +174,7 @@ fn complete_fixture_with_types(
         let definition = builder
             .unit(topn)
             .unwrap()
-            .add(None, types[0].clone(), ExprKind::Value(columns[0]))
+            .add(None, types[0].clone(), ExprKind::input(columns[0]))
             .unwrap();
         builder
             .unit(topn)

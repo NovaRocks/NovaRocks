@@ -2159,12 +2159,12 @@ mod conditional_compiled_selection {
         let left = builder
             .unit(output)
             .unwrap()
-            .add(None, integer.clone(), ExprKind::Value(input_ids[0]))
+            .add(None, integer.clone(), ExprKind::input(input_ids[0]))
             .unwrap();
         let right = builder
             .unit(output)
             .unwrap()
-            .add(None, integer.clone(), ExprKind::Value(input_ids[1]))
+            .add(None, integer.clone(), ExprKind::input(input_ids[1]))
             .unwrap();
         let parameter = SemanticParameterRef {
             id: SemanticParameterId::new(0),
@@ -2188,7 +2188,7 @@ mod conditional_compiled_selection {
         let applies = builder
             .unit(output)
             .unwrap()
-            .add(None, boolean.clone(), ExprKind::Value(input_ids[2]))
+            .add(None, boolean.clone(), ExprKind::input(input_ids[2]))
             .unwrap();
         let mut outputs = Vec::new();
         let mut fields = Vec::new();

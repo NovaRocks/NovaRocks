@@ -465,16 +465,22 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
             }
             verify_input_id(*column_id, input, &format!("{context} `{column}`"))
         }
-        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => Ok(()),
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::LocalValue(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::Constant(_) => Ok(()),
+        ExprKind::BinaryOp { left, right, .. }
+        | ExprKind::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             verify_expr(left, input, context)?;
             verify_expr(right, input, context)
         }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => verify_expr(expr, input, context),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Nested(expr) => {
+            verify_expr(expr, input, context)
+        }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             for arg in args {
                 verify_expr(arg, input, context)?;
@@ -492,24 +498,6 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
         }
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
             verify_expr(body, input, context)
-        }
-        ExprKind::InList { expr, list, .. } => {
-            verify_expr(expr, input, context)?;
-            for item in list {
-                verify_expr(item, input, context)?;
-            }
-            Ok(())
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            verify_expr(expr, input, context)?;
-            verify_expr(low, input, context)?;
-            verify_expr(high, input, context)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            verify_expr(expr, input, context)?;
-            verify_expr(pattern, input, context)
         }
         ExprKind::Case {
             operand,

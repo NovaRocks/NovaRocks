@@ -50,12 +50,14 @@ fn collect_scalar_column_ids(
             out.insert(*column_id);
         }
         ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. } => {
+        ScalarNode::BinaryOp { left, right, .. }
+        | ScalarNode::Let {
+            initializer: left,
+            body: right,
+            ..
+        } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);
-        }
-        ScalarNode::UnaryOp { child, .. } => {
-            collect_scalar_column_ids(arena, *child, out);
         }
         ScalarNode::FunctionCall { args, .. } => {
             for &arg in args {
@@ -79,23 +81,6 @@ fn collect_scalar_column_ids(
         ScalarNode::IsNull { child, .. } => {
             collect_scalar_column_ids(arena, *child, out);
         }
-        ScalarNode::InList { child, list, .. } => {
-            collect_scalar_column_ids(arena, *child, out);
-            for &item in list {
-                collect_scalar_column_ids(arena, item, out);
-            }
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            collect_scalar_column_ids(arena, *child, out);
-            collect_scalar_column_ids(arena, *low, out);
-            collect_scalar_column_ids(arena, *high, out);
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            collect_scalar_column_ids(arena, *child, out);
-            collect_scalar_column_ids(arena, *pattern, out);
-        }
         ScalarNode::Case {
             operand,
             when_then,
@@ -112,9 +97,6 @@ fn collect_scalar_column_ids(
             if let Some(e) = else_expr {
                 collect_scalar_column_ids(arena, *e, out);
             }
-        }
-        ScalarNode::IsTruthValue { child, .. } => {
-            collect_scalar_column_ids(arena, *child, out);
         }
         ScalarNode::Nested(child) => {
             collect_scalar_column_ids(arena, *child, out);
@@ -138,7 +120,7 @@ fn collect_scalar_column_ids(
         ScalarNode::Lambda { body, .. } => {
             collect_scalar_column_ids(arena, *body, out);
         }
-        ScalarNode::LambdaParamRef { .. } => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::LocalValue(_) => {}
     }
 }
 

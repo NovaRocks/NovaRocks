@@ -22,8 +22,6 @@
 
 mod failure_projection;
 
-mod between;
-pub use between::*;
 mod arithmetic;
 mod array_cast;
 mod array_common;
@@ -119,9 +117,7 @@ pub use arithmetic::{
 };
 pub use array_generate::array_generate_item_type;
 pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
-pub use coercion::{
-    supports_boolean_negation_value_type, wider_type, wider_type_with_construction,
-};
+pub use coercion::{wider_type, wider_type_with_construction};
 pub use comparison::{
     ComparisonOperator, JoinKeyMatch, KeyComparison, KeyLeaf, KeyRelation,
     OrderedComparisonAlgorithm, UnsupportedKeyType, canonical_f32_bits, canonical_f64_bits,

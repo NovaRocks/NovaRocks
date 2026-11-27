@@ -76,17 +76,17 @@ fn actual_null_tests_distinguish_success_null_from_round_error_placeholder_on_sp
 }
 
 #[test]
-fn actual_pure_round_boolean_error_is_suppressed_only_by_later_required_decider() {
+fn actual_pure_round_boolean_error_survives_later_deciding_flags() {
     for (case, flags, expected) in [
         (
             UnaryCase::PureAnd,
             vec![Some(false), Some(true), Some(true)],
-            vec![Some(false), None, Some(true)],
+            vec![None, None, Some(true)],
         ),
         (
             UnaryCase::PureOr,
             vec![Some(true), Some(false), Some(false)],
-            vec![Some(true), None, Some(true)],
+            vec![None, None, Some(true)],
         ),
     ] {
         let program = unary_program(case);
@@ -115,10 +115,11 @@ fn actual_pure_round_boolean_error_is_suppressed_only_by_later_required_decider(
             )
             .unwrap();
         assert_eq!(booleans(&output), expected);
-        assert_eq!(output.errors().len(), 1);
-        assert_eq!(output.errors()[0].selected_ordinal(), 1);
-        assert_eq!(output.selection().row(1), Some(7));
-        assert!(output.errors()[0].message().contains("overflow"));
+        assert_eq!(output.errors().len(), 2);
+        for (error, row) in output.errors().iter().zip([2, 7]) {
+            assert_eq!(output.selection().row(error.selected_ordinal()), Some(row));
+            assert!(error.message().contains("overflow"));
+        }
     }
 }
 
@@ -129,7 +130,7 @@ fn actual_not_filter_requires_value_child_and_keeps_nullable_truth_semantics() {
     let flow = unit.control_flow();
     let parent = &flow.uses()[&unit.root(program.root).unwrap().use_id];
     assert_eq!(parent.context.demand, EvaluationDemand::TruthOnly);
-    assert_eq!(parent.control, ControlShape::Eager);
+    assert_eq!(parent.control, ControlShape::OrderedNull);
     assert_eq!(
         flow.uses()[&parent.arguments[0]].context.demand,
         EvaluationDemand::Value
@@ -137,8 +138,15 @@ fn actual_not_filter_requires_value_child_and_keeps_nullable_truth_semantics() {
     let definitions = unit.definitions();
     assert!(matches!(
         definitions.node(parent.definition).unwrap().kind(),
-        StaticExprKind::Not(_)
+        StaticExprKind::BoundCall { args } if args.len() == 1
     ));
+    assert_eq!(
+        unit.calls()[&parent.context.use_id]
+            .prepared()
+            .call_contract()
+            .function_id(),
+        &novarocks_type_contract::OperatorFunction::BooleanNot.function_id()
+    );
     let child = &flow.uses()[&parent.arguments[0]];
     assert_eq!(child.control, ControlShape::Conjunction);
     assert!(matches!(
@@ -241,96 +249,5 @@ fn every_actual_round_null_rand_boundary_callback_keeps_all_seven_causes_and_no_
             ));
             assert!(after.trace().is_empty());
         }
-    }
-}
-
-#[test]
-fn numeric_not_preserves_zero_nonzero_nan_and_null_in_the_original_successful_domain() {
-    use crate::zero_port;
-    use arrow::{
-        array::{ArrayRef, Float64Array, Int64Array},
-        datatypes::DataType,
-    };
-    use novarocks_expression_contract::{ExprKind, UnaryOperator};
-    use novarocks_type_contract::{FunctionValueType, SemanticParameters};
-    use std::sync::Arc;
-
-    let numeric: Vec<ArrayRef> = vec![
-        Arc::new(arrow::array::Int8Array::from(vec![Some(0), Some(-1), None])),
-        Arc::new(arrow::array::Int16Array::from(vec![
-            Some(0),
-            Some(-1),
-            None,
-        ])),
-        Arc::new(arrow::array::Int32Array::from(vec![
-            Some(0),
-            Some(-1),
-            None,
-        ])),
-        Arc::new(Int64Array::from(vec![Some(0), Some(-1), None])),
-        Arc::new(arrow::array::Float32Array::from(vec![
-            Some(-0.0),
-            Some(f32::NAN),
-            None,
-        ])),
-        Arc::new(Float64Array::from(vec![Some(-0.0), Some(f64::NAN), None])),
-        Arc::new(
-            arrow::array::Decimal128Array::from(vec![Some(0), Some(-1), None])
-                .with_precision_and_scale(18, 4)
-                .unwrap(),
-        ),
-    ];
-    let result = FunctionValueType::new(DataType::Boolean, true);
-    // SQL NOT is true exactly at numeric zero, false at every nonzero value
-    // (including NaN), and preserves SQL NULL; these are independent expectations.
-    for input in numeric {
-        for (row, expected) in [Some(true), Some(false), None].into_iter().enumerate() {
-            let unit = zero_port::primitive(
-                [input.slice(row, 1)],
-                result.clone(),
-                |children| ExprKind::Unary {
-                    op: UnaryOperator::Not,
-                    expr: children[0],
-                },
-                &SemanticParameters::default(),
-            )
-            .unwrap();
-            let output = zero_port::evaluate(unit);
-            assert!(output.errors().is_empty());
-            assert_eq!(booleans(&output), vec![expected]);
-        }
-    }
-}
-
-#[test]
-fn boolean_not_over_constant_uses_the_value_root_null_contract() {
-    use crate::zero_port;
-    use arrow::{
-        array::{ArrayRef, BooleanArray},
-        datatypes::DataType,
-    };
-    use novarocks_expression_contract::{ExprKind, UnaryOperator};
-    use novarocks_type_contract::{FunctionValueType, SemanticParameters};
-    use std::sync::Arc;
-
-    for (value, expected) in [
-        (Some(true), Some(false)),
-        (Some(false), Some(true)),
-        (None, None),
-    ] {
-        let array: ArrayRef = Arc::new(BooleanArray::from(vec![value]));
-        let unit = zero_port::primitive(
-            [array],
-            FunctionValueType::new(DataType::Boolean, true),
-            |children| ExprKind::Unary {
-                op: UnaryOperator::Not,
-                expr: children[0],
-            },
-            &SemanticParameters::default(),
-        )
-        .unwrap();
-        let output = zero_port::evaluate(unit);
-        assert!(output.errors().is_empty());
-        assert_eq!(booleans(&output), vec![expected]);
     }
 }

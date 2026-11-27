@@ -204,6 +204,7 @@ fn remap_scalar(
     let node = arena.node(expr).clone();
     let value_type = arena.value_type(expr).clone();
     Ok(match node {
+        ScalarNode::Let { .. } | ScalarNode::LocalValue(_) => None,
         ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
         ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {
             Some(expr)
@@ -226,10 +227,6 @@ fn remap_scalar(
                 value_type,
                 control,
             )?)
-        }
-        ScalarNode::UnaryOp { op, child } => {
-            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
-            Some(arena.intern_observed(ScalarNode::UnaryOp { op, child }, value_type, control)?)
         }
         ScalarNode::FunctionCall {
             name,
@@ -313,60 +310,6 @@ fn remap_scalar(
                 control,
             )?)
         }
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => {
-            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
-            let list = candidate_or_none!(remap_scalar_vec(arena, list, bindings, control)?);
-            Some(arena.intern_observed(
-                ScalarNode::InList {
-                    child,
-                    list,
-                    negated,
-                },
-                value_type,
-                control,
-            )?)
-        }
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => {
-            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
-            let low = candidate_or_none!(remap_scalar(arena, low, bindings, control)?);
-            let high = candidate_or_none!(remap_scalar(arena, high, bindings, control)?);
-            Some(arena.intern_observed(
-                ScalarNode::Between {
-                    child,
-                    low,
-                    high,
-                    negated,
-                },
-                value_type,
-                control,
-            )?)
-        }
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => {
-            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
-            let pattern = candidate_or_none!(remap_scalar(arena, pattern, bindings, control)?);
-            Some(arena.intern_observed(
-                ScalarNode::Like {
-                    child,
-                    pattern,
-                    negated,
-                },
-                value_type,
-                control,
-            )?)
-        }
         ScalarNode::Case {
             ieee_float_equality,
             operand,
@@ -390,22 +333,6 @@ fn remap_scalar(
                     operand,
                     when_then,
                     else_expr,
-                },
-                value_type,
-                control,
-            )?)
-        }
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => {
-            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
-            Some(arena.intern_observed(
-                ScalarNode::IsTruthValue {
-                    child,
-                    value,
-                    negated,
                 },
                 value_type,
                 control,

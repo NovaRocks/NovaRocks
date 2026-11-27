@@ -1497,7 +1497,12 @@ mod tests {
                         }
                         contains_mul_with_win(left, win_id) || contains_mul_with_win(right, win_id)
                     }
-                    ExprKind::BinaryOp { left, right, .. } => {
+                    ExprKind::BinaryOp { left, right, .. }
+                    | ExprKind::Let {
+                        initializer: left,
+                        body: right,
+                        ..
+                    } => {
                         contains_mul_with_win(left, win_id) || contains_mul_with_win(right, win_id)
                     }
                     _ => false,
@@ -2059,19 +2064,11 @@ mod tests {
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         };
-        let between_conjunct = TypedExpr {
-            kind: ExprKind::Between {
-                expr: novarocks_parser::ast::AstBox::new(col_ref(
-                    L_QUANTITY,
-                    "l_quantity",
-                    DataType::Float64,
-                )),
-                low: novarocks_parser::ast::AstBox::new(low_expr),
-                high: novarocks_parser::ast::AstBox::new(high_expr),
-                negated: false,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let between_conjunct = crate::common::binary_operator::test_inclusive_range(
+            col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
+            low_expr,
+            high_expr,
+        );
 
         // Build the corr conjunct and Apply/Filter plan mirroring winmagic_filter_apply().
         let corr_conj = eq_expr(

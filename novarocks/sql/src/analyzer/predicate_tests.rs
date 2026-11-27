@@ -221,7 +221,7 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
         "SELECT coalesce(1,2) = coalesce(3,4)",
         "SELECT coalesce(1,2) BETWEEN coalesce(3,4) AND coalesce(5,6)",
         "SELECT coalesce(1,2) IN (coalesce(3,4), coalesce(5,6))",
-        "SELECT coalesce('a','b') LIKE coalesce('c','d')",
+        "SELECT coalesce(CAST('a' AS VARCHAR),CAST('b' AS VARCHAR)) LIKE coalesce(CAST('c' AS VARCHAR),CAST('d' AS VARCHAR))",
     ] {
         let query = query(sql);
         let ast::Expr::Predicated(node) = projection(&query) else {
@@ -229,38 +229,55 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
         };
         let expected_probe = ctx.analyze_expr(&node.value, &scope).unwrap();
         let actual = ctx.analyze_expr(projection(&query), &scope).unwrap();
-        let probe = match &actual.kind {
-            ExprKind::FunctionCall { binding, args, .. }
-                if binding.function_id == OperatorFunction::Equal.function_id() =>
-            {
-                &args[0]
-            }
-            ExprKind::Between { expr: left, .. }
-            | ExprKind::InList { expr: left, .. }
-            | ExprKind::Like { expr: left, .. } => left,
-            _ => panic!("the admitted profile keeps its original typed IR kind"),
-        };
+        let (probe, pairs): (&TypedExpr, Vec<(&TypedExpr, &ast::Expr)>) =
+            match (&actual.kind, &node.predicate) {
+                (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::Comparison(p))
+                    if binding.function_id == OperatorFunction::Equal.function_id() =>
+                {
+                    (&args[0], vec![(&args[1], &p.right)])
+                }
+                (
+                    ExprKind::Let {
+                        initializer,
+                        body,
+                        binding,
+                    },
+                    ast::Predicate::Between(p),
+                ) => {
+                    let ExprKind::BinaryOp { left, right, .. } = &body.kind else {
+                        panic!("BETWEEN uses the original ordered pair of comparisons");
+                    };
+                    let Some((OperatorFunction::LessThanOrEqual, [minimum, first_probe])) =
+                        crate::common::binary_operator::typed_operands(left)
+                    else {
+                        panic!("the minimum starts the first comparison");
+                    };
+                    let Some((OperatorFunction::LessThanOrEqual, [second_probe, maximum])) =
+                        crate::common::binary_operator::typed_operands(right)
+                    else {
+                        panic!("the maximum ends the second comparison");
+                    };
+                    for probe in [first_probe, second_probe] {
+                        assert!(matches!(probe.kind, ExprKind::LocalValue(id) if id == *binding));
+                    }
+                    (initializer, vec![(minimum, &p.min), (maximum, &p.max)])
+                }
+                (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::In(p))
+                    if binding.function_id == OperatorFunction::InList.function_id() =>
+                {
+                    let ast::Expr::InList(values) = &p.value_list else {
+                        panic!("list");
+                    };
+                    (&args[0], args[1..].iter().zip(&values.values).collect())
+                }
+                (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::Like(p))
+                    if binding.function_id == OperatorFunction::Like.function_id() =>
+                {
+                    (&args[0], vec![(&args[1], &p.pattern)])
+                }
+                _ => panic!("source predicate kind and admitted typed shape must agree"),
+            };
         same_typed(probe, &expected_probe, &control);
-        let pairs: Vec<(&TypedExpr, &ast::Expr)> = match (&actual.kind, &node.predicate) {
-            (ExprKind::FunctionCall { binding, args, .. }, ast::Predicate::Comparison(p))
-                if binding.function_id == OperatorFunction::Equal.function_id() =>
-            {
-                vec![(&args[1], &p.right)]
-            }
-            (ExprKind::Between { low, high, .. }, ast::Predicate::Between(p)) => {
-                vec![(low, &p.min), (high, &p.max)]
-            }
-            (ExprKind::InList { list, .. }, ast::Predicate::In(p)) => {
-                let ast::Expr::InList(values) = &p.value_list else {
-                    panic!("list")
-                };
-                list.iter().zip(&values.values).collect()
-            }
-            (ExprKind::Like { pattern, .. }, ast::Predicate::Like(p)) => {
-                vec![(pattern, &p.pattern)]
-            }
-            _ => panic!("source predicate kind and admitted typed shape must agree"),
-        };
         for (actual, syntax) in pairs {
             same_typed(actual, &ctx.analyze_expr(syntax, &scope).unwrap(), &control);
         }
@@ -283,5 +300,10 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
     }
     let like = query("SELECT 'ab' LIKE 'a%'");
     let typed = ctx.analyze_expr(projection(&like), &scope).unwrap();
-    assert!(matches!(typed.kind, ExprKind::Like { negated: false, .. }));
+    assert!(matches!(
+        typed.kind,
+        ExprKind::FunctionCall { binding, args, .. }
+            if binding.function_id == novarocks_type_contract::OperatorFunction::Like.function_id()
+                && args.len() == 2
+    ));
 }

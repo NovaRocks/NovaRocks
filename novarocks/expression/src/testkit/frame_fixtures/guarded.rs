@@ -180,11 +180,11 @@ pub fn program(shape: Shape) -> FrameFixture {
     }
     let mut authors = BTreeMap::new();
     let flag_expr = builder
-        .add(None, bool_type.clone(), ExprKind::Value(flag))
+        .add(None, bool_type.clone(), ExprKind::input(flag))
         .unwrap();
     let root = if matches!(shape, Shape::Random) {
         let bound_expr = builder
-            .add(None, integer.clone(), ExprKind::Value(bound))
+            .add(None, integer.clone(), ExprKind::input(bound))
             .unwrap();
         let from_column = add_call(
             &mut builder,
@@ -259,10 +259,10 @@ pub fn program(shape: Shape) -> FrameFixture {
         )
     } else {
         let value = builder
-            .add(None, decimal.clone(), ExprKind::Value(decimal_value))
+            .add(None, decimal.clone(), ExprKind::input(decimal_value))
             .unwrap();
         let fallback_expr = builder
-            .add(None, decimal.clone(), ExprKind::Value(fallback))
+            .add(None, decimal.clone(), ExprKind::input(fallback))
             .unwrap();
         let digit_type = FunctionValueType::new(DataType::Int32, false);
         let places = ConstantValue::from_i32(

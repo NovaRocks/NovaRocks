@@ -113,7 +113,7 @@ fn invocation_program_with(
         checked_constants::kind(&mut source_pools, checked_constants::null(ty, POLICY));
     }
     let mut data = builder
-        .add(None, source_type.clone(), ExprKind::Value(columns[0].0))
+        .add(None, source_type.clone(), ExprKind::input(columns[0].0))
         .unwrap();
     let name_type = FunctionValueType::new(DataType::Utf8, false);
     let name = if source_mode == SourceMode::Slot {
@@ -168,7 +168,7 @@ fn invocation_program_with(
             .unwrap();
     } else if source_mode == SourceMode::RequiredError {
         let tail = builder
-            .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
+            .add(None, tail_type.clone(), ExprKind::input(columns[2].0))
             .unwrap();
         let one_ty = FunctionValueType::new(DataType::Int64, false);
         let one = builder
@@ -237,7 +237,7 @@ fn invocation_program_with(
         SourceMode::IfThen | SourceMode::IfElse | SourceMode::NestedIf
     ) {
         let flag = builder
-            .add(None, flag_type.clone(), ExprKind::Value(columns[1].0))
+            .add(None, flag_type.clone(), ExprKind::input(columns[1].0))
             .unwrap();
         let null = builder
             .add(
@@ -251,7 +251,7 @@ fn invocation_program_with(
             .unwrap();
         if source_mode == SourceMode::NestedIf {
             let tail = builder
-                .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
+                .add(None, tail_type.clone(), ExprKind::input(columns[2].0))
                 .unwrap();
             let inner = builder
                 .add(
@@ -320,7 +320,7 @@ fn invocation_program_with(
             continue;
         }
         let tail = builder
-            .add(None, tail_type.clone(), ExprKind::Value(columns[2].0))
+            .add(None, tail_type.clone(), ExprKind::input(columns[2].0))
             .unwrap();
         let zero = builder
             .add(
@@ -443,7 +443,7 @@ fn invocation_program_with(
                 .unwrap();
             let otherwise_type = FunctionValueType::new(DataType::Boolean, true);
             let flag = builder
-                .add(None, flag_type.clone(), ExprKind::Value(columns[1].0))
+                .add(None, flag_type.clone(), ExprKind::input(columns[1].0))
                 .unwrap();
             let otherwise = builder
                 .add(

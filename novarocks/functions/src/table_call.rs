@@ -69,7 +69,10 @@ impl TableCallContract {
             .iter()
             .map(|argument| match argument {
                 FunctionArgumentType::Value(value) => value,
-                FunctionArgumentType::Lambda { .. } => unreachable!("checked table channels"),
+                FunctionArgumentType::Lambda { .. }
+                | FunctionArgumentType::CandidateGroup { .. } => {
+                    unreachable!("checked table channels")
+                }
             })
     }
     pub fn result_types(&self) -> &[FunctionValueType] {

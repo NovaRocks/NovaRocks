@@ -950,7 +950,7 @@ fn change_stream_source(
         &mut builder,
         expand,
         FunctionValueType::new(DataType::Int64, false),
-        novarocks_expression_contract::ExprKind::Value(value),
+        novarocks_expression_contract::ExprKind::input(value),
         novarocks_expression_contract::RootScope::Port(0),
     );
     let effect = builder

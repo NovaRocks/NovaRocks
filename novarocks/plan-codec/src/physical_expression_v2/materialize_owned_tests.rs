@@ -244,17 +244,14 @@ fn caller_owned_wide_lists_and_clones_have_actual_quantum_and_original_source_lo
     defs.push(definition(
         2,
         3,
-        wire::expression_definition::Kind::InList(wire::InListExpression {
-            expr_id: Some(0),
-            list_expr_ids: vec![0; 320],
-            negated: false,
+        wire::expression_definition::Kind::Conjunction(wire::ExpressionIds {
+            expr_ids: vec![0; 320],
         }),
     ));
     let (_, facts, arena) = invoke(&f, &defs, &c, SOURCE, limits(), None).unwrap();
-    let novarocks_expression_contract::ExprKind::InList { list: args, .. } =
-        &arena.get(2).unwrap().kind
+    let novarocks_expression_contract::ExprKind::Conjunction { args } = &arena.get(2).unwrap().kind
     else {
-        panic!("original in-list")
+        panic!("original conjunction")
     };
     assert_eq!(args.len(), 320);
     assert!(args.iter().all(|id| id.get() == 0));

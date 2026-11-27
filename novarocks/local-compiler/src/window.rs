@@ -120,10 +120,17 @@ pub(crate) fn admit_window(
             }
         };
         for argument in function.argument_types.iter() {
-            let lambda = matches!(argument, FunctionArgumentType::Lambda { .. });
             work.step()?;
-            if lambda {
-                return Err(unsupported("window call with a lambda argument"));
+            match argument {
+                FunctionArgumentType::Value(_) => {}
+                FunctionArgumentType::Lambda { .. } => {
+                    return Err(unsupported("window call with a lambda argument"));
+                }
+                FunctionArgumentType::CandidateGroup { .. } => {
+                    return Err(FragmentCompileError::Invalid(
+                        "window call contains a scalar candidate group",
+                    ));
+                }
             }
         }
         work.flush()?;

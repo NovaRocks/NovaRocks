@@ -756,7 +756,7 @@ fn actual_scan_unit_root_is_rechecked_after_the_value_origin_changes() {
     let mut builder = BoundExprSetBuilder::new(UnitLimits {
         expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
     });
-    let definition = builder.add(None, ty(), ExprKind::Value(v(0))).unwrap();
+    let definition = builder.add(None, ty(), ExprKind::input(v(0))).unwrap();
     assert_eq!(
         builder
             .root(definition, EvaluationDemand::TruthOnly, RootScope::Port(0))

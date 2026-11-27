@@ -403,11 +403,12 @@ fn state_sources_count_star_stream_loans_exact_actual_partial_and_final_own_requ
     work.finish().unwrap();
     assert_eq!(graph.root().fragment, entry.fragment().id());
     assert_eq!(graph.root().node, entry.node().inputs[0]);
-    let ContractExprKind::Value(state) = entry
+    let Some(state) = entry
         .fragment()
         .root_expression(entry.node().id, entry.source().arguments[0])
         .unwrap()
         .kind
+        .input_value()
     else {
         unreachable!()
     };

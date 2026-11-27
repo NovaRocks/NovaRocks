@@ -63,6 +63,7 @@ pub use novarocks_constant_contract::{
     ConstantResourceFacts, ConstantTableError, ConstantValue,
 };
 pub use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
+pub use novarocks_function_contract::FunctionCandidate as StaticFunctionCandidate;
 pub use novarocks_type_contract::FunctionValueType as ValueType;
 pub use novarocks_type_contract::{
     AggregateStateFormatId, BucketLayoutAlgorithm, DecimalOverflowPolicy,
@@ -143,4 +144,4 @@ use novarocks_expression_contract::{
 
 // Internal fixtures name the same neutral expression vocabulary directly.
 #[cfg(test)]
-use novarocks_expression_contract::{BinaryOperator, LegacyBindingMetadata, UnaryOperator};
+use novarocks_expression_contract::{BinaryOperator, LegacyBindingMetadata};

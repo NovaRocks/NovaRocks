@@ -140,10 +140,7 @@ pub fn expression_value(
     node: crate::NodeId,
     root: RootOrdinal,
 ) -> Option<crate::ValueId> {
-    match fragment.root_expression(node, root)?.kind {
-        crate::ExprKind::Value(value) => Some(value),
-        _ => None,
-    }
+    fragment.root_expression(node, root)?.kind.input_value()
 }
 /// Recover the original slot through conversions that preserve its key semantics.
 pub fn join_key_source_value(
@@ -153,8 +150,10 @@ pub fn join_key_source_value(
 ) -> Option<crate::ValueId> {
     fn read(unit: &crate::BoundExprSet, id: crate::ExprId) -> Option<crate::ValueId> {
         let definition = unit.definition(id)?;
+        if let Some(value) = definition.kind.input_value() {
+            return Some(value);
+        }
         match &definition.kind {
-            crate::ExprKind::Value(value) => Some(*value),
             crate::ExprKind::Cast { expr, target, .. } => {
                 use novarocks_type_contract::{CharacterKind, ValueKind};
                 let from = &unit.definition(*expr)?.ty;
@@ -234,7 +233,7 @@ pub(crate) fn expressions_have_closed_value_scope(
         let Some(definition) = unit.definition(id) else {
             return false;
         };
-        if matches!(definition.kind, crate::ExprKind::Value(_)) {
+        if definition.kind.input_value().is_some() {
             return false;
         }
         definition

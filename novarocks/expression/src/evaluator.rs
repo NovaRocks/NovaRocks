@@ -415,16 +415,14 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::Input
                     | StaticExprKind::Lambda { .. }
                     | StaticExprKind::LambdaParameter { .. }
+                    | StaticExprKind::LocalValue { .. }
+                    | StaticExprKind::Let { .. }
                     | StaticExprKind::NaryAnd { .. }
                     | StaticExprKind::NaryOr { .. }
-                    | StaticExprKind::Not(_)
                     | StaticExprKind::IsNull(_)
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
                     | StaticExprKind::PreparedCast { .. }
-                    | StaticExprKind::PreparedBetween { .. }
-                    | StaticExprKind::PreparedLike { .. }
-                    | StaticExprKind::PreparedInList { .. }
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
                     | StaticExprKind::Eq(..)
@@ -441,18 +439,6 @@ impl CompiledExpressionInstance {
                                     .ok_or_else(|| {
                                         invalid("missing mandatory arithmetic effect recipe")
                                     })?
-                                    .own_effects(invocation.context)
-                            } else if matches!(node.kind(), StaticExprKind::PreparedLike { .. }) {
-                                program
-                                    .recipes()
-                                    .native_like(occurrence)
-                                    .ok_or_else(|| invalid("missing mandatory LIKE effect recipe"))?
-                                    .own_effects(invocation.context)
-                            } else if matches!(node.kind(), StaticExprKind::PreparedInList { .. }) {
-                                program
-                                    .recipes()
-                                    .native_inlist(occurrence)
-                                    .ok_or_else(|| invalid("missing mandatory IN effect recipe"))?
                                     .own_effects(invocation.context)
                             } else if let ControlShape::Case {
                                 simple: true, arms, ..
@@ -476,28 +462,6 @@ impl CompiledExpressionInstance {
                                     }
                                 }
                                 ScopedExpressionEffects::primitive(invocation.context, own)
-                            } else if let StaticExprKind::PreparedBetween { plan, .. } = node.kind()
-                            {
-                                let lower = program
-                                    .recipes()
-                                    .comparison(ComparisonSite::BetweenLower(occurrence))
-                                    .ok_or_else(|| {
-                                        invalid("missing mandatory BETWEEN lower effect recipe")
-                                    })?;
-                                let upper = program
-                                    .recipes()
-                                    .comparison(ComparisonSite::BetweenUpper(occurrence))
-                                    .ok_or_else(|| {
-                                        invalid("missing mandatory BETWEEN upper effect recipe")
-                                    })?;
-                                if lower.operator() != plan.lower()
-                                    || upper.operator() != plan.upper()
-                                {
-                                    return Err(invalid(
-                                        "BETWEEN comparison effects differ from original expansion",
-                                    ));
-                                }
-                                lower.own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
                                 program
                                     .recipes()
@@ -546,8 +510,12 @@ impl CompiledExpressionInstance {
                 StaticExprKind::Constant(_)
                 | StaticExprKind::Input
                 | StaticExprKind::LambdaParameter { .. }
+                | StaticExprKind::LocalValue { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.is_empty() => {}
+                StaticExprKind::Let { .. }
+                    if invocation.control == ControlShape::Let
+                        && invocation.arguments.len() == 2 => {}
                 StaticExprKind::Lambda { .. }
                     if invocation.control == ControlShape::LambdaBody
                         && invocation.arguments.len() == 1 => {}
@@ -558,41 +526,13 @@ impl CompiledExpressionInstance {
                         } else {
                             ControlShape::Disjunction
                         }) => {}
-                StaticExprKind::Not(_)
-                | StaticExprKind::IsNull(_)
-                | StaticExprKind::IsNotNull(_)
+                StaticExprKind::IsNull(_) | StaticExprKind::IsNotNull(_)
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1 => {}
                 StaticExprKind::PreparedCast { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.recipes().cast(occurrence).is_some() => {}
-                StaticExprKind::PreparedInList {
-                    values, is_not_in, ..
-                } if invocation.control
-                    == (ControlShape::Membership {
-                        negated: *is_not_in,
-                    })
-                    && invocation.arguments.len() == values.len() + 1
-                    && program.recipes().native_inlist(occurrence).is_some() => {}
-                StaticExprKind::PreparedLike { .. }
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 2
-                        && program.recipes().native_like(occurrence).is_some() => {}
-                StaticExprKind::PreparedBetween { plan, .. }
-                    if invocation.control
-                        == (ControlShape::Between {
-                            negated: plan.negated(),
-                        })
-                        && invocation.arguments.len() == 4
-                        && program
-                            .recipes()
-                            .comparison(ComparisonSite::BetweenLower(occurrence))
-                            .is_some()
-                        && program
-                            .recipes()
-                            .comparison(ComparisonSite::BetweenUpper(occurrence))
-                            .is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2
@@ -1188,6 +1128,9 @@ fn admit_call_protocol(
         ) => {
             call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
                 && guarded::supports_result(result)
+        }
+        (ControlShape::CandidateGroup, PreparedPureKernel::Membership(_)) => {
+            call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
         }
         (ControlShape::OrderedNull, PreparedPureKernel::Scalar(_)) => {
             call.call_contract().effects().null_behavior != FunctionNullBehavior::ControlDefined

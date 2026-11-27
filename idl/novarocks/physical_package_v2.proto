@@ -139,6 +139,7 @@ message FunctionArgumentType {
   oneof kind {
     uint32 value_type_id = 1;
     novarocks.call_request.LambdaArgumentType lambda = 2;
+    uint32 candidate_group_element_value_type_id = 3;
   }
 }
 
@@ -358,15 +359,15 @@ enum WriterDerivedKind {
 }
 message ExpressionDefinition {
   uint32 id = 1;
-  reserved 2, 21;
+  reserved 2, 8, 16 to 18, 20, 21;
   reserved "owner_node_id", "window_call", "literal";
+  reserved "unary", "in_list", "between", "like", "is_truth_value";
   optional uint32 lambda_scope_expr_id = 3;
   optional uint32 value_type_id = 4;
   oneof kind {
     uint32 value_id = 5;
     LambdaParameter lambda_parameter = 6;
     novarocks.call_request.ConstantReference constant = 7;
-    UnaryExpression unary = 8;
     BinaryExpression binary = 9;
     ExpressionIds conjunction = 10;
     ExpressionIds disjunction = 11;
@@ -374,29 +375,22 @@ message ExpressionDefinition {
     LambdaExpression lambda = 13;
     CastExpression cast = 14;
     IsNullExpression is_null = 15;
-    InListExpression in_list = 16;
-    BetweenExpression between = 17;
-    LikeExpression like = 18;
     CaseExpression case_expression = 19;
-    TruthValueExpression is_truth_value = 20;
+    // Local addresses name the owning Let in this exact expression unit.
+    uint32 local_value_expr_id = 22;
+    LetExpression let_expression = 23;
 
   }
+}
+message LetExpression {
+  optional uint32 value_expr_id = 1;
+  optional uint32 body_expr_id = 2;
 }
 message ExpressionIds { repeated uint32 expr_ids = 1; }
 message ValueIds { repeated uint32 value_ids = 1; }
 message LambdaParameter {
   optional uint32 lambda_expr_id = 1;
   uint32 ordinal = 2;
-}
-message UnaryExpression {
-  UnaryOperator op = 1;
-  optional uint32 expr_id = 2;
-}
-enum UnaryOperator {
-  reserved 1, 2, 4;
-  reserved "UNARY_OPERATOR_PLUS", "UNARY_OPERATOR_MINUS", "UNARY_OPERATOR_BITWISE_NOT";
-  UNARY_OPERATOR_UNSPECIFIED = 0;
-  UNARY_OPERATOR_NOT = 3;
 }
 message BinaryExpression {
   optional uint32 left_expr_id = 1;
@@ -451,22 +445,6 @@ message IsNullExpression {
   optional uint32 expr_id = 1;
   bool negated = 2;
 }
-message InListExpression {
-  optional uint32 expr_id = 1;
-  repeated uint32 list_expr_ids = 2;
-  bool negated = 3;
-}
-message BetweenExpression {
-  optional uint32 expr_id = 1;
-  optional uint32 low_expr_id = 2;
-  optional uint32 high_expr_id = 3;
-  bool negated = 4;
-}
-message LikeExpression {
-  optional uint32 expr_id = 1;
-  optional uint32 pattern_expr_id = 2;
-  bool negated = 3;
-}
 message CaseExpression {
   optional uint32 operand_expr_id = 1;
   repeated WhenThen arms = 2;
@@ -476,11 +454,6 @@ message CaseExpression {
 message WhenThen {
   optional uint32 when_expr_id = 1;
   optional uint32 then_expr_id = 2;
-}
-message TruthValueExpression {
-  optional uint32 expr_id = 1;
-  bool value = 2;
-  bool negated = 3;
 }
 message WindowCall {
   optional uint32 function_binding_id = 1;
@@ -634,6 +607,15 @@ message ExpressionUnit {
   novarocks.physical_control_v2.ExpressionControl control = 4;
   novarocks.physical_semantics_v2.ExpressionClaims claims = 5;
   repeated novarocks.call_request.UnitCallRequest requests = 6;
+  repeated SourceControlExpansion control_expansions = 7;
+}
+// Authored control wrappers sharing one source position in the depth budget.
+message SourceControlExpansion {
+  optional uint32 root_expr_id = 1;
+  optional uint32 positive_expr_id = 2;
+  optional uint32 conjunction_expr_id = 3;
+  optional uint32 first_branch_expr_id = 4;
+  optional uint32 second_branch_expr_id = 5;
 }
 message ExpressionPort { repeated ExpressionInput values = 1; }
 message ExpressionInput {

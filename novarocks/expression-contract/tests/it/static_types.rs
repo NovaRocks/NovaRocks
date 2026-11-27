@@ -99,7 +99,7 @@ fn checked(
             b.add(
                 None,
                 ty.clone(),
-                ExprKind::Value(ValueId::new(ordinal as u32)),
+                ExprKind::input(ValueId::new(ordinal as u32)),
             )
             .unwrap()
         })
@@ -406,7 +406,7 @@ fn static_case_keeps_exact_branches_implicit_null_and_type_only_checks() {
 }
 
 #[test]
-fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
+fn static_null_predicates_keep_value_demand_and_require_nonnullable_boolean() {
     for hidden in [false, true] {
         for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
             for negated in [false, true] {
@@ -451,32 +451,6 @@ fn static_unary_null_predicates_preserve_value_demand_and_reject_narrowing() {
                     }
                     type_error(run(input, boolean(true)), "non-nullable Boolean");
                 }
-            }
-            let run = |input, result| {
-                checked(
-                    &[input],
-                    result,
-                    |ids| ExprKind::Unary {
-                        expr: ids[0],
-                        op: UnaryOperator::Not,
-                    },
-                    hidden,
-                    demand,
-                    &Control::good(),
-                )
-            };
-            run(boolean(true), boolean(true)).unwrap();
-            type_error(run(boolean(true), boolean(false)), "unary expression types");
-            for unsupported in [
-                ValueType::new(DataType::Utf8, false),
-                ValueType::try_with_logical_type(
-                    DataType::LargeBinary,
-                    false,
-                    ValueLogicalType::Json,
-                )
-                .unwrap(),
-            ] {
-                type_error(run(unsupported, boolean(false)), "unary expression types");
             }
         }
     }
@@ -647,7 +621,7 @@ fn array_cast_modes_preserve_live_and_unused_declarations() {
             checked_array_cast(
                 list(DataType::Int32, true),
                 list(DataType::Int64, true),
-                ExprKind::Value(ValueId::new(0)),
+                ExprKind::input(ValueId::new(0)),
                 mode,
                 unused,
             )
@@ -656,7 +630,7 @@ fn array_cast_modes_preserve_live_and_unused_declarations() {
                 checked_array_cast(
                     list(DataType::Int32, true),
                     list(DataType::Int64, false),
-                    ExprKind::Value(ValueId::new(0)),
+                    ExprKind::input(ValueId::new(0)),
                     mode,
                     unused,
                 ),
@@ -668,7 +642,7 @@ fn array_cast_modes_preserve_live_and_unused_declarations() {
 
 #[test]
 fn null_list_json_cast_checks_live_and_unused_definitions_and_full_types() {
-    let input = ExprKind::Value(ValueId::new(0));
+    let input = ExprKind::input(ValueId::new(0));
     for unused in [false, true] {
         for (source_nullable, result_nullable) in [(false, false), (false, true), (true, true)] {
             checked_array_cast(

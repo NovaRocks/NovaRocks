@@ -102,7 +102,7 @@ fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
     let definition = builder
         .unit(project)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(value))
+        .add(None, ty.clone(), ExprKind::input(value))
         .unwrap();
     let projected_type = if unary {
         p::ValueType::new(arrow::datatypes::DataType::Boolean, false)
@@ -116,8 +116,8 @@ fn pair_with_constant(cv: p::ConstantValue, unary: bool) -> p::FragmentPackage {
             .add(
                 None,
                 projected_type.clone(),
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Not,
+                ExprKind::IsNull {
+                    negated: true,
                     expr: definition,
                 },
             )

@@ -828,7 +828,6 @@ fn prepare_core<'loan, 'source, 'control>(
                     parameter_types, ..
                 } => numeric
                     .bytes::<novarocks_type_contract::FunctionValueType>(parameter_types.len())?,
-                ExprKind::InList { list, .. } => numeric.bytes::<ExprId>(list.len())?,
                 ExprKind::Case { when_then, .. } => {
                     numeric.bytes::<(ExprId, ExprId)>(when_then.len())?
                 }
@@ -1203,12 +1202,12 @@ fn count_kind(
     };
     let mut refs = 0usize;
     match &node.kind {
-        ExprKind::Value(_) => {}
+        ExprKind::Value(novarocks_expression_contract::ValueAddress::Input(_)) => {}
+        ExprKind::Value(novarocks_expression_contract::ValueAddress::Local(_)) => refs = 1,
+        ExprKind::Let { .. } => refs = 2,
         ExprKind::LambdaParameter { .. } => refs = 1,
         ExprKind::Constant(_) => counts.constant_lookups = numeric_add(counts.constant_lookups, 1)?,
-        ExprKind::Unary { .. } | ExprKind::IsNull { .. } | ExprKind::IsTruthValue { .. } => {
-            refs = 1
-        }
+        ExprKind::IsNull { .. } => refs = 1,
         ExprKind::Binary { .. } => refs = 2,
         ExprKind::Cast { .. } => {
             refs = 1;
@@ -1234,12 +1233,6 @@ fn count_kind(
                 .max_lambda_id_bytes
                 .max(bytes::<u32>(input.lambda_parameter_type_ids.len())?);
         }
-        ExprKind::InList { list, .. } => {
-            refs = numeric_add(1, list.len())?;
-            numeric(vector::<u32>(facts, list.len()))?;
-        }
-        ExprKind::Between { .. } => refs = 3,
-        ExprKind::Like { .. } => refs = 2,
         ExprKind::Case {
             operand,
             when_then,

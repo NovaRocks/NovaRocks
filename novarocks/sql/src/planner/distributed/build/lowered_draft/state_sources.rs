@@ -526,8 +526,11 @@ fn check_transport_observed<'a, G: StateGraph<'a>>(
                 });
                 // The actual node unit is borrowed on the original meter.
                 work.step()?;
-                local_input && output && pair.is_some_and(|(_, value)| value == endpoint.value)
-                    && expression.is_some_and(|expr| matches!(expr.kind, novarocks_expression_contract::ExprKind::Value(value) if value == link.source.value))
+                local_input
+                    && output
+                    && pair.is_some_and(|(_, value)| value == endpoint.value)
+                    && expression
+                        .is_some_and(|expr| expr.kind.input_value() == Some(link.source.value))
             }
             (
                 NodeKind::SetOp {
@@ -637,8 +640,13 @@ pub(super) fn check_state_inputs_observed<'a>(
         .as_ref()
         .and_then(|unit| unit.definition(expression));
     work.step()?;
-    if endpoint.fragment != entry.fragment.id() || entry.node.inputs.as_ref() != [endpoint.node] || !actual.is_some_and(|expr| matches!(expr.kind, novarocks_expression_contract::ExprKind::Value(value) if value == endpoint.value)) {
-        return Err(SqlSourceJournalError::InvalidSource("aggregate state association differs from its actual merge channel"));
+    if endpoint.fragment != entry.fragment.id()
+        || entry.node.inputs.as_ref() != [endpoint.node]
+        || !actual.is_some_and(|expr| expr.kind.input_value() == Some(endpoint.value))
+    {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "aggregate state association differs from its actual merge channel",
+        ));
     }
     work.flush()?;
     let child = entry.fragment.nodes().get(&endpoint.node);
@@ -1175,9 +1183,12 @@ fn construction_input_root<'a, G: StateGraph<'a>>(
             "merge differs from its original child association",
         ));
     }
-    let actual=match demand {
-        AggregateRuntimeDemand::ExpressionState(expr)=>graph.unit(fragment,node.id).and_then(|unit| unit.definition(expr)).is_some_and(|expr|matches!(expr.kind,novarocks_expression_contract::ExprKind::Value(value) if value==root.value)),
-        AggregateRuntimeDemand::WriterState(value)=>value==root.value,
+    let actual = match demand {
+        AggregateRuntimeDemand::ExpressionState(expr) => graph
+            .unit(fragment, node.id)
+            .and_then(|unit| unit.definition(expr))
+            .is_some_and(|expr| expr.kind.input_value() == Some(root.value)),
+        AggregateRuntimeDemand::WriterState(value) => value == root.value,
         AggregateRuntimeDemand::Update | AggregateRuntimeDemand::FilteredUpdate { .. } => false,
     };
     work.step()?;

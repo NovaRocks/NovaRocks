@@ -33,6 +33,10 @@ pub const MAX_CALL_EFFECT_ARGUMENTS: usize = 4096;
 #[derive(Clone, Copy, Debug)]
 pub enum CallArgumentUses<'a> {
     SelectedChannels(&'a [Option<novarocks_type_contract::ExpressionUseId>]),
+    CandidateGroup {
+        probe: novarocks_type_contract::ExpressionUseId,
+        candidates: &'a [novarocks_type_contract::ExpressionUseId],
+    },
     TemporalSources {
         facts: &'a novarocks_type_contract::TemporalSourceFacts,
         channels: &'a [crate::TemporalSourceChannel<'a>],
@@ -53,6 +57,16 @@ impl CallArgumentUses<'_> {
             (Self::SelectedChannels(left), Self::SelectedChannels(right)) => {
                 std::ptr::eq(left, right)
             }
+            (
+                Self::CandidateGroup {
+                    probe: left,
+                    candidates: lc,
+                },
+                Self::CandidateGroup {
+                    probe: right,
+                    candidates: rc,
+                },
+            ) => left == right && std::ptr::eq(lc, rc),
             (
                 Self::TemporalSources {
                     facts: left,
@@ -247,6 +261,14 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         }
         let selected_shape = match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses) => uses.len() == input.request.arguments.len(),
+            CallArgumentUses::CandidateGroup { candidates, .. } => {
+                input.kind == FunctionKind::Scalar
+                    && matches!(
+                        input.request.arguments,
+                        [crate::FunctionArgument::Value { .. }, crate::FunctionArgument::CandidateGroup { members, .. }]
+                            if !members.is_empty() && members.len() == candidates.len()
+                    )
+            }
             CallArgumentUses::TemporalSources { facts, channels } => {
                 input.kind == FunctionKind::Scalar
                     && facts.validate().is_ok()
@@ -299,6 +321,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
         validate_input_types(input, &mut work)?;
         let merge_state = match input.argument_uses {
             CallArgumentUses::SelectedChannels(_)
+            | CallArgumentUses::CandidateGroup { .. }
             | CallArgumentUses::TemporalSources { .. }
             | CallArgumentUses::MaterializedInput { .. } => None,
             CallArgumentUses::AggregateMerge {
@@ -397,9 +420,10 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 if matches!(
                     declaration.argument_control,
                     novarocks_type_contract::ArgumentControl::TemporalSource(_)
+                        | novarocks_type_contract::ArgumentControl::CandidateGroup
                 ) {
                     return Err(CallEffectRefinementError::InvalidInput(
-                        "temporal source fact is absent",
+                        "call requires its exact source argument protocol",
                     ));
                 }
                 for use_id in uses {
@@ -414,6 +438,16 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                             "call argument demand differs from its exact owner control",
                         ));
                     }
+                    work.step().map_err(CallEffectRefinementError::Control)?;
+                }
+            }
+            CallArgumentUses::CandidateGroup { candidates, .. } => {
+                if selected_control != novarocks_type_contract::ArgumentControl::CandidateGroup {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "candidate group differs from its exact owner control",
+                    ));
+                }
+                for _ in candidates {
                     work.step().map_err(CallEffectRefinementError::Control)?;
                 }
             }
@@ -617,6 +651,27 @@ fn validate_input_types<E: Error>(
                     return Err(CallEffectRefinementError::InvalidInput(
                         "call value argument differs from its already-coerced selected domain",
                     ));
+                }
+            }
+            (
+                FunctionArgument::CandidateGroup {
+                    element_type,
+                    members,
+                },
+                FunctionArgumentType::CandidateGroup {
+                    element_type: selected_element,
+                },
+            ) => {
+                validate(element_type, work)?;
+                validate(selected_element, work)?;
+                if !exact(element_type, selected_element, work)? {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "candidate group differs from its exact selected domain",
+                    ));
+                }
+                for member in members {
+                    work.step().map_err(CallEffectRefinementError::Control)?;
+                    validate(&member.value_type, work)?;
                 }
             }
             (
@@ -859,8 +914,8 @@ impl ScopedExpressionEffects {
             ..self
         })
     }
-    /// The complete typed ScalarInvocationV1 specialization is the ONE source
-    /// of this own capability. It never changes row-error or NULL behavior.
+    /// A typed preparation attaches this capability when its selected owner
+    /// performs operations that can raise Data for the whole invocation.
     pub(crate) const fn with_invocation_data_capability(mut self) -> Self {
         self.effects.may_raise_invocation_data = true;
         self

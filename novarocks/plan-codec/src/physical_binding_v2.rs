@@ -137,6 +137,7 @@ pub enum BindingSource<'a> {
 #[derive(Clone, Copy)]
 pub enum ArgumentTypeIds<'a> {
     Value(u32),
+    CandidateGroup { element: u32, members: &'a [u32] },
     Lambda { parameters: &'a [u32], result: u32 },
 }
 #[derive(Clone, Copy)]

@@ -62,7 +62,13 @@ message OriginalFunctionArgument {
   oneof kind {
     OriginalValueArgument value = 1;
     LambdaArgumentType lambda = 2;
+    OriginalCandidateGroup candidate_group = 3;
   }
+}
+
+message OriginalCandidateGroup {
+  optional uint32 element_value_type_id = 1;
+  repeated OriginalValueArgument members = 2;
 }
 
 message OriginalValueArgument {

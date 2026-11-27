@@ -63,7 +63,7 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
     });
     let input = ValueId::new(1);
     let ty = utf8();
-    let argument = draft.add(None, ty.clone(), ExprKind::Value(input)).unwrap();
+    let argument = draft.add(None, ty.clone(), ExprKind::input(input)).unwrap();
     let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,
         "upper",
@@ -127,7 +127,7 @@ fn missing_overflow_policy_is_an_invariant() {
     });
     let ty = utf8();
     let argument = draft
-        .add(None, ty.clone(), ExprKind::Value(ValueId::new(1)))
+        .add(None, ty.clone(), ExprKind::input(ValueId::new(1)))
         .unwrap();
     let owner = ClaimAuthor::with_exact_ordinary_binding(
         &functions,
@@ -753,7 +753,7 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     );
     let digits_value = ValueId::new(1);
     let digits_type = FunctionValueType::new(DataType::Int32, false);
-    let digits = fixture.add(digits_type.clone(), ExprKind::Value(digits_value));
+    let digits = fixture.add(digits_type.clone(), ExprKind::input(digits_value));
     let round = fixture.call(
         "round",
         &[decimal, digits],

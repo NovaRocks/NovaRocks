@@ -269,6 +269,11 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                         FunctionArgumentType::Lambda { .. } => Err(ResolveError::BadSignature(
                             "legacy scalar signature cannot represent a lambda argument".into(),
                         )),
+                        FunctionArgumentType::CandidateGroup { .. } => {
+                            Err(ResolveError::BadSignature(
+                                "legacy scalar signature cannot represent a candidate group".into(),
+                            ))
+                        }
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -425,23 +430,6 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments: std::slice::from_ref(argument),
                 logical_argument_count: 1,
                 expected_result_type: Some(target),
-            },
-            control,
-        )
-    }
-
-    fn resolve_like_with_escape_binding(
-        &self,
-        arguments: &[FunctionArgument],
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
-        self.resolve_bound_trusted(
-            novarocks_functions::native_like::ESCAPE_FUNCTION_NAME,
-            FunctionKind::Scalar,
-            FunctionBindingRequest {
-                arguments,
-                logical_argument_count: arguments.len(),
-                expected_result_type: None,
             },
             control,
         )
@@ -869,7 +857,9 @@ impl TestExactAggregateBindingResolver {
             .iter()
             .map(|argument| match argument {
                 FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type().clone()),
-                FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
+                FunctionArgument::Lambda { .. } | FunctionArgument::CandidateGroup { .. } => {
+                    Err(FunctionBindingError::NoMatchingOverload)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let overload = self

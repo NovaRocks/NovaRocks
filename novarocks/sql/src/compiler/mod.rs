@@ -567,22 +567,6 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
-    /// The explicit ESCAPE expression is selected only by LIKE syntax.
-    fn resolve_like_with_escape_binding(
-        &self,
-        _arguments: &[novarocks_functions::FunctionArgument],
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<
-        novarocks_functions::ResolvedFunctionBinding,
-        novarocks_functions::FunctionBindingError,
-    > {
-        control.checkpoint(
-            novarocks_type_contract::CompilePhase::FunctionSpecialization,
-            0,
-        )?;
-        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
-    }
-
     /// Planner-only normalization selected after JSON membership admission.
     fn resolve_json_canonical_key_binding(
         &self,
@@ -727,7 +711,7 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     fn volatility(&self, name: &str) -> novarocks_functions::FunctionVolatility;
 }
 
-pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
+pub use crate::common::expr::{BinOp, LiteralValue};
 pub(crate) mod materialized_values;
 pub use materialized_values::{
     SqlConstantExpressionSite, SqlConstantExpressionStep, SqlConstantQueryStep,

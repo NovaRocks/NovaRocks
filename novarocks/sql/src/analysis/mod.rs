@@ -79,7 +79,7 @@ impl UnpivotConstant {
     }
 }
 pub(crate) use crate::common::{
-    BinOp, JoinKind, LambdaParam, OutputColumn, UnOp, WindowBound, WindowFrame, WindowFrameType,
+    BinOp, JoinKind, LambdaParam, OutputColumn, WindowBound, WindowFrame, WindowFrameType,
 };
 use crate::planner::table::TableDef;
 
@@ -605,6 +605,10 @@ pub(crate) fn test_window_binding(
     )
 }
 
+/// Statement-local lexical address. It never names a relational input or port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalBindingId(pub(crate) u32);
+
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     /// Resolved column reference.
@@ -613,8 +617,18 @@ pub enum ExprKind {
         qualifier: Option<String>,
         column: String,
     },
+    /// A value computed once before the scoped body.
+    Let {
+        binding: LocalBindingId,
+        initializer: AstBox<TypedExpr>,
+        body: AstBox<TypedExpr>,
+    },
+    LocalValue(LocalBindingId),
     /// Resolved lambda parameter reference.
-    LambdaParamRef { name: String, slot_id: i32 },
+    LambdaParamRef {
+        name: String,
+        slot_id: i32,
+    },
     /// Literal value.
     Literal(LiteralValue),
     /// Materialized values keep their original Field, pool and selected ordinal.
@@ -626,8 +640,6 @@ pub enum ExprKind {
         right: AstBox<TypedExpr>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
-    /// Unary operation.
-    UnaryOp { op: UnOp, expr: AstBox<TypedExpr> },
     /// Scalar function call (non-aggregate).
     FunctionCall {
         name: String,
@@ -673,37 +685,12 @@ pub enum ExprKind {
         expr: AstBox<TypedExpr>,
         negated: bool,
     },
-    /// [NOT] IN (list).
-    InList {
-        expr: AstBox<TypedExpr>,
-        list: AstVec<TypedExpr>,
-        negated: bool,
-    },
-    /// [NOT] BETWEEN low AND high.
-    Between {
-        expr: AstBox<TypedExpr>,
-        low: AstBox<TypedExpr>,
-        high: AstBox<TypedExpr>,
-        negated: bool,
-    },
-    /// [NOT] LIKE pattern.
-    Like {
-        expr: AstBox<TypedExpr>,
-        pattern: AstBox<TypedExpr>,
-        negated: bool,
-    },
     /// CASE [operand] WHEN ... THEN ... [ELSE ...] END.
     Case {
         ieee_float_equality: bool,
         operand: Option<AstBox<TypedExpr>>,
         when_then: AstVec<(TypedExpr, TypedExpr)>,
         else_expr: Option<AstBox<TypedExpr>>,
-    },
-    /// IS [NOT] TRUE / IS [NOT] FALSE.
-    IsTruthValue {
-        expr: AstBox<TypedExpr>,
-        value: bool,
-        negated: bool,
     },
     /// Parenthesized expression (preserved for display fidelity).
     Nested(AstBox<TypedExpr>),

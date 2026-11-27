@@ -25,7 +25,7 @@ use novarocks_constant_contract::{
 };
 use novarocks_expression_contract::*;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_function_contract::FunctionArgument;
+use novarocks_function_contract::{FunctionArgument, FunctionCandidate};
 use novarocks_type_contract::*;
 use std::sync::{Arc, Mutex};
 
@@ -118,6 +118,9 @@ fn original_request(types: &[FunctionArgumentType]) -> PhysicalCallRequest {
         types
             .iter()
             .map(|ty| match ty {
+                FunctionArgumentType::CandidateGroup { .. } => {
+                    panic!("candidate groups require specific source occurrences")
+                }
                 FunctionArgumentType::Value(ty) => value(ty.clone()),
                 FunctionArgumentType::Lambda {
                     parameter_types,
@@ -141,11 +144,14 @@ fn scalar_unit(types: Vec<FunctionArgumentType>) -> (BoundExprSet, ConstantPools
     let mut pools = ConstantPools::empty();
     for (ordinal, ty) in types.iter().enumerate() {
         let argument = match ty {
+            FunctionArgumentType::CandidateGroup { .. } => {
+                panic!("candidate groups require a scalar IN fixture")
+            }
             FunctionArgumentType::Value(ty) => {
                 let value = ValueId::new(ordinal as u32);
                 ports.push((value, ty.clone()));
                 builder
-                    .add(None, ty.clone(), ExprKind::Value(value))
+                    .add(None, ty.clone(), ExprKind::input(value))
                     .unwrap()
             }
             FunctionArgumentType::Lambda {
@@ -464,6 +470,74 @@ fn static_requests_keep_original_none_some_constraint_and_reference_address() {
             );
         }
     }
+}
+
+#[test]
+fn candidate_group_materializes_in_source_order_with_two_argument_channels() {
+    let pool = ConstantPool::try_new(
+        Arc::new(Field::new("candidate", DataType::Int64, true)),
+        integer(true),
+        Int64Array::from(vec![Some(31), None]).to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &SetupControl::good(),
+    )
+    .unwrap();
+    let pool_id = ConstantPoolId::new(9);
+    let mut pools = ConstantPools::empty();
+    pools.insert(pool_id, pool.clone()).unwrap();
+    let mut members = vec![
+        FunctionCandidate {
+            value_type: integer(false),
+            constant: None,
+        };
+        4096
+    ];
+    for (position, ordinal) in [(0, 0), (4095, 1)] {
+        members[position] = FunctionCandidate {
+            value_type: integer(true),
+            constant: Some(ConstantReference {
+                pool: pool_id,
+                ordinal,
+            }),
+        };
+    }
+    let source = request(vec![
+        value(integer(false)),
+        FunctionArgument::CandidateGroup {
+            element_type: integer(true),
+            members: members.into_boxed_slice(),
+        },
+    ]);
+    let control = SetupControl::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let materialized = materialize_call_request_observed(&source, &pools, &mut work, 2).unwrap();
+    let request = materialized.request();
+    assert_eq!(request.logical_argument_count, 2);
+    let [
+        FunctionArgument::Value { .. },
+        FunctionArgument::CandidateGroup {
+            element_type,
+            members,
+        },
+    ] = request.arguments
+    else {
+        panic!("candidate group changed its argument channels");
+    };
+    assert_eq!(element_type, &integer(true));
+    assert_eq!(members.len(), 4096);
+    let first = members[0].constant.as_ref().unwrap();
+    assert_eq!(first.try_i64().unwrap(), Some(31));
+    assert!(Arc::ptr_eq(first.pool().array(), pool.array()));
+    assert!(
+        members[1..4095]
+            .iter()
+            .all(|member| !member.value_type.nullable() && member.constant.is_none())
+    );
+    let last = members[4095].constant.as_ref().unwrap();
+    assert_eq!(last.try_i64().unwrap(), None);
+    assert!(Arc::ptr_eq(last.pool().array(), pool.array()));
+    work.finish().unwrap();
 }
 
 #[test]

@@ -434,7 +434,7 @@ fn conversion_project_output_layout_keeps_largeint_after_each_signed_width() {
             .unwrap();
         let draft = builder.unit(output).unwrap();
         let leaf = draft
-            .add(None, source_type.clone(), ExprKind::Value(input_value))
+            .add(None, source_type.clone(), ExprKind::input(input_value))
             .unwrap();
         let author = ClaimAuthor::with_legacy_binding(
             &functions,

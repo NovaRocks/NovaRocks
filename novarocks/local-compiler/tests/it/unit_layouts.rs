@@ -88,7 +88,7 @@ fn source_columns(
             builder
                 .unit(root)
                 .unwrap()
-                .add(None, ty, ExprKind::Value(value))
+                .add(None, ty, ExprKind::input(value))
                 .unwrap(),
         );
     }
@@ -352,7 +352,7 @@ fn rng_program(
     let predicate = builder
         .unit(filter)
         .unwrap()
-        .add(None, bool_type, ExprKind::Value(bool_value))
+        .add(None, bool_type, ExprKind::input(bool_value))
         .unwrap();
     let predicate = builder
         .unit(filter)
@@ -363,7 +363,7 @@ fn rng_program(
         .add_filter(filter, first_project, Box::from([predicate]))
         .unwrap();
     let argument = bound_constant.as_ref().map_or_else(
-        || ExprKind::Value(bound_value),
+        || ExprKind::input(bound_value),
         |value| checked_source(&mut constants, value),
     );
     let call_argument = builder
@@ -396,12 +396,12 @@ fn rng_program(
     let identity_a = builder
         .unit(second_project)
         .unwrap()
-        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
+        .add(None, bound_type.clone(), ExprKind::input(bound_value))
         .unwrap();
     let identity_b = builder
         .unit(second_project)
         .unwrap()
-        .add(None, bound_type.clone(), ExprKind::Value(bound_value))
+        .add(None, bound_type.clone(), ExprKind::input(bound_value))
         .unwrap();
     let mut project_expressions = vec![(call_root, sample_value)];
     let mut project_output = vec![sample_value];

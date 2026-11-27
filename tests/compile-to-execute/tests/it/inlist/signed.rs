@@ -21,7 +21,9 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Ar
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_expression::CompiledExpressionInstance;
-use novarocks_expression::testkit::{CallbackControl, PassThroughCallHost, callback_causes};
+use novarocks_expression::testkit::{
+    CallbackControl, CountingAllocator, PassThroughCallHost, callback_causes,
+};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
@@ -29,7 +31,7 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{LocalProgram, ProgramRootRef};
 use novarocks_sql_testkit::{installed_builtin_owner_catalogue, signed_inlist_source};
-use novarocks_test_compile_to_execute::programs::compiled_signed_inlist_root;
+use novarocks_test_compile_to_execute::programs::{compiled_signed_inlist_root, membership_use};
 
 use novarocks_type_contract::ControlShape;
 use std::{sync::Arc, time::Duration};
@@ -121,22 +123,32 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
                 positive_truth.as_str(),
                 vec![Some(true), Some(false), Some(false), Some(true)],
             ),
-            (negative_truth.as_str(), vec![Some(false); 4]),
+            (
+                negative_truth.as_str(),
+                vec![Some(false), None, None, Some(false)],
+            ),
         ] {
             let (program, site) = compiled_signed_inlist_root(
                 &signed_inlist_source(sql, ty.clone()),
                 &installed_builtin_owner_catalogue(),
             );
             let unit = program.unit(site.unit).unwrap();
-            let use_id = unit.root(site.root).unwrap().use_id;
-            let recipe = unit.recipes().native_inlist(use_id).unwrap();
-            assert_eq!(recipe.source_type().data_type().clone(), ty);
-            assert!(
-                recipe
-                    .candidate_types()
-                    .iter()
-                    .all(|candidate| *candidate.data_type() == ty)
-            );
+            let root_use = unit.root(site.root).unwrap().use_id;
+            let use_id = membership_use(unit, root_use).unwrap();
+            let novarocks_functions::PreparedPureKernel::Membership(prepared) =
+                unit.calls()[&use_id].prepared()
+            else {
+                panic!("selected membership owner")
+            };
+            let [
+                novarocks_type_contract::FunctionArgumentType::Value(probe),
+                novarocks_type_contract::FunctionArgumentType::CandidateGroup { element_type },
+            ] = prepared.call().selected().argument_types.as_ref()
+            else {
+                panic!("exact two logical arguments")
+            };
+            assert_eq!(probe.data_type(), &ty);
+            assert_eq!(element_type.data_type(), &ty);
             let data = batch(&program, site, input.clone());
             for rows in [vec![0, 1, 2, 3], vec![1, 3], vec![]] {
                 let selection = Selection::try_sparse(4, &rows).unwrap();
@@ -236,6 +248,54 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
         assert_eq!(values(&out), vec![Some(!negated); 2]);
     }
 }
+
+#[test]
+fn first_failed_candidate_follows_the_original_order_even_after_a_match() {
+    use novarocks_functions::DataFailureReason;
+
+    let divide = "BIGINT '1' / (k - k)";
+    for (first, second, reason) in [
+        ("-k", divide, DataFailureReason::NumericOutOfRange),
+        (divide, "-k", DataFailureReason::DivisionByZero),
+    ] {
+        let sql = format!("SELECT k IN (k, {first}, {second}) FROM t0");
+        let (program, site) = compiled_signed_inlist_root(
+            &signed_inlist_source(&sql, DataType::Int64),
+            &installed_builtin_owner_catalogue(),
+        );
+        let data = batch(
+            &program,
+            site,
+            Arc::new(Int64Array::from(vec![None, Some(i64::MIN)])),
+        );
+        let selection = Selection::all(data.num_rows());
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+        )
+        .unwrap();
+        let output = frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
+        assert_eq!(values(&output), vec![None, None]);
+        let [failed] = output.errors() else {
+            panic!("only the non-NULL probe demands either failed candidate");
+        };
+        assert_eq!(failed.selected_ordinal(), 1);
+        assert_eq!(failed.reason(), reason);
+    }
+}
+
 fn causes() -> [KernelFailure; 7] {
     callback_causes([
         "in-origin-invalid",
@@ -245,14 +305,15 @@ fn causes() -> [KernelFailure; 7] {
 }
 #[test]
 fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_and_control() {
-    // A prior match, NULL candidate, or runtime NULL source cannot suppress
-    // the later required CASE expression. All are actual single-column SQL.
-    for (source, prefix) in [
-        ("k", "k"),
-        ("k", "CAST(NULL AS BIGINT)"),
+    // A prior match or NULL candidate still demands the later CASE. When the
+    // actual probe is NULL, the same CASE is skipped.
+    for (source, prefix, null_probe_for_negative) in [
+        ("k", "k", false),
+        ("k", "CAST(NULL AS BIGINT)", false),
         (
             "(CASE WHEN k < 0 THEN CAST(NULL AS BIGINT) ELSE k END)",
             "k",
+            true,
         ),
     ] {
         for operator in ["IN", "NOT IN"] {
@@ -266,8 +327,9 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
             );
             let unit = program.unit(site.unit).unwrap();
             let flow = unit.control_flow();
-            let membership = &flow.uses()[&unit.root(site.root).unwrap().use_id];
-            assert_eq!(membership.control, ControlShape::Membership { negated });
+            let use_id = membership_use(unit, unit.root(site.root).unwrap().use_id).unwrap();
+            let membership = &flow.uses()[&use_id];
+            assert_eq!(membership.control, ControlShape::CandidateGroup);
             assert_eq!(membership.arguments.len(), 3);
             let case_use = &flow.uses()[&membership.arguments[2]];
             assert_eq!(
@@ -284,16 +346,13 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
             );
             assert_eq!(
                 flow.regions()[&case_use.context.region].guard.unwrap().kind,
-                novarocks_type_contract::GuardKind::MembershipAfterSource { ordinal: 1 }
+                novarocks_type_contract::GuardKind::CandidateAfterSource { ordinal: 1 }
             );
             let definition = unit.definitions().node(membership.definition).unwrap();
-            let StaticExprKind::PreparedInList {
-                values: definitions,
-                ..
-            } = definition.kind()
-            else {
+            let StaticExprKind::BoundCall { args, .. } = definition.kind() else {
                 panic!("actual ordered membership")
             };
+            let definitions = &args[1..];
             assert_eq!(definitions.len(), 2);
             for (ordinal, definition) in definitions.iter().enumerate() {
                 assert_eq!(
@@ -337,7 +396,9 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                     values(&output),
                     rows.iter().map(|row| expected[*row]).collect::<Vec<_>>()
                 );
-                let failed_ordinal = rows.iter().position(|row| *row == 0);
+                let failed_ordinal = rows
+                    .iter()
+                    .position(|row| *row == 0 && !null_probe_for_negative);
                 assert_eq!(output.errors().len(), usize::from(failed_ordinal.is_some()));
                 if let Some(ordinal) = failed_ordinal {
                     assert_eq!(output.errors()[0].selected_ordinal(), ordinal);
@@ -428,5 +489,98 @@ fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_
                 }
             }
         }
+    }
+}
+
+#[test]
+fn wide_dynamic_candidates_refund_group_work_on_success_refusal_and_cancellation() {
+    let row_count = 2_048;
+    let candidates = (1..=512)
+        .map(|offset| format!("k + BIGINT '{offset}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT k IN ({candidates}) FROM t0");
+    let (program, site) = compiled_signed_inlist_root(
+        &signed_inlist_source(&sql, DataType::Int64),
+        &installed_builtin_owner_catalogue(),
+    );
+    let data = batch(
+        &program,
+        site,
+        Arc::new(Int64Array::from_iter_values(0..row_count as i64)),
+    );
+    let selected = Selection::all(row_count);
+    let scope = ScalarInvocationScope::new(selected, selected);
+    let new_frame = |allocator: Arc<CountingAllocator>| {
+        CompiledExpressionInstance::try_new_with_allocator(
+            program.unit(site.unit).unwrap().clone(),
+            site.root,
+            &Control,
+            Some(allocator),
+        )
+        .unwrap()
+    };
+
+    // The direct frame allocator covers retained group and mapping backing.
+    // The Execution host accounts separately for actual leaf output buffers.
+    let budget = 16 * row_count * size_of::<i64>();
+    let allocator = Arc::new(CountingAllocator::new(budget));
+    let record = CallbackControl::bounded(KernelFailure::Cancelled, usize::MAX, "IN never waits");
+    let mut frame = new_frame(allocator.clone());
+    let output = frame
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &data,
+                source: None,
+            },
+            scope,
+            ScalarInvocationActivation::Activated,
+            &record,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert!(output.errors().is_empty());
+    assert_eq!(values(&output), vec![Some(false); row_count]);
+    drop(frame);
+    let (reserved, refunded) = allocator.reservation_totals();
+    assert!(reserved > 0);
+    assert_eq!(reserved, refunded);
+    assert_eq!(allocator.outstanding(), 0);
+
+    let refused_allocator = Arc::new(CountingAllocator::new(1));
+    let stopped_allocator = Arc::new(CountingAllocator::new(budget));
+    let midway = CallbackControl::bounded(
+        KernelFailure::Cancelled,
+        record.trace().len() / 2,
+        "IN never waits",
+    );
+    for (allocator, control, expected) in [
+        (
+            refused_allocator,
+            &Control as &dyn KernelEvaluationControl,
+            KernelFailure::ResourceExhausted,
+        ),
+        (stopped_allocator, &midway, KernelFailure::Cancelled),
+    ] {
+        let mut frame = new_frame(allocator.clone());
+        assert_eq!(
+            frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    scope,
+                    ScalarInvocationActivation::Activated,
+                    control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap_err(),
+            ExprEvaluationFailure::Kernel(expected)
+        );
+        drop(frame);
+        assert_eq!(allocator.outstanding(), 0);
+        let (reserved, refunded) = allocator.reservation_totals();
+        assert_eq!(reserved, refunded);
     }
 }

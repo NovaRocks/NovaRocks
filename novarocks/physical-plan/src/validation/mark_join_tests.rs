@@ -60,12 +60,12 @@ fn mark_fragment(
         let key_left = builder.define(
             join,
             ValueType::new(DataType::Binary, true),
-            ExprKind::Value(inputs[0]),
+            ExprKind::input(inputs[0]),
         )?;
         let key_right = builder.define(
             join,
             ValueType::new(DataType::Binary, true),
-            ExprKind::Value(inputs[1]),
+            ExprKind::input(inputs[1]),
         )?;
         let key_left = builder.root_definition(
             join,
@@ -99,7 +99,7 @@ fn mark_fragment(
         let input = builder.define(
             join,
             ValueType::new(DataType::Binary, true),
-            ExprKind::Value(inputs[0]),
+            ExprKind::input(inputs[0]),
         )?;
         let predicate = builder.define(
             join,

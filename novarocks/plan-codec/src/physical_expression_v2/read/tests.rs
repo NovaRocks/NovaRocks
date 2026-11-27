@@ -453,8 +453,8 @@ impl Fixture {
             expression(
                 1,
                 3,
-                K::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Not as i32,
+                K::IsNull(wire::IsNullExpression {
+                    negated: true,
                     expr_id: Some(0),
                 }),
             ),
@@ -504,29 +504,22 @@ impl Fixture {
             expression(
                 9,
                 3,
-                K::InList(wire::InListExpression {
-                    expr_id: Some(17),
-                    list_expr_ids: vec![0, 17, 0],
-                    negated: true,
+                K::Conjunction(wire::ExpressionIds {
+                    expr_ids: vec![17, 0, 17, 0],
                 }),
             ),
             expression(
                 10,
                 3,
-                K::Between(wire::BetweenExpression {
-                    expr_id: Some(0),
-                    low_expr_id: Some(0),
-                    high_expr_id: Some(17),
-                    negated: false,
+                K::Conjunction(wire::ExpressionIds {
+                    expr_ids: vec![0, 0, 17],
                 }),
             ),
             expression(
                 11,
                 3,
-                K::Like(wire::LikeExpression {
-                    expr_id: Some(16),
-                    pattern_expr_id: Some(16),
-                    negated: false,
+                K::Disjunction(wire::ExpressionIds {
+                    expr_ids: vec![16, 16],
                 }),
             ),
             expression(
@@ -553,9 +546,8 @@ impl Fixture {
             expression(
                 14,
                 2,
-                K::IsTruthValue(wire::TruthValueExpression {
+                K::IsNull(wire::IsNullExpression {
                     expr_id: Some(4),
-                    value: true,
                     negated: false,
                 }),
             ),
@@ -579,8 +571,8 @@ fn small() -> Vec<wire::ExpressionDefinition> {
         expression(
             0,
             2,
-            wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                op: wire::UnaryOperator::Not as i32,
+            wire::expression_definition::Kind::IsNull(wire::IsNullExpression {
+                negated: true,
                 expr_id: Some(1),
             }),
         ),
@@ -720,10 +712,10 @@ fn receiving_expressions_cover_all_sixteen_scalar_kinds_and_original_dense_corre
                 .unwrap(),
             Some(-7)
         );
-        let Some(K::InList(list)) = token.definition(9).unwrap().unwrap().kind.as_ref() else {
-            panic!("actual in-list");
+        let Some(K::Conjunction(list)) = token.definition(9).unwrap().unwrap().kind.as_ref() else {
+            panic!("actual conjunction");
         };
-        assert_eq!(list.list_expr_ids, [0, 17, 0]);
+        assert_eq!(list.expr_ids, [17, 0, 17, 0]);
         // Frozen expected nullable=true accepts this actual nonnullable Value
         // shape. Domain/fits proof remains with the original Fragment author.
         assert_eq!(functions.as_wire()[0].arguments[0], arg(1));
@@ -761,14 +753,12 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     let mut bad = valid.clone();
     bad[0].lambda_scope_expr_id = Some(404);
     cases.push(bad);
-    for (op, expr_id) in [
-        (0, Some(u32::MAX)),
-        (99, Some(u32::MAX)),
-        (wire::UnaryOperator::Not as i32, None),
-        (wire::UnaryOperator::Not as i32, Some(404)),
-    ] {
+    for expr_id in [None, Some(404)] {
         let mut bad = valid.clone();
-        bad[0].kind = Some(K::Unary(wire::UnaryExpression { op, expr_id }));
+        bad[0].kind = Some(K::IsNull(wire::IsNullExpression {
+            expr_id,
+            negated: false,
+        }));
         cases.push(bad);
     }
     let mut bad = valid.clone();
@@ -1149,9 +1139,9 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
     let defs = small();
     prefixes(&fixture, &defs, SOURCE, limits(), true, true);
     let mut bad = defs.clone();
-    bad[0].kind = Some(wire::expression_definition::Kind::Unary(
-        wire::UnaryExpression {
-            op: wire::UnaryOperator::Not as i32,
+    bad[0].kind = Some(wire::expression_definition::Kind::IsNull(
+        wire::IsNullExpression {
+            negated: true,
             expr_id: Some(404),
         },
     ));
@@ -1224,8 +1214,8 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
             expression(
                 id,
                 2,
-                wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Not as i32,
+                wire::expression_definition::Kind::IsNull(wire::IsNullExpression {
+                    negated: true,
                     expr_id: Some(320),
                 }),
             )

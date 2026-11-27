@@ -151,11 +151,15 @@ impl ScalarStorage<'_> {
         }
         .map_err(|_| CompileControlError::ResourceExhausted.into())
     }
+    fn charge_definition(&mut self) {
+        if let Self::Node(storage) = self {
+            storage.order.get_mut().definitions += 1;
+        }
+    }
     fn record_definition(&mut self, definition: ExprId) {
         match self {
             Self::Node(storage) => {
                 let order = storage.order.get_mut();
-                order.definitions += 1;
                 order.events.push(NullableEmission::Definition {
                     node: storage.node,
                     definition,
@@ -164,6 +168,27 @@ impl ScalarStorage<'_> {
             Self::Standalone(storage) => storage.events.push(definition),
         }
     }
+}
+
+struct LoweredControlExpansion {
+    positive: ExprId,
+    conjunction: ExprId,
+    branches: [ExprId; 2],
+}
+
+fn expanded_conjunction(expression: &TypedExpr, includes_not: bool) -> Option<[&TypedExpr; 2]> {
+    let ExprKind::BinaryOp {
+        left, op, right, ..
+    } = &expression.kind
+    else {
+        return None;
+    };
+    let expected = if includes_not {
+        BinOp::ExpandedNegatedConjunction
+    } else {
+        BinOp::ExpandedConjunction
+    };
+    (*op == expected).then_some([left, right])
 }
 
 pub(super) struct ScalarEmission<'emission, 'control> {
@@ -176,6 +201,7 @@ pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) work: &'emission mut CompileCheckpoints<'control>,
     pub(super) constant_emission: &'emission mut constant_emission::SqlConstantEmission,
     pub(super) lambda_scope: &'emission mut Vec<LoweringLambdaScope>,
+    pub(super) local_scope: Vec<(crate::analysis::LocalBindingId, ExprId, ValueType)>,
     pub(super) storage: ScalarStorage<'emission>,
     pub(super) call_sources: &'emission mut SqlLogicalSourceJournal,
 }
@@ -193,7 +219,7 @@ impl ScalarEmission<'_, '_> {
         let binding = source.captured().binding().resolved();
         let source_type = self.value_declared_type(source_value)?;
         let source_expression =
-            self.add_scoped_expression(source_type, ContractExprKind::Value(source_value))?;
+            self.add_scoped_expression(source_type, ContractExprKind::input(source_value))?;
         let path_expression = self.lower_constant_expression(
             source.canonical_path(),
             ValueType::new(DataType::Utf8, false),
@@ -356,10 +382,7 @@ impl ScalarEmission<'_, '_> {
             .channels
             .first()
             .and_then(|channel| unit.definition(channel.expression))
-            .and_then(|definition| match definition.kind {
-                ContractExprKind::Value(value) => Some(value),
-                _ => None,
-            })
+            .and_then(|definition| definition.kind.input_value())
             .ok_or(ContractLoweringError::InvalidFunctionBinding {
                 detail: "derived source has no actual raw input value".into(),
             })?;
@@ -394,6 +417,107 @@ impl ScalarEmission<'_, '_> {
         result
     }
 
+    fn lower_control_expansion(
+        &mut self,
+        expression: &TypedExpr,
+        includes_not: bool,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<Option<LoweredControlExpansion>, ContractLoweringError> {
+        if let Some(operands) = expanded_conjunction(expression, includes_not) {
+            let (conjunction, branches) = self.lower_expanded_conjunction(operands, visible)?;
+            return Ok(Some(LoweredControlExpansion {
+                positive: conjunction,
+                conjunction,
+                branches,
+            }));
+        }
+        if let ExprKind::Let {
+            binding,
+            initializer,
+            body,
+        } = &expression.kind
+            && let Some(operands) = expanded_conjunction(body, includes_not)
+        {
+            let (positive, (conjunction, branches)) =
+                self.lower_let(*binding, initializer, visible, |emission| {
+                    let (conjunction, branches) =
+                        emission.lower_expanded_conjunction(operands, visible)?;
+                    Ok((conjunction, (conjunction, branches)))
+                })?;
+            return Ok(Some(LoweredControlExpansion {
+                positive,
+                conjunction,
+                branches,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn lower_expanded_conjunction(
+        &mut self,
+        [left, right]: [&TypedExpr; 2],
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<(ExprId, [ExprId; 2]), ContractLoweringError> {
+        let left = self.lower_expression(left, visible)?;
+        let right = self.lower_expression(right, visible)?;
+        let branches = [left, right];
+        let nullable = self.expression_value_type(left)?.nullable()
+            || self.expression_value_type(right)?.nullable();
+        let conjunction = self.add_scoped_expression(
+            ValueType::new(DataType::Boolean, nullable),
+            ContractExprKind::Conjunction {
+                args: Box::new(branches),
+            },
+        )?;
+        Ok((conjunction, branches))
+    }
+
+    fn lower_let<T>(
+        &mut self,
+        binding: crate::analysis::LocalBindingId,
+        initializer: &TypedExpr,
+        visible: &BTreeMap<ColumnId, ValueId>,
+        lower_body: impl FnOnce(&mut Self) -> Result<(ExprId, T), ContractLoweringError>,
+    ) -> Result<(ExprId, T), ContractLoweringError> {
+        let initializer = self.lower_expression(initializer, visible)?;
+        let initializer_type = self.expression_value_type(initializer)?;
+        let definition = self.reserve_definition_identity()?;
+        self.local_scope
+            .push((binding, definition, initializer_type));
+        let body = lower_body(self);
+        self.local_scope.pop();
+        let (body, ancillary) = body?;
+        let body_type = self.expression_value_type(body)?;
+        let scope = self.lambda_scope.last().map(|scope| scope.lambda);
+        self.storage.unit_mut()?.insert(
+            definition,
+            scope,
+            body_type,
+            ContractExprKind::Let {
+                value: initializer,
+                body,
+            },
+        )?;
+        self.record_definition_event(definition)?;
+        Ok((definition, ancillary))
+    }
+
+    fn record_control_expansion(
+        &mut self,
+        root: ExprId,
+        expansion: LoweredControlExpansion,
+    ) -> Result<(), ContractLoweringError> {
+        self.work.flush()?;
+        self.storage.unit_mut()?.record_control_expansion(
+            root,
+            expansion.positive,
+            expansion.conjunction,
+            expansion.branches,
+        )?;
+        self.work.step()?;
+        Ok(())
+    }
+
     #[recursive::recursive]
     pub(super) fn lower_expression_inner(
         &mut self,
@@ -404,8 +528,14 @@ impl ScalarEmission<'_, '_> {
         if let ExprKind::Literal(literal) = &expression.kind {
             return self.lower_literal_expression(literal, expression);
         }
+        if let Some(expansion) = self.lower_control_expansion(expression, false, visible)? {
+            let result = expansion.positive;
+            self.record_control_expansion(result, expansion)?;
+            return Ok(result);
+        }
         let mut ty = expression_type(expression);
         let mut captured_call = None;
+        let mut control_expansion = None;
         let kind = match &expression.kind {
             ExprKind::ColumnRef { column_id, .. } => {
                 // A reference is the value, so it is typed by the value's own
@@ -421,7 +551,7 @@ impl ScalarEmission<'_, '_> {
                     return Ok(definition);
                 }
                 ty = self.value_declared_type(value)?;
-                ContractExprKind::Value(value)
+                ContractExprKind::input(value)
             }
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
             ExprKind::Constant(value) => return self.lower_constant_expression(value, ty),
@@ -473,10 +603,6 @@ impl ScalarEmission<'_, '_> {
                     decimal_overflow_policy: *decimal_overflow_policy,
                 }
             }
-            ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
-                op: lower_unary_operator(*op),
-                expr: self.lower_expression(expr, visible)?,
-            },
             ExprKind::Cast {
                 expr,
                 decimal_overflow_policy,
@@ -493,76 +619,6 @@ impl ScalarEmission<'_, '_> {
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(expr, visible)?,
-                negated: *negated,
-            },
-            ExprKind::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                // A membership test compares one value against many, so all
-                // of them are compared as one type. The engine widens them at
-                // run time; the contract states the comparison it performs,
-                // so the widening is written down here -- the same way a
-                // range test and a comparison operator already do.
-                let input = self.lower_expression(expr, visible)?;
-                let candidates = list
-                    .iter()
-                    .map(|item| self.lower_expression(item, visible))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut compared = self.expression_value_type(input)?;
-                for candidate in &candidates {
-                    let other = self.expression_value_type(*candidate)?;
-                    compared = self.common_comparison_value_type(&compared, &other)?;
-                }
-                let list = candidates
-                    .into_iter()
-                    .map(|candidate| self.cast_expression_to(candidate, &compared))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let input = self.cast_expression_to(input, &compared)?;
-                if !ty.nullable() && self.membership_nullable(input, &list)? {
-                    ty = ty
-                        .with_nullable(true)
-                        .expect("validated Boolean NULL contract");
-                }
-                ContractExprKind::InList {
-                    expr: input,
-                    list: list.into_boxed_slice(),
-                    negated: *negated,
-                }
-            }
-            ExprKind::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                // A range test compares one value against two bounds, so all
-                // three are compared as one type. The engine widens them at
-                // run time; the contract states the comparison it performs,
-                // so the widening is written down here.
-                let input = self.lower_expression(expr, visible)?;
-                let low = self.lower_expression(low, visible)?;
-                let high = self.lower_expression(high, visible)?;
-                let mut compared = self.expression_value_type(input)?;
-                for operand in [low, high] {
-                    let other = self.expression_value_type(operand)?;
-                    compared = self.common_comparison_value_type(&compared, &other)?;
-                }
-                ContractExprKind::Between {
-                    expr: self.cast_expression_to(input, &compared)?,
-                    low: self.cast_expression_to(low, &compared)?,
-                    high: self.cast_expression_to(high, &compared)?,
-                    negated: *negated,
-                }
-            }
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } => ContractExprKind::Like {
-                expr: self.lower_expression(expr, visible)?,
-                pattern: self.lower_expression(pattern, visible)?,
                 negated: *negated,
             },
             ExprKind::Case {
@@ -625,15 +681,6 @@ impl ScalarEmission<'_, '_> {
                     else_expr,
                 }
             }
-            ExprKind::IsTruthValue {
-                expr,
-                value,
-                negated,
-            } => ContractExprKind::IsTruthValue {
-                expr: self.lower_expression(expr, visible)?,
-                value: *value,
-                negated: *negated,
-            },
             ExprKind::FunctionCall {
                 args,
                 distinct,
@@ -651,8 +698,17 @@ impl ScalarEmission<'_, '_> {
                         detail: format!("scalar expression carries {:?} binding", binding.kind),
                     });
                 }
-                if binding.logical_argument_count != args.len()
-                    || binding.selected.argument_types.len() != args.len()
+                let grouped = matches!(
+                    binding.selected.argument_types.as_ref(),
+                    [
+                        FunctionArgumentType::Value(_),
+                        FunctionArgumentType::CandidateGroup { .. }
+                    ]
+                );
+                let logical_count = if grouped { 2 } else { args.len() };
+                if binding.logical_argument_count != logical_count
+                    || binding.selected.argument_types.len() != logical_count
+                    || grouped && args.len() < 2
                 {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
                         detail: format!(
@@ -689,25 +745,11 @@ impl ScalarEmission<'_, '_> {
                 self.work.flush()?;
                 let captured = capture_logical_call_arguments(
                     binding,
-                    args.len(),
+                    logical_count,
                     args.iter(),
                     self.constant_policy,
                     self.control,
                 )?;
-                self.work.flush()?;
-                let mut argument_types = Vec::new();
-                argument_types
-                    .try_reserve_exact(args.len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
-                self.work.step()?;
-                self.work.flush()?;
-                for argument in binding.selected.argument_types.iter() {
-                    argument_types.push(full_source_argument(argument));
-                    self.work.step()?;
-                }
-                self.work.flush()?;
-                let argument_types = argument_types.into_boxed_slice();
-                self.work.step()?;
                 self.work.flush()?;
                 let mut lowered_args = Vec::new();
                 lowered_args
@@ -715,14 +757,48 @@ impl ScalarEmission<'_, '_> {
                     .map_err(|_| CompileControlError::ResourceExhausted)?;
                 self.work.step()?;
                 self.work.flush()?;
-                let mut channels =
-                    self.reserve_call_channels(captured.request().arguments.len())?;
-                for (ordinal, (argument, expected)) in
-                    args.iter().zip(argument_types.iter()).enumerate()
-                {
-                    let lowered = self.lower_captured_scalar_argument(
-                        argument, ordinal, &captured, visible, expected,
-                    )?;
+                let mut channels = if grouped {
+                    reserve_ordered_channels(self.work, args.len())?
+                } else {
+                    self.reserve_call_channels(args.len())?
+                };
+                for (ordinal, argument) in args.iter().enumerate() {
+                    let outer_not = ordinal == 0
+                        && crate::common::negation::is_boolean_not(&binding.function_id);
+                    let expansion = if outer_not {
+                        self.lower_control_expansion(argument, true, visible)?
+                    } else {
+                        None
+                    };
+                    let lowered = if let Some(expansion) = expansion {
+                        let channel =
+                            self.original_emission_channel(expansion.positive, ordinal, &captured)?;
+                        control_expansion = Some(expansion);
+                        channel
+                    } else if grouped && ordinal > 0 {
+                        let [
+                            _,
+                            novarocks_functions::FunctionArgument::CandidateGroup {
+                                members, ..
+                            },
+                        ] = captured.request().arguments
+                        else {
+                            return Err(ContractLoweringError::InvalidFunctionBinding {
+                                detail: "IN has no captured candidate group".into(),
+                            });
+                        };
+                        let member = members.get(ordinal - 1).ok_or(
+                            ContractLoweringError::InvalidFunctionBinding {
+                                detail: "IN has no captured candidate at its source ordinal".into(),
+                            },
+                        )?;
+                        self.lower_group_candidate(argument, member, visible)?
+                    } else {
+                        let expected = &binding.selected.argument_types[ordinal];
+                        self.lower_captured_scalar_argument(
+                            argument, ordinal, &captured, visible, expected,
+                        )?
+                    };
                     lowered_args.push(lowered.expression);
                     self.work.step()?;
                     channels.push(lowered);
@@ -796,6 +872,32 @@ impl ScalarEmission<'_, '_> {
                     },
                     args: lowered_args,
                 }
+            }
+            ExprKind::Let {
+                binding,
+                initializer,
+                body,
+            } => {
+                let (definition, ()) =
+                    self.lower_let(*binding, initializer, visible, |emission| {
+                        let body = emission.lower_expression(body, visible)?;
+                        Ok((body, ()))
+                    })?;
+                return Ok(definition);
+            }
+            ExprKind::LocalValue(binding) => {
+                let (_, definition, initializer_type) = self
+                    .local_scope
+                    .iter()
+                    .rev()
+                    .find(|(id, _, _)| id == binding)
+                    .ok_or(ContractLoweringError::InvalidFunctionBinding {
+                        detail: "local value stands outside its lexical body".into(),
+                    })?;
+                ty = initializer_type.clone();
+                ContractExprKind::Value(novarocks_expression_contract::ValueAddress::Local(
+                    *definition,
+                ))
             }
             ExprKind::LambdaFunction { params, body } => {
                 // The lambda's identity exists before its body, because every
@@ -897,6 +999,9 @@ impl ScalarEmission<'_, '_> {
             }
         }
         let emitted = self.add_scoped_expression(ty, kind)?;
+        if let Some(expansion) = control_expansion {
+            self.record_control_expansion(emitted, expansion)?;
+        }
         if let Some((captured, channels, canonical)) = captured_call {
             self.record_expression_source(
                 emitted,
@@ -1012,9 +1117,15 @@ impl ScalarEmission<'_, '_> {
         canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
+        let source_count =
+            crate::binding::scalar_source_count(captured.request()).ok_or_else(|| {
+                ContractLoweringError::InvalidFunctionBinding {
+                    detail: "recorded scalar source has an invalid request count".into(),
+                }
+            })?;
         let mut arguments = Vec::new();
         arguments
-            .try_reserve_exact(captured.request().arguments.len())
+            .try_reserve_exact(source_count)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.work.step()?;
         self.work.flush()?;
@@ -1039,7 +1150,7 @@ impl ScalarEmission<'_, '_> {
         };
         let count = args.len();
         self.work.step()?;
-        if count != channels.len() || count != captured.request().arguments.len() {
+        if count != channels.len() || count != source_count {
             return Err(ContractLoweringError::InvalidFunctionBinding {
                 detail: "recorded call channel count differs from its original emission".into(),
             });
@@ -1083,6 +1194,26 @@ impl ScalarEmission<'_, '_> {
         );
         self.work.step()?;
         Ok(())
+    }
+
+    fn lower_group_candidate(
+        &mut self,
+        expression: &TypedExpr,
+        candidate: &novarocks_functions::FunctionCandidate,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
+        let (expression, role) = match &candidate.constant {
+            Some(value) => (
+                self.lower_constant_expression(value, expression_type(expression))?,
+                SqlOperationalChannelRole::CapturedConstant,
+            ),
+            None => (
+                self.lower_expression(expression, visible)?,
+                SqlOperationalChannelRole::ValueWithoutConstant,
+            ),
+        };
+        self.work.step()?;
+        Ok(LoweredOperationalChannel { expression, role })
     }
 
     pub(super) fn lower_captured_scalar_argument(
@@ -1172,6 +1303,18 @@ impl ScalarEmission<'_, '_> {
     }
 
     pub(super) fn reserve_definition(&mut self) -> Result<ExprId, ContractLoweringError> {
+        self.check_fragment_definition_limit()?;
+        self.work.flush()?;
+        self.storage.reserve_definition_event()?;
+        self.work.flush()?;
+        let id = self.storage.unit_mut()?.reserve()?;
+        self.storage.charge_definition();
+        self.storage.record_definition(id);
+        self.work.step()?;
+        Ok(id)
+    }
+
+    fn check_fragment_definition_limit(&self) -> Result<(), ContractLoweringError> {
         let count = self.storage.fragment_definition_count();
         if count == Some(novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions) {
             return Err(novarocks_expression_contract::UnitError::Resource(
@@ -1179,15 +1322,27 @@ impl ScalarEmission<'_, '_> {
             )
             .into());
         }
-        // This scratch only remembers the original construction sequence.
-        // It does not assign a global expression ID or grant source access.
+        Ok(())
+    }
+
+    fn reserve_definition_identity(&mut self) -> Result<ExprId, ContractLoweringError> {
+        self.check_fragment_definition_limit()?;
+        self.work.flush()?;
+        let id = self.storage.unit_mut()?.reserve()?;
+        self.storage.charge_definition();
+        self.work.step()?;
+        Ok(id)
+    }
+
+    fn record_definition_event(&mut self, id: ExprId) -> Result<(), ContractLoweringError> {
+        // A Let claims its address before the body. The type event follows
+        // actual dependencies, so a late body type can update the binding.
         self.work.flush()?;
         self.storage.reserve_definition_event()?;
         self.work.flush()?;
-        let id = self.storage.unit_mut()?.reserve()?;
         self.storage.record_definition(id);
         self.work.step()?;
-        Ok(id)
+        Ok(())
     }
 
     pub(super) fn insert_definition(
@@ -1709,7 +1864,7 @@ pub(super) fn original_emission_channel(
         Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
             SqlOperationalChannelRole::Lambda
         }
-        None => {
+        Some(novarocks_functions::FunctionArgument::CandidateGroup { .. }) | None => {
             return Err(ContractLoweringError::InvalidFunctionBinding {
                 detail: "emitted call channel has no original request occurrence".into(),
             });
@@ -1726,6 +1881,13 @@ pub(super) fn reserve_call_channels(
     if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
         return Err(CompileControlError::ResourceExhausted.into());
     }
+    reserve_ordered_channels(work, count)
+}
+
+fn reserve_ordered_channels(
+    work: &mut CompileCheckpoints<'_>,
+    count: usize,
+) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
     std::alloc::Layout::array::<LoweredOperationalChannel>(count)
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     work.step()?;

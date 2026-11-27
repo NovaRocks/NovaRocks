@@ -513,11 +513,11 @@ fn add_join(
     let key = JoinKey {
         match_relation: novarocks_type_contract::JoinKeyMatch::Grouping,
         left: builder
-            .fixture_value_root(JOIN, left_type, ExprKind::Value(probe.1[0]))
+            .fixture_value_root(JOIN, left_type, ExprKind::input(probe.1[0]))
             .unwrap(),
         right: {
             let definition = builder
-                .fixture_definition(JOIN, right_type, ExprKind::Value(build.1))
+                .fixture_definition(JOIN, right_type, ExprKind::input(build.1))
                 .unwrap();
             builder
                 .fixture_occurrence(
@@ -1568,7 +1568,7 @@ fn try_aggregate_topn_typed(
     // The group key republishes the scan value itself.
     let grouped = scan[0];
     let group_key = builder
-        .fixture_value_root(AGGREGATE, ty.clone(), ExprKind::Value(grouped))
+        .fixture_value_root(AGGREGATE, ty.clone(), ExprKind::input(grouped))
         .unwrap();
     builder
         .add_row_consuming(
@@ -1585,7 +1585,7 @@ fn try_aggregate_topn_typed(
         )
         .unwrap();
     let order_key = builder
-        .fixture_value_root(TOPN, ty.clone(), ExprKind::Value(grouped))
+        .fixture_value_root(TOPN, ty.clone(), ExprKind::input(grouped))
         .unwrap();
     builder
         .add_top_n(
@@ -1790,7 +1790,7 @@ fn add_count(
         .map(|state| {
             let ty = builder.value(state).unwrap().ty.clone();
             Box::from([builder
-                .fixture_value_root(node, ty, ExprKind::Value(state))
+                .fixture_value_root(node, ty, ExprKind::input(state))
                 .unwrap()])
         })
         .unwrap_or_default();

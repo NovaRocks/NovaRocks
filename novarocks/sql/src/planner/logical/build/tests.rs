@@ -2993,7 +2993,6 @@ fn expr_references_col(e: &TypedExpr, id: ColumnId) -> bool {
         ExprKind::BinaryOp { left, right, .. } => {
             expr_references_col(left, id) || expr_references_col(right, id)
         }
-        ExprKind::UnaryOp { expr, .. } => expr_references_col(expr, id),
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             args.iter().any(|a| expr_references_col(a, id))
         }

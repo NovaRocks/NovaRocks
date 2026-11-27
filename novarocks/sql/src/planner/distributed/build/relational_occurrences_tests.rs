@@ -573,7 +573,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         .add_values(leaf, Box::from([Box::from([cell])]), Box::from([value]))
         .unwrap();
     let argument = builder
-        .add_expression(owner, list.clone(), ExprKind::Value(value))
+        .add_expression(owner, list.clone(), ExprKind::input(value))
         .unwrap();
     let parameter = builder
         .unit(owner)

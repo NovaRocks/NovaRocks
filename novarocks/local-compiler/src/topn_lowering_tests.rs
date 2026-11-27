@@ -336,7 +336,7 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
         .add_root(
             project,
             base.fragment().values()[&columns[0]].ty.clone(),
-            ExprKind::Value(columns[0]),
+            ExprKind::input(columns[0]),
             RootScope::Port(0),
             EvaluationDemand::Value,
         )
@@ -345,7 +345,7 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
         .add_root(
             project,
             base.fragment().values()[&columns[1]].ty.clone(),
-            ExprKind::Value(columns[1]),
+            ExprKind::input(columns[1]),
             RootScope::Port(0),
             EvaluationDemand::Value,
         )
@@ -368,7 +368,7 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
         .add_root(
             topn,
             base.fragment().values()[&columns[0]].ty.clone(),
-            ExprKind::Value(columns[0]),
+            ExprKind::input(columns[0]),
             RootScope::Port(0),
             EvaluationDemand::Value,
         )
@@ -449,7 +449,7 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
         .add_root(
             final_node,
             input.fragment.values()[&column].ty.clone(),
-            ExprKind::Value(column),
+            ExprKind::input(column),
             RootScope::Port(0),
             EvaluationDemand::Value,
         )
@@ -1010,7 +1010,7 @@ mod scan_split {
             .add_root(
                 PARTIAL,
                 int64(),
-                ExprKind::Value(provider[0]),
+                ExprKind::input(provider[0]),
                 RootScope::Port(0),
                 EvaluationDemand::Value,
             )
@@ -1073,7 +1073,7 @@ mod scan_split {
             .add_root(
                 FINAL,
                 int64(),
-                ExprKind::Value(received[0]),
+                ExprKind::input(received[0]),
                 RootScope::Port(0),
                 EvaluationDemand::Value,
             )
@@ -1309,11 +1309,12 @@ fn grouped_topn_refuses_invalid_phase_offset_and_empty_keys_before_construction(
         panic!("TopN")
     };
     let expr = order_by[0].expr;
-    let ExprKind::Value(value) = package
+    let Some(value) = package
         .fragment()
         .root_expression(NodeId::new(0), expr)
         .unwrap()
         .kind
+        .input_value()
     else {
         panic!("direct key")
     };
@@ -1410,7 +1411,7 @@ fn grouped_topn_rejects_a_key_outside_the_partition_domain() {
         .fragment()
         .root_expression(NodeId::new(0), expr)
         .unwrap();
-    let ExprKind::Value(value) = definition.kind else {
+    let Some(value) = definition.kind.input_value() else {
         unreachable!()
     };
     let comparator = novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1;

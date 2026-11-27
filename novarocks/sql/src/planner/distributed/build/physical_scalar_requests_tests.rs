@@ -97,7 +97,7 @@ fn node(id: u32, ty: FunctionValueType, kind: ExprKind) -> ExprNode {
     }
 }
 fn value(id: u32, ty: FunctionValueType) -> ExprNode {
-    node(id, ty, ExprKind::Value(ValueId::new(id)))
+    node(id, ty, ExprKind::input(ValueId::new(id)))
 }
 // These are direct-component fixtures, not SQL journal receipts or sealed
 // units. Each invocation still borrows its source and argument definitions
@@ -316,8 +316,8 @@ fn scalar_requests_actual_lower_coalesce_if_preserve_order_repetition_sparse_ids
     // identities remain distinct from those local definition addresses.
     let expressions = vec![
         value(0, text.clone()),
-        node(1, text.clone(), ExprKind::Value(ValueId::new(u32::MAX))),
-        node(2, boolean.clone(), ExprKind::Value(ValueId::new(7))),
+        node(1, text.clone(), ExprKind::input(ValueId::new(u32::MAX))),
+        node(2, boolean.clone(), ExprKind::input(ValueId::new(7))),
     ];
     for (name, types, ids, control_intrinsic) in [
         ("lower", vec![text.clone()], vec![1], false),
@@ -333,8 +333,10 @@ fn scalar_requests_actual_lower_coalesce_if_preserve_order_repetition_sparse_ids
         let pools = ConstantPools::empty();
         let fixture = RequestFixture::new(&expressions, source);
         let source = fixture.source();
-        assert!(matches!(fixture.argument(ExprId::new(1)).kind,
-            ExprKind::Value(id) if id == ValueId::new(u32::MAX)));
+        assert_eq!(
+            fixture.argument(ExprId::new(1)).kind.input_value(),
+            Some(ValueId::new(u32::MAX))
+        );
         let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
         let ExprKind::FunctionCall { function, .. } = &source.kind else {
             unreachable!()
@@ -482,7 +484,7 @@ fn scalar_requests_keep_actual_nullable_covariance_separate_from_selected_owner_
     let expressions = vec![node(
         0,
         actual.clone(),
-        ExprKind::Value(ValueId::new(u32::MAX)),
+        ExprKind::input(ValueId::new(u32::MAX)),
     )];
     let source = call(
         binding(&catalog, "lower", std::slice::from_ref(&selected)),
@@ -651,7 +653,7 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
     let expressions = vec![value(0, text.clone())];
     let ordinary = SourceDefinition {
         ty: text.clone(),
-        kind: ExprKind::Value(ValueId::new(17)),
+        kind: ExprKind::input(ValueId::new(17)),
     };
     let ordinary_fixture = RequestFixture::new(&expressions, ordinary.clone());
     assert!(matches!(

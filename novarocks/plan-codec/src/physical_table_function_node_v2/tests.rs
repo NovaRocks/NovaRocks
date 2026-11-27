@@ -323,7 +323,7 @@ impl Fixture {
                     id: ExprId::new(id),
                     lambda_scope: None,
                     ty: value.clone(),
-                    kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+                    kind: novarocks_expression_contract::ExprKind::input(p::ValueId::new(0)),
                 }),
             &values,
             &Control::default(),

@@ -233,7 +233,7 @@ fn fixture(
     let mut output = Vec::new();
     for (index, source) in initial_values.iter().enumerate() {
         let expression = builder
-            .fixture_value_root(duplicate, items[index].1.clone(), ExprKind::Value(*source))
+            .fixture_value_root(duplicate, items[index].1.clone(), ExprKind::input(*source))
             .unwrap();
         let value = builder
             .add_value(
@@ -361,7 +361,7 @@ fn fixture(
         let node = NodeId::new(7);
         let source = repeat_output[0];
         let ty = FunctionValueType::new(DataType::Int64, true);
-        let values = add_projection(&mut builder, node, repeat, &[(ExprKind::Value(source), ty)]);
+        let values = add_projection(&mut builder, node, repeat, &[(ExprKind::input(source), ty)]);
         (node, values, Some(node))
     } else {
         (repeat, repeat_output, None)
