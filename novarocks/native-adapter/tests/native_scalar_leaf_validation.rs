@@ -135,8 +135,10 @@ fn no_allocation<T>(operation: impl FnOnce() -> T) -> T {
     result
 }
 
+const FIXTURE_TIMEZONE_BYTES: usize = 1024;
+
 fn fixture(wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
-    fixture_with_timezone_bytes(novarocks_type_contract::wrong_last_byte)
+    fixture_with_timezone_bytes(FIXTURE_TIMEZONE_BYTES, wrong_last_byte)
 }
 fn fixture_with_timezone_bytes(bytes: usize, wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
     let zone = "z".repeat(bytes);
@@ -410,7 +412,7 @@ fn empty_schema_witness_emits_neither_value_nor_absent_record() {
         let turn = no_allocation(|| owned.cursor.step(output).unwrap());
         assert_eq!(untouched, [0xa5; 32]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-        assert_eq!(turn.examined_bytes, 6 * 1024);
+        assert_eq!(turn.examined_bytes, 6 * FIXTURE_TIMEZONE_BYTES);
         assert!(turn.visited_cells <= 1024);
         assert_eq!(
             turn.status,
