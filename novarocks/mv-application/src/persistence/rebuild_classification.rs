@@ -50,6 +50,7 @@ pub enum ReplacementEvidence<E> {
 pub enum RefreshBindingClassification<E> {
     Unchanged,
     NeedsRebuild(Marker),
+    NeedsRebuildWithoutMarker,
     InvalidDefinition { marker: Marker, cause: Option<E> },
     IncompatibleStorage { marker: Marker, cause: E },
     Blocked,
@@ -80,11 +81,12 @@ pub fn classify_refresh_observation<E: std::fmt::Display>(
         return Err(cause);
     }
     let scope = match publication {
-        PublicationEvidence::Current(id) => MarkerScope::Publication(id.clone()),
-        PublicationEvidence::Unpublished(revision) => MarkerScope::UnpublishedBinding(*revision),
-        PublicationEvidence::Retired(_)
-        | PublicationEvidence::Unattributed
-        | PublicationEvidence::Unknown => {
+        PublicationEvidence::Current(id) => Some(MarkerScope::Publication(id.clone())),
+        PublicationEvidence::Unpublished(revision) => {
+            Some(MarkerScope::UnpublishedBinding(*revision))
+        }
+        PublicationEvidence::Unattributed => None,
+        PublicationEvidence::Retired(_) | PublicationEvidence::Unknown => {
             return Ok(RefreshBindingClassification::Blocked);
         }
     };
@@ -98,6 +100,9 @@ pub fn classify_refresh_observation<E: std::fmt::Display>(
     let replacement = match replacement {
         Ok(value) => value,
         Err(DefinitionAnalysisFailure::Deterministic(cause)) => {
+            let Some(scope) = scope else {
+                return Err(cause);
+            };
             let marker = Marker::InvalidDefinition {
                 scope,
                 kind: InvalidDefinitionKind::Resolution,
@@ -116,6 +121,9 @@ pub fn classify_refresh_observation<E: std::fmt::Display>(
         | ReplacementEvidence::IncompatibleStorage { binding: value, .. } => *value,
     };
     if observed.binding.outputs != binding.outputs {
+        let Some(scope) = scope else {
+            return Ok(RefreshBindingClassification::Blocked);
+        };
         let marker = Marker::InvalidDefinition {
             scope,
             kind: InvalidDefinitionKind::OutputDeclaration,
@@ -138,6 +146,9 @@ pub fn classify_refresh_observation<E: std::fmt::Display>(
             cause,
             ..
         } => {
+            let Some(scope) = scope else {
+                return Err(cause);
+            };
             let marker = Marker::NeedsRebuild {
                 scope,
                 changes: vec![BindingChange {
@@ -194,10 +205,12 @@ pub fn classify_refresh_observation<E: std::fmt::Display>(
     }
     if changes.is_empty() {
         Ok(RefreshBindingClassification::Unchanged)
-    } else {
+    } else if let Some(scope) = scope {
         Ok(RefreshBindingClassification::NeedsRebuild(
             Marker::NeedsRebuild { scope, changes },
         ))
+    } else {
+        Ok(RefreshBindingClassification::NeedsRebuildWithoutMarker)
     }
 }
 

@@ -124,3 +124,31 @@ fn recovery_at_identical_facts_requires_an_active_marker_in_that_generation() {
         RefreshBindingClassification::Unchanged
     );
 }
+
+#[test]
+fn unattributed_current_accepts_compatible_binding_without_inventing_a_marker_scope() {
+    let stored = evidence();
+    let mut rebound = stored;
+    rebound.binding.dependencies = facts(6);
+    let mut changed_output = stored;
+    changed_output.binding.outputs = facts(7);
+    for (observed, classification) in [
+        (stored, RefreshBindingClassification::Unchanged),
+        (
+            rebound,
+            RefreshBindingClassification::NeedsRebuildWithoutMarker,
+        ),
+        (changed_output, RefreshBindingClassification::Blocked),
+    ] {
+        assert_eq!(
+            classify_refresh_binding::<String>(
+                stored,
+                Ok(observed),
+                PublicationEvidence::Unattributed,
+                &[],
+            )
+            .unwrap(),
+            classification,
+        );
+    }
+}

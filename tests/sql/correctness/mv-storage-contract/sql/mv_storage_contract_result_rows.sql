@@ -26,7 +26,7 @@ WITH (format_version = 3, partitioning = ARRAY['k']);
 INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact
 SELECT 'excluded', -id, to_hex(sha256(to_utf8(CAST(id AS VARCHAR))))
 FROM TABLE(sequence(1, 4096)) AS cold(id);
-INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('east', 10), ROW('west', 20);
+INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('east', 10), ROW('west', 20), ROW('discard', -4097);
 
 -- query 5
 -- @skip_result_check=true
@@ -46,7 +46,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW rows_mv;
 -- The MV delta deletes one logical row. SHOW and P must report the one
 -- visible row for either legal file layout. Spark checks the actual files below.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=2,slot-changes=0,logical-rows=1,full-refreshes=1
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=2,slot-changes=0,logical-rows=1,full-refreshes=1,table-commits=4
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 9
@@ -62,6 +62,8 @@ SELECT k, v FROM rows_mv ORDER BY k;
 -- query 11
 -- @skip_result_check=true
 INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('north', 30);
+-- Keep a signed window without changing the visible append.
+DELETE FROM mvrows_${uuid0}.ns_${uuid0}.fact WHERE k = 'discard';
 
 -- query 12
 -- @result_contains=MV refresh: ContentLocate
@@ -70,7 +72,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW rows_mv;
 -- query 13
 -- This refresh accepts one new row, while the complete target contains two.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2,full-refreshes=1
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2,full-refreshes=1,table-commits=6
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 14
@@ -87,7 +89,7 @@ SELECT k, v FROM rows_mv ORDER BY k;
 -- An unchanged source produces a metadata-only publication. Its zero accepted
 -- rows must preserve the complete target's logical row count and physical files.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,metadata-only-last=true,full-refreshes=1
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,metadata-only-last=true,full-refreshes=1,table-commits=7
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 17
@@ -111,7 +113,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW rows_mv;
 -- query 21
 -- Deleting both remaining rows accepts two changes, but leaves zero target rows.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0,full-refreshes=1
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0,full-refreshes=1,table-commits=9
 REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 22

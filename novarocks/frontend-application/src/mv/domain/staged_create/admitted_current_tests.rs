@@ -1083,15 +1083,17 @@ async fn metadata_only_current_renewal_installs_fresh_generation_in_the_same_rep
     current_with_driver(
         &cpu.control,
         &mut cpu.driver,
-        super::install_metadata_only_current_projection_async_in(
-            &fixture.entrance,
-            &view,
-            &fixture.resolver,
+        super::renew_admitted_current_projection_async_in(
+            super::CurrentProjectionServices {
+                entrance: &fixture.entrance,
+                readiness: &view,
+                connector_control: &fixture.resolver,
+                metadata_cpu: &cpu.factory,
+                registration: &registration,
+            },
             fixture.catalog.clone(),
-            Arc::new(before.projection.facts.clone()),
+            super::CurrentRenewal::MetadataOnly(Arc::new(before.projection.facts.clone())),
             context(),
-            &cpu.factory,
-            &registration,
         ),
     )
     .await
@@ -1184,15 +1186,17 @@ async fn metadata_only_current_renewal_refuses_a_changed_carrier_on_its_actual_r
     let error = current_with_driver(
         &cpu.control,
         &mut cpu.driver,
-        super::install_metadata_only_current_projection_async_in(
-            &fixture.entrance,
-            &view,
-            &fixture.resolver,
+        super::renew_admitted_current_projection_async_in(
+            super::CurrentProjectionServices {
+                entrance: &fixture.entrance,
+                readiness: &view,
+                connector_control: &fixture.resolver,
+                metadata_cpu: &cpu.factory,
+                registration: &registration,
+            },
             fixture.catalog.clone(),
-            Arc::new(before.projection.facts.clone()),
+            super::CurrentRenewal::MetadataOnly(Arc::new(before.projection.facts.clone())),
             context(),
-            &cpu.factory,
-            &registration,
         ),
     )
     .await

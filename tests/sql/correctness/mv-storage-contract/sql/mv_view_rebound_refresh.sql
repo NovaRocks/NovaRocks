@@ -81,7 +81,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 16
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=7,full-refreshes=3,full-refresh-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,table-commits=6,full-refreshes=3,full-refresh-last=true,logical-rows=3,binding-changes=1,source=replacement,markers=clear
 REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 17

@@ -8,7 +8,7 @@
 -- @tags=mv,iceberg,rest,minio,storage-contract
 -- FULL publishes consecutive delete/append snapshots in one REST commit.
 -- Hide the response and readback for the original query. The next refresh
--- observes the landed publication under the same owner and has no new work.
+-- observes the landed publication under the same owner and advances only P.
 
 -- query 1
 -- @skip_result_check=true
@@ -72,7 +72,7 @@ REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 12
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0,table-commits=3,full-refreshes=2,full-refresh-last=true,logical-rows=5,total-records=5,source=fact
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,slot-changes=0,table-commits=4,full-refreshes=2,metadata-only-last=true,logical-rows=5,total-records=5,source=fact
 -- @result_rows_where=Property=UnsettledEffects
 -- @result_rows_count=1
 -- @result_rows_expect=Value=0

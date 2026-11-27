@@ -87,7 +87,8 @@ async fn explain_original_inner(
     };
     use crate::mv::domain::refresh::rewrite_context::RefreshRewriteInputs;
     use novarocks_mv_application::persistence::{
-        codec::Marker,
+        codec::{Marker, PublicationEvidence},
+        keyed_documents::{MvKeyedDocumentProjection, StoredKeyedMvProjection},
         rebuild_classification::{
             RebuildEvidence, RefreshBindingClassification, classify_refresh_observation,
         },
@@ -131,6 +132,7 @@ async fn explain_original_inner(
             .clone(),
         incarnation: binding.planning_pin().binding().incarnation(),
     };
+    let unattributed_full = current.requires_unattributed_full_refresh();
     let full = match &input.session_properties {
         Some(properties) => novarocks_mv_application::session_properties::manual_refresh_is_full(
             properties,
@@ -138,7 +140,7 @@ async fn explain_original_inner(
             input.statement.is_full(),
         )?,
         None => input.statement.is_full(),
-    };
+    } || unattributed_full;
     let eligibility = current.eligibility();
     if eligibility.explicit_rebuild_required || (full && eligibility.strict_recovery_required) {
         return Ok(vec!["MV refresh: ExplicitRebuildRequired".into()]);
@@ -165,12 +167,20 @@ async fn explain_original_inner(
         };
         return Ok(lines);
     }
-    // A strict replay may start from an unattributed Current after physical
-    // maintenance. Its proof owns the historical P check. Only ordinary
-    // planning requires the ready projection to describe Current's P.
-    if current.publication_revision != projection.facts.source_revision().publication_revision {
-        return Err("EXPLAIN REFRESH observed a different MV generation".into());
-    }
+    // Strict replay owns its historical P check. An unattributed full refresh
+    // uses the exact observed target with no previous publication. EXPLAIN
+    // keeps this projection local to the statement.
+    let projection = if unattributed_full {
+        StoredKeyedMvProjection {
+            mv_id: projection.mv_id,
+            facts: MvKeyedDocumentProjection::try_from_current(current.clone())?,
+        }
+    } else {
+        if current.publication_revision != projection.facts.source_revision().publication_revision {
+            return Err("EXPLAIN REFRESH observed a different MV generation".into());
+        }
+        projection
+    };
     let can_incrementally_refresh =
         eligibility.automatic_refresh && !eligibility.automatic_reuse_blocked;
     let analyzed =
@@ -179,19 +189,29 @@ async fn explain_original_inner(
         .decoded_markers()
         .map_err(|error| error.to_string())?;
     let root = current.root_binding_revision();
+    let scope = current.publication_evidence(&root);
+    if matches!(scope, PublicationEvidence::Unattributed) && !unattributed_full {
+        return Err("EXPLAIN REFRESH has no reusable MV generation".into());
+    }
     match classify_refresh_observation(
         RebuildEvidence::from(&current.versions),
         analyzed
             .as_ref()
             .map(RefreshBindingObservation::evidence)
             .map_err(definition_analysis_failure),
-        current.publication_evidence(&root),
+        scope,
         &markers,
     )? {
         RefreshBindingClassification::Unchanged => {}
         RefreshBindingClassification::NeedsRebuild(_) => {
             return Ok(vec![
                 "MV refresh: NeedsRebuild".into(),
+                "Data write: full overwrite with the newly analyzed sources".into(),
+            ]);
+        }
+        RefreshBindingClassification::NeedsRebuildWithoutMarker => {
+            return Ok(vec![
+                "MV refresh: FullReplace".into(),
                 "Data write: full overwrite with the newly analyzed sources".into(),
             ]);
         }

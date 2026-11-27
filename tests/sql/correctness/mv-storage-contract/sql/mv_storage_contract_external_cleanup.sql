@@ -86,7 +86,7 @@ printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_CLEANUP_OK
 -- The retained P's old dependencies are still in current properties; no old
 -- metadata log or document sidecar is needed. Counts remain cumulative at REST.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=1,slot-changes=0,table-commits=5
+-- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=1,slot-changes=0,table-commits=4
 -- @result_rows_where=name=cleanup_mv
 -- @result_rows_count=1
 -- @result_rows_expect=manageability=MANAGEABLE
@@ -94,20 +94,22 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcl
 
 -- query 8
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=2,slot-changes=0,table-commits=6
+-- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=2,slot-changes=0,table-commits=5
 REFRESH MATERIALIZED VIEW cleanup_mv;
 
 -- query 9
 SELECT k, v FROM cleanup_mv ORDER BY k;
 
 -- query 10
--- This second MV is disposable after an external data rewrite. The action
+-- The second MV will have no current P after an external data rewrite. The action
 -- must replace at least one file and advance main.
 -- @skip_result_check=true
 CREATE MATERIALIZED VIEW rewrite_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
 REFRESH MATERIALIZED VIEW rewrite_mv;
 INSERT INTO fact VALUES ROW('north', 30);
+SET SESSION "mvclean_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW rewrite_mv;
+RESET SESSION "mvclean_${uuid0}".incremental_refresh_enabled;
 
 -- query 11
 -- @result_contains=MV_EXTERNAL_REWRITE_NO_RECORD
@@ -134,10 +136,18 @@ test "$spark_status" -eq 0
 printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_REWRITE_NO_RECORD
 
 -- query 12
--- @expect_error=external
-REFRESH MATERIALIZED VIEW rewrite_mv;
+-- @result_contains=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 13
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.rewrite_mv,publications=3,slot-changes=0,full-refreshes=3,full-refresh-last=true,logical-rows=3,total-records=3,source=fact
+REFRESH MATERIALIZED VIEW rewrite_mv;
+
+-- query 14
+SELECT k, v FROM rewrite_mv ORDER BY k, v;
+
+-- query 15
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvclean_${uuid0}.ns_${uuid0};

@@ -393,6 +393,19 @@ impl MvKeyedObservedCurrentDocuments {
         marker_eligibility(self.applicable_publication.evidence(), self.markers())
     }
 
+    pub fn requires_unattributed_full_refresh(&self) -> bool {
+        if self.interpretation.is_aggregate()
+            || !matches!(
+                self.applicable_publication(),
+                ApplicablePublication::Unattributed
+            )
+        {
+            return false;
+        }
+        let eligibility = self.eligibility();
+        eligibility.automatic_refresh && !eligibility.strict_recovery_required
+    }
+
     pub fn servable_publication(&self) -> Option<&KeyedPublicationDocument> {
         if self.eligibility().rewrite_serving {
             self.publication.as_ref()

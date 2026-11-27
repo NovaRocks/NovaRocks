@@ -351,8 +351,8 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .check_active()
         .map_err(RefreshError::from)?;
     // A fresh Current can renew an open management entrance after metadata
-    // maintenance or when a non-aggregate publication landed. Other snapshot
-    // changes may only install a read-only candidate.
+    // maintenance, a landed non-aggregate publication, or an unattributed
+    // content snapshot that has no unresolved verification obligation.
     let (closed, observed_current) =
         reobserve_current_management_before_refresh(io, source, &iceberg_target, connector_context)
             .await?;
@@ -390,6 +390,9 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             ));
         }
     }
+    let unattributed_full = observed_current
+        .as_ref()
+        .is_some_and(|current| current.requires_unattributed_full_refresh());
     let explicit_rebuild = stmt.is_explicit_rebuild();
     if !explicit_rebuild
         && observed_current.as_ref().is_some_and(|current| {
@@ -467,7 +470,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             ))
         })?,
         None => stmt.is_full(),
-    };
+    } || unattributed_full;
     let full_statement = (full_sources || full_overwrite).then(|| {
         let mut full = stmt.clone();
         if !full.is_explicit_rebuild() {
@@ -739,7 +742,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         )));
     }
     use novarocks_mv_application::persistence::{
-        codec::{Marker, marker_eligibility},
+        codec::{Marker, PublicationEvidence, marker_eligibility},
         rebuild_classification::{RefreshBindingClassification, classify_refresh_observation},
     };
     let analyzed = prepare_refresh_binding_candidate(
@@ -756,6 +759,11 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         .map_err(|error| RefreshError::user(error.to_string()))?;
     let root = observed_current.root_binding_revision();
     let scope = observed_current.publication_evidence(&root);
+    if matches!(scope, PublicationEvidence::Unattributed) && !unattributed_full {
+        return Err(RefreshError::user(
+            "The materialized-view binding has no reusable current generation",
+        ));
+    }
     let eligibility = marker_eligibility(scope, &markers);
     if eligibility.strict_recovery_required && stmt.is_full() {
         return Err(RefreshError::user(
@@ -774,7 +782,12 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         scope,
         &markers,
     )?;
-    let rebuild = match classified {
+    let needs_rebuild = matches!(
+        classified,
+        RefreshBindingClassification::NeedsRebuild(_)
+            | RefreshBindingClassification::NeedsRebuildWithoutMarker
+    );
+    let rebuild_marker = match classified {
         RefreshBindingClassification::Blocked => {
             return Err(RefreshError::user(
                 "The materialized-view binding has no reusable current generation",
@@ -818,7 +831,8 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             .await?;
             return Err(cause);
         }
-        RefreshBindingClassification::Unchanged => None,
+        RefreshBindingClassification::Unchanged
+        | RefreshBindingClassification::NeedsRebuildWithoutMarker => None,
     };
     let RefreshBindingObservation::Complete(candidate) = analyzed? else {
         return Err(RefreshError::user(
@@ -826,27 +840,30 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         ));
     };
     let candidate = *candidate;
-    if let Some(marker) = rebuild {
-        for (key, existing) in markers {
-            if existing.scope() == marker.scope() {
-                clear.insert(key);
+    if needs_rebuild {
+        let writes_marker = rebuild_marker.is_some();
+        if let Some(marker) = rebuild_marker {
+            for (key, existing) in markers {
+                if existing.scope() == marker.scope() {
+                    clear.insert(key);
+                }
             }
+            clear.insert(
+                marker
+                    .encode()
+                    .map_err(|error| RefreshError::user(error.to_string()))?
+                    .0,
+            );
+            io.write_binding_marker(
+                source,
+                target_binding.planning_pin(),
+                observed_current.clone(),
+                &mv_definition.facts,
+                marker,
+                connector_context.clone(),
+            )
+            .await?;
         }
-        clear.insert(
-            marker
-                .encode()
-                .map_err(|error| RefreshError::user(error.to_string()))?
-                .0,
-        );
-        io.write_binding_marker(
-            source,
-            target_binding.planning_pin(),
-            observed_current.clone(),
-            &mv_definition.facts,
-            marker,
-            connector_context.clone(),
-        )
-        .await?;
         io.capture_refresh_sources(
             source,
             &candidate.observed.document,
@@ -873,29 +890,34 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             previous_sources, ..
         } = &mut baseline;
         previous_sources.clear();
-        let documents = target_binding
-            .planning_pin()
-            .derive_document_storage_lease()?;
-        let after_marker = io
-            .observe_current(
-                source,
-                &documents,
-                crate::mv::domain::staged_create::keyed_request(
+        let rebuild_current = if writes_marker {
+            let documents = target_binding
+                .planning_pin()
+                .derive_document_storage_lease()?;
+            let after_marker = io
+                .observe_current(
+                    source,
                     &documents,
-                    observed_current.view.table.clone(),
-                    observed_current.view.object_id.clone(),
-                    connector_context.clone(),
-                ),
-            )
-            .await?;
-        if after_marker.eligibility().strict_recovery_required
-            || after_marker.eligibility().explicit_rebuild_required
-            || after_marker.view.current_snapshot != observed_current.view.current_snapshot
-        {
-            return Err(RefreshError::user(
-                "MV rebuild observation changed after the binding marker",
-            ));
-        }
+                    crate::mv::domain::staged_create::keyed_request(
+                        &documents,
+                        observed_current.view.table.clone(),
+                        observed_current.view.object_id.clone(),
+                        connector_context.clone(),
+                    ),
+                )
+                .await?;
+            if after_marker.eligibility().strict_recovery_required
+                || after_marker.eligibility().explicit_rebuild_required
+                || after_marker.view.current_snapshot != observed_current.view.current_snapshot
+            {
+                return Err(RefreshError::user(
+                    "MV rebuild observation changed after the binding marker",
+                ));
+            }
+            after_marker
+        } else {
+            observed_current
+        };
         return Ok(PlannedRequestedRefresh {
             plan: build_iceberg_refresh_plan(
                 &mv_definition,
@@ -917,7 +939,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             explicit_recovery: None,
             can_incrementally_refresh: false,
             replay: None,
-            original_current: after_marker,
+            original_current: rebuild_current,
             rebuild: Some(RefreshRebuildBinding {
                 candidate,
                 markers_remove: clear,
@@ -2270,18 +2292,18 @@ async fn reobserve_current_management_before_refresh(
         } else if schema.exact_schema().metadata_version == observed.view.metadata_version
             && !expected.interpretation().is_aggregate()
             && !observed.interpretation.is_aggregate()
-            && matches!(
-                observed.applicable_publication(),
-                ApplicablePublication::Bound(_)
-            )
-            && observed.eligibility().rewrite_serving
+            && (observed.requires_unattributed_full_refresh()
+                || (matches!(
+                    observed.applicable_publication(),
+                    ApplicablePublication::Bound(_)
+                ) && observed.eligibility().rewrite_serving
+                    && observed.publication_revision != previous.publication_revision))
             && observed.view.table == previous.target
             && observed.view.object_id == previous.target_object_id
             && observed.deployment_owner == previous.deployment_owner
             && observed.process_incarnation == previous.process_incarnation
-            && observed.publication_revision != previous.publication_revision
         {
-            Some(CurrentRenewal::PublishedContent {
+            Some(CurrentRenewal::ExactContent {
                 target: expected.target(),
                 expected: Box::new(observed.view.clone()),
                 previous: expected.management_dependencies(documents.control_runtime_id()),

@@ -380,7 +380,7 @@ pub(crate) enum CurrentRenewal {
     MetadataOnly(
         Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
     ),
-    PublishedContent {
+    ExactContent {
         target: novarocks_mv_application::product::MvTarget,
         expected: Box<KeyedDocumentView>,
         previous: ManagementDependencySet,
@@ -398,14 +398,11 @@ pub(crate) async fn renew_admitted_current_projection_async_in(
             expected.target(),
             MvConvergence::MetadataOnlyCurrent { expected },
         ),
-        CurrentRenewal::PublishedContent {
+        CurrentRenewal::ExactContent {
             target,
             expected,
             previous,
-        } => (
-            target,
-            MvConvergence::PublishedContent { expected, previous },
-        ),
+        } => (target, MvConvergence::ExactContent { expected, previous }),
     };
     install_current_projection_async_in(
         services,
@@ -503,8 +500,8 @@ enum MvConvergence {
             novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
         >,
     },
-    /// Same-owner content Current advanced while this entrance stayed open.
-    PublishedContent {
+    /// Same-owner content Current changed while this entrance stayed open.
+    ExactContent {
         expected: Box<KeyedDocumentView>,
         previous: ManagementDependencySet,
     },
@@ -1438,7 +1435,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
-            MvConvergence::PublishedContent { expected, previous } => {
+            MvConvergence::ExactContent { expected, previous } => {
                 let (observed, admission, _) = self
                     .entrance
                     .observe_exact_keyed_admission_async(
@@ -1675,9 +1672,9 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
-            MvConvergence::PublishedContent { .. } => {
+            MvConvergence::ExactContent { .. } => {
                 return Err(conflict(
-                    "Published content renewal requires the original async observation".into(),
+                    "Exact content renewal requires the original async observation".into(),
                 ));
             }
             MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
