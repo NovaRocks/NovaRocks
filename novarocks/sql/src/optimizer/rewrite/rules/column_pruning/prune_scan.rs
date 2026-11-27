@@ -50,7 +50,7 @@ fn collect_scalar_column_ids(
             out.insert(*column_id);
         }
         ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -411,14 +411,11 @@ mod tests {
             ))),
             novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         );
-        let pred = arena.intern(
-            ScalarNode::BinaryOp {
-                op: crate::analysis::BinOp::Gt,
-                left: col_b,
-                right: zero,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        let pred = arena.test_intern_operator(
+            crate::analysis::BinOp::Gt,
+            col_b,
+            zero,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         scan.predicates.push(pred);
 

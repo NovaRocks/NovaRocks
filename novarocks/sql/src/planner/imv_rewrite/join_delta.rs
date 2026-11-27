@@ -1838,7 +1838,6 @@ mod tests {
             )
             .expect("installed DOUBLE equality");
         let condition = crate::common::binary_operator::typed_call(
-            operator,
             crate::binding::SqlFunctionBinding::from_plan(
                 crate::planner::BINDING_AUTHORITY,
                 binding,
@@ -2374,25 +2373,12 @@ mod tests {
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col_expr(
-                            left_key.column_id.0,
-                            &left_key.name,
-                        )),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(col_expr(
-                            right_key.column_id.0,
-                            &right_key.name,
-                        )),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
+                condition: Some(crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    col_expr(left_key.column_id.0, &left_key.name),
+                    col_expr(right_key.column_id.0, &right_key.name),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )),
             }),
             vec![left, right],
             None,
@@ -2652,33 +2638,20 @@ mod tests {
     }
 
     fn condition() -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_expr(1, "left_k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_expr(10, "right_k")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_expr(1, "left_k"),
+            col_expr(10, "right_k"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn assert_condition_refs(condition: Option<&TypedExpr>) {
-        let Some(TypedExpr {
-            kind:
-                ExprKind::BinaryOp {
-                    left,
-                    op,
-                    right,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-            ..
-        }) = condition
+        let Some((BinOp::Eq, [left, right])) =
+            condition.and_then(crate::common::binary_operator::typed_comparison)
         else {
-            panic!("expected binary join condition");
+            panic!("expected selected equality in the join condition");
         };
-        assert_eq!(*op, BinOp::Eq);
         assert!(matches!(
             &left.kind,
             ExprKind::ColumnRef { column_id, column, .. }

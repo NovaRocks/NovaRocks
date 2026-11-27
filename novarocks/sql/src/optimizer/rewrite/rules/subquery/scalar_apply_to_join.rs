@@ -40,7 +40,7 @@ use arrow::datatypes::DataType;
 use super::scalar_utils;
 use crate::column_id::ColumnId;
 use crate::common::ApplyKind;
-use crate::common::{BinOp, JoinKind, OutputColumn};
+use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::operator::{
     AggregateOutputLayout, ApplyOp, AssertOneRowOp, LogicalAggregateOp, Operator, ProjectOp,
     ScalarProjectItem,
@@ -379,24 +379,20 @@ fn apply_opt(
         &ctx.control_view(),
     )?;
     let one = scalar_utils::int_literal(arena, 1, &ctx.control_view())?;
-    let cnt_le_1 = scalar_utils::binary_op(
+    let cnt_le_1 = crate::optimizer::scalar::intern_scalar_operator(
+        ctx.function_catalog(),
         arena,
-        BinOp::Le,
-        cnt_ref,
-        one,
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::OperatorFunction::LessThanOrEqual,
+        [cnt_ref, one],
+        ctx.decimal_overflow_policy(),
         &ctx.control_view(),
     )?;
-    let assert_cond = scalar_utils::binary_op(
+    let assert_cond = crate::optimizer::scalar_expr::combine_disjuncts(
         arena,
-        BinOp::Or,
-        cnt_is_null,
-        cnt_le_1,
-        DataType::Boolean,
-        false,
+        vec![cnt_is_null, cnt_le_1],
         &ctx.control_view(),
-    )?;
+    )?
+    .expect("row-count assertion has two disjuncts");
     let assert_expr = scalar_utils::assert_true(
         ctx.function_catalog(),
         arena,
@@ -612,15 +608,12 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn ctx_with_factory() -> RewriteContext<'static> {
@@ -1252,8 +1245,8 @@ mod tests {
 
         // First arg: cnt IS NULL OR cnt <= 1
         let cond_arg = &args[0];
-        let ExprKind::BinaryOp {
-            op: BinOp::Or,
+        let ExprKind::BooleanConnective {
+            op: crate::common::BooleanOp::Or,
             left: left_or,
             right: right_or,
             ..
@@ -1283,14 +1276,13 @@ mod tests {
         );
 
         // Right: cnt <= 1
-        let ExprKind::BinaryOp {
-            op: BinOp::Le,
-            left: le_left,
-            right: le_right,
-            ..
-        } = &right_or.kind
+        let Some((novarocks_type_contract::OperatorFunction::LessThanOrEqual, [le_left, le_right])) =
+            crate::common::binary_operator::typed_operands(right_or)
         else {
-            panic!("right OR branch must be <=; got: {:?}", right_or.kind);
+            panic!(
+                "right OR branch must use the installed <= binding; got: {:?}",
+                right_or.kind
+            );
         };
         let ExprKind::ColumnRef {
             column_id: le_id, ..

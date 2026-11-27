@@ -104,19 +104,18 @@ fn column_scalar(memo: &mut Memo, output: &OutputColumn) -> ScalarId {
         .unwrap()
 }
 
-fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
-    memo.scalars
-        .intern_observed(
-            ScalarNode::BinaryOp {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(DataType::Boolean, true),
-            &Control::default(),
-        )
-        .unwrap()
+fn binary(
+    memo: &mut Memo,
+    op: impl Into<crate::common::binary_operator::TestOperator>,
+    left: ScalarId,
+    right: ScalarId,
+) -> ScalarId {
+    memo.scalars.test_intern_operator(
+        op,
+        left,
+        right,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 fn range_stat(ndv: Option<f64>) -> ColumnStatistic {
@@ -471,7 +470,7 @@ fn publication_fixture() -> (Memo, GroupId) {
     let eq = binary(&mut memo, BinOp::Eq, lhs, rhs);
     let mut predicate = eq;
     for _ in 1..320 {
-        predicate = binary(&mut memo, BinOp::And, predicate, eq);
+        predicate = binary(&mut memo, crate::common::BooleanOp::And, predicate, eq);
     }
     let source = child(&mut memo, output, 1000.0, Some(5.0));
     let expr = filter(&mut memo, predicate, source, false);

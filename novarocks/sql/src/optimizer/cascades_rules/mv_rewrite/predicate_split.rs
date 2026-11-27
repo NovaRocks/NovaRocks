@@ -468,16 +468,17 @@ mod tests {
         }
     }
 
-    fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+    fn bin(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     /// The single base column `a` used by every single-column case below.

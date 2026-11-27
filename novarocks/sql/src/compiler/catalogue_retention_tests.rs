@@ -471,7 +471,6 @@ fn catalogue_analyze_captures_once_before_bindings_and_retains_that_exact_owner(
         &SessionOptimizerSettings::default(),
         crate::planning::dml::statistics_final_context_for_test(),
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        false,
         crate::constant::test_constant_policy(),
         &SqlCompileControl::unbounded(),
     )

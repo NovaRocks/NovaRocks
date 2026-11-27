@@ -88,13 +88,17 @@ fn source() -> wire::SemanticParameters {
                 }),
             ),
             entry(0, TimeZone("Asia/Shanghai".into())),
-            entry(2, AllowThrowException(true)),
-            entry(4, AllowThrowException(true)),
-            entry(5, AllowThrowException(false)),
-            entry(6, AllowThrowException(false)),
+            entry(2, TimeZone("+08:00".into())),
+            entry(4, TimeZone("+08:00".into())),
+            entry(5, TimeZone("UTC".into())),
+            entry(6, TimeZone("UTC".into())),
         ],
     }
 }
+fn source_timezone_bytes() -> usize {
+    "Asia/Shanghai".len() + 2 * "+08:00".len() + 2 * "UTC".len()
+}
+
 #[test]
 fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
     let input = source();
@@ -115,23 +119,31 @@ fn bounded_parameters_keep_all_raw_variants_scoped_keys_and_sparse_ids() {
     );
     assert_eq!(
         table.get(SemanticParameterId::new(2)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("+08:00").unwrap()
+        ))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(4)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("+08:00").unwrap()
+        ))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(5)),
-        Some(&SemanticParameterValue::AllowThrowException(false))
+        Some(&SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap()
+        ))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(6)),
-        Some(&SemanticParameterValue::AllowThrowException(false))
+        Some(&SemanticParameterValue::TimeZone(
+            novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap()
+        ))
     );
     assert_eq!(
         table.get(SemanticParameterId::new(6)).unwrap().key(),
-        SemanticParameterKey::AllowThrowException
+        SemanticParameterKey::TimeZone
     );
     // This is a cumulative node-request bound, not n actual allocated nodes.
     assert_eq!(facts.parameter_count, 6);
@@ -196,12 +208,7 @@ fn bounded_parameters_inline_zones_and_actual_source_capacity_are_admitted() {
     ));
     let wide = wire::SemanticParameters {
         entries: (0..320)
-            .map(|id| {
-                entry(
-                    id,
-                    wire::semantic_parameter::Value::AllowThrowException(false),
-                )
-            })
+            .map(|id| entry(id, wire::semantic_parameter::Value::TimeZone("UTC".into())))
             .collect(),
     };
     let control = Control::default();
@@ -232,7 +239,7 @@ fn bounded_parameters_preserve_constructor_and_lazy_decoder_error_order() {
     let cases = [
         (
             vec![
-                entry(0, AllowThrowException(false)),
+                entry(0, TimeZone("UTC".into())),
                 entry(0, TimeZone("UTC".into())),
                 wire::SemanticParameter { id: 9, value: None },
             ],
@@ -240,7 +247,7 @@ fn bounded_parameters_preserve_constructor_and_lazy_decoder_error_order() {
         ),
         (
             vec![
-                entry(0, AllowThrowException(false)),
+                entry(0, TimeZone("UTC".into())),
                 entry(0, TimeZone("".into())),
             ],
             SemanticParameterError::InvalidTimeZone,
@@ -267,7 +274,7 @@ fn bounded_parameters_preserve_constructor_and_lazy_decoder_error_order() {
         ),
         (
             vec![
-                entry(0, AllowThrowException(false)),
+                entry(0, TimeZone("UTC".into())),
                 entry(0, TimeZone("x".repeat(256))),
             ],
             SemanticParameterError::InvalidTimeZone,
@@ -281,7 +288,7 @@ fn bounded_parameters_preserve_constructor_and_lazy_decoder_error_order() {
     }
     let missing = wire::SemanticParameters {
         entries: vec![
-            entry(0, AllowThrowException(true)),
+            entry(0, TimeZone("+08:00".into())),
             wire::SemanticParameter { id: 1, value: None },
         ],
     };
@@ -349,7 +356,7 @@ fn bounded_parameters_every_actual_callback_retains_first_control_and_never_publ
             entries: vec![
                 entry(
                     0,
-                    wire::semantic_parameter::Value::AllowThrowException(true),
+                    wire::semantic_parameter::Value::TimeZone("+08:00".into()),
                 ),
                 wire::SemanticParameter { id: 1, value: None },
             ],
@@ -403,15 +410,15 @@ fn bounded_parameter_sending_matches_independent_canonical_wire_and_prepared_loa
     assert_eq!(facts.parameter_count, 6);
     assert_eq!(
         facts.timezone_request_bytes_upper_bound,
-        "Asia/Shanghai".len()
+        source_timezone_bytes()
     );
-    assert_eq!(facts.allocation_requests_upper_bound, 2);
+    assert_eq!(facts.allocation_requests_upper_bound, 6);
     assert_eq!(
         facts.allocation_request_bytes_upper_bound,
         std::alloc::Layout::array::<wire::SemanticParameter>(6)
             .unwrap()
             .size()
-            + "Asia/Shanghai".len()
+            + source_timezone_bytes()
     );
     let prepared = prepare_semantic_parameters_encode(&table, SOURCE, limits(), &control).unwrap();
     assert_eq!(*prepared.facts(), facts);
@@ -497,12 +504,14 @@ fn bounded_parameter_sending_every_callback_and_real_source_quantum_use_original
     for table in [&empty, &raw, &zone, &short, &offset] {
         let control = EncodeControl::default();
         let (wire, facts) = encode_semantic_parameters(table, SOURCE, limits(), &control).unwrap();
+        let mut zone_bytes = 0;
         for entry in &wire.entries {
             if let Some(wire::semantic_parameter::Value::TimeZone(zone)) = &entry.value {
                 assert_eq!(zone.capacity(), zone.len());
-                assert_eq!(zone.len(), facts.timezone_request_bytes_upper_bound);
+                zone_bytes += zone.len();
             }
         }
+        assert_eq!(zone_bytes, facts.timezone_request_bytes_upper_bound);
         let trace = control.0.trace.into_inner().unwrap();
         assert_eq!(trace[0], (CompilePhase::Encode, 0));
         for at in 0..trace.len() {
@@ -521,7 +530,9 @@ fn bounded_parameter_sending_every_callback_and_real_source_quantum_use_original
     let wide = SemanticParameters::try_new((0..320).map(|id| {
         (
             SemanticParameterId::new(id),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::TimeZone(
+                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+            ),
         )
     }))
     .unwrap();
@@ -634,10 +645,10 @@ fn observed_parameters_preserve_original_facts_sparse_ids_layout_and_caller_phas
     assert_eq!(encoded, expected);
     assert_eq!(encoded, old_wire);
     assert_eq!(facts, sending);
-    assert_eq!(facts.allocation_requests_upper_bound, 2);
+    assert_eq!(facts.allocation_requests_upper_bound, 6);
     assert_eq!(
         facts.allocation_request_bytes_upper_bound,
-        Layout::array::<wire::SemanticParameter>(6).unwrap().size() + "Asia/Shanghai".len()
+        Layout::array::<wire::SemanticParameter>(6).unwrap().size() + source_timezone_bytes()
     );
     assert!(
         control
@@ -905,7 +916,7 @@ fn observed_parameters_every_actual_callback_keeps_primary_cause_and_caller_foot
             entries: vec![
                 entry(
                     0,
-                    wire::semantic_parameter::Value::AllowThrowException(true),
+                    wire::semantic_parameter::Value::TimeZone("+08:00".into()),
                 ),
                 wire::SemanticParameter { id: 1, value: None },
             ],

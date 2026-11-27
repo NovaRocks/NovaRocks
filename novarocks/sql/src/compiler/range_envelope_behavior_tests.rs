@@ -235,7 +235,10 @@ fn retains_original_interval_union(tree: &OptimizedOperatorNode) -> bool {
             for conjunct in conjuncts {
                 if !matches!(
                     arena.node(unwrap_nested(arena, conjunct)),
-                    ScalarNode::BinaryOp { op: BinOp::Or, .. }
+                    ScalarNode::BooleanConnective {
+                        op: crate::common::BooleanOp::Or,
+                        ..
+                    }
                 ) {
                     continue;
                 }
@@ -277,7 +280,10 @@ fn retains_residual_or(tree: &OptimizedOperatorNode) -> bool {
             found |= terms.iter().any(|id| {
                 matches!(
                     arena.node(unwrap_nested(arena, *id)),
-                    ScalarNode::BinaryOp { op: BinOp::Or, .. }
+                    ScalarNode::BooleanConnective {
+                        op: crate::common::BooleanOp::Or,
+                        ..
+                    }
                 )
             });
         }

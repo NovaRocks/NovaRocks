@@ -151,27 +151,31 @@ impl Fixture {
         )
     }
 
-    pub(super) fn binary(&self, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
-        self.binary_typed(op, left, right, DataType::Int64, true)
+    pub(super) fn binary(
+        &self,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        left: ScalarId,
+        right: ScalarId,
+    ) -> ScalarId {
+        self.binary_typed(op, left, right, DataType::Int64)
     }
 
     pub(super) fn binary_typed(
         &self,
-        op: BinOp,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
         left: ScalarId,
         right: ScalarId,
         data_type: DataType,
-        nullable: bool,
     ) -> ScalarId {
-        self.intern(
-            ScalarNode::BinaryOp {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-        )
+        let mut arena = self.arena.borrow_mut();
+        let result = arena.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
+        assert_eq!(arena.data_type(result), &data_type);
+        result
     }
 
     pub(super) fn node(&self, id: ScalarId) -> ScalarNode {

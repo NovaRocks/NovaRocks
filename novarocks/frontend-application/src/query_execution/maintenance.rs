@@ -54,7 +54,6 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct PreparedDistributedRewriteCohort {
     description: novarocks_query_application::preparation::FrozenExecutionDescription,
     template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
@@ -74,8 +73,7 @@ impl PreparedDistributedRewriteCohort {
         ),
         novarocks_query_application::api::QueryExecutionError,
     > {
-        let options =
-            crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
+        let options = crate::query_execution::contract::synthetic_query_options();
         crate::query_execution::internal_consumer::write::prepare_write_computation(
             self.description,
             self.template,
@@ -564,7 +562,6 @@ fn freeze_rewrite_cohort_recipe(
             .sql_semantics()
             .sql_mode()
             .decimal_overflow_policy(),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         constant_policy,
         control,
     )?;
@@ -638,7 +635,6 @@ fn finish_rewrite_cohort_recipe(
     Ok(PreparedDistributedRewriteCohort {
         description: parts.description,
         template,
-        execution: recipe.execution.clone(),
         write_session: recipe
             .session
             .write_session()

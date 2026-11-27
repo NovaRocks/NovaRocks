@@ -45,7 +45,7 @@ fn actual_functions() -> PureEngineFunctionCatalog {
         let builtin = novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
         let mut builder = EngineFunctionCatalogBuilder::new();
         let mut installed = Vec::new();
-        for (catalog, definition) in actual.definitions().iter().map(|definition| (&actual,definition)).chain(std::iter::once((&builtin,builtin.definition("rand",FunctionKind::Scalar).unwrap()))) {
+        for (catalog, definition) in actual.definitions().iter().map(|definition| (&actual,definition)).chain(["rand", "__operator_modulo", "__operator_divide"].into_iter().map(|name| (&builtin, builtin.definition(name, FunctionKind::Scalar).unwrap()))) {
             let binding = definition.binding_declaration().unwrap();
             builder.register(definition.clone()).unwrap();
             for overload in binding.overloads() {
@@ -150,10 +150,6 @@ fn invocation_program_with(
             ExprKind::Constant(register_constant(&mut source_pools, &name)),
         )
         .unwrap();
-    let allow_ref = novarocks_type_contract::SemanticParameterRef {
-        id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
-        expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-    };
     if source_mode == SourceMode::Computed {
         data = builder
             .add(
@@ -181,29 +177,13 @@ fn invocation_program_with(
                 ),
             )
             .unwrap();
-        // Fractional Divide(1, 0) is a successful NULL by the frozen
-        // arithmetic contract. Integer Modulo(1, 0) is the real RowData
-        // failure required to test transport from outside outer demand.
-        let remainder_ty = novarocks_type_contract::arithmetic_result_value_type_with_op(
-            &one_ty,
-            &tail_type,
-            novarocks_type_contract::ArithmeticOperator::Modulo,
+        let remainder = crate::testkit::claim_author::add_catalogue_predicate(
+            &mut builder,
+            &mut source_pools,
+            novarocks_type_contract::OperatorFunction::Modulo,
+            vec![one, tail],
         )
         .unwrap();
-        let remainder = builder
-            .add(
-                None,
-                remainder_ty,
-                ExprKind::Binary {
-                    op: novarocks_expression_contract::BinaryOperator::Modulo,
-                    left: one,
-                    right: tail,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: Some(allow_ref),
-                },
-            )
-            .unwrap();
         let bool_ty = FunctionValueType::new(DataType::Boolean, true);
         let condition = builder
             .add(
@@ -336,30 +316,14 @@ fn invocation_program_with(
                 ),
             )
             .unwrap();
-        let divided_type = novarocks_type_contract::arithmetic_result_value_type_with_op(
-            &tail_type,
-            &FunctionValueType::new(DataType::Int64, false),
-            novarocks_type_contract::ArithmeticOperator::Divide,
+        let divided = crate::testkit::claim_author::add_catalogue_predicate(
+            &mut builder,
+            &mut source_pools,
+            novarocks_type_contract::OperatorFunction::Divide,
+            vec![tail, zero],
         )
         .unwrap();
-        let divided = builder
-            .add(
-                None,
-                divided_type.clone(),
-                ExprKind::Binary {
-                    op: novarocks_expression_contract::BinaryOperator::Divide,
-                    left: tail,
-                    right: zero,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
-                        id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
-                        expected_key:
-                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-                    }),
-                },
-            )
-            .unwrap();
+        let divided_type = builder.definition(divided).unwrap().ty.clone();
         definitions.push(divided);
         arguments.push(argument(divided_type, None));
     }
@@ -477,21 +441,7 @@ fn invocation_program_with(
             )
         }
     };
-    // The complete dead arithmetic definition retains its explicit original
-    // arithmetic fixture policy and semantic parameter, even with demand zero.
-    let parameters = if count >= 5
-        || matches!(
-            source_mode,
-            SourceMode::Computed | SourceMode::RequiredError | SourceMode::NestedIf
-        ) {
-        SemanticParameters::try_new([(
-            novarocks_type_contract::SemanticParameterId::new(u32::MAX),
-            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap()
-    } else {
-        SemanticParameters::try_new([]).unwrap()
-    };
+    let parameters = SemanticParameters::try_new([]).unwrap();
     let demand = if matches!(guard, Guard::Filter) {
         EvaluationDemand::TruthOnly
     } else {
@@ -562,7 +512,7 @@ pub fn original_source_program(field_name: &str, guard: Guard, mode: SourceMode)
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = EngineFunctionCatalogBuilder::new();
     let mut installed = Vec::new();
-    for name in ["__array_struct_subfield", "if", "rand"] {
+    for name in ["__array_struct_subfield", "__operator_modulo", "if", "rand"] {
         let definition = catalog.definition(name, FunctionKind::Scalar).unwrap();
         let binding = definition.binding_declaration().unwrap();
         builder.register(definition.clone()).unwrap();

@@ -260,8 +260,8 @@ fn split_and_scalar(arena: &ScalarArena, expr: ScalarId) -> Vec<ScalarId> {
 
 fn split_and_scalar_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            op: crate::common::BinOp::And,
+        ScalarNode::BooleanConnective {
+            op: crate::common::BooleanOp::And,
             left,
             right,
             ..
@@ -285,7 +285,7 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -377,15 +377,17 @@ mod tests {
         )
     }
 
-    fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
-        memo.scalars.intern(
-            ScalarNode::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+    fn binary(
+        memo: &mut Memo,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        left: ScalarId,
+        right: ScalarId,
+    ) -> ScalarId {
+        memo.scalars.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -398,7 +400,7 @@ mod tests {
     }
 
     fn and(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
-        binary(memo, BinOp::And, left, right)
+        binary(memo, crate::common::BooleanOp::And, left, right)
     }
 
     fn eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {

@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 
 use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnostic};
 use super::{ExplainLevel, PlanNodeExplainStage};
-use crate::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
+use crate::analysis::{ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
 use crate::common::ApplyKind;
 use crate::common::negation::{typed_operand, typed_operand_has_lower_precedence, write_negation};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
@@ -732,37 +732,9 @@ fn expression(
                 out.write_str("'")
             }
         },
-        ExprKind::BinaryOp {
-            left, op, right, ..
-        } => {
-            let op_str = match op {
-                BinOp::Add => "+",
-                BinOp::Sub => "-",
-                BinOp::Mul => "*",
-                BinOp::Div => "/",
-                BinOp::Mod => "%",
-                BinOp::Eq => "=",
-                BinOp::Ne => "!=",
-                BinOp::Lt => "<",
-                BinOp::Le => "<=",
-                BinOp::Gt => ">",
-                BinOp::Ge => ">=",
-                BinOp::EqForNull => "<=>",
-                BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
-                    "AND"
-                }
-                BinOp::Or => "OR",
-            };
-            let (left, right) = if matches!(op, BinOp::Eq | BinOp::EqForNull)
-                && matches!(left.kind, ExprKind::Literal(_) | ExprKind::Constant(_))
-                && matches!(right.kind, ExprKind::ColumnRef { .. })
-            {
-                (right.as_ref(), left.as_ref())
-            } else {
-                (left.as_ref(), right.as_ref())
-            };
+        ExprKind::BooleanConnective { left, op, right } => {
             expression(out, left, next, diagnostic)?;
-            write!(out, " {op_str} ")?;
+            write!(out, " {} ", op.sql())?;
             expression(out, right, next, diagnostic)
         }
         ExprKind::FunctionCall {
@@ -921,7 +893,7 @@ fn validate_expression_depth(expr: &TypedExpr, depth: usize, visited: &mut usize
     *visited += 1;
     let next = depth + 1;
     match &expr.kind {
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BooleanConnective { left, right, .. } => {
             validate_expression_depth(left, next, visited)?;
             validate_expression_depth(right, next, visited)?;
         }

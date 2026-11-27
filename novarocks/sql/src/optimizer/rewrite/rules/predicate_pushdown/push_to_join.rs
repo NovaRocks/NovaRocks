@@ -110,6 +110,7 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                 let left = join_children.remove(0);
 
                 let (new_join_expr, changed) = push_filter_predicates_opt(
+                    ctx.function_catalog(),
                     filter_op.predicate,
                     join_op,
                     left,
@@ -131,6 +132,7 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                 let right = children.remove(1);
                 let left = children.remove(0);
                 match push_join_condition_predicates_opt(
+                    ctx.function_catalog(),
                     join_op,
                     left,
                     right,
@@ -154,6 +156,7 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
 // ---------------------------------------------------------------------------
 
 fn push_filter_predicates_opt(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     predicate: ScalarId,
     join: LogicalJoinOp,
     left: OptExpr,
@@ -180,6 +183,7 @@ fn push_filter_predicates_opt(
 
     if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
         let derived = derive_inner_join_predicates(
+            function_catalog,
             arena,
             &left_ids,
             &right_ids,
@@ -336,6 +340,7 @@ fn push_filter_predicates_opt(
 }
 
 fn push_join_condition_predicates_opt(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     join: LogicalJoinOp,
     left: OptExpr,
     right: OptExpr,
@@ -362,6 +367,7 @@ fn push_join_condition_predicates_opt(
     scalar_expr::split_conjuncts(arena, cond_id, &mut conjuncts);
 
     let derived = derive_inner_join_predicates(
+        function_catalog,
         arena,
         &left_ids,
         &right_ids,
@@ -817,24 +823,20 @@ mod tests {
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
@@ -886,6 +888,7 @@ mod tests {
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
     }
@@ -1025,15 +1028,7 @@ mod tests {
                 )),
                 novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), false),
             );
-            let predicate = arena.intern(
-                ScalarNode::BinaryOp {
-                    left: cast,
-                    right: literal,
-                    op: BinOp::Eq,
-                    decimal_overflow_policy: OutputNull,
-                },
-                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-            );
+            let predicate = arena.test_intern_operator(BinOp::Eq, cast, literal, OutputNull);
             let join = OptExpr::new(
                 Operator::LogicalJoin(LogicalJoinOp {
                     naa_author: None,
@@ -1100,25 +1095,26 @@ mod selected_boolean_factor_tests {
                 control,
             )
             .unwrap();
-        let mut binary = |op, left, right| {
-            arena
-                .intern_observed(
-                    ScalarNode::BinaryOp {
-                        op,
-                        left,
-                        right,
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    source_type.clone(),
-                    control,
-                )
-                .unwrap()
+        let mut binary = |op: crate::common::binary_operator::TestOperator, left, right| {
+            arena.test_intern_operator(
+                op,
+                left,
+                right,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            )
         };
-        let equality = binary(BinOp::Eq, left, right);
-        let first = binary(BinOp::And, equality, selected_true);
-        let second = binary(BinOp::And, selected_true, equality);
-        let disjunction = binary(BinOp::Or, first, second);
+        let equality = binary(BinOp::Eq.into(), left, right);
+        let first = binary(
+            crate::common::BooleanOp::And.into(),
+            equality,
+            selected_true,
+        );
+        let second = binary(
+            crate::common::BooleanOp::And.into(),
+            selected_true,
+            equality,
+        );
+        let disjunction = binary(crate::common::BooleanOp::Or.into(), first, second);
         let node_count = arena.node_count();
         let (common, residual) = factor_common_eq_from_or(
             &mut arena,

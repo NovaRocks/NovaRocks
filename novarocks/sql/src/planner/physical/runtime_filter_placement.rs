@@ -185,7 +185,7 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
                 out.push(*column_id);
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -400,7 +400,7 @@ fn bind_expression_to_columns(
                     .with_nullable(input.value_type.nullable())
                     .expect("validated root NULL contract");
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -2309,15 +2309,12 @@ mod tests {
     }
 
     fn binary_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Add,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn eq_cond(left: TypedExpr, right: TypedExpr, null_safe: bool) -> PhysicalHashJoinEqCondition {

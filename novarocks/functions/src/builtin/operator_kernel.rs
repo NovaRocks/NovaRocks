@@ -17,18 +17,22 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BooleanBuilder, PrimitiveBuilder};
+use arrow_array::builder::{BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder};
 use arrow_array::types::{
-    ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
-    Int64Type,
+    ArrowPrimitiveType, Decimal128Type, Decimal256Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type,
 };
 use arrow_array::{Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    ArithmeticOperator, ComparisonOperator, KeyRelation, OperatorFunction, PureCompileControl,
+    ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy, OperatorFunction,
+    PureCompileControl, ValueLogicalType,
 };
 
-use crate::arithmetic::{ArithmeticRowResult, SignedWidth, signed_arithmetic_row, trino_decimal};
+use crate::arithmetic::{
+    ArithmeticPrepareError, ArithmeticRowResult, PreparedArithmeticRecipe, SignedWidth,
+    signed_arithmetic_row, trino_decimal,
+};
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -51,6 +55,7 @@ enum Operation {
     Real(ArithmeticOperator),
     Double(ArithmeticOperator),
     Decimal(trino_decimal::DecimalArithmetic, [u128; 2]),
+    Wide(PreparedArithmeticRecipe),
     Compare {
         operator: OperatorFunction,
         recipe: PreparedComparisonRecipe,
@@ -85,7 +90,27 @@ impl BinaryOperatorKernel {
             return Err(invalid("Binary operator expects two exact value arguments"));
         };
         drop(arguments);
-        let operation = if let Some(op) = operator.arithmetic() {
+        let operation = if let Some(op) = operator.arithmetic()
+            && [left, right]
+                .into_iter()
+                .any(|ty| ty.logical_type() == ValueLogicalType::LargeInt)
+        {
+            let recipe = PreparedArithmeticRecipe::try_new(
+                op,
+                left,
+                right,
+                contract.result_type(),
+                contract.decimal_overflow_policy(),
+                false,
+                control,
+            )
+            .map_err(|error| match error {
+                ArithmeticPrepareError::Control(error) => compile_failure(error),
+                ArithmeticPrepareError::Kernel(error) => error,
+                _ => invalid("Wide operator has no exact arithmetic implementation"),
+            })?;
+            Operation::Wide(recipe)
+        } else if let Some(op) = operator.arithmetic() {
             match (
                 left.data_type(),
                 right.data_type(),
@@ -151,12 +176,7 @@ pub(super) fn preserves_integer_array_operands(
     operator: OperatorFunction,
     operands: [&FunctionValueType; 2],
 ) -> bool {
-    matches!(
-        operator,
-        OperatorFunction::Equal | OperatorFunction::NotEqual
-    ) && operands
-        .into_iter()
-        .all(PreparedComparisonRecipe::supports_array_equality_operand)
+    PreparedCompositeComparisonRecipe::uses_integer_array_equality(operator, operands)
 }
 
 pub(super) fn composite_comparison_recipe(
@@ -164,27 +184,12 @@ pub(super) fn composite_comparison_recipe(
     operands: [&FunctionValueType; 2],
     control: &dyn PureCompileControl,
 ) -> Result<Option<PreparedCompositeComparisonRecipe>, FunctionBindingError> {
-    if preserves_integer_array_operands(operator, operands)
-        || !operands
-            .into_iter()
-            .any(PreparedCompositeComparisonRecipe::is_composite)
-    {
-        return Ok(None);
-    }
-    let relation = match operator {
-        OperatorFunction::Equal | OperatorFunction::NotEqual => KeyRelation::Equal,
-        OperatorFunction::Identical | OperatorFunction::Distinct => KeyRelation::Identical,
-        _ => return Err(FunctionBindingError::NoMatchingOverload),
-    };
-    let [left, right] = operands;
-    PreparedCompositeComparisonRecipe::try_new(relation, left, right, control)
-        .map(Some)
-        .map_err(
-            |error: ComparisonPrepareError| match error.control_error() {
-                Some(error) => FunctionBindingError::Control(error),
-                None => FunctionBindingError::NoMatchingOverload,
-            },
-        )
+    PreparedCompositeComparisonRecipe::try_new_for_operator(operator, operands, control).map_err(
+        |error: ComparisonPrepareError| match error.control_error() {
+            Some(error) => FunctionBindingError::Control(error),
+            None => FunctionBindingError::NoMatchingOverload,
+        },
+    )
 }
 
 pub(super) fn comparison_recipe(
@@ -243,10 +248,20 @@ impl PreparedScalarKernel for BinaryOperatorKernel {
             DataType::Float32 => Output::Real,
             DataType::Float64 => Output::Double,
             DataType::Decimal128(..) => Output::Decimal128,
+            DataType::Decimal256(..) => Output::Decimal256,
+            DataType::FixedSizeBinary(16)
+                if self.contract.result_type().logical_type() == ValueLogicalType::LargeInt =>
+            {
+                Output::FixedSizeBinary16
+            }
             _ => unreachable!("binary operator declares a funded primitive result"),
         };
         let row_errors = match self.operation.as_ref() {
             Operation::Signed(..) | Operation::Decimal(..) => true,
+            Operation::Wide(recipe) => {
+                matches!(recipe.result_type().data_type(), DataType::Decimal256(..))
+                    && recipe.decimal_overflow_policy() == DecimalOverflowPolicy::ReportError
+            }
             Operation::CompositeCompare { recipe, .. } => recipe.may_raise_row_error(),
             _ => false,
         };
@@ -370,6 +385,9 @@ impl ScalarKernelInstance for Instance {
                     }))
                 },
             ),
+            Operation::Wide(recipe) => {
+                wide_arithmetic(recipe, input, inputs, control, &mut work, &mut errors)
+            }
             Operation::CompositeCompare { negated, recipe } => {
                 let selection = input.selection();
                 let observed = crate::KernelControlObservation::new(control);
@@ -548,6 +566,89 @@ fn arithmetic<T: ArrowPrimitiveType>(
     }
     work.flush()?;
     Ok(Arc::new(output.finish()))
+}
+
+fn wide_arithmetic(
+    recipe: &PreparedArithmeticRecipe,
+    input: ScalarCallInput<'_, '_>,
+    [left, right]: [EvaluatedArgument<'_>; 2],
+    control: &dyn KernelEvaluationControl,
+    work: &mut EvaluationCheckpoints<'_>,
+    errors: &mut Vec<RowDataError>,
+) -> Result<ArrayRef, KernelFailure> {
+    use ArithmeticRowResult as Row;
+
+    let selection = input.selection();
+    let result_type = recipe.result_type().data_type();
+    let mut visit_rows = |append: &mut dyn FnMut(Row) -> Result<(), KernelFailure>| {
+        for (ordinal, row) in selection.iter().enumerate() {
+            work.step()?;
+            work.flush()?;
+            let result = recipe.evaluate_row(left, ordinal, row, right, ordinal, row, control)?;
+            if let Row::RowError(error) = result {
+                if errors.is_empty() {
+                    errors
+                        .try_reserve_exact(selection.len())
+                        .map_err(|_| KernelFailure::ResourceExhausted)?;
+                }
+                errors.push(error);
+                append(Row::Null)?;
+            } else {
+                append(result)?;
+            }
+        }
+        work.flush()
+    };
+
+    macro_rules! primitive {
+        ($ty:ty, $value:path) => {{
+            capacity(
+                selection.len(),
+                std::mem::size_of::<<$ty as ArrowPrimitiveType>::Native>(),
+            )?;
+            let mut builder = PrimitiveBuilder::<$ty>::with_capacity(selection.len())
+                .with_data_type(result_type.clone());
+            visit_rows(&mut |result| {
+                match result {
+                    $value(value) => builder.append_value(value),
+                    Row::Null => builder.append_null(),
+                    _ => {
+                        return Err(internal(
+                            "Wide arithmetic returned a different result carrier",
+                        ));
+                    }
+                }
+                Ok(())
+            })?;
+            Arc::new(builder.finish()) as ArrayRef
+        }};
+    }
+
+    let output = match result_type {
+        DataType::Float64 => primitive!(Float64Type, Row::Float),
+        DataType::Decimal256(..) => primitive!(Decimal256Type, Row::Decimal256),
+        DataType::FixedSizeBinary(16) => {
+            capacity(selection.len(), 16)?;
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
+            visit_rows(&mut |result| {
+                match result {
+                    Row::LargeInt(value) => builder
+                        .append_value(value.to_be_bytes())
+                        .map_err(|_| internal("LARGEINT result lost its original width"))?,
+                    Row::Null => builder.append_null(),
+                    _ => {
+                        return Err(internal(
+                            "LARGEINT arithmetic returned a different result carrier",
+                        ));
+                    }
+                }
+                Ok(())
+            })?;
+            Arc::new(builder.finish()) as ArrayRef
+        }
+        _ => return Err(invalid("Wide arithmetic has no exact output builder")),
+    };
+    Ok(output)
 }
 
 fn comparison(

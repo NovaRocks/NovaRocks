@@ -62,19 +62,27 @@ fn table() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(2),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
     ])
     .unwrap()
@@ -102,7 +110,9 @@ fn exact_values_sparse_ids_and_input_are_preserved() {
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        ))
     );
     assert_eq!(
         control.checkpoints.into_inner().unwrap(),
@@ -155,7 +165,7 @@ fn every_repeated_reference_is_checked_and_one_definition_is_retained() {
         ]
     );
     // A repeated ID never skips the expected-key check.
-    let wrong = reference(0, SemanticParameterKey::AllowThrowException);
+    let wrong = reference(0, SemanticParameterKey::StatementStartUtc);
     assert_eq!(
         input.project_observed(
             [reference(0, SemanticParameterKey::TimeZone), wrong,],
@@ -180,7 +190,7 @@ fn missing_and_wrong_key_remain_parameter_errors() {
             SemanticParameterError::MissingId(missing.id)
         ))
     );
-    let wrong = reference(1, SemanticParameterKey::AllowThrowException);
+    let wrong = reference(1, SemanticParameterKey::StatementStartUtc);
     assert_eq!(
         input.project_observed([wrong], CompilePhase::Validate, &Control::default()),
         Err(SemanticParameterProjectionError::Parameter(
@@ -279,7 +289,7 @@ fn intermediate_failure_accounts_all_completed_references_without_overreading() 
     };
     let consumed = AtomicUsize::new(0);
     let refs = std::iter::repeat_n(
-        reference(u32::MAX, SemanticParameterKey::AllowThrowException),
+        reference(u32::MAX, SemanticParameterKey::StatementStartUtc),
         1025,
     )
     .inspect(|_| {
@@ -307,7 +317,9 @@ fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
     let input = SemanticParameters::try_new((0..MAX_SEMANTIC_PARAMETERS).map(|id| {
         (
             SemanticParameterId::new(id as u32),
-            SemanticParameterValue::AllowThrowException(id % 2 == 0),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(i64::from(u8::from(id % 2 == 0)), 0).unwrap(),
+            ),
         )
     }))
     .unwrap();
@@ -318,7 +330,7 @@ fn maximum_valid_definition_table_projects_without_a_second_validation_pass() {
             input
                 .entries()
                 .keys()
-                .map(|id| reference(id.get(), SemanticParameterKey::AllowThrowException)),
+                .map(|id| reference(id.get(), SemanticParameterKey::StatementStartUtc)),
             CompilePhase::Decode,
             &control,
         )

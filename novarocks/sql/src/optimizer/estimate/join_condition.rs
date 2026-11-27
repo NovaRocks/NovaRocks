@@ -78,9 +78,9 @@ fn collect_join_conjuncts(
     residuals: &mut Vec<ScalarId>,
 ) {
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {

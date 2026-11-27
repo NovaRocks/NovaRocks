@@ -131,7 +131,6 @@ pub(crate) fn author_standalone(
             &inputs,
             functions,
             sealed_functions,
-            sql_semantics.sql_mode().allow_throw_exception(),
             constant_policy,
             control,
         )
@@ -369,7 +368,6 @@ fn prepare_typed(
             &expression,
             functions,
             sealed_functions,
-            sql_semantics.sql_mode().allow_throw_exception(),
             constant_policy,
             control,
         )
@@ -743,7 +741,7 @@ fn validate_scalar(
                 }
                 pending.extend(args);
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,

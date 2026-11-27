@@ -110,9 +110,9 @@ fn lower_delete_predicate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<(u32, Domain, bool)>, super::SqlCompileError> {
     work.step()?;
-    let ExprKind::BinaryOp {
+    let ExprKind::BooleanConnective {
         left,
-        op: BinOp::Or,
+        op: crate::common::BooleanOp::Or,
         right,
         ..
     } = &unnest(predicate).kind
@@ -328,15 +328,9 @@ fn can_offer_atom(
     {
         return false;
     }
-    let is_literal = |expression: &TypedExpr| {
-        !expression.value_type.nullable()
-            && matches!(
-                expression.kind,
-                ExprKind::Literal(_) | ExprKind::Constant(_)
-            )
-    };
-    (lower_column(scan, columns, left).is_some() && is_literal(right))
-        || (is_literal(left) && lower_column(scan, columns, right).is_some())
+    // Literal admission below checks exact values and lossless conversions.
+    // A pruning-only offer remains eligible when that author can prove it.
+    lower_column(scan, columns, left).is_some() || lower_column(scan, columns, right).is_some()
 }
 
 /// Shared exact atom author. Each caller supplies its original column identity
@@ -477,16 +471,9 @@ fn comparison_domain(
         BinOp::Le => single_range(value_type, Bound::Unbounded, Bound::Inclusive(value))?,
         BinOp::Gt => single_range(value_type, Bound::Exclusive(value), Bound::Unbounded)?,
         BinOp::Ge => single_range(value_type, Bound::Inclusive(value), Bound::Unbounded)?,
-        BinOp::EqForNull
-        | BinOp::Add
-        | BinOp::Sub
-        | BinOp::Mul
-        | BinOp::Div
-        | BinOp::Mod
-        | BinOp::And
-        | BinOp::ExpandedConjunction
-        | BinOp::ExpandedNegatedConjunction
-        | BinOp::Or => return None,
+        BinOp::EqForNull | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            return None;
+        }
     };
     Some(Domain::new(values, false))
 }
@@ -679,11 +666,7 @@ const fn reverse_comparison(op: BinOp) -> BinOp {
         | BinOp::Sub
         | BinOp::Mul
         | BinOp::Div
-        | BinOp::Mod
-        | BinOp::And
-        | BinOp::ExpandedConjunction
-        | BinOp::ExpandedNegatedConjunction
-        | BinOp::Or => op,
+        | BinOp::Mod => op,
     }
 }
 
@@ -787,15 +770,12 @@ mod tests {
     }
 
     fn comparison(op: BinOp, left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn scan(predicates: Vec<TypedExpr>) -> PlanScanNode {

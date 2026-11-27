@@ -148,11 +148,10 @@ fn commutative_normalization_and_float_bit_identity_are_preserved() {
             &control,
         )
         .unwrap();
-    let binary = |left, right| ScalarNode::BinaryOp {
-        op: crate::common::BinOp::Eq,
+    let binary = |left, right| ScalarNode::BooleanConnective {
+        op: crate::common::BooleanOp::And,
         left,
         right,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     };
     let a = arena
         .intern_observed(

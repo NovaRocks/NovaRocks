@@ -19,10 +19,7 @@
 //! Non-call nodes take their own effect from the Functions recipe.
 
 use super::controls::installed_scalar_control_shape;
-use super::error::{
-    CallAuthorError, InvariantRefusal, arithmetic_author_error, cast_author_error,
-    comparison_author_error,
-};
+use super::error::{CallAuthorError, InvariantRefusal, cast_author_error, comparison_author_error};
 use super::{CallAuthorInputs, UnitCallAuthorship, scalar_binding_selection};
 use crate::{
     ExprCompileError, ExprCompileFailure,
@@ -31,18 +28,17 @@ use crate::{
 };
 use novarocks_constant_contract::{ConstantError, ConstantTableError};
 use novarocks_expression_contract::{
-    BinaryOperator, CallRequestMaterializationError, ExprId, ExprKind, ExprNode,
-    ExpressionCallClaim, SealedUnit, TemporalSourceProjectionError,
+    CallRequestMaterializationError, ExprId, ExprKind, ExprNode, ExpressionCallClaim, SealedUnit,
+    TemporalSourceProjectionError,
 };
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, PreparedArithmeticRecipe, PreparedCastRecipe,
-    PreparedComparisonRecipe, PreparedNullSafeComparisonRecipe, PureCallPreparation, PureKernelAbi,
+    CallArgumentUses, CallEffectInput, PreparedCastRecipe, PureCallPreparation, PureKernelAbi,
     ScopedExpressionEffects, TemporalSourceChannel,
 };
 use novarocks_type_contract::{
     ArrowTypeProfile, CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase,
-    ControlShape, ExpressionEffectContext, ExpressionUseId, SemanticParameterValue,
-    SemanticParameters, arrow_data_types_exact_with_profile_observed,
+    ControlShape, ExpressionEffectContext, ExpressionUseId,
+    arrow_data_types_exact_with_profile_observed,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -600,17 +596,13 @@ fn own_effects(
     context: ExpressionEffectContext,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScopedExpressionEffects, CallAuthorError> {
-    let allow = |reference, parameters: &SemanticParameters| match parameters
-        .require(reference)
-        .map_err(|error| CallAuthorError::effects(format!("Parameter({error:?})")))?
-    {
-        SemanticParameterValue::AllowThrowException(value) => Ok(*value),
-        _ => Err(CallAuthorError::effects_invalid(
-            "primitive parameter is not ALLOW_THROW_EXCEPTION",
-        )),
-    };
     work.step()?;
     Ok(match &source.kind {
+        ExprKind::FunctionCall { .. } => {
+            return Err(CallAuthorError::effects_invalid(
+                "call effects require their installed owner",
+            ));
+        }
         ExprKind::Value(_)
         | ExprKind::Let { .. }
         | ExprKind::Lambda { .. }
@@ -671,66 +663,7 @@ fn own_effects(
             })?;
             recipe.own_effects(context)
         }
-        ExprKind::Binary {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-            allow_throw_exception,
-        } => {
-            let left = definition(unit, *left)?;
-            let right = definition(unit, *right)?;
-            if let Some(operator) = op.arithmetic_operator() {
-                let reference = allow_throw_exception.ok_or(CallAuthorError::effects_invalid(
-                    "arithmetic has no explicit ALLOW_THROW_EXCEPTION reference",
-                ))?;
-                let allow = allow(reference, inputs.environment.parameters)?;
-                let recipe = PreparedArithmeticRecipe::try_new(
-                    operator,
-                    &left.ty,
-                    &right.ty,
-                    &source.ty,
-                    *decimal_overflow_policy,
-                    allow,
-                    work.control(),
-                )
-                .map_err(arithmetic_author_error)?;
-                recipe.own_effects(context)
-            } else if let Some(operator) = op.comparison_operator() {
-                let recipe = PreparedComparisonRecipe::try_new(
-                    operator,
-                    &left.ty,
-                    &right.ty,
-                    work.control(),
-                )
-                .map_err(comparison_author_error)?;
-                recipe.own_effects(context)
-            } else if *op == BinaryOperator::EqForNull {
-                let recipe =
-                    PreparedNullSafeComparisonRecipe::try_new(&left.ty, &right.ty, work.control())
-                        .map_err(comparison_author_error)?;
-                recipe.own_effects(context)
-            } else {
-                return Err(CallAuthorError::effects(format!(
-                    "UnsupportedExpression({:?}, Binary({op:?}))",
-                    source.id
-                )));
-            }
-        }
-        other => {
-            return Err(CallAuthorError::effects(format!(
-                "UnsupportedExpression({:?}, {})",
-                source.id,
-                expression_kind_label(other)
-            )));
-        }
     })
-}
-
-fn expression_kind_label(kind: &ExprKind) -> String {
-    let debug = format!("{kind:?}");
-    let end = debug.find([' ', '{', '(']).unwrap_or(debug.len());
-    debug[..end].to_string()
 }
 
 fn definition(unit: &SealedUnit, id: ExprId) -> Result<&ExprNode, CallAuthorError> {

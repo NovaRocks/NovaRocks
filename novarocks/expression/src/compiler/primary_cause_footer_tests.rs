@@ -82,13 +82,6 @@ fn refuses() -> Vec<(ExprCompileError, novarocks_failure_contract::FailureFact)>
             );
         let binding: ExprCompileFailure<std::convert::Infallible> = binding.into();
         cases.push((binding.into_pure(), expected));
-        let arithmetic = novarocks_functions::ArithmeticCreationFailure::<
-                std::convert::Infallible,
-            >::Construction(
-                novarocks_type_contract::ValueConstructionFailure::BTree(source)
-            );
-        let arithmetic: ExprCompileFailure<std::convert::Infallible> = arithmetic.into();
-        cases.push((arithmetic.into_pure(), expected));
     }
     cases
 }

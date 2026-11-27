@@ -62,12 +62,11 @@ use novarocks_spi::connector::write_stack::{
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, OrderedComparisonAlgorithm,
     PartitionCountParameterId, PartitionHashAlgorithm, PartitionSpaceId, PureCompileControl,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
+    SemanticParameterId, SemanticParameterValue, SemanticParameters,
 };
 use sha2::{Digest, Sha256};
 use {
-    novarocks_expression_contract::{BinaryOperator, BoundFunction, ExprKind as ContractExprKind},
+    novarocks_expression_contract::{BoundFunction, ExprKind as ContractExprKind},
     novarocks_physical_plan::{
         AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId,
         AggregateGrouping, AggregatePhase, AggregateSequenceId, BoundTableFunction,
@@ -115,7 +114,7 @@ use super::lowered_draft::{
     validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
-use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+use crate::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::binding::{
     AggregateRequestCaptureError, CapturedLogicalCallArguments, LogicalCallArgumentCaptureError,
     SqlFunctionBinding, capture_aggregate_logical_request, capture_logical_call_arguments,
@@ -152,7 +151,6 @@ pub(crate) fn lower_final_physical_plan(
     dop_domain: PipelineDopDomain,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -163,7 +161,6 @@ pub(crate) fn lower_final_physical_plan(
         None,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -176,7 +173,6 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     reads: FinalizedProviderReadSet,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -187,7 +183,6 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
         Some(reads),
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -212,7 +207,6 @@ pub(crate) fn lower_final_physical_write_plan(
     input: FinalWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -229,7 +223,6 @@ pub(crate) fn lower_final_physical_write_plan(
         reads,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )?;
@@ -305,7 +298,6 @@ pub(crate) fn lower_final_change_stream_write_plan(
     input: FinalChangeStreamWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -321,7 +313,6 @@ pub(crate) fn lower_final_change_stream_write_plan(
         reads,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )?;
@@ -360,7 +351,6 @@ fn lower_final_physical_plan_inner(
     reads: Option<FinalizedProviderReadSet>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -372,7 +362,6 @@ fn lower_final_physical_plan_inner(
         None,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -386,7 +375,6 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
     semantics: crate::compiler::root_output::RootOutputSemantics,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -398,7 +386,6 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
         Some(semantics),
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -412,7 +399,6 @@ fn lower_final_physical_plan_inner_with_domains(
     semantics: Option<crate::compiler::root_output::RootOutputSemantics>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
@@ -427,7 +413,6 @@ fn lower_final_physical_plan_inner_with_domains(
         reads,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )?;
@@ -500,9 +485,7 @@ struct ContractLoweringVisitor<'a> {
     #[cfg(test)]
     original_emission_observer:
         Option<&'a mut dyn original_emission_test_observer::OriginalEmissionObserver>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
-    root_allow_throw_exception_used: bool,
     semantic_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
@@ -1579,9 +1562,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         owner: NodeId,
     ) -> scalar_emission::ScalarEmission<'_, 'a> {
         scalar_emission::ScalarEmission {
-            root_allow_throw_exception: self.root_allow_throw_exception,
             constant_policy: self.constant_policy,
-            root_allow_throw_exception_used: &mut self.root_allow_throw_exception_used,
             parameters: &mut self.semantic_parameters,
             functions: &self.functions,
             control: self.control,
@@ -1608,7 +1589,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         provider_reads: Option<FinalizedProviderReadSet>,
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        root_allow_throw_exception: bool,
         constant_policy: novarocks_constant_contract::ConstantValidation,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, ContractLoweringError> {
@@ -1616,9 +1596,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(Self {
             #[cfg(test)]
             original_emission_observer: None,
-            root_allow_throw_exception,
             constant_policy,
-            root_allow_throw_exception_used: false,
             semantic_parameters: BTreeMap::new(),
             functions,
             sealed_functions,
@@ -2124,11 +2102,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
             self.attach_runtime_filter_endpoints()?;
-            let parameters = scalar_emission::freeze_semantic_parameters(
-                self.root_allow_throw_exception_used,
-                self.root_allow_throw_exception,
-                std::mem::take(&mut self.semantic_parameters),
-            )?;
+            let parameters = scalar_emission::freeze_semantic_parameters(std::mem::take(
+                &mut self.semantic_parameters,
+            ))?;
             #[cfg(test)]
             if let Some(observer) = self.original_emission_observer.take() {
                 observer.observe(
@@ -7893,8 +7869,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         // Split the top-level conjunction here rather than lowering one nested
         // expression: the filter owns the conjunct list, so consumers that
         // reason per conjunct never have to re-split a tree.
-        let predicates =
-            self.lower_boolean_connective(node, predicate, BinOp::And, &child.columns)?;
+        let predicates = self.lower_boolean_connective(
+            node,
+            predicate,
+            crate::common::BooleanOp::And,
+            &child.columns,
+        )?;
         let mut roots = Vec::with_capacity(predicates.len());
         for definition in predicates {
             roots.push(self.root_definition(
@@ -10518,7 +10498,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         &mut self,
         owner: NodeId,
         root: &TypedExpr,
-        connective: BinOp,
+        connective: crate::common::BooleanOp,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<Box<[ExprId]>, ContractLoweringError> {
         self.scalar_emission(owner)
@@ -12437,7 +12417,7 @@ fn expression_is_replica_deterministic(expression: &TypedExpr) -> bool {
         | ExprKind::Constant(_)
         | ExprKind::LocalValue(_)
         | ExprKind::LambdaParamRef { .. } => true,
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -12908,9 +12888,6 @@ fn published_value_type(declared: &ValueType, expression: &ValueType) -> ValueTy
 /// total; a function decides for itself, which is why `coalesce` over a null
 /// argument is not null; and a literal or a value says what it says.
 const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
-    if let ContractExprKind::Binary { op, .. } = kind {
-        return !matches!(op, BinaryOperator::EqForNull);
-    }
     matches!(
         kind,
         ContractExprKind::Cast { .. }
@@ -12926,10 +12903,7 @@ fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprI
         ContractExprKind::Cast { expr, .. } => {
             operands.push(*expr);
         }
-        ContractExprKind::Binary { left, right, .. } => {
-            operands.push(*left);
-            operands.push(*right);
-        }
+
         ContractExprKind::Conjunction { args } | ContractExprKind::Disjunction { args } => {
             operands.extend(args.iter().copied());
         }
@@ -13018,49 +12992,6 @@ fn require_output_shape(
 
 fn checked_ordinal(context: &'static str, ordinal: usize) -> Result<u32, ContractLoweringError> {
     u32::try_from(ordinal).map_err(|_| ContractLoweringError::OrdinalOverflow { context, ordinal })
-}
-
-/// Maps the non-connective binary operators. `AND`/`OR` never reach here:
-/// they lower to n-ary connectives through `lower_boolean_connective`.
-/// Whether this operator answers about two values of one type.
-///
-/// A comparison does; arithmetic derives its result from the pair it is given
-/// and a boolean connective takes booleans only.
-const fn is_comparison_operator(op: BinOp) -> bool {
-    matches!(
-        op,
-        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::EqForNull
-    )
-}
-
-fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
-    use novarocks_type_contract::{ArithmeticOperator as A, ComparisonOperator as C};
-    if let Some(op) = crate::compiler::selected_scalar_call::arithmetic_operator(operator) {
-        return match op {
-            A::Add => BinaryOperator::Add,
-            A::Subtract => BinaryOperator::Subtract,
-            A::Multiply => BinaryOperator::Multiply,
-            A::Divide => BinaryOperator::Divide,
-            A::Modulo => BinaryOperator::Modulo,
-        };
-    }
-    if let Some(op) = crate::compiler::selected_scalar_call::comparison_operator(operator) {
-        return match op {
-            C::Eq => BinaryOperator::Eq,
-            C::Ne => BinaryOperator::NotEq,
-            C::Lt => BinaryOperator::Lt,
-            C::Le => BinaryOperator::LtEq,
-            C::Gt => BinaryOperator::Gt,
-            C::Ge => BinaryOperator::GtEq,
-        };
-    }
-    match operator {
-        BinOp::EqForNull => BinaryOperator::EqForNull,
-        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction | BinOp::Or => {
-            unreachable!("boolean connectives lower to n-ary Conjunction/Disjunction")
-        }
-        _ => unreachable!("neutral binary operator projection is exhaustive"),
-    }
 }
 
 fn require_decimal_precision(
@@ -13302,7 +13233,7 @@ fn expression_kind_name(kind: &ExprKind) -> &'static str {
         ExprKind::LocalValue(_) => "LocalValue",
         ExprKind::LambdaParamRef { .. } => "LambdaParamRef",
         ExprKind::Literal(_) | ExprKind::Constant(_) => "Literal",
-        ExprKind::BinaryOp { .. } => "BinaryOp",
+        ExprKind::BooleanConnective { .. } => "BinaryOp",
         ExprKind::FunctionCall { .. } => "FunctionCall",
         ExprKind::LambdaFunction { .. } => "LambdaFunction",
         ExprKind::AggregateCall { .. } => "AggregateCall",
@@ -14375,7 +14306,6 @@ mod tests {
                         dop(),
                         catalog.snapshot(),
                         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                        false,
                         policy.into(),
                         control,
                     ) {
@@ -14392,7 +14322,6 @@ mod tests {
                     None,
                     catalog.snapshot(),
                     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                    false,
                     policy.into(),
                     control,
                 )?;
@@ -14491,7 +14420,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &control,
             ));
@@ -14550,7 +14478,6 @@ mod tests {
                     dop(),
                     crate::functions::builtin_sql_function_catalog().snapshot(),
                     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                    false,
                     crate::constant::test_constant_policy(),
                     &control
                 )),
@@ -14584,7 +14511,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &control
             )),
@@ -14624,7 +14550,6 @@ mod tests {
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -15050,7 +14975,6 @@ mod tests {
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )?
@@ -15126,7 +15050,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -15191,7 +15114,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
@@ -15288,7 +15210,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -15347,7 +15268,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
@@ -15535,7 +15455,6 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::compiler::SqlFunctionCatalog::snapshot(&functions),
-            false,
             crate::constant::test_constant_policy(),
             &control,
             &mut observer,
@@ -15756,7 +15675,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -15951,7 +15869,6 @@ mod tests {
                 },
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
@@ -16222,7 +16139,6 @@ mod tests {
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
@@ -16341,15 +16257,12 @@ mod tests {
     #[test]
     fn lowers_values_filter_project_directly_into_the_final_contract() {
         let input = column(1, "number", DataType::Int64, false);
-        let predicate = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(literal_int(0)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let predicate = crate::common::binary_operator::test_operator(
+            crate::common::BinOp::Gt,
+            column_ref(&input),
+            literal_int(0),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let filter = PhysicalPlanNode {
             kind: PhysicalPlanKind::Filter(PlanFilterNode { predicate }),
             children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
@@ -16367,19 +16280,12 @@ mod tests {
                         output_column_id: input.column_id,
                     },
                     ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::BinaryOp {
-                                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
-                                op: BinOp::Add,
-                                right: novarocks_parser::ast::AstBox::new(literal_int(1)),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                            },
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int64,
-                                true,
-                            ),
-                        },
+                        expr: crate::common::binary_operator::test_operator(
+                            crate::common::BinOp::Add,
+                            column_ref(&input),
+                            literal_int(1),
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        ),
                         output_name: "next".to_string(),
                         output_column_id: computed.column_id,
                     },
@@ -16940,7 +16846,6 @@ mod tests {
                 dop(),
                 Some(reads),
                 Arc::clone(&functions),
-                false,
                 crate::constant::test_constant_policy(),
                 control,
                 &mut observer,
@@ -17020,7 +16925,6 @@ mod tests {
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -17229,19 +17133,12 @@ mod tests {
         };
         let filter = PhysicalPlanNode {
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
-                        op: BinOp::Gt,
-                        right: novarocks_parser::ast::AstBox::new(literal_int(0)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                predicate: crate::common::binary_operator::test_operator(
+                    crate::common::BinOp::Gt,
+                    column_ref(&input),
+                    literal_int(0),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             children: vec![repeated_project],
             output_columns: vec![input.clone(), input],
@@ -17876,7 +17773,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
@@ -17908,7 +17804,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
@@ -17944,7 +17839,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
@@ -17983,7 +17877,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
@@ -18012,7 +17905,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
@@ -18040,7 +17932,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
@@ -18073,7 +17964,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
@@ -18997,7 +18887,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
             )
@@ -19138,16 +19027,12 @@ mod tests {
         };
         let filter = |volatile| {
             let predicate = if volatile {
-                TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(scalar_call("rand", vec![])),
-                        op: BinOp::Gt,
-                        right: novarocks_parser::ast::AstBox::new(literal_float(0.0)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: ValueType::new(DataType::Boolean, false),
-                }
+                crate::common::binary_operator::test_operator(
+                    crate::common::BinOp::Gt,
+                    scalar_call("rand", vec![]),
+                    literal_float(0.0),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )
             } else {
                 literal_bool(true)
             };
@@ -19167,7 +19052,6 @@ mod tests {
                 None,
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &control,
             )
@@ -19223,7 +19107,6 @@ mod tests {
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -19261,7 +19144,6 @@ mod tests {
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -19981,12 +19863,13 @@ mod tests {
         let large = literal_largeint(i128::MAX);
         let signed = literal_int(7);
         let kinds = [
-            ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(large.clone()),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(signed.clone()),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
+            crate::common::binary_operator::test_operator(
+                crate::common::BinOp::Eq,
+                large.clone(),
+                signed.clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            )
+            .kind,
             ExprKind::Case {
                 ieee_float_equality: false,
                 operand: Some(novarocks_parser::ast::AstBox::new(large)),
@@ -20072,7 +19955,6 @@ mod tests {
                     dop(),
                     None,
                     crate::functions::builtin_sql_function_catalog().snapshot(),
-                    false,
                     crate::constant::test_constant_policy(),
                     &control,
                     &mut observer,
@@ -20180,7 +20062,6 @@ mod tests {
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
             &control,
         )
@@ -20285,7 +20166,6 @@ mod tests {
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 crate::constant::test_constant_policy(),
                 &control,
             )

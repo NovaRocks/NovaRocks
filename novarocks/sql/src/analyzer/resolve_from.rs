@@ -260,36 +260,12 @@ impl<'a> super::AnalyzerContext<'a> {
                         _ => left_key.clone(),
                     };
                     using_output.push((col_name, left_id, right_id, output));
-                    let legacy_key = |key: &TypedExpr| {
-                        use crate::common::binary_operator::{
-                            requires_legacy_wide, uses_structural_comparison,
-                        };
-                        requires_legacy_wide(key.value_type.value_type())
-                            || uses_structural_comparison(key.value_type.value_type())
-                    };
-                    if legacy_key(&left_key) || legacy_key(&right_key) {
-                        conds.push(TypedExpr {
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Boolean,
-                                false,
-                            ),
-
-                            kind: ExprKind::BinaryOp {
-                                left: novarocks_parser::ast::AstBox::new(left_key),
-                                op: BinOp::Eq,
-                                right: novarocks_parser::ast::AstBox::new(right_key),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                            },
-                        });
-                    } else {
-                        conds.push(self.analyze_binary_operator(
-                            novarocks_type_contract::OperatorFunction::Equal,
-                            left_key,
-                            right_key,
-                            col_obj.span,
-                        )?);
-                    }
+                    conds.push(self.analyze_binary_operator(
+                        novarocks_type_contract::OperatorFunction::Equal,
+                        left_key,
+                        right_key,
+                        col_obj.span,
+                    )?);
                 }
                 if conds.is_empty() {
                     None
@@ -303,12 +279,10 @@ impl<'a> super::AnalyzerContext<'a> {
                                 false,
                             ),
 
-                            kind: ExprKind::BinaryOp {
+                            kind: ExprKind::BooleanConnective {
                                 left: novarocks_parser::ast::AstBox::new(prev),
-                                op: BinOp::And,
+                                op: crate::common::BooleanOp::And,
                                 right: novarocks_parser::ast::AstBox::new(result),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         };
                     }

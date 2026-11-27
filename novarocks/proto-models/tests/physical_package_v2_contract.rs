@@ -343,33 +343,31 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
 }
 
 #[test]
-fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
+fn retired_binary_and_semantic_parameter_positions_remain_reserved() {
     let pool = pool();
-    let descriptor = pool
-        .get_message_by_name("novarocks.physical_package_v2.BinaryExpression")
+    let expression = pool
+        .get_message_by_name("novarocks.physical_package_v2.ExpressionDefinition")
         .unwrap();
-    let field = descriptor
-        .get_field_by_name("allow_throw_exception")
-        .unwrap();
-    assert_eq!(field.number(), 5);
-    assert!(field.supports_presence());
-    assert!(!field.is_list());
-    let Kind::Message(reference) = field.kind() else {
-        panic!("intrinsic uses a typed reference");
-    };
-    assert_eq!(
-        reference.full_name(),
-        "novarocks.physical_semantics_v2.SemanticParameterRef"
+    assert!(expression.reserved_ranges().any(|range| range.contains(&9)));
+    assert!(expression.reserved_names().any(|name| name == "binary"));
+    assert!(
+        pool.get_message_by_name("novarocks.physical_package_v2.BinaryExpression")
+            .is_none()
     );
-    assert_eq!(
-        reference.get_field_by_name("id").unwrap().kind(),
-        Kind::Uint32
+    let parameter = pool
+        .get_message_by_name("novarocks.physical_semantics_v2.SemanticParameter")
+        .unwrap();
+    assert!(parameter.reserved_ranges().any(|range| range.contains(&4)));
+    assert!(
+        parameter
+            .reserved_names()
+            .any(|name| name == "allow_throw_exception")
     );
     assert!(
-        reference
-            .get_field_by_name("id")
+        pool.get_enum_by_name("novarocks.physical_semantics_v2.SemanticParameterKey")
             .unwrap()
-            .supports_presence()
+            .get_value(3)
+            .is_none()
     );
 }
 
@@ -400,79 +398,23 @@ fn cast_mode_has_presence_and_retired_conversion_fields_remain_reserved() {
 }
 
 #[test]
-fn intrinsic_reference_raw_wire_distinguishes_absence_zero_max_and_unknown_key() {
-    use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as semantics};
-    // Binary field 5 wraps an explicit zero ID and the closed ALLOW key (3).
-    let binary = v2::BinaryExpression::decode(&[0x2a, 4, 8, 0, 16, 3][..]).unwrap();
-    let zero = semantics::SemanticParameterRef {
-        id: Some(0),
-        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
-    };
-    assert_eq!(binary.allow_throw_exception, Some(zero));
-    assert_eq!(binary.encode_to_vec(), [0x2a, 4, 8, 0, 16, 3]);
-    assert!(
-        v2::BinaryExpression::decode(&[][..])
-            .unwrap()
-            .allow_throw_exception
-            .is_none()
-    );
-    let empty_binary = v2::BinaryExpression::decode(&[0x2a, 0][..]).unwrap();
-    assert_eq!(
-        empty_binary.allow_throw_exception,
-        Some(semantics::SemanticParameterRef::default())
-    );
-    assert_ne!(
-        empty_binary.encode_to_vec(),
-        v2::BinaryExpression::default().encode_to_vec()
-    );
-    for id in [0, u32::MAX] {
-        for expected_key in [
-            semantics::SemanticParameterKey::AllowThrowException as i32,
-            0,
-            i32::MAX,
-        ] {
-            let reference = semantics::SemanticParameterRef {
-                id: Some(id),
-                expected_key,
-            };
-            let binary = v2::BinaryExpression {
-                allow_throw_exception: Some(reference),
-                ..Default::default()
-            };
-            let cast = v2::CastExpression {
-                ..Default::default()
-            };
-            assert_eq!(
-                v2::BinaryExpression::decode(binary.encode_to_vec().as_slice()).unwrap(),
-                binary
-            );
-            assert_eq!(
-                v2::CastExpression::decode(cast.encode_to_vec().as_slice()).unwrap(),
-                cast
-            );
-        }
-    }
-    // This DTO preserves absent/unknown facts for typed rejection; it does not
-    // itself prove arithmetic presence, key legality or parameter closure.
+fn retired_binary_bytes_do_not_decode_as_another_expression() {
+    use novarocks_proto_models::physical_package_v2 as v2;
+    let definition = v2::ExpressionDefinition::decode(&[0x4a, 0][..]).unwrap();
+    assert!(definition.kind.is_none());
+    assert!(definition.encode_to_vec().is_empty());
 }
 
 #[test]
-fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier() {
+fn let_cast_and_live_parameters_survive_one_package_carrier() {
     use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as semantics};
-    let reference = |id| semantics::SemanticParameterRef {
-        id: Some(id),
-        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
-    };
     let expressions = vec![
         v2::ExpressionDefinition {
             id: 0,
-            kind: Some(v2::expression_definition::Kind::Binary(
-                v2::BinaryExpression {
-                    left_expr_id: Some(0),
-                    right_expr_id: Some(u32::MAX),
-                    op: v2::BinaryOperator::Multiply as i32,
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
-                    allow_throw_exception: Some(reference(0)),
+            kind: Some(v2::expression_definition::Kind::LetExpression(
+                v2::LetExpression {
+                    value_expr_id: Some(0),
+                    body_expr_id: Some(u32::MAX),
                 },
             )),
             ..Default::default()
@@ -491,14 +433,20 @@ fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier()
         entries: vec![
             semantics::SemanticParameter {
                 id: 0,
-                value: Some(semantics::semantic_parameter::Value::AllowThrowException(
-                    false,
+                value: Some(semantics::semantic_parameter::Value::StatementStartUtc(
+                    semantics::StatementStartUtc {
+                        seconds: Some(0),
+                        nanos: Some(0),
+                    },
                 )),
             },
             semantics::SemanticParameter {
                 id: u32::MAX,
-                value: Some(semantics::semantic_parameter::Value::AllowThrowException(
-                    true,
+                value: Some(semantics::semantic_parameter::Value::StatementStartUtc(
+                    semantics::StatementStartUtc {
+                        seconds: Some(1),
+                        nanos: Some(0),
+                    },
                 )),
             },
         ],

@@ -24,7 +24,7 @@
 
 use input_source::FrameInput;
 
-use crate::{ComparisonSite, CompiledExprSet, StaticExprKind};
+use crate::{CompiledExprSet, StaticExprKind};
 use arrow::{
     array::{ArrayRef, UInt64Array, new_empty_array, new_null_array},
     compute::{TakeOptions, take},
@@ -422,66 +422,37 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNull(_)
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
-                    | StaticExprKind::PreparedCast { .. }
-                    | StaticExprKind::PreparedArithmetic { .. }
-                    | StaticExprKind::PreparedNullSafeComparison { .. }
-                    | StaticExprKind::Eq(..)
-                    | StaticExprKind::Ne(..)
-                    | StaticExprKind::Lt(..)
-                    | StaticExprKind::Le(..)
-                    | StaticExprKind::Gt(..)
-                    | StaticExprKind::Ge(..) => {
-                        let mut summary =
-                            if matches!(node.kind(), StaticExprKind::PreparedArithmetic { .. }) {
-                                program
+                    | StaticExprKind::PreparedCast { .. } => {
+                        let mut summary = if let ControlShape::Case {
+                            simple: true, arms, ..
+                        } = invocation.control
+                        {
+                            let mut own = novarocks_type_contract::ExpressionEffects::PURE_VALUE;
+                            for arm in 0..arms {
+                                work.step()?;
+                                let recipe = program
                                     .recipes()
-                                    .arithmetic(occurrence)
+                                    .case_comparison(occurrence, arm)
                                     .ok_or_else(|| {
-                                        invalid("missing mandatory arithmetic effect recipe")
-                                    })?
-                                    .own_effects(invocation.context)
-                            } else if let ControlShape::Case {
-                                simple: true, arms, ..
-                            } = invocation.control
-                            {
-                                let mut own =
-                                    novarocks_type_contract::ExpressionEffects::PURE_VALUE;
-                                for arm in 0..arms {
-                                    work.step()?;
-                                    let recipe = program
-                                        .recipes()
-                                        .case_comparison(occurrence, arm)
-                                        .ok_or_else(|| {
-                                            invalid("missing mandatory CASE WHEN effect recipe")
-                                        })?;
-                                    if let crate::primitives::PreparedNodeComparison::Composite(
-                                        recipe,
-                                    ) = recipe
-                                    {
-                                        own.may_raise_row_error |= recipe.may_raise_row_error();
-                                    }
+                                        invalid("missing mandatory CASE WHEN effect recipe")
+                                    })?;
+                                if let crate::primitives::PreparedNodeComparison::Composite(
+                                    recipe,
+                                ) = recipe
+                                {
+                                    own.may_raise_row_error |= recipe.may_raise_row_error();
                                 }
-                                ScopedExpressionEffects::primitive(invocation.context, own)
-                            } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
-                                program
-                                    .recipes()
-                                    .cast(occurrence)
-                                    .ok_or_else(|| invalid("missing mandatory cast effect recipe"))?
-                                    .own_effects(invocation.context)
-                            } else if matches!(
-                                node.kind(),
-                                StaticExprKind::PreparedNullSafeComparison { .. }
-                            ) {
-                                program
-                                    .recipes()
-                                    .null_safe_comparison(occurrence)
-                                    .ok_or_else(|| {
-                                        invalid("missing mandatory null-safe effect recipe")
-                                    })?
-                                    .own_effects(invocation.context)
-                            } else {
-                                ScopedExpressionEffects::pure_value(invocation.context)
-                            };
+                            }
+                            ScopedExpressionEffects::primitive(invocation.context, own)
+                        } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
+                            program
+                                .recipes()
+                                .cast(occurrence)
+                                .ok_or_else(|| invalid("missing mandatory cast effect recipe"))?
+                                .own_effects(invocation.context)
+                        } else {
+                            ScopedExpressionEffects::pure_value(invocation.context)
+                        };
                         for (ordinal, child) in invocation.arguments.iter().enumerate() {
                             let child = *effects.get(child).ok_or_else(|| {
                                 invalid("missing prepared ordered operand effects")
@@ -533,21 +504,6 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.recipes().cast(occurrence).is_some() => {}
-                StaticExprKind::PreparedArithmetic { .. }
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 2
-                        && program.recipes().arithmetic(occurrence).is_some() => {}
-                StaticExprKind::PreparedNullSafeComparison { .. }
-                    if invocation.control == ControlShape::Eager
-                        && invocation.arguments.len() == 2
-                        && program.recipes().null_safe_comparison(occurrence).is_some() => {}
-                kind if kind.ordinary_comparison().is_some()
-                    && invocation.control == ControlShape::Eager
-                    && invocation.arguments.len() == 2
-                    && program
-                        .recipes()
-                        .comparison(ComparisonSite::Binary(occurrence))
-                        .is_some() => {}
                 StaticExprKind::Case { .. }
                     if matches!(invocation.control, ControlShape::Case { .. })
                         && guarded::supports_result(node.data_type()) => {}

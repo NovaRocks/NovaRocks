@@ -17,7 +17,7 @@
 
 use arrow::{array::BooleanArray, datatypes::DataType};
 use novarocks_expression::{
-    ComparisonSite, EvaluationInput, ExprEvaluationFailure,
+    EvaluationInput, ExprEvaluationFailure,
     testkit::{
         CallbackControl, PassThroughCallHost,
         guarded_fixtures::{
@@ -32,12 +32,9 @@ use novarocks_expression::{
 use novarocks_functions::{
     KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
-use novarocks_type_contract::FunctionValueType;
 
 #[test]
-fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() {
-    // This is the accepted ordinary bit identity contract, not IEEE ==:
-    // equal NaN payloads compare equal, and opposite signed zero differs.
+fn ordinary_eq_and_not_eq_use_ieee_float_equality_in_sparse_rows() {
     let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
     let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
     let left = vec![
@@ -67,19 +64,13 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
     let rows = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     for kind in [EqualityCase::Eq, EqualityCase::NotEq] {
         let program = equality_program(kind);
-        let recipe = program
-            .unit
-            .recipes()
-            .comparison(ComparisonSite::Binary(root_use(&program)))
-            .unwrap();
+        let unit = &program.unit;
+        let occurrence = &unit.control_flow().uses()[&root_use(&program)];
         assert_eq!(
-            recipe.left_type(),
-            &FunctionValueType::new(DataType::Float64, true)
+            occurrence.control,
+            novarocks_type_contract::ControlShape::OrderedNull
         );
-        assert_eq!(
-            recipe.right_type(),
-            &FunctionValueType::new(DataType::Float64, true)
-        );
+        assert_eq!(occurrence.arguments.len(), 2);
         let input = float_batch(&program, left.clone(), right.clone(), vec![None; 10]);
         let selection = Selection::try_sparse(10, &rows).unwrap();
         let output = program
@@ -96,9 +87,9 @@ fn ordinary_eq_and_not_eq_preserve_frozen_float_bits_and_nulls_in_sparse_rows() 
             )
             .unwrap();
         let eq = [
+            Some(false),
+            Some(false),
             Some(true),
-            Some(false),
-            Some(false),
             Some(true),
             Some(true),
             Some(false),

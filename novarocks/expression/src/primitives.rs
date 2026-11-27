@@ -26,15 +26,14 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::ExpressionUseId;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, PureCompileControl,
-    ValueLogicalType, ValueSchemaCreationFactory, ValueSchemaCreationScope,
+    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, OperatorFunction,
+    PureCompileControl, ValueSchemaCreationFactory, ValueSchemaCreationScope,
     ValueTypeStorageLifetime,
 };
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ComparisonSite {
-    Binary(ExpressionUseId),
     CaseWhen {
         occurrence: ExpressionUseId,
         arm: u32,
@@ -59,14 +58,15 @@ pub(crate) fn case_own_effects<'a, E: From<CompileControlError>>(
     {
         for label in labels {
             work.step()?;
-            let recipe = PreparedCompositeComparisonRecipe::try_new(
-                novarocks_type_contract::KeyRelation::Equal,
-                operand,
-                label?,
+            if let Some(recipe) = PreparedCompositeComparisonRecipe::try_new_for_operator(
+                OperatorFunction::Equal,
+                [operand, label?],
                 work.control(),
             )
-            .map_err(&comparison_error)?;
-            effects.may_raise_row_error |= recipe.may_raise_row_error();
+            .map_err(&comparison_error)?
+            {
+                effects.may_raise_row_error |= recipe.may_raise_row_error();
+            }
         }
     }
     Ok(novarocks_functions::ScopedExpressionEffects::primitive(
@@ -78,7 +78,6 @@ pub(crate) fn case_own_effects<'a, E: From<CompileControlError>>(
 pub enum ProgramPrimitiveError {
     Control(CompileControlError),
     Comparison(ComparisonPrepareError),
-    Arithmetic(novarocks_functions::ArithmeticPrepareError),
     Cast(novarocks_functions::CastPrepareError),
     Invalid(&'static str),
 }
@@ -103,7 +102,6 @@ impl fmt::Display for ProgramPrimitiveError {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::Comparison(e) => e.fmt(f),
-            Self::Arithmetic(e) => e.fmt(f),
             Self::Cast(e) => e.fmt(f),
             Self::Invalid(message) => f.write_str(message),
         }
@@ -114,7 +112,6 @@ impl std::error::Error for ProgramPrimitiveError {
         match self {
             Self::Control(e) => Some(e),
             Self::Comparison(e) => Some(e),
-            Self::Arithmetic(e) => Some(e),
             Self::Cast(e) => Some(e),
             Self::Invalid(_) => None,
         }
@@ -145,13 +142,6 @@ impl<H> From<ComparisonPrepareError> for ProgramCreationFailure<ProgramPrimitive
         ProgramPrimitiveError::from(error).into()
     }
 }
-impl<H> From<novarocks_functions::ArithmeticPrepareError>
-    for ProgramCreationFailure<ProgramPrimitiveError, H>
-{
-    fn from(error: novarocks_functions::ArithmeticPrepareError) -> Self {
-        ProgramPrimitiveError::from(error).into()
-    }
-}
 impl<H> From<novarocks_functions::CastPrepareError>
     for ProgramCreationFailure<ProgramPrimitiveError, H>
 {
@@ -160,41 +150,6 @@ impl<H> From<novarocks_functions::CastPrepareError>
     }
 }
 
-fn arithmetic_creation_failure<H>(
-    error: novarocks_functions::ArithmeticCreationFailure<H>,
-) -> ProgramCreationFailure<ProgramPrimitiveError, H> {
-    use novarocks_functions::{
-        ArithmeticCreationFailure as Failure, ArithmeticTypeCreationFailure as TypeFailure,
-    };
-    use novarocks_type_contract::ValueConstructionFailure as Construction;
-    match error {
-        Failure::Prepare(error) => ProgramPrimitiveError::from(error).into(),
-        Failure::Construction(Construction::Observer(TypeFailure::Control(error))) => ProgramCreationFailure::Control(error),
-        Failure::Construction(Construction::Observer(TypeFailure::Creator(error))) => ProgramCreationFailure::Creator(error),
-        Failure::Construction(Construction::Layout(error)) => ProgramCreationFailure::Resource(error),
-        Failure::Construction(Construction::Vec(error)) => match error {
-            novarocks_type_contract::ControlResourceError::Control(error) => ProgramCreationFailure::Control(error),
-            // Canonical Float64 has no collection construction. A future
-            // unknown collection route must fail its original source model.
-            novarocks_type_contract::ControlResourceError::SourceModel(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
-        },
-        Failure::Construction(Construction::HashMap(error)) => match error {
-            novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::Arithmetic(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic),
-            novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
-        },
-        Failure::Construction(Construction::BTree(error)) => match error {
-            novarocks_type_contract::owned_resources::btree::BTreeResourceError::Arithmetic(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic),
-            novarocks_type_contract::owned_resources::btree::BTreeResourceError::SourceModel(_) =>
-                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
-        },
-        Failure::Construction(Construction::ValueType(_) | Construction::Rule(_)) =>
-            ProgramPrimitiveError::Arithmetic(novarocks_functions::ArithmeticPrepareError::TypeMismatch).into(),
-    }
-}
 fn before_recipe_insert<K: Ord, V, H>(
     recipes: &BTreeMap<K, V>,
     retained: &mut ProgramCreation<'_, H>,
@@ -273,39 +228,6 @@ fn compile_core<H>(
                 ))?
                 .kind();
             match kind {
-                kind if kind.ordinary_comparison().is_some() => {
-                    let (operator, left, right) =
-                        kind.ordinary_comparison().expect("checked comparison kind");
-                    if invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 2
-                        || flow.uses()[&invocation.arguments[0]].definition != left
-                        || flow.uses()[&invocation.arguments[1]].definition != right
-                    {
-                        return Err(ProgramPrimitiveError::Invalid(
-                            "comparison differs from its actual ordered occurrence",
-                        )
-                        .into());
-                    }
-                    work.flush()?;
-                    let recipe =
-                        prepare_comparison_node(operator, value(left)?, value(right)?, control)?;
-                    let result = value(invocation.definition)?;
-                    if *result.data_type() != arrow::datatypes::DataType::Boolean
-                        || result.logical_type() != ValueLogicalType::Physical
-                        || (recipe.nullable_result() && !result.nullable())
-                    {
-                        return Err(ProgramPrimitiveError::Invalid(
-                            "comparison result loses successful SQL NULL or its Boolean domain",
-                        )
-                        .into());
-                    }
-                    before_recipe_insert(&recipes, retained, work)?;
-                    recipes.insert(
-                        ComparisonSite::Binary(occurrence),
-                        PreparedNodeComparison::Ordinary(recipe),
-                    );
-                    work.step()?;
-                }
                 StaticExprKind::Case {
                     ieee_float_equality,
                     has_case_expr: true,
@@ -356,15 +278,14 @@ fn compile_core<H>(
                                     left, right, control,
                                 )?,
                             )
-                        } else if PreparedCompositeComparisonRecipe::is_composite(left) {
-                            PreparedNodeComparison::Composite(
-                                PreparedCompositeComparisonRecipe::try_new(
-                                    novarocks_type_contract::KeyRelation::Equal,
-                                    left,
-                                    right,
-                                    control,
-                                )?,
-                            )
+                        } else if let Some(recipe) =
+                            PreparedCompositeComparisonRecipe::try_new_for_operator(
+                                OperatorFunction::Equal,
+                                [left, right],
+                                control,
+                            )?
+                        {
+                            PreparedNodeComparison::Composite(recipe)
                         } else {
                             PreparedNodeComparison::Ordinary(prepare_comparison_node(
                                 ComparisonOperator::Eq,
@@ -383,126 +304,6 @@ fn compile_core<H>(
         }
     }
     Ok(recipes)
-}
-
-impl From<novarocks_functions::ArithmeticPrepareError> for ProgramPrimitiveError {
-    fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
-        match value {
-            novarocks_functions::ArithmeticPrepareError::Control(cause)
-            | novarocks_functions::ArithmeticPrepareError::Kernel(
-                novarocks_functions::KernelFailure::CompileControl(cause),
-            ) => Self::Control(cause),
-            original => Self::Arithmetic(original),
-        }
-    }
-}
-
-pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H>>(
-    checked: &CompiledParts,
-    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
-    factory: Option<&F>,
-    control: &dyn PureCompileControl,
-) -> Result<
-    CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
-    ProgramCreationFailure<ProgramPrimitiveError, H>,
-> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let mut scope = match factory {
-        Some(factory) => Some(
-            factory
-                .begin_scope()
-                .map_err(ProgramCreationFailure::Creator)?,
-        ),
-        None => None,
-    };
-    let mut retained = ProgramCreation {
-        creator: scope
-            .as_mut()
-            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
-    };
-    let result = (|| {
-        let mut recipes = BTreeMap::new();
-        {
-            let flow = &checked.flow;
-            let definitions = &checked.definitions;
-            let types = &checked.types;
-            let value = |id: crate::CompiledExprId| match types.get(id.index()) {
-                Some(FunctionArgumentType::Value(value)) => Ok(value),
-                _ => Err(ProgramPrimitiveError::Invalid(
-                    "arithmetic requires complete value types",
-                )),
-            };
-            for (&use_id, invocation) in flow.uses() {
-                work.step()?;
-                let kind = definitions
-                    .node(invocation.definition)
-                    .ok_or(ProgramPrimitiveError::Invalid(
-                        "missing arithmetic definition",
-                    ))?
-                    .kind();
-                let StaticExprKind::PreparedArithmetic {
-                    operator,
-                    left,
-                    right,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                } = kind
-                else {
-                    continue;
-                };
-                if invocation.control != ControlShape::Eager
-                    || invocation.arguments.len() != 2
-                    || flow.uses()[&invocation.arguments[0]].definition != *left
-                    || flow.uses()[&invocation.arguments[1]].definition != *right
-                {
-                    return Err(ProgramPrimitiveError::Invalid(
-                        "arithmetic differs from its actual ordered occurrence",
-                    )
-                    .into());
-                }
-                work.flush()?;
-                let recipe = match factory {
-                    Some(factory) => {
-                        novarocks_functions::PreparedArithmeticRecipe::try_new_with_creator_in(
-                            *operator,
-                            value(*left)?,
-                            value(*right)?,
-                            value(invocation.definition)?,
-                            *decimal_overflow_policy,
-                            *allow_throw_exception,
-                            factory,
-                            control,
-                        )
-                        .map_err(arithmetic_creation_failure)?
-                    }
-                    None => prepare_arithmetic_node(
-                        *operator,
-                        value(*left)?,
-                        value(*right)?,
-                        value(invocation.definition)?,
-                        *decimal_overflow_policy,
-                        *allow_throw_exception,
-                        control,
-                    )?,
-                };
-                before_recipe_insert(&recipes, &mut retained, &mut work)?;
-                recipes.insert(use_id, recipe);
-                work.step()?;
-            }
-        }
-        Ok(recipes)
-    })();
-    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
-        return result.map(|entries| CreatedPrimitiveMap {
-            entries,
-            _storage: retained.storage(),
-        });
-    }
-    work.finish()?;
-    Ok(CreatedPrimitiveMap {
-        entries: result?,
-        _storage: retained.storage(),
-    })
 }
 
 impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
@@ -603,95 +404,6 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     })
 }
 
-pub(crate) fn compile_null_safe_comparisons_with_factory<H, F: ValueSchemaCreationFactory<H>>(
-    checked: &CompiledParts,
-    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
-    factory: Option<&F>,
-    control: &dyn PureCompileControl,
-) -> Result<
-    CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNullSafeComparisonRecipe>,
-    ProgramCreationFailure<ProgramPrimitiveError, H>,
-> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let mut scope = match factory {
-        Some(factory) => Some(
-            factory
-                .begin_scope()
-                .map_err(ProgramCreationFailure::Creator)?,
-        ),
-        None => None,
-    };
-    let mut retained = ProgramCreation {
-        creator: scope
-            .as_mut()
-            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
-    };
-    let result = (|| {
-        let mut recipes = BTreeMap::new();
-        {
-            let flow = &checked.flow;
-            let definitions = &checked.definitions;
-            let types = &checked.types;
-            let value = |id: crate::CompiledExprId| match types.get(id.index()) {
-                Some(FunctionArgumentType::Value(value)) => Ok(value),
-                _ => Err(ProgramPrimitiveError::Invalid(
-                    "null-safe comparison requires complete value types",
-                )),
-            };
-            for (&use_id, invocation) in flow.uses() {
-                work.step()?;
-                let kind = definitions
-                    .node(invocation.definition)
-                    .ok_or(ProgramPrimitiveError::Invalid(
-                        "missing null-safe comparison definition",
-                    ))?
-                    .kind();
-                let StaticExprKind::PreparedNullSafeComparison { left, right } = kind else {
-                    continue;
-                };
-                if invocation.control != ControlShape::Eager
-                    || invocation.arguments.len() != 2
-                    || flow.uses()[&invocation.arguments[0]].definition != *left
-                    || flow.uses()[&invocation.arguments[1]].definition != *right
-                {
-                    return Err(ProgramPrimitiveError::Invalid(
-                        "null-safe comparison differs from its actual ordered occurrence",
-                    )
-                    .into());
-                }
-                let result = value(invocation.definition)?;
-                if *result.data_type() != arrow::datatypes::DataType::Boolean
-                    || result.logical_type() != ValueLogicalType::Physical
-                    || result.nullable()
-                {
-                    return Err(ProgramPrimitiveError::Invalid(
-                        "null-safe comparison requires nonnullable Physical Boolean result",
-                    )
-                    .into());
-                }
-                work.flush()?;
-                let recipe =
-                    prepare_null_safe_comparison_node(value(*left)?, value(*right)?, control)?;
-                before_recipe_insert(&recipes, &mut retained, &mut work)?;
-                recipes.insert(use_id, recipe);
-                work.step()?;
-            }
-        }
-        Ok(recipes)
-    })();
-    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
-        return result.map(|entries| CreatedPrimitiveMap {
-            entries,
-            _storage: retained.storage(),
-        });
-    }
-    work.finish()?;
-    Ok(CreatedPrimitiveMap {
-        entries: result?,
-        _storage: retained.storage(),
-    })
-}
-
 /// Prepare one ordinary comparison with the same exact domains as a program use.
 pub fn prepare_comparison_node(
     operator: ComparisonOperator,
@@ -703,13 +415,6 @@ pub fn prepare_comparison_node(
         operator, left, right, control,
     )?)
 }
-pub fn prepare_null_safe_comparison_node(
-    left: &FunctionValueType,
-    right: &FunctionValueType,
-    control: &dyn PureCompileControl,
-) -> Result<novarocks_functions::PreparedNullSafeComparisonRecipe, ProgramPrimitiveError> {
-    Ok(novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(left, right, control)?)
-}
 pub fn prepare_cast_node(
     _operation: novarocks_functions::CastOperation,
     source: &FunctionValueType,
@@ -719,24 +424,5 @@ pub fn prepare_cast_node(
 ) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
     Ok(novarocks_functions::PreparedCastRecipe::try_new_trino(
         source, result, cast_mode, control,
-    )?)
-}
-pub fn prepare_arithmetic_node(
-    operator: novarocks_type_contract::ArithmeticOperator,
-    left: &FunctionValueType,
-    right: &FunctionValueType,
-    result: &FunctionValueType,
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-    allow_throw_exception: bool,
-    control: &dyn PureCompileControl,
-) -> Result<novarocks_functions::PreparedArithmeticRecipe, ProgramPrimitiveError> {
-    Ok(novarocks_functions::PreparedArithmeticRecipe::try_new(
-        operator,
-        left,
-        right,
-        result,
-        policy,
-        allow_throw_exception,
-        control,
     )?)
 }

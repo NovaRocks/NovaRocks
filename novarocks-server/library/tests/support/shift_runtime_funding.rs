@@ -193,7 +193,7 @@ fn source_for_arguments(
             builder
                 .unit(project)
                 .unwrap()
-                .add(None, ty.clone(), ExprKind::Value(input))
+                .add(None, ty.clone(), ExprKind::input(input))
                 .unwrap(),
         );
     }

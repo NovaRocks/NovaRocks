@@ -26,30 +26,6 @@ fn shape(message: &'static str) -> ExpressionCodecError {
     ExpressionCodecError::InvalidShape(message)
 }
 
-/// Constant-size closed projections. The caller owns observation and scope.
-pub(super) fn decode_binary(
-    op: i32,
-) -> Result<novarocks_expression_contract::BinaryOperator, ExpressionCodecError> {
-    use wire::BinaryOperator as W;
-    Ok(
-        match W::try_from(op).map_err(|_| shape("binary operator is unknown"))? {
-            W::Unspecified => return Err(shape("binary operator is unspecified")),
-            W::Add => novarocks_expression_contract::BinaryOperator::Add,
-            W::Subtract => novarocks_expression_contract::BinaryOperator::Subtract,
-            W::Multiply => novarocks_expression_contract::BinaryOperator::Multiply,
-            W::Divide => novarocks_expression_contract::BinaryOperator::Divide,
-            W::Modulo => novarocks_expression_contract::BinaryOperator::Modulo,
-            W::Eq => novarocks_expression_contract::BinaryOperator::Eq,
-            W::EqForNull => novarocks_expression_contract::BinaryOperator::EqForNull,
-            W::NotEq => novarocks_expression_contract::BinaryOperator::NotEq,
-            W::Lt => novarocks_expression_contract::BinaryOperator::Lt,
-            W::LtEq => novarocks_expression_contract::BinaryOperator::LtEq,
-            W::Gt => novarocks_expression_contract::BinaryOperator::Gt,
-            W::GtEq => novarocks_expression_contract::BinaryOperator::GtEq,
-        },
-    )
-}
-
 pub(crate) fn decode_window_units(units: i32) -> Result<p::WindowFrameUnits, ExpressionCodecError> {
     use wire::WindowFrameUnits as W;
     Ok(match W::try_from(units) {
@@ -150,33 +126,6 @@ mod tests {
     }
     fn bound(kind: wire::window_bound::Kind) -> wire::WindowBound {
         wire::WindowBound { kind: Some(kind) }
-    }
-
-    #[test]
-    fn receiving_operators_cover_every_closed_variant_and_original_error_categories() {
-        use novarocks_expression_contract::BinaryOperator as B;
-        use wire::BinaryOperator as V;
-        for (wire, expected) in [
-            (V::Add, B::Add),
-            (V::Subtract, B::Subtract),
-            (V::Multiply, B::Multiply),
-            (V::Divide, B::Divide),
-            (V::Modulo, B::Modulo),
-            (V::Eq, B::Eq),
-            (V::EqForNull, B::EqForNull),
-            (V::NotEq, B::NotEq),
-            (V::Lt, B::Lt),
-            (V::LtEq, B::LtEq),
-            (V::Gt, B::Gt),
-            (V::GtEq, B::GtEq),
-        ] {
-            assert_eq!(decode_binary(wire as i32).unwrap(), expected);
-        }
-        // Former operation numbers are reserved and follow the unknown-value path.
-        error(decode_binary(0), "binary operator is unspecified");
-        for raw in [13, 14, 15, -1, i32::MAX] {
-            error(decode_binary(raw), "binary operator is unknown");
-        }
     }
 
     #[test]

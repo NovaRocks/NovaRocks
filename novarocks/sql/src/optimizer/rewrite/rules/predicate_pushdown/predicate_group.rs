@@ -18,7 +18,6 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::column_id::ColumnId;
-use crate::common::BinOp;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
 
@@ -123,18 +122,11 @@ fn signed_column_literal_equality_key(arena: &ScalarArena, expr: ScalarId) -> Op
     use arrow::datatypes::DataType;
     use novarocks_functions::{FunctionKind, FunctionResultType};
     use novarocks_type_contract::{
-        DecimalOverflowPolicy, FunctionArgumentType, FunctionValueType, OperatorFunction,
-        ValueLogicalType,
+        FunctionArgumentType, FunctionValueType, OperatorFunction, ValueLogicalType,
     };
 
     let result = arena.value_type(expr);
     let operands = match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        } => [*left, *right],
         ScalarNode::FunctionCall {
             args,
             binding,
@@ -215,35 +207,22 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
         ),
         ScalarNode::LocalValue(binding) => format!("LocalValue({})", binding.0),
         ScalarNode::Nested(inner) => canonical_expr_key(arena, *inner),
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => canonical_bool_key(arena, "AND", *left, *right),
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right,
             ..
         } => canonical_bool_key(arena, "OR", *left, *right),
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => {
-            // For commutative ops (Eq, Ne) canonicalize operand order so that
-            // `a = b` and `b = a` produce the same key regardless of which
-            // direction the arena normalization swapped them.
-            let lk = canonical_expr_key(arena, *left);
-            let rk = canonical_expr_key(arena, *right);
-            let (lk, rk) = if matches!(op, BinOp::Eq | BinOp::Ne) && lk > rk {
-                (rk, lk)
-            } else {
-                (lk, rk)
-            };
-            format!("BinaryOp({op:?},{decimal_overflow_policy:?},{lk},{rk})")
+        ScalarNode::BooleanConnective { left, op, right } => {
+            let left = canonical_expr_key(arena, *left);
+            let right = canonical_expr_key(arena, *right);
+            format!("BooleanConnective({op:?},{left},{right})")
         }
         ScalarNode::FunctionCall {
             name,
@@ -360,20 +339,18 @@ fn canonical_bool_key(
 fn collect_bool_terms(arena: &ScalarArena, expr: ScalarId, op_name: &str, out: &mut Vec<String>) {
     match (arena.node(expr), op_name) {
         (
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             "AND",
         )
         | (
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::Or,
+                op: crate::common::BooleanOp::Or,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             "OR",
         ) => {
@@ -433,16 +410,17 @@ mod tests {
         }
     }
 
-    fn bool_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+    fn bool_expr(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn func(
@@ -493,10 +471,10 @@ mod tests {
     fn top_level_and_is_split_but_or_stays_atomic() {
         let expr = bool_expr(
             bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
-            BinOp::And,
+            crate::common::BooleanOp::And,
             bool_expr(
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
-                BinOp::Or,
+                crate::common::BooleanOp::Or,
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(3)),
             ),
         );
@@ -518,7 +496,10 @@ mod tests {
         let second_expr = materialize(&arena, groups[1].expr);
         assert!(matches!(
             second_expr.kind,
-            ExprKind::BinaryOp { op: BinOp::Or, .. }
+            ExprKind::BooleanConnective {
+                op: crate::common::BooleanOp::Or,
+                ..
+            }
         ));
     }
 
@@ -527,7 +508,7 @@ mod tests {
         let expr = TypedExpr {
             kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(bool_expr(
                 bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
             ))),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -565,10 +546,10 @@ mod tests {
     fn split_or_refs_flattens_nested_or() {
         let expr = bool_expr(
             bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             bool_expr(
                 bool_expr(col("a", 1), BinOp::Eq, int_lit(2)),
-                BinOp::Or,
+                crate::common::BooleanOp::Or,
                 bool_expr(col("a", 1), BinOp::Eq, int_lit(3)),
             ),
         );

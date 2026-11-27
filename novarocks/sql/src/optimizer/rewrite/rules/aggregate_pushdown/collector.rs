@@ -352,9 +352,9 @@ fn walk_and_collect_equi(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<(Sca
     }
     match arena.node(expr) {
         ScalarNode::Nested(inner) => walk_and_collect_equi(arena, *inner, out),
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -629,15 +629,12 @@ mod tests {
 
     fn eq_typed(a: &str, b: &str) -> crate::analysis::TypedExpr {
         use crate::analysis::BinOp;
-        crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_typed(a, DataType::Int64)),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref_typed(b, DataType::Int64)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_ref_typed(a, DataType::Int64),
+            col_ref_typed(b, DataType::Int64),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn collect_test_push_plan(
@@ -751,15 +748,12 @@ mod tests {
     fn rejects_aggregate_expr_not_columnref() {
         let mut arena = make_arena();
         use crate::analysis::BinOp;
-        let non_col = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_typed("a", DataType::Int64)),
-                op: BinOp::Add,
-                right: novarocks_parser::ast::AstBox::new(col_ref_typed("b", DataType::Int64)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
-        };
+        let non_col = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col_ref_typed("a", DataType::Int64),
+            col_ref_typed("b", DataType::Int64),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let arg_id = intern_typed(
             &mut arena,
             &non_col,
@@ -983,23 +977,12 @@ mod tests {
         let d = scan_opt_with_alias(Some("d"), &[("d_date_sk", DataType::Int64)]);
 
         use crate::analysis::BinOp;
-        let cond = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                    "cs",
-                    "cs_sold_date_sk",
-                    DataType::Int64,
-                )),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                    "d",
-                    "d_date_sk",
-                    DataType::Int64,
-                )),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let cond = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            qualified_col_ref_typed("cs", "cs_sold_date_sk", DataType::Int64),
+            qualified_col_ref_typed("d", "d_date_sk", DataType::Int64),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let join = join_opt(JoinKind::Inner, Some(cond), cs, d, &mut arena);
         let sum_arg = intern_typed(
             &mut arena,
@@ -1183,51 +1166,24 @@ mod tests {
 
         use crate::analysis::BinOp;
         let cond = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(crate::analysis::TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                            "l",
-                            "c0",
-                            DataType::Int64,
-                        )),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                            "r",
-                            "c0",
-                            DataType::Int64,
-                        )),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
+            kind: ExprKind::BooleanConnective {
+                left: novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_operator(
+                        BinOp::Eq,
+                        qualified_col_ref_typed("l", "c0", DataType::Int64),
+                        qualified_col_ref_typed("r", "c0", DataType::Int64),
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     ),
-                }),
-                op: BinOp::And,
-                right: novarocks_parser::ast::AstBox::new(crate::analysis::TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                            "l",
-                            "c1",
-                            DataType::Utf8,
-                        )),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(qualified_col_ref_typed(
-                            "r",
-                            "c1",
-                            DataType::Utf8,
-                        )),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
+                ),
+                op: crate::common::BooleanOp::And,
+                right: novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_operator(
+                        BinOp::Eq,
+                        qualified_col_ref_typed("l", "c1", DataType::Utf8),
+                        qualified_col_ref_typed("r", "c1", DataType::Utf8),
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };

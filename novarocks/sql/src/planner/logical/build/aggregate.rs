@@ -899,7 +899,7 @@ fn any_expression(expr: &TypedExpr, matches_expr: &dyn Fn(&TypedExpr) -> bool) -
             .chain(order_by.iter().map(|item| &item.expr))
             .chain(filter.as_deref())
             .any(contains),
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -962,16 +962,10 @@ fn rewrite_expr_children_with<E>(
             initializer: novarocks_parser::ast::AstBox::new(rewrite_child(initializer)?),
             body: novarocks_parser::ast::AstBox::new(rewrite_child(body)?),
         },
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => ExprKind::BinaryOp {
+        ExprKind::BooleanConnective { left, op, right } => ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(rewrite_child(left)?),
             op: *op,
             right: novarocks_parser::ast::AstBox::new(rewrite_child(right)?),
-            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::FunctionCall {
             name,
@@ -1211,7 +1205,7 @@ pub(super) fn collect_aggregates(
                 source,
             });
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -1333,7 +1327,7 @@ fn collect_non_agg_column_refs_inner(
                 }
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -2203,15 +2197,12 @@ mod call_policy_tests {
             },
             value_type,
         };
-        let computed = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(selected.clone()),
-                right: novarocks_parser::ast::AstBox::new(constant_expr(vec![1], 0)),
-                op: BinOp::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: FunctionValueType::new(DataType::Int64, true),
-        };
+        let computed = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            selected.clone(),
+            constant_expr(vec![1], 0),
+            DecimalOverflowPolicy::OutputNull,
+        );
         let nested =
             |json| crate::test_value_types::string_structure(&[("payload", true, json)], false);
         let uuid = FunctionValueType::try_with_logical_type(

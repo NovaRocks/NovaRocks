@@ -703,51 +703,41 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn lt_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Lt,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Lt,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
     fn mul_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Mul,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Mul,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn str_lit(s: &str) -> TypedExpr {
@@ -1483,21 +1473,19 @@ mod tests {
             // The value expression must be `2.0 * WIN_ID`, i.e. the BinaryOp must be Mul.
             // Walk the predicate: find the BinaryOp whose right (or left) is ColumnRef(win_id).
             fn contains_mul_with_win(expr: &TypedExpr, win_id: ColumnId) -> bool {
+                if let Some((novarocks_type_contract::OperatorFunction::Multiply, [left, right])) =
+                    crate::common::binary_operator::typed_operands(expr)
+                    && [left, right]
+                        .into_iter()
+                        .any(|part| collect_column_id_refs(part).contains(&win_id))
+                {
+                    return true;
+                }
                 match &expr.kind {
-                    ExprKind::BinaryOp {
-                        left,
-                        op: BinOp::Mul,
-                        right,
-                        ..
-                    } => {
-                        let lr = collect_column_id_refs(right);
-                        let ll = collect_column_id_refs(left);
-                        if lr.contains(&win_id) || ll.contains(&win_id) {
-                            return true;
-                        }
-                        contains_mul_with_win(left, win_id) || contains_mul_with_win(right, win_id)
+                    ExprKind::FunctionCall { args, .. } => {
+                        args.iter().any(|arg| contains_mul_with_win(arg, win_id))
                     }
-                    ExprKind::BinaryOp { left, right, .. }
+                    ExprKind::BooleanConnective { left, right, .. }
                     | ExprKind::Let {
                         initializer: left,
                         body: right,
@@ -1818,25 +1806,18 @@ mod tests {
         let (pred, a_orig, left, right) = extract_filter_apply(&plan);
         let a = a_orig.clone();
         // Add a Filter below the aggregate input: l_quantity > 0
-        let residual_pred = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(
-                    INNER_L_QUANTITY,
-                    "l_quantity",
+        let residual_pred = crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(0)),
+                value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Float64,
-                )),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Float64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    false,
+                ),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let inner_with_filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: residual_pred,
@@ -1889,25 +1870,18 @@ mod tests {
             col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
         );
         // Residual inside subquery: l_quantity < 999
-        let inner_residual = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(
-                    INNER_L_QUANTITY,
-                    "l_quantity",
+        let inner_residual = crate::common::binary_operator::test_operator(
+            BinOp::Lt,
+            col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Float(999.0)),
+                value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Float64,
-                )),
-                op: BinOp::Lt,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Float(999.0)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Float64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    false,
+                ),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let inner_with_filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: inner_residual,
@@ -1986,25 +1960,15 @@ mod tests {
         // l_orderkey > 100 references outer lineitem (not only "part"), so 4c does NOT drop it.
         // After 4a (removes corr-twin) and 4b (removes subquery-comparison), outer_conjuncts = [l_orderkey > 100].
         // sub_residual = [inner l_quantity < 999].  Same count (1), but non-phys-eq → None.
-        let outer_extra = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(
-                    L_ORDERKEY,
-                    "l_orderkey",
-                    DataType::Int64,
-                )),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(100)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let outer_extra = crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            col_ref(L_ORDERKEY, "l_orderkey", DataType::Int64),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(100)),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let pred = and_expr(
             and_expr(
                 eq_expr(
@@ -2037,33 +2001,19 @@ mod tests {
     fn transform_rewrites_subquery_comparison_inside_between() {
         // The subquery conjunct: l_quantity BETWEEN (APPLY_OUT - 1.0) AND (APPLY_OUT + 1.0)
         // low  = APPLY_OUT - 1.0
-        let low_expr = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_nullable(
-                    APPLY_OUT,
-                    "avg_subq",
-                    DataType::Float64,
-                )),
-                op: BinOp::Sub,
-                right: novarocks_parser::ast::AstBox::new(float_lit(1.0)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
-        };
+        let low_expr = crate::common::binary_operator::test_operator(
+            BinOp::Sub,
+            col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            float_lit(1.0),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         // high = APPLY_OUT + 1.0
-        let high_expr = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_nullable(
-                    APPLY_OUT,
-                    "avg_subq",
-                    DataType::Float64,
-                )),
-                op: BinOp::Add,
-                right: novarocks_parser::ast::AstBox::new(float_lit(1.0)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
-        };
+        let high_expr = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            float_lit(1.0),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let between_conjunct = crate::common::binary_operator::test_inclusive_range(
             col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
             low_expr,

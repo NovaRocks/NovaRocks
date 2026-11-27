@@ -221,10 +221,12 @@ pub(super) fn wrap_scalar_applies(
                 .into_iter()
                 .next()
                 .ok_or("JSON mark build has no value")?;
-            let [probe_binding, build_binding] = spec
+            let crate::analysis::JsonMarkKeyBindings {
+                keys: [probe_binding, build_binding],
+                equality,
+            } = spec
                 .mark_key_bindings
-                .ok_or("JSON mark join has no authored normalization bindings")?;
-            let decimal_overflow_policy = probe_binding.decimal_overflow_policy();
+                .ok_or("JSON mark join has no authored key bindings")?;
             let (probe_plan, probe_key) = project_mark_key(
                 current,
                 TypedExpr {
@@ -255,18 +257,8 @@ pub(super) fn wrap_scalar_applies(
                 factory,
                 false,
             )?;
-            let predicate = TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(probe_key),
-                    op: BinOp::Eq,
-                    right: novarocks_parser::ast::AstBox::new(build_key),
-                    decimal_overflow_policy,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Boolean,
-                    true,
-                ),
-            };
+            let predicate =
+                crate::common::binary_operator::typed_call(equality, vec![probe_key, build_key]);
             current = LogicalPlanNode::new(
                 LogicalPlanKind::Join(LogicalJoinNode {
                     naa_author: Some(Box::new(crate::common::naa::NaaAuthorFacts {

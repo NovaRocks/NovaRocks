@@ -253,12 +253,6 @@ mod unary_lowering_tests;
 #[cfg(test)]
 mod case_lowering_tests;
 
-#[cfg(test)]
-mod equality_lowering_tests;
-
-#[cfg(test)]
-mod arithmetic_lowering_tests;
-
 mod sort;
 mod stream_sink;
 mod system_relation;

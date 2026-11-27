@@ -39,7 +39,7 @@ fn f64_values() -> ArrayRef {
     ]))
 }
 
-fn ieee_nan_bits(op: BinaryOperator, left: f64, right: f64) -> u64 {
+fn ieee_nan_bits(op: OperatorFunction, left: f64, right: f64) -> u64 {
     // IEEE/Rust does not prescribe one universal NaN payload/sign. Use the
     // target's independent Rust f64 primitive for that representation only,
     // preserving the exact-bit check without guessing a host-specific NaN.
@@ -48,31 +48,30 @@ fn ieee_nan_bits(op: BinaryOperator, left: f64, right: f64) -> u64 {
     let left = std::hint::black_box(left);
     let right = std::hint::black_box(right);
     let value = match op {
-        BinaryOperator::Add => left + right,
-        BinaryOperator::Subtract => left - right,
-        BinaryOperator::Multiply => left * right,
-        BinaryOperator::Divide => left / right,
-        BinaryOperator::Modulo => left % right,
+        OperatorFunction::Add => left + right,
+        OperatorFunction::Subtract => left - right,
+        OperatorFunction::Multiply => left * right,
+        OperatorFunction::Divide => left / right,
+        OperatorFunction::Modulo => left % right,
         _ => panic!("exact five arithmetic operators only"),
     };
     assert!(value.is_nan(), "the standards oracle is only for NaN cases");
     value.to_bits()
 }
 
-fn expected_bits(op: BinaryOperator) -> [Option<u64>; 6] {
+fn expected_bits(op: OperatorFunction) -> [Option<u64>; 6] {
     // The selected input rows [0,2,3,6,10,11] are
     // [1.5,+0,-0,qNaN(payload42),NULL,7], paired with themselves.
     // Binary-exact finite arithmetic gives 3, 2.25, 14, 49, 1 and +0.
     // Addition of two -0 values gives -0; subtraction and multiplication
     // of identical signed zeros give +0. NULL input always propagates.
-    // The established SQL F64 division rule maps either RHS signed zero
-    // to successful NULL, while remainder keeps IEEE invalid-operation NaN.
+    // Trino DOUBLE division and remainder both preserve IEEE NaN on zero over zero.
     // Finite values/zero signs/NULLs below are authored literals, independent
     // of either arithmetic implementation and of the NaN representation oracle.
     let nan = f64::from_bits(0x7ff8_0000_0000_0042);
     let nan = Some(ieee_nan_bits(op, nan, nan));
     match op {
-        BinaryOperator::Add => [
+        OperatorFunction::Add => [
             Some(0x4008_0000_0000_0000),
             Some(0),
             Some(0x8000_0000_0000_0000),
@@ -80,8 +79,8 @@ fn expected_bits(op: BinaryOperator) -> [Option<u64>; 6] {
             None,
             Some(0x402c_0000_0000_0000),
         ],
-        BinaryOperator::Subtract => [Some(0), Some(0), Some(0), nan, None, Some(0)],
-        BinaryOperator::Multiply => [
+        OperatorFunction::Subtract => [Some(0), Some(0), Some(0), nan, None, Some(0)],
+        OperatorFunction::Multiply => [
             Some(0x4002_0000_0000_0000),
             Some(0),
             Some(0),
@@ -89,15 +88,15 @@ fn expected_bits(op: BinaryOperator) -> [Option<u64>; 6] {
             None,
             Some(0x4048_8000_0000_0000),
         ],
-        BinaryOperator::Divide => [
+        OperatorFunction::Divide => [
             Some(0x3ff0_0000_0000_0000),
-            None,
-            None,
+            Some(ieee_nan_bits(op, 0.0, 0.0)),
+            Some(ieee_nan_bits(op, -0.0, -0.0)),
             nan,
             None,
             Some(0x3ff0_0000_0000_0000),
         ],
-        BinaryOperator::Modulo => [
+        OperatorFunction::Modulo => [
             Some(0),
             Some(ieee_nan_bits(op, 0.0, 0.0)),
             Some(ieee_nan_bits(op, -0.0, -0.0)),
@@ -111,11 +110,11 @@ fn expected_bits(op: BinaryOperator) -> [Option<u64>; 6] {
 #[test]
 fn float_arithmetic_required_actual_compiler_frame_sparse_bits_and_empty_selection() {
     for op in [
-        BinaryOperator::Add,
-        BinaryOperator::Subtract,
-        BinaryOperator::Multiply,
-        BinaryOperator::Divide,
-        BinaryOperator::Modulo,
+        OperatorFunction::Add,
+        OperatorFunction::Subtract,
+        OperatorFunction::Multiply,
+        OperatorFunction::Divide,
+        OperatorFunction::Modulo,
     ] {
         let program = build_program(op, DataType::Float64, DataType::Float64, Wrap::Bare, false);
         let left = f64_values();
@@ -167,7 +166,7 @@ fn float_arithmetic_required_actual_compiler_frame_sparse_bits_and_empty_selecti
 #[test]
 fn float_arithmetic_required_actual_frame_seven_causes_prefix_and_failed_latch() {
     let program = build_program(
-        BinaryOperator::Divide,
+        OperatorFunction::Divide,
         DataType::Float64,
         DataType::Float64,
         Wrap::Bare,

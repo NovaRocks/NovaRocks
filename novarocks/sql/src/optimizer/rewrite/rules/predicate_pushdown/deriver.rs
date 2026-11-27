@@ -29,6 +29,7 @@ use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNod
 use crate::optimizer::scalar_expr;
 
 pub(crate) fn derive_inner_join_predicates(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
@@ -81,6 +82,7 @@ pub(crate) fn derive_inner_join_predicates(
             };
             if let Some(target) = target
                 && let Some(group) = substitute_constraint_column(
+                    function_catalog,
                     arena,
                     constraint,
                     target,
@@ -95,7 +97,12 @@ pub(crate) fn derive_inner_join_predicates(
 
     for group in filter_groups {
         derived.extend(derive_or_branch_side_filters(
-            arena, left_ids, right_ids, group, control,
+            function_catalog,
+            arena,
+            left_ids,
+            right_ids,
+            group,
+            control,
         )?);
     }
 
@@ -173,6 +180,7 @@ fn extract_column_literal_constraint(
 }
 
 fn substitute_constraint_column(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     constraint: &ColumnConstraint,
     target_column: ScalarId,
@@ -196,11 +204,27 @@ fn substitute_constraint_column(
         return Ok(None);
     }
     let expr = match &constraint.kind {
-        ConstraintKind::Eq(value) => binary_bool(arena, target_column, BinOp::Eq, *value, control)?,
+        ConstraintKind::Eq(value) => binary_bool(
+            function_catalog,
+            arena,
+            target_column,
+            BinOp::Eq,
+            *value,
+            control,
+        )?,
         ConstraintKind::InList(list) => {
             let equalities = list
                 .iter()
-                .map(|&candidate| binary_bool(arena, target_column, BinOp::Eq, candidate, control))
+                .map(|&candidate| {
+                    binary_bool(
+                        function_catalog,
+                        arena,
+                        target_column,
+                        BinOp::Eq,
+                        candidate,
+                        control,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let Some(disjunction) = scalar_expr::combine_disjuncts(arena, equalities, control)?
             else {
@@ -209,12 +233,27 @@ fn substitute_constraint_column(
             disjunction
         }
         ConstraintKind::Lower { op, value } | ConstraintKind::Upper { op, value } => {
-            binary_bool(arena, target_column, *op, *value, control)?
+            binary_bool(function_catalog, arena, target_column, *op, *value, control)?
         }
         ConstraintKind::Between { low, high } => {
-            let lower = binary_bool(arena, *low, BinOp::Le, target_column, control)?;
-            let upper = binary_bool(arena, target_column, BinOp::Le, *high, control)?;
-            binary_bool(arena, lower, BinOp::And, upper, control)?
+            let lower = binary_bool(
+                function_catalog,
+                arena,
+                *low,
+                BinOp::Le,
+                target_column,
+                control,
+            )?;
+            let upper = binary_bool(
+                function_catalog,
+                arena,
+                target_column,
+                BinOp::Le,
+                *high,
+                control,
+            )?;
+            scalar_expr::combine_conjuncts(arena, vec![lower, upper], control)?
+                .expect("inclusive derived range has two bounds")
         }
     };
     Ok(Some(PredicateGroup::new(
@@ -226,6 +265,7 @@ fn substitute_constraint_column(
 }
 
 fn derive_or_branch_side_filters(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
@@ -315,13 +355,15 @@ fn derive_or_branch_side_filters(
             continue;
         }
 
-        if let Some(group) = derive_or_in_list(arena, comparison, &per_branch, control)? {
+        if let Some(group) =
+            derive_or_in_list(function_catalog, arena, comparison, &per_branch, control)?
+        {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
             }
             derived.push(group);
         } else if let Some(group) =
-            derive_or_range_envelope(arena, comparison, &per_branch, control)?
+            derive_or_range_envelope(function_catalog, arena, comparison, &per_branch, control)?
         {
             if let Some(side) = single_column_side(arena, group.expr, left_ids, right_ids) {
                 specialized_sides.insert(side);
@@ -334,7 +376,9 @@ fn derive_or_branch_side_filters(
         if specialized_sides.contains(&side) {
             continue;
         }
-        if let Some(group) = derive_or_side_fallback(arena, side, &per_branch, control)? {
+        if let Some(group) =
+            derive_or_side_fallback(function_catalog, arena, side, &per_branch, control)?
+        {
             derived.push(group);
         }
     }
@@ -404,6 +448,7 @@ fn derived_kind_for_constraint(kind: &ConstraintKind) -> PredicateDerivedKind {
 }
 
 fn derive_or_in_list(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     comparison: ScalarId,
     per_branch: &[BranchCandidates],
@@ -435,6 +480,7 @@ fn derive_or_in_list(
         return Ok(None);
     };
     substitute_constraint_column(
+        function_catalog,
         arena,
         &constraint,
         constraint.column,
@@ -444,6 +490,7 @@ fn derive_or_in_list(
 }
 
 fn derive_or_range_envelope(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     comparison: ScalarId,
     per_branch: &[BranchCandidates],
@@ -502,6 +549,7 @@ fn derive_or_range_envelope(
         return Ok(None);
     };
     substitute_constraint_column(
+        function_catalog,
         arena,
         &constraint,
         constraint.column,
@@ -698,6 +746,7 @@ fn is_cross_side_pair(
 }
 
 fn derive_or_side_fallback(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     side: Side,
     per_branch: &[BranchCandidates],
@@ -713,7 +762,8 @@ fn derive_or_side_fallback(
         }
         let mut exprs = Vec::with_capacity(constraints.len());
         for constraint in constraints {
-            let Some(expr) = constraint_to_expr(arena, constraint, control)? else {
+            let Some(expr) = constraint_to_expr(function_catalog, arena, constraint, control)?
+            else {
                 return Ok(None);
             };
             exprs.push(expr);
@@ -939,31 +989,41 @@ fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
 }
 
 fn binary_bool(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     left: ScalarId,
     op: BinOp,
     right: ScalarId,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let nullable = arena.nullable(left) || arena.nullable(right);
-    arena.intern_observed(
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
+    use novarocks_type_contract::OperatorFunction as Operator;
+
+    let (operator, args) = match op {
+        BinOp::Eq => (Operator::Equal, [left, right]),
+        BinOp::Lt => (Operator::LessThan, [left, right]),
+        BinOp::Le => (Operator::LessThanOrEqual, [left, right]),
+        BinOp::Gt => (Operator::LessThan, [right, left]),
+        BinOp::Ge => (Operator::LessThanOrEqual, [right, left]),
+        _ => unreachable!("constraint extraction admits only supported comparison kinds"),
+    };
+    crate::optimizer::scalar::intern_scalar_operator(
+        function_catalog,
+        arena,
+        operator,
+        args,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         control,
     )
 }
 
 fn constraint_to_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     constraint: &ColumnConstraint,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
     Ok(substitute_constraint_column(
+        function_catalog,
         arena,
         constraint,
         constraint.column,
@@ -1025,10 +1085,12 @@ mod tests {
     fn large_int_lit(v: i128) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Decimal128(38, 0),
+            value_type: novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
                 false,
-            ),
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
         }
     }
 
@@ -1049,16 +1111,17 @@ mod tests {
         }
     }
 
-    fn bool_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+    fn bool_expr(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn group(arena: &mut ScalarArena, expr: TypedExpr) -> PredicateGroup {
@@ -1126,6 +1189,7 @@ mod tests {
         );
 
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1153,6 +1217,7 @@ mod tests {
         );
 
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1184,6 +1249,7 @@ mod tests {
         );
 
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1221,6 +1287,7 @@ mod tests {
         );
 
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1241,19 +1308,20 @@ mod tests {
         let or_pred = bool_expr(
             bool_expr(
                 bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(1)),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             bool_expr(
                 bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(2)),
             ),
         );
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1276,19 +1344,20 @@ mod tests {
         let or_pred = bool_expr(
             bool_expr(
                 bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(1)),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             bool_expr(
                 bool_expr(col("l", "c", 3), BinOp::Eq, col("r", "d", 4)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("l", "c", 3), BinOp::Eq, int_lit(2)),
             ),
         );
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1, 3]),
             &ids(&[2, 4]),
@@ -1319,6 +1388,7 @@ mod tests {
         );
         let nondeterministic = nondeterministic_group(&mut arena);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1337,15 +1407,16 @@ mod tests {
         let or_pred = bool_expr(
             bool_expr(
                 bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
-                BinOp::And,
+                crate::common::BooleanOp::And,
                 bool_expr(col("l", "a", 1), BinOp::Eq, int_lit(1)),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             bool_expr(col("l", "a", 1), BinOp::Eq, col("r", "b", 2)),
         );
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[2]),
@@ -1371,7 +1442,7 @@ mod tests {
                 int_lit(100),
                 int_lit(150),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             crate::common::binary_operator::test_inclusive_range(
                 col("s", "price", 3),
                 int_lit(50),
@@ -1381,6 +1452,7 @@ mod tests {
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[3]),
@@ -1399,15 +1471,25 @@ mod tests {
     #[test]
     fn range_envelope_compares_large_int_bounds_exactly() {
         let mut arena = ScalarArena::new();
+        let probe = || {
+            let mut column = col("s", "price", 3);
+            column.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            column
+        };
         let or_pred = bool_expr(
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 large_int_lit(9_007_199_254_740_993),
                 large_int_lit(9_007_199_254_741_500),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 large_int_lit(9_007_199_254_740_992),
                 large_int_lit(9_007_199_254_741_600),
             ),
@@ -1415,6 +1497,7 @@ mod tests {
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[3]),
@@ -1438,7 +1521,7 @@ mod tests {
                 decimal_lit("10.25"),
                 decimal_lit("20.00"),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             crate::common::binary_operator::test_inclusive_range(
                 col("s", "price", 3),
                 decimal_lit("9.50"),
@@ -1448,6 +1531,7 @@ mod tests {
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[3]),
@@ -1464,15 +1548,21 @@ mod tests {
     #[test]
     fn unsupported_range_literal_skips_range_envelope() {
         let mut arena = ScalarArena::new();
+        let probe = || {
+            let mut column = col("s", "price", 3);
+            column.value_type =
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false);
+            column
+        };
         let or_pred = bool_expr(
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 string_lit("a"),
                 string_lit("z"),
             ),
-            BinOp::Or,
+            crate::common::BooleanOp::Or,
             crate::common::binary_operator::test_inclusive_range(
-                col("s", "price", 3),
+                probe(),
                 string_lit("b"),
                 string_lit("y"),
             ),
@@ -1480,6 +1570,7 @@ mod tests {
 
         let or_group = group(&mut arena, or_pred);
         let derived = derive_inner_join_predicates(
+            crate::functions::builtin_sql_function_catalog(),
             &mut arena,
             &ids(&[1]),
             &ids(&[3]),

@@ -1536,9 +1536,6 @@ fn ordered_null_demands_only_surviving_rows_and_keeps_original_error_scope() {
         HarnessControl,
         expression_text::{Consistency, TextColumn, TextContext, TextError, type_expression_text},
     };
-    use novarocks_type_contract::{
-        SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    };
 
     let owner = Arc::new(Owner::for_overload(ORDERED));
     let functions = catalog(owner.clone());
@@ -1548,10 +1545,6 @@ fn ordered_null_demands_only_surviving_rows_and_keeps_original_error_scope() {
         constant_policy: policy(),
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters: &parameters,
-        allow_throw_exception: SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        },
     };
     let columns = ["a", "b"].map(|name| TextColumn {
         name: name.into(),

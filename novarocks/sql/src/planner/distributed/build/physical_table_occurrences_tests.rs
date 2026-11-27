@@ -45,7 +45,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use {
-    novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope},
+    novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope},
     novarocks_physical_plan::{
         BoundTableFunction, ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprId,
         FragmentId, FragmentSink, NodeId, NodeKind, PipelineDopDomain, PlanLimits,
@@ -208,19 +208,13 @@ impl Fixture {
                         ty(DataType::Int64, false),
                         checked::i64(1),
                     );
-                    let add = builder
-                        .add_expression(
-                            owner,
-                            ty(DataType::Int64, true),
-                            ExprKind::Binary {
-                                op: BinaryOperator::Add,
-                                left: a,
-                                right: b,
-                                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                                allow_throw_exception: Some(allow_ref()),
-                            },
-                        )
-                        .unwrap();
+                    let add = novarocks_expression::testkit::add_catalogue_predicate(
+                        builder.unit(owner).unwrap(),
+                        &mut pools,
+                        novarocks_type_contract::OperatorFunction::Add,
+                        vec![a, b],
+                    )
+                    .unwrap();
                     let test = builder
                         .add_expression(
                             owner,
@@ -410,20 +404,24 @@ fn seal_fixture_units(
         .construction_nodes()
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
-    let parameters = SemanticParameters::try_new([(
-        allow_ref().id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let mut effects = BTreeMap::new();
     for node in nodes {
         if builder.construction_unit(node).is_none() {
             continue;
         }
         let ports = builder.node_ports(node).unwrap();
-        let draft = builder.take_unit_builder(node).unwrap();
+        let mut draft = builder.take_unit_builder(node).unwrap();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        novarocks_expression::testkit::declare_call_controls(
+            &mut draft,
+            &functions,
+            pools,
+            &parameters,
+            &mut work,
+        );
         let sealed = draft.seal(ports, &mut work).unwrap();
         let authored = super::super::expression_component_test_fixture::author_component_calls(
             &sealed,
@@ -464,7 +462,7 @@ fn summaries(fixture: &Fixture) -> BTreeMap<NodeId, NodeExpressionEffects> {
 fn allow_ref() -> SemanticParameterRef {
     SemanticParameterRef {
         id: SemanticParameterId::new(71),
-        expected_key: SemanticParameterKey::AllowThrowException,
+        expected_key: SemanticParameterKey::StatementStartUtc,
     }
 }
 fn request<'a>(
@@ -922,7 +920,9 @@ fn table_occurrences_genuine_case_arithmetic_child_error_is_not_erased_by_called
     let occ = f.occurrences();
     let params = SemanticParameters::try_new([(
         allow_ref().id,
-        SemanticParameterValue::AllowThrowException(false),
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+        ),
     )])
     .unwrap();
     let scoped = summaries(&f);
@@ -1178,7 +1178,9 @@ fn table_fragment_composer_keeps_real_child_error_and_publishes_exact_complete_c
     let occurrences = fixture.occurrences();
     let parameters = SemanticParameters::try_new([(
         allow_ref().id,
-        SemanticParameterValue::AllowThrowException(false),
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+        ),
     )])
     .unwrap();
     let scopes = fragment_scopes(&fixture, &occurrences);

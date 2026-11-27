@@ -103,8 +103,7 @@ pub(super) async fn prepare_read(
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
-        let options =
-            with_query_sql_semantics(query_options_from_session_settings(&execution), &semantics);
+        let options = query_options_from_session_settings(&execution);
         let capacity = QueryResultCapacityBinding::try_new(&input.scope, input.window)
             .map_err(statement_work_error)?;
         let context = RequestContext::admit(

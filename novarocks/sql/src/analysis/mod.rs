@@ -633,12 +633,11 @@ pub enum ExprKind {
     Literal(LiteralValue),
     /// Materialized values keep their original Field, pool and selected ordinal.
     Constant(novarocks_functions::ConstantValue),
-    /// Binary operation (arithmetic, comparison, logical).
-    BinaryOp {
+    /// Ordered Boolean connective.
+    BooleanConnective {
         left: AstBox<TypedExpr>,
-        op: BinOp,
+        op: crate::common::BooleanOp,
         right: AstBox<TypedExpr>,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// Scalar function call (non-aggregate).
     FunctionCall {
@@ -771,6 +770,13 @@ pub(crate) struct RelationMarkSpec {
     pub predicate: TypedExpr,
 }
 
+/// The original bindings for both materialized keys and their equality.
+#[derive(Clone, Debug)]
+pub(crate) struct JsonMarkKeyBindings {
+    pub keys: [crate::binding::SqlFunctionBinding; 2],
+    pub equality: crate::binding::SqlFunctionBinding,
+}
+
 /// A clause-owned scalar subquery or value-form mark probe.
 /// The planner emits `LogicalPlanKind::Apply` for scalar results and a
 /// null-aware mark join for `mark_probe`. The inner query is
@@ -785,7 +791,7 @@ pub(crate) struct ApplyScalarSpec {
     /// JSON value-form IN uses the same clause insertion points, with a mark join.
     pub mark_probe: Option<TypedExpr>,
     /// Exact hidden-call selection for the materialized probe and RHS values.
-    pub mark_key_bindings: Option<[crate::binding::SqlFunctionBinding; 2]>,
+    pub mark_key_bindings: Option<JsonMarkKeyBindings>,
     /// A materialized probe and an ordinary typed predicate over actual pairs.
     pub relation_mark: Option<RelationMarkSpec>,
     /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).

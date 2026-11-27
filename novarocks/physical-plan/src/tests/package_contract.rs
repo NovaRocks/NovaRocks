@@ -73,15 +73,6 @@ fn fixture_pruning_tables(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FrozenFra
         .collect()
 }
 
-fn intrinsic_reference(id: u32) -> SemanticParameterRef {
-    SemanticParameterRef {
-        id: SemanticParameterId::new(id),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    }
-}
-
-// Tests that deliberately corrupt the frozen table pass this actual source
-// to extraction. This helper performs no alternate validation or inference.
 fn fixture_parameter_input(plan: &PhysicalPlan, parameters: SemanticParameters) -> PhysicalPlan {
     crate::plan::PhysicalPlanParts {
         constants: plan.constants().clone(),
@@ -126,22 +117,7 @@ fn package_input(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> FragmentPackageInput {
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control).unwrap();
-    let parameters = SemanticParameters::try_new(
-        fragment
-            .nodes()
-            .values()
-            .filter_map(|node| node.expressions.as_deref())
-            .flat_map(|unit| unit.definitions())
-            .flat_map(|definition| definition.kind.intrinsic_parameter_references())
-            .map(|reference| {
-                (
-                    reference.id,
-                    SemanticParameterValue::AllowThrowException(false),
-                )
-            })
-            .collect::<BTreeMap<_, _>>(),
-    )
-    .unwrap();
+    let parameters = SemanticParameters::default();
     FragmentPackageInput {
         constants: fixture_constants.for_fragment(&fragment),
 
@@ -290,7 +266,7 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
     );
 }
 
-fn binary_control_fixture(
+fn let_control_fixture(
     fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (Fragment, ExprId, ExprId, ExprId) {
     let mut builder = FragmentBuilder::new(FragmentId::new(83));
@@ -313,12 +289,9 @@ fn binary_control_fixture(
         .define(
             node,
             ty(DataType::Int64, false),
-            ExprKind::Binary {
-                left,
-                allow_throw_exception: Some(intrinsic_reference(0)),
-                op: BinaryOperator::Subtract,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ExprKind::Let {
+                value: left,
+                body: right,
             },
         )
         .unwrap();
@@ -377,7 +350,7 @@ fn binary_control_fixture(
 #[test]
 fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids() {
     let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let (original, root, left, right) = binary_control_fixture(&mut constants);
+    let (original, root, left, right) = let_control_fixture(&mut constants);
     let checked = FragmentPackage::try_new(
         package_input(original.clone(), &mut constants),
         package_admission(),
@@ -390,9 +363,8 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
     for mutation in 0..2 {
         let error = candidate_fixture_unit(&original, original.root(), |parts| {
             if mutation == 0 {
-                let ExprKind::Binary {
-                    left: a, right: b, ..
-                } = &mut parts.definitions[root.get() as usize].kind
+                let ExprKind::Let { value: a, body: b } =
+                    &mut parts.definitions[root.get() as usize].kind
                 else {
                     unreachable!()
                 };
@@ -699,7 +671,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
         (
             invocation.arguments[0],
             condition,
-            EvaluationDemand::TruthOnly,
+            EvaluationDemand::Value,
             GuardKind::CaseWhen { arm: 0 },
         ),
         (
@@ -1873,7 +1845,12 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
                 novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
             ),
         ),
-        (second.id, SemanticParameterValue::AllowThrowException(true)),
+        (
+            second.id,
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
+        ),
     ])
     .unwrap();
     assert!(
@@ -2086,7 +2063,9 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     );
     input.parameters = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::AllowThrowException(true),
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+        ),
     )])
     .unwrap();
     assert!(
@@ -2373,264 +2352,6 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
         unit.claims()
     );
     assert_no_constant_package_equal(&packages[&fragment.id()], &checked);
-}
-
-fn intrinsic_package_fixture(
-    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
-) -> FragmentPackageInput {
-    let mut builder = FragmentBuilder::new(FragmentId::new(91));
-    let node = builder.reserve_node_id().unwrap();
-    let left = builder
-        .define(
-            node,
-            (ty(DataType::Int64, false)).clone(),
-            fixture_constants.i64(4, &(ty(DataType::Int64, false))),
-        )
-        .unwrap();
-    let right = builder
-        .define(
-            node,
-            (ty(DataType::Int64, false)).clone(),
-            fixture_constants.i64(2, &(ty(DataType::Int64, false))),
-        )
-        .unwrap();
-    let arithmetic = builder
-        .define(
-            node,
-            ty(DataType::Int64, false),
-            ExprKind::Binary {
-                left,
-                op: BinaryOperator::Add,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: Some(intrinsic_reference(0)),
-            },
-        )
-        .unwrap();
-    let arithmetic = builder
-        .define(
-            node,
-            ty(DataType::Int64, false),
-            ExprKind::Binary {
-                left: arithmetic,
-                op: BinaryOperator::Add,
-                right,
-                decimal_overflow_policy:
-                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: Some(intrinsic_reference(u32::MAX)),
-            },
-        )
-        .unwrap();
-    let cast = builder
-        .define(
-            node,
-            ty(DataType::Int64, false),
-            ExprKind::Cast {
-                expr: arithmetic,
-                target: DataType::Int64,
-                cast_mode: novarocks_type_contract::TrinoCastMode::Implicit,
-            },
-        )
-        .unwrap();
-    let output = builder
-        .add_value(
-            ty(DataType::Int64, false),
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    let root = builder.root_definition(
-        node,
-        cast,
-        EvaluationDemand::Value,
-        crate::RootScope::AllPorts,
-    );
-    builder
-        .add_values(node, Box::from([Box::from([root])]), Box::from([output]))
-        .unwrap();
-    let fragment = builder
-        .finish_fixture_definition(
-            node,
-            FragmentSink::Noop,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
-    let mut input = package_input(fragment, fixture_constants);
-    input.parameters = SemanticParameters::try_new([
-        (
-            SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(false),
-        ),
-        (
-            SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::AllowThrowException(true),
-        ),
-    ])
-    .unwrap();
-    input
-}
-
-#[test]
-fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_scopes() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let input = intrinsic_package_fixture(&mut fixture_constants);
-    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
-    assert_eq!(
-        checked
-            .parameters()
-            .require(intrinsic_reference(0))
-            .unwrap(),
-        &SemanticParameterValue::AllowThrowException(false)
-    );
-    assert_eq!(
-        checked
-            .parameters()
-            .require(intrinsic_reference(u32::MAX))
-            .unwrap(),
-        &SemanticParameterValue::AllowThrowException(true)
-    );
-    let mut builder =
-        PlanBuilder::new(version()).with_semantic_parameters(input.parameters.clone());
-    builder.add_fragment(input.fragment).unwrap();
-    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
-    let packages = extract_fragment_packages(
-        &plan,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &fixture_pruning_tables(&plan),
-        &package_admissions(&plan),
-        &Control,
-    )
-    .unwrap();
-    assert_no_constant_package_equal(&packages[&checked.fragment().id()], &checked);
-}
-
-#[test]
-fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values() {
-    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let input = intrinsic_package_fixture(&mut fixture_constants);
-    let mut missing = input.clone();
-    missing.parameters = SemanticParameters::default();
-    assert_eq!(
-        FragmentPackage::try_new(missing, package_admission(), &Control).unwrap_err(),
-        FragmentPackageError::Parameter(
-            novarocks_type_contract::SemanticParameterError::MissingId(SemanticParameterId::new(0))
-        )
-    );
-    let mut wrong = input.clone();
-    wrong.parameters = SemanticParameters::try_new([
-        (
-            SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(false),
-        ),
-        (
-            SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::TimeZone(
-                novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
-            ),
-        ),
-    ])
-    .unwrap();
-    assert_eq!(
-        FragmentPackage::try_new(wrong, package_admission(), &Control).unwrap_err(),
-        FragmentPackageError::Parameter(
-            novarocks_type_contract::SemanticParameterError::KeyMismatch(intrinsic_reference(
-                u32::MAX
-            ))
-        )
-    );
-    let mut extra = input.clone();
-    extra.parameters = SemanticParameters::try_new(
-        input
-            .parameters
-            .entries()
-            .iter()
-            .map(|(id, value)| (*id, value.clone()))
-            .chain([(
-                SemanticParameterId::new(7),
-                SemanticParameterValue::AllowThrowException(false),
-            )]),
-    )
-    .unwrap();
-    assert_eq!(
-        FragmentPackage::try_new(extra.clone(), package_admission(), &Control).unwrap_err(),
-        FragmentPackageError::UnusedParameters
-    );
-    let mut builder = PlanBuilder::new(version()).with_semantic_parameters(extra.parameters);
-    builder.add_fragment(extra.fragment).unwrap();
-    let plan = crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap();
-    assert_eq!(
-        extract_fragment_packages(
-            &plan,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &fixture_pruning_tables(&plan),
-            &package_admissions(&plan),
-            &Control,
-        )
-        .unwrap_err(),
-        FragmentPackageExtractionError::UnusedParameters
-    );
-    // Whole-plan publication cannot leave even an unused-runtime definition's
-    // intrinsic reference dangling. No external extraction table can repair it.
-    let mut missing_plan = PlanBuilder::new(version());
-    missing_plan.add_fragment(input.fragment).unwrap();
-    assert!(
-        crate::tests::constant_fixture::publish_plan(missing_plan, &fixture_constants)
-            .unwrap_err()
-            .errors()
-            .iter()
-            .any(|error| error.message().contains("missing semantic parameter ID"))
-    );
-}
-
-#[test]
-fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
-    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
-    let input = intrinsic_package_fixture(&mut constants);
-    for mutation in 0..2 {
-        let error = candidate_fixture_unit(&input.fragment, input.fragment.root(), |parts| {
-            let expression = parts
-                .definitions
-                .iter_mut()
-                .find(|expression| matches!(expression.kind, ExprKind::Binary { .. }))
-                .unwrap();
-            match &mut expression.kind {
-                ExprKind::Binary {
-                    allow_throw_exception,
-                    ..
-                } => match mutation {
-                    0 => *allow_throw_exception = None,
-                    _ => {
-                        *allow_throw_exception = Some(SemanticParameterRef {
-                            id: SemanticParameterId::new(0),
-                            expected_key: SemanticParameterKey::TimeZone,
-                        })
-                    }
-                },
-                _ => unreachable!(),
-            }
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                novarocks_expression_contract::UnitError::Invalid { .. }
-            ),
-            "{error:?}"
-        );
-        assert!(
-            error.to_string().contains("ALLOW_THROW_EXCEPTION"),
-            "{error}"
-        );
-    }
 }
 
 #[test]

@@ -82,7 +82,6 @@ pub(super) fn fold_node(
         &expression,
         Arc::clone(ctx.function_catalog_arc()),
         Arc::clone(sealed_functions),
-        ctx.root_allow_throw_exception(),
         arena.constant_policy(),
         &control,
     );

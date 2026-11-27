@@ -32,8 +32,8 @@ use novarocks_functions::{KernelFailure, PureEngineFunctionCatalog};
 use novarocks_parser::{ParserError, Span, UnsupportedCallSyntax, parser::parse_expression};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    FunctionValueType, PureCompileControl, SemanticParameterProjectionError, SemanticParameterRef,
-    SemanticParameters, ValueTypeError, ValueTypeStorageLifetime,
+    FunctionValueType, PureCompileControl, SemanticParameterProjectionError, SemanticParameters,
+    ValueTypeError, ValueTypeStorageLifetime,
 };
 use std::{collections::BTreeMap, convert::Infallible, error::Error, fmt, sync::Arc};
 
@@ -55,7 +55,6 @@ pub struct TextContext<'a> {
     pub constant_policy: ConstantValidation,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
     pub parameters: &'a SemanticParameters,
-    pub allow_throw_exception: SemanticParameterRef,
 }
 
 /// One standalone authored root and its actual input projection and environment.
@@ -269,10 +268,7 @@ fn type_parsed<'a>(
                     }
                     _ => &[],
                 };
-                node.kind
-                    .intrinsic_parameter_references()
-                    .chain(call_refs)
-                    .copied()
+                call_refs.iter().copied()
             }),
             CompilePhase::FunctionSpecialization,
             work.control(),

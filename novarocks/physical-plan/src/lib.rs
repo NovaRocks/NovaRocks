@@ -144,4 +144,4 @@ use novarocks_expression_contract::{
 
 // Internal fixtures name the same neutral expression vocabulary directly.
 #[cfg(test)]
-use novarocks_expression_contract::{BinaryOperator, LegacyBindingMetadata};
+use novarocks_expression_contract::LegacyBindingMetadata;

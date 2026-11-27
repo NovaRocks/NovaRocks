@@ -35,10 +35,10 @@ use novarocks_physical_plan::{
     ValueId,
 };
 use novarocks_type_contract::{
-    AggregateStateFormatId, CompileControlError, DecimalOverflowPolicy, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility, SemanticParameterId,
-    SemanticParameterRef, SemanticParameterValue, ValueLogicalType,
+    AggregateStateFormatId, CompileControlError, FunctionArgumentEvaluation, FunctionArgumentType,
+    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind,
+    FunctionOverloadId, FunctionValueType, FunctionVolatility, SemanticParameterId,
+    SemanticParameterValue, ValueLogicalType,
 };
 use std::{
     collections::HashMap,
@@ -112,12 +112,6 @@ fn int() -> FunctionValueType {
 }
 fn boolean() -> FunctionValueType {
     FunctionValueType::new(DataType::Boolean, true)
-}
-fn allow(id: u32) -> SemanticParameterRef {
-    SemanticParameterRef {
-        id: SemanticParameterId::new(id),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    }
 }
 fn function(kind: FunctionKind) -> BoundFunction {
     BoundFunction {
@@ -234,11 +228,15 @@ impl Fixture {
             parameters: SemanticParameters::try_new([
                 (
                     SemanticParameterId::new(0),
-                    SemanticParameterValue::AllowThrowException(false),
+                    SemanticParameterValue::TimeZone(
+                        novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                    ),
                 ),
                 (
                     SemanticParameterId::new(u32::MAX),
-                    SemanticParameterValue::AllowThrowException(true),
+                    SemanticParameterValue::StatementStartUtc(
+                        novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                    ),
                 ),
             ])
             .unwrap(),
@@ -417,13 +415,7 @@ fn all_kinds() -> Fixture {
             negated: true,
             expr: z,
         },
-        ExprKind::Binary {
-            left: z,
-            op: BinaryOperator::Add,
-            right: a,
-            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            allow_throw_exception: Some(allow(0)),
-        },
+        ExprKind::Let { value: z, body: a },
         ExprKind::Conjunction {
             args: Box::from([z, a, z]),
         },
@@ -518,7 +510,7 @@ fn prefixes(
 }
 
 #[test]
-fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurrences() {
+fn namespace_scalar_kinds_preserve_dense_headers_and_ordered_occurrences() {
     use wire::expression_definition::Kind;
     let f = all_kinds();
     let (facts, out) = f.run(&Control::default(), SOURCE, limits(), true).unwrap();
@@ -557,14 +549,13 @@ fn namespace_all_sixteen_scalar_kinds_preserve_dense_headers_and_ordered_occurre
             expr_id: Some(15)
         }))
     );
-    let Some(Kind::Binary(binary)) = &out[4].kind else {
-        panic!("binary")
-    };
     assert_eq!(
-        (binary.left_expr_id, binary.right_expr_id, binary.op),
-        (Some(15), Some(0), wire::BinaryOperator::Add as i32)
+        out[4].kind,
+        Some(Kind::LetExpression(wire::LetExpression {
+            value_expr_id: Some(15),
+            body_expr_id: Some(0),
+        }))
     );
-    assert_eq!(binary.allow_throw_exception.as_ref().unwrap().id, Some(0));
     assert_eq!(
         out[5].kind,
         Some(Kind::Conjunction(wire::ExpressionIds {
@@ -762,72 +753,6 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
         f.roots.push((17, right));
         f.input[0].type_id = 17;
         rejected(&f);
-    }
-}
-
-#[test]
-fn namespace_intrinsics_require_original_boolean_parameters_and_exact_presence() {
-    use wire::expression_definition::Kind;
-    for op in [
-        BinaryOperator::Add,
-        BinaryOperator::Subtract,
-        BinaryOperator::Multiply,
-        BinaryOperator::Divide,
-        BinaryOperator::Modulo,
-    ] {
-        for id in [0, u32::MAX] {
-            let f = Fixture::single(ExprKind::Binary {
-                left: ExprId::new(0),
-                op,
-                right: ExprId::new(u32::MAX),
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: Some(allow(id)),
-            });
-            let out = f
-                .run(&Control::default(), SOURCE, limits(), true)
-                .unwrap()
-                .1;
-            let Some(Kind::Binary(binary)) = &out[0].kind else {
-                panic!("binary")
-            };
-            assert_eq!(binary.allow_throw_exception.as_ref().unwrap().id, Some(id));
-            assert_eq!(
-                f.parameters.require(allow(id)).unwrap(),
-                &SemanticParameterValue::AllowThrowException(id == u32::MAX)
-            );
-            let mut missing = f;
-            missing.parameters = SemanticParameters::default();
-            assert!(
-                missing
-                    .run(&Control::default(), SOURCE, limits(), false)
-                    .is_err()
-            );
-        }
-        let missing = Fixture::single(ExprKind::Binary {
-            left: ExprId::new(0),
-            op,
-            right: ExprId::new(0),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: None,
-        });
-        assert!(
-            missing
-                .run(&Control::default(), SOURCE, limits(), false)
-                .is_err()
-        );
-    }
-    for present in [false, true] {
-        let f = Fixture::single(ExprKind::Binary {
-            left: ExprId::new(0),
-            op: BinaryOperator::Eq,
-            right: ExprId::new(0),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: present.then(|| allow(0)),
-        });
-        assert_eq!(
-            f.run(&Control::default(), SOURCE, limits(), true).is_ok(),
-            !present
-        );
     }
 }
 
@@ -1120,9 +1045,15 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
         }
     });
     prefixes(|c| bad.run(c, SOURCE, limits(), true), false);
-    let mut no_key = all_kinds();
-    no_key.parameters = SemanticParameters::default();
-    prefixes(|c| no_key.run(c, SOURCE, limits(), true), false);
+    let mut no_binding = all_kinds();
+    no_binding.replace(7, |node| {
+        let ExprKind::FunctionCall { function, .. } = &mut node.kind else {
+            unreachable!()
+        };
+        function.function_id =
+            novarocks_type_contract::FunctionId::try_new("fixture/missing-binding").unwrap();
+    });
+    prefixes(|c| no_binding.run(c, SOURCE, limits(), true), false);
 }
 
 #[test]

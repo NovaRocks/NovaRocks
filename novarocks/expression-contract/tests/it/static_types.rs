@@ -17,7 +17,7 @@
 
 //! Lowest-owner static type correspondence, including actual TypeOnly children.
 use super::support::*;
-use arrow_schema::{DataType, Field, TimeUnit};
+use arrow_schema::{DataType, Field};
 use novarocks_expression_contract::*;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_type_contract::*;
@@ -142,15 +142,6 @@ fn checked(
     );
     Ok((unit, definition))
 }
-fn binary(op: BinaryOperator, ids: &[ExprId]) -> ExprKind {
-    ExprKind::Binary {
-        left: ids[0],
-        right: ids[1],
-        op,
-        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        allow_throw_exception: None,
-    }
-}
 fn type_error(result: Result<(BoundExprSet, ExprId), UnitError>, expected: &str) {
     let error = result.unwrap_err();
     assert!(
@@ -205,104 +196,6 @@ fn nested(child_nullable: bool, json: bool, dictionary_id: i64, annotation: &str
         ValueLayout::try_new(&source, storage).unwrap(),
     )
     .unwrap()
-}
-
-#[test]
-fn static_comparisons_keep_nullsafe_domains_and_type_only_checks() {
-    let exact = nested(true, true, -91, "original");
-    for op in [
-        BinaryOperator::Eq,
-        BinaryOperator::NotEq,
-        BinaryOperator::EqForNull,
-        BinaryOperator::Lt,
-        BinaryOperator::LtEq,
-        BinaryOperator::Gt,
-        BinaryOperator::GtEq,
-    ] {
-        for hidden in [false, true] {
-            for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
-                let nullable = op != BinaryOperator::EqForNull;
-                let run = |left, right, result| {
-                    checked(
-                        &[left, right],
-                        result,
-                        |ids| binary(op, ids),
-                        hidden,
-                        demand,
-                        &Control::good(),
-                    )
-                };
-                let (unit, definition) =
-                    run(integer(true), integer(false), boolean(nullable)).unwrap();
-                assert_eq!(unit.definition(definition).unwrap().ty, boolean(nullable));
-                type_error(
-                    run(integer(true), integer(false), boolean(!nullable)),
-                    "binary expression types are inconsistent",
-                );
-                run(
-                    exact.clone(),
-                    nested(true, true, 17, "nonsemantic source change"),
-                    boolean(nullable),
-                )
-                .unwrap();
-                for changed in [
-                    nested(false, true, -91, "original"),
-                    nested(true, false, -91, "original"),
-                ] {
-                    type_error(
-                        run(exact.clone(), changed, boolean(nullable)),
-                        "binary expression types are inconsistent",
-                    );
-                }
-                for (left, right) in [
-                    (
-                        ValueType::try_with_logical_type(
-                            DataType::LargeBinary,
-                            false,
-                            ValueLogicalType::Json,
-                        )
-                        .unwrap(),
-                        ValueType::new(DataType::LargeBinary, false),
-                    ),
-                    (
-                        ValueType::try_with_logical_type(
-                            DataType::FixedSizeBinary(16),
-                            false,
-                            ValueLogicalType::Uuid,
-                        )
-                        .unwrap(),
-                        ValueType::new(DataType::FixedSizeBinary(16), false),
-                    ),
-                    (
-                        ValueType::new(DataType::Decimal128(18, 2), false),
-                        ValueType::new(DataType::Decimal128(18, 3), false),
-                    ),
-                    (
-                        ValueType::new(
-                            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                            false,
-                        ),
-                        ValueType::new(
-                            DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
-                            false,
-                        ),
-                    ),
-                    (integer(false), ValueType::new(DataType::Int32, false)),
-                ] {
-                    type_error(
-                        run(left, right, boolean(nullable)),
-                        "binary expression types are inconsistent",
-                    );
-                }
-                if demand == EvaluationDemand::Value {
-                    type_error(
-                        run(integer(false), integer(false), integer(false)),
-                        "binary expression types are inconsistent",
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -457,7 +350,7 @@ fn static_null_predicates_keep_value_demand_and_require_nonnullable_boolean() {
 }
 
 #[test]
-fn wide_static_comparison_type_checks_keep_every_original_control_prefix() {
+fn wide_case_match_type_checks_keep_every_original_control_prefix() {
     let full = ValueType::new(
         DataType::Struct(
             (0..320)
@@ -479,38 +372,41 @@ fn wide_static_comparison_type_checks_keep_every_original_control_prefix() {
         false,
     );
     for hidden in [false, true] {
-        for op in [BinaryOperator::Eq, BinaryOperator::EqForNull] {
-            for right in [&full, &changed] {
-                let run = |control: &Control| {
-                    checked(
-                        &[full.clone(), right.clone()],
-                        boolean(false),
-                        |ids| binary(op, ids),
-                        hidden,
-                        EvaluationDemand::Value,
-                        control,
-                    )
-                };
-                let good = Control::good();
-                if std::ptr::eq(right, &full) {
-                    run(&good).unwrap();
-                } else {
-                    type_error(run(&good), "binary expression types are inconsistent");
-                }
-                let trace = good.trace();
-                assert!(trace.iter().any(|(_, work)| *work == 256));
-                for at in 0..trace.len() {
-                    for cause in [
-                        CompileControlError::Cancelled,
-                        CompileControlError::DeadlineExceeded,
-                        CompileControlError::ResourceExhausted,
-                    ] {
-                        let control = Control::at(at, cause.clone());
-                        assert!(
-                            matches!(run(&control),Err(UnitError::Control(actual)) if actual==cause)
-                        );
-                        assert_eq!(control.trace(), trace[..=at]);
-                    }
+        for right in [&full, &changed] {
+            let run = |control: &Control| {
+                checked(
+                    &[full.clone(), right.clone(), boolean(false)],
+                    boolean(false),
+                    |ids| ExprKind::Case {
+                        ieee_float_equality: false,
+                        operand: Some(ids[0]),
+                        when_then: Box::from([(ids[1], ids[2])]),
+                        else_expr: Some(ids[2]),
+                    },
+                    hidden,
+                    EvaluationDemand::Value,
+                    control,
+                )
+            };
+            let good = Control::good();
+            if std::ptr::eq(right, &full) {
+                run(&good).unwrap();
+            } else {
+                type_error(run(&good), "CASE WHEN");
+            }
+            let trace = good.trace();
+            assert!(trace.iter().any(|(_, work)| *work == 256));
+            for at in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = Control::at(at, cause.clone());
+                    assert!(
+                        matches!(run(&control),Err(UnitError::Control(actual)) if actual==cause)
+                    );
+                    assert_eq!(control.trace(), trace[..=at]);
                 }
             }
         }

@@ -77,6 +77,7 @@ fn functions() -> PureEngineFunctionCatalog {
         "bitwise_xor",
         "bitwise_not",
         "slice",
+        "__operator_greater_than",
     ] {
         let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();
@@ -298,22 +299,13 @@ fn fixture_family(
             // new fixture compares two exact narrow values without a cast.
             value
         };
-        let compare = builder
-            .unit(output)
-            .unwrap()
-            .add(
-                None,
-                boolean.clone(),
-                ExprKind::Binary {
-                    op: novarocks_expression_contract::BinaryOperator::Gt,
-                    left: result,
-                    right: zero,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap();
+        let compare = novarocks_expression::testkit::add_catalogue_predicate(
+            builder.unit(output).unwrap(),
+            &mut source_pools,
+            novarocks_type_contract::OperatorFunction::GreaterThan,
+            vec![result, zero],
+        )
+        .unwrap();
         let flag = builder
             .unit(output)
             .unwrap()

@@ -402,14 +402,11 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(right)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        memo.scalars.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        memo.scalars.test_intern_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -435,14 +432,11 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(right)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let expr = memo.scalars.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Add,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        let expr = memo.scalars.test_intern_operator(
+            BinOp::Add,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         ScalarSortKey {
             expr,
@@ -1103,11 +1097,10 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         memo.scalars.intern(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left: equality,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: checked,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )

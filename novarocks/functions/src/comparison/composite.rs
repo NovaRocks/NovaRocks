@@ -23,8 +23,8 @@ use arrow_schema::DataType;
 use novarocks_failure_contract::kernel_reason::MAP_KEY_INDETERMINATE;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ExpressionEffectContext, ExpressionEffects,
-    FunctionValueType, KeyComparison, KeyRelation, PureCompileControl, ValueKind, ValueTypeRef,
-    key_domains_match_observed,
+    FunctionValueType, KeyComparison, KeyRelation, OperatorFunction, PureCompileControl, ValueKind,
+    ValueTypeRef, key_domains_match_observed,
 };
 use novarocks_value_arrays::{
     ValueFailure,
@@ -120,6 +120,38 @@ impl PreparedCompositeComparisonRecipe {
                 | ValueKind::Struct(_)
                 | ValueKind::Map { .. }
         )
+    }
+
+    pub(crate) fn uses_integer_array_equality(
+        operator: OperatorFunction,
+        operands: [&FunctionValueType; 2],
+    ) -> bool {
+        matches!(
+            operator,
+            OperatorFunction::Equal | OperatorFunction::NotEqual
+        ) && operands
+            .into_iter()
+            .all(super::PreparedComparisonRecipe::supports_array_equality_operand)
+    }
+
+    /// Select the recursive recipe of an already bound operator. Signed ARRAY
+    /// equality uses the exact element layouts accepted by the flat recipe.
+    pub fn try_new_for_operator(
+        operator: OperatorFunction,
+        operands @ [left, right]: [&FunctionValueType; 2],
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<Self>, ComparisonPrepareError> {
+        if Self::uses_integer_array_equality(operator, operands)
+            || !operands.into_iter().any(Self::is_composite)
+        {
+            return Ok(None);
+        }
+        let relation = match operator {
+            OperatorFunction::Equal | OperatorFunction::NotEqual => KeyRelation::Equal,
+            OperatorFunction::Identical | OperatorFunction::Distinct => KeyRelation::Identical,
+            _ => return Err(ComparisonPrepareError::Unsupported),
+        };
+        Self::try_new(relation, left, right, control).map(Some)
     }
 
     pub fn try_new(

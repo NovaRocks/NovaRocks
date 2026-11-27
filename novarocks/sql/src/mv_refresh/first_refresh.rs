@@ -805,7 +805,6 @@ pub fn compile_final_join_incremental_refresh_change_stream(
             final_write,
         },
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -863,7 +862,6 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         None,
         shape,
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -987,7 +985,6 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
             final_write,
         },
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -1040,7 +1037,6 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         None,
         shape,
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -1436,7 +1432,7 @@ fn add_join_incremental_change_stream_effect(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-    use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
+    use crate::common::{CHANGE_OP_DELETE, LiteralValue};
     use crate::optimizer::operator::{ChangeEventOutputExpr, ChangeEventSpec};
     use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
@@ -1544,17 +1540,12 @@ fn add_join_incremental_change_stream_effect(
                     .expect("valid value root nullability transform"),
                 control,
             )?;
-            let is_delete = arena.intern_observed(
-                ScalarNode::BinaryOp {
-                    op: BinOp::Eq,
-                    left: action_ref,
-                    right: delete,
-                    decimal_overflow_policy,
-                },
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Boolean,
-                    action.value_type.nullable(),
-                ),
+            let is_delete = crate::optimizer::scalar::intern_scalar_operator(
+                functions,
+                &mut arena,
+                novarocks_type_contract::OperatorFunction::Equal,
+                [action_ref, delete],
+                decimal_overflow_policy,
                 control,
             )?;
             let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
@@ -1644,24 +1635,12 @@ fn add_join_incremental_change_stream_effect(
                 control,
             )?;
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(
-                    &mut arena,
-                    surviving,
-                    is_fresh,
-                    decimal_overflow_policy,
-                    control,
-                )?),
+                predicate: Some(conjoin(&mut arena, surviving, is_fresh, control)?),
                 effect: ConnectorRowMutationEffect::Insert,
                 assignments: assignments.clone(),
             });
             events.push(ChangeEventSpec {
-                predicate: Some(conjoin(
-                    &mut arena,
-                    surviving,
-                    is_existing,
-                    decimal_overflow_policy,
-                    control,
-                )?),
+                predicate: Some(conjoin(&mut arena, surviving, is_existing, control)?),
                 effect: ConnectorRowMutationEffect::Replace,
                 assignments,
             });
@@ -1699,17 +1678,15 @@ fn conjoin(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     left: Option<crate::optimizer::scalar::ScalarId>,
     right: crate::optimizer::scalar::ScalarId,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     match left {
         None => Ok(right),
         Some(left) => arena.intern_observed(
-            crate::optimizer::scalar::ScalarNode::BinaryOp {
-                op: crate::common::BinOp::And,
+            crate::optimizer::scalar::ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left,
                 right,
-                decimal_overflow_policy,
             },
             novarocks_type_contract::FunctionValueType::new(
                 arrow::datatypes::DataType::Boolean,

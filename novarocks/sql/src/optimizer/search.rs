@@ -759,21 +759,15 @@ mod tests {
     }
 
     fn minus_int(expr: TypedExpr, value: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(expr),
-                op: BinOp::Sub,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(value)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        crate::common::binary_operator::test_operator(
+            BinOp::Sub,
+            expr,
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(value)),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-        }
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn eq_cond(memo: &mut Memo, left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {

@@ -306,15 +306,12 @@ mod tests {
             }],
         );
 
-        let cond_typed = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_typed("k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_typed("k")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let cond_typed = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_typed("k"),
+            col_typed("k"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let cond_id = intern_typed(
             &mut arena,
             &cond_typed,

@@ -2990,7 +2990,7 @@ fn assert_one_row_output_columns_pass_through() {
 fn expr_references_col(e: &TypedExpr, id: ColumnId) -> bool {
     match &e.kind {
         ExprKind::ColumnRef { column_id, .. } => *column_id == id,
-        ExprKind::BinaryOp { left, right, .. } => {
+        ExprKind::BooleanConnective { left, right, .. } => {
             expr_references_col(left, id) || expr_references_col(right, id)
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
@@ -3703,8 +3703,8 @@ fn json_mark_probe_is_materialized_after_its_aggregate() {
         unreachable!()
     };
     assert!(matches!(
-        &mark.condition.as_ref().unwrap().kind,
-        ExprKind::BinaryOp { op: BinOp::Eq, .. }
+        crate::common::binary_operator::typed_comparison(mark.condition.as_ref().unwrap()),
+        Some((BinOp::Eq, _))
     ));
     assert!(matches!(join.left().kind, LogicalPlanKind::Project(_)));
     assert!(matches!(

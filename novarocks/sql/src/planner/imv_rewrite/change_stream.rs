@@ -390,7 +390,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
             func.eq_ignore_ascii_case(name)
                 || args.iter().any(|arg| expr_contains_function(arg, name))
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,

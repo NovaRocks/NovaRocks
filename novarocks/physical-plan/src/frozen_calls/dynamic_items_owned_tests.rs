@@ -56,7 +56,7 @@ fn actual_sparse_call_environments_keep_original_count_and_caller_phase_without_
         },
         SemanticParameterRef {
             id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterKey::AllowThrowException,
+            expected_key: SemanticParameterKey::StatementStartUtc,
         },
     ];
     let fragment = dynamic_relations(3, &environment);

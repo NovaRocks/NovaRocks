@@ -17,7 +17,6 @@
 
 use super::tests::Definitions;
 use super::*;
-use novarocks_expression_contract::{BinaryOperator, ExprKind};
 use std::{alloc::Layout, sync::Mutex};
 const B: usize = 4 * 1024 * 1024;
 const CAUSES: [CompileControlError; 3] = [
@@ -64,13 +63,7 @@ fn limits() -> ControlProjectionLimits {
 fn fixture() -> (Definitions, ExpressionControlFlow<ExprId>) {
     let mut definitions = Definitions::default();
     let leaf = definitions.boolean(true);
-    let root = definitions.add(ExprKind::Binary {
-        op: BinaryOperator::Eq,
-        left: leaf,
-        right: leaf,
-        allow_throw_exception: None,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-    });
+    let root = definitions.add(super::tests::eager_pair([leaf, leaf]));
     let region = EvaluationRegionId::new(u32::MAX);
     let inv = |id, definition, args: &[ExpressionUseId]| ExpressionInvocation {
         context: ExpressionEffectContext {

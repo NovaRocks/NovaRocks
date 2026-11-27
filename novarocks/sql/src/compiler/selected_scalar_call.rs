@@ -26,8 +26,7 @@ use novarocks_functions::{
     FunctionResultType,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy, FunctionArgumentType,
-    FunctionValueType, PureCompileControl,
+    DecimalOverflowPolicy, FunctionArgumentType, FunctionValueType, PureCompileControl,
 };
 use std::sync::Arc;
 
@@ -180,33 +179,6 @@ pub(crate) fn comparison_target(
         .clone()
         .with_nullable(source.nullable())
         .expect("validated root NULL contract")
-}
-
-pub(crate) const fn arithmetic_operator(op: crate::common::BinOp) -> Option<ArithmeticOperator> {
-    use crate::common::BinOp;
-    Some(match op {
-        BinOp::Add => ArithmeticOperator::Add,
-        BinOp::Sub => ArithmeticOperator::Subtract,
-        BinOp::Mul => ArithmeticOperator::Multiply,
-        BinOp::Div => ArithmeticOperator::Divide,
-        BinOp::Mod => ArithmeticOperator::Modulo,
-        _ => return None,
-    })
-}
-pub(crate) const fn comparison_operator(op: crate::common::BinOp) -> Option<ComparisonOperator> {
-    use crate::common::BinOp;
-    Some(match op {
-        BinOp::Eq => ComparisonOperator::Eq,
-        BinOp::Ne => ComparisonOperator::Ne,
-        BinOp::Lt => ComparisonOperator::Lt,
-        BinOp::Le => ComparisonOperator::Le,
-        BinOp::Gt => ComparisonOperator::Gt,
-        BinOp::Ge => ComparisonOperator::Ge,
-        _ => return None,
-    })
-}
-pub(crate) const fn arithmetic_allows_throw(op: crate::common::BinOp) -> bool {
-    arithmetic_operator(op).is_some()
 }
 
 #[cfg(test)]

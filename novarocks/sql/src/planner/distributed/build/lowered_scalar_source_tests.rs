@@ -167,7 +167,6 @@ pub(in crate::planner::distributed::build) fn lower_draft_with_control(
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         control,
     )
@@ -640,7 +639,6 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         &control,
     )
@@ -814,7 +812,6 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         &control,
     )
@@ -862,7 +859,6 @@ fn scalar_journal_capture_and_actual_recording_preserve_every_lowering_control_p
                 dop(),
                 functions.clone(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 policy(),
                 control,
             )

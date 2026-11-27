@@ -178,12 +178,6 @@ fn expression(
         kind: Some(kind),
     }
 }
-fn allow() -> semantics::SemanticParameterRef {
-    semantics::SemanticParameterRef {
-        id: Some(0),
-        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
-    }
-}
 struct Fixture {
     types: DecodedTypeTable,
     carrier_i64: u32,
@@ -316,11 +310,15 @@ impl Fixture {
         let parameters = SemanticParameters::try_new([
             (
                 SemanticParameterId::new(0),
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::TimeZone(
+                    novarocks_type_contract::TimeZoneKey::parse("UTC").unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(u32::MAX),
-                SemanticParameterValue::AllowThrowException(true),
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(5),
@@ -461,12 +459,9 @@ impl Fixture {
             expression(
                 2,
                 1,
-                K::Binary(wire::BinaryExpression {
-                    left_expr_id: Some(0),
-                    right_expr_id: Some(17),
-                    op: wire::BinaryOperator::Add as i32,
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
-                    allow_throw_exception: Some(allow()),
+                K::LetExpression(wire::LetExpression {
+                    value_expr_id: Some(17),
+                    body_expr_id: Some(0),
                 }),
             ),
             expression(
@@ -637,7 +632,7 @@ fn prefixes(
 }
 
 #[test]
-fn receiving_expressions_cover_all_sixteen_scalar_kinds_and_original_dense_correspondence() {
+fn receiving_expressions_cover_scalar_kinds_and_original_dense_correspondence() {
     use wire::expression_definition::Kind as K;
     let fixture = Fixture::new();
     let definitions = fixture.all_kinds();
@@ -692,7 +687,7 @@ fn receiving_expressions_cover_all_sixteen_scalar_kinds_and_original_dense_corre
                 kinds.push(kind);
             }
         }
-        assert_eq!(kinds.len(), 16);
+        assert_eq!(kinds.len(), 11);
         assert!(token.definition(123456).unwrap().is_none());
         let zero = token.definition(0).unwrap().unwrap();
         let Some(K::Constant(reference)) = zero.kind.as_ref() else {
@@ -1011,37 +1006,9 @@ fn receiving_calls_and_lambdas_use_exact_original_namespaces() {
 }
 
 #[test]
-fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
+fn receiving_cast_requires_its_exact_carrier() {
     use wire::expression_definition::Kind as K;
     let fixture = Fixture::new();
-    for op in [
-        wire::BinaryOperator::Add,
-        wire::BinaryOperator::Subtract,
-        wire::BinaryOperator::Multiply,
-        wire::BinaryOperator::Divide,
-        wire::BinaryOperator::Modulo,
-    ] {
-        for id in [0, u32::MAX] {
-            let mut defs = small();
-            defs[0].value_type_id = Some(1);
-            defs[0].kind = Some(K::Binary(wire::BinaryExpression {
-                left_expr_id: Some(1),
-                right_expr_id: Some(1),
-                op: op as i32,
-                decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
-                allow_throw_exception: Some(semantics::SemanticParameterRef {
-                    id: Some(id),
-                    ..allow()
-                }),
-            }));
-            assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_ok());
-            let Some(K::Binary(binary)) = defs[0].kind.as_mut() else {
-                unreachable!()
-            };
-            binary.allow_throw_exception = None;
-            assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_err());
-        }
-    }
     let cast = expression(
         0,
         1,
@@ -1073,15 +1040,6 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
     value.target_carrier_type_id = Some(none_zone);
     defs[0].value_type_id = Some(8);
     assert!(run(&fixture, &defs, SOURCE, limits(), &Control::default()).is_err());
-    let mut binary = small();
-    binary[0].kind = Some(K::Binary(wire::BinaryExpression {
-        left_expr_id: Some(1),
-        right_expr_id: Some(1),
-        op: wire::BinaryOperator::Eq as i32,
-        decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
-        allow_throw_exception: Some(allow()),
-    }));
-    assert!(run(&fixture, &binary, SOURCE, limits(), &Control::default()).is_err());
 }
 
 #[test]

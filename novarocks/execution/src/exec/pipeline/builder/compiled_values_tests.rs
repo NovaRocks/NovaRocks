@@ -27,7 +27,7 @@ use std::time::Duration;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::{ConstantPool, KernelFailure};
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef};
 use novarocks_physical_plan::{
@@ -37,8 +37,7 @@ use novarocks_physical_plan::{
     ResultField, ResultPort, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameters,
     arithmetic_result_value_type_with_op,
 };
 
@@ -52,10 +51,6 @@ use crate::runtime::task::io::NoopTaskEventSink;
 use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause};
 use novarocks_expression::CompiledExpressionInstance;
 
-const ALLOW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(3),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
 const VALUES: NodeId = NodeId::new(1);
 const PROJECT: NodeId = NodeId::new(2);
 const OVERFLOW: &str = "Arithmetic overflow: Overflow happened on: 9223372036854775807 + 1";
@@ -216,21 +211,11 @@ fn values_program_with_sources(
                         operand,
                         crate::exec::operators::family_fixture::constant_sources::i64(1),
                     );
-                    builder
-                        .unit(VALUES)
-                        .unwrap()
-                        .add(
-                            None,
-                            sum,
-                            ExprKind::Binary {
-                                op: BinaryOperator::Add,
-                                left,
-                                right,
-                                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                                allow_throw_exception: Some(ALLOW),
-                            },
-                        )
-                        .unwrap()
+                    builder.operator(
+                        VALUES,
+                        novarocks_type_contract::OperatorFunction::Add,
+                        [left, right],
+                    )
                 }
             };
             let root = builder
@@ -283,7 +268,7 @@ fn values_program_with_sources(
             projected.into_boxed_slice(),
         )
         .unwrap();
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_definition(
             PROJECT,
@@ -301,8 +286,7 @@ fn values_program_with_sources(
         .flatten()
         .any(|cell| matches!(cell, Cell::Overflow))
     {
-        SemanticParameters::try_new([(ALLOW.id, SemanticParameterValue::AllowThrowException(true))])
-            .unwrap()
+        SemanticParameters::default()
     } else {
         SemanticParameters::default()
     };

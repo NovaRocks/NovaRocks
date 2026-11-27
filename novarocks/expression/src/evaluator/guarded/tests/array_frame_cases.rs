@@ -248,7 +248,9 @@ fn original_domain_required_child_row_outside_demand_stops_before_parent_instant
     assert_eq!(row.error().selected_ordinal(), 0);
     assert!(row.error().message().contains("zero"));
     assert!(
-        frame.instances.is_empty(),
+        !frame
+            .instances
+            .contains_key(&program.unit.root(program.root).unwrap().use_id),
         "required child failure must precede parent creation/core, not merely suppress its output"
     );
 }

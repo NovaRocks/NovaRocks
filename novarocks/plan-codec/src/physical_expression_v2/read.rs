@@ -30,15 +30,14 @@ use crate::{
     binding_index_v2::BindingIndex,
     physical_aggregate_binding_v2::PreparedAggregateBindingHeaders,
     physical_binding_v2::PreparedFunctionBindingHeaders,
-    physical_semantics_v2::{SemanticsCodecError, decode_decimal_policy, decode_reference},
     physical_type_v2::{DecodedTypeTable, TypeCodecError},
     physical_value_v2::DecodedValues,
 };
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReference};
-use novarocks_proto_models::{physical_package_v2 as wire, physical_semantics_v2 as semantics};
+use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameterKey,
-    SemanticParameters, arrow_data_types_exact_borrowed_with_profile_observed,
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameters,
+    arrow_data_types_exact_borrowed_with_profile_observed,
 };
 use std::mem::size_of;
 
@@ -267,7 +266,7 @@ impl<'wire> ExpressionDefinitionInput<'wire> {
     }
 }
 
-/// Borrow all sixteen closed scalar wire kinds. Types and control come from the
+/// Borrow the eleven closed scalar wire kinds. Types and control come from the
 /// original value namespace; function and aggregate tokens must retain that
 /// same immutable correspondence. Source is a mandatory whole coexistence
 /// invoice, not encoded length, a guessed capacity or allocation authority.
@@ -436,16 +435,7 @@ fn references(
             value.lambda_expr_id,
             "lambda parameter owner is absent",
         )?)?,
-        K::Binary(value) => {
-            visit(required(
-                value.left_expr_id,
-                "binary left operand is absent",
-            )?)?;
-            visit(required(
-                value.right_expr_id,
-                "binary right operand is absent",
-            )?)?;
-        }
+
         K::Conjunction(value) | K::Disjunction(value) => {
             for id in &value.expr_ids {
                 visit(*id)?;
@@ -851,21 +841,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     .ok_or_else(|| shape("lambda parameter ordinal is out of bounds"))?;
                 self.match_type_root(header, parameter, admission, work)?;
             }
-            K::Binary(value) => {
-                let op = super::receiving_grammar::decode_binary(value.op)?;
-                let arithmetic = op.arithmetic_operator().is_some();
-                decode_decimal_policy(value.decimal_overflow_policy)?;
-                let same_presence = arithmetic == value.allow_throw_exception.is_some();
-                work.step()?;
-                if !same_presence {
-                    return Err(shape(
-                        "binary ALLOW reference presence differs from its operator",
-                    ));
-                }
-                if let Some(reference) = &value.allow_throw_exception {
-                    self.allow_throw(reference, admission, work)?;
-                }
-            }
+
             K::Conjunction(_) | K::Disjunction(_) => {}
             K::FunctionCall(value) => {
                 self.call(
@@ -935,35 +911,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             K::IsNull(_) | K::CaseExpression(_) => {}
         }
         work.step()?;
-        Ok(())
-    }
-    fn allow_throw(
-        &mut self,
-        reference: &semantics::SemanticParameterRef,
-        admission: &mut Admission<'_, '_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), Error> {
-        self.charge(
-            tree_lookup_work(self.parameters.entries().len())?,
-            admission,
-            work,
-        )?;
-        let reference = decode_reference(reference, work)?;
-        let valid = reference.expected_key == SemanticParameterKey::AllowThrowException;
-        work.step()?;
-        if !valid {
-            return Err(shape(
-                "intrinsic ALLOW reference has the wrong expected key",
-            ));
-        }
-        work.flush()?;
-        let resolved = self
-            .parameters
-            .require(reference)
-            .map_err(SemanticsCodecError::from);
-        work.step()?;
-        work.flush()?;
-        resolved?;
         Ok(())
     }
     fn function_header(

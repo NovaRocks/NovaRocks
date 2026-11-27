@@ -35,12 +35,12 @@ fn boolean_values(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Optio
 }
 
 #[test]
-fn floating_nullsafe_keeps_nan_any_nonnull_and_signed_zero_in_both_operand_orders() {
+fn floating_nullsafe_matches_only_two_nans_and_collapses_signed_zero_in_both_operand_orders() {
     let left = [
         Some(0.0),
         Some(-0.0),
         Some(f64::from_bits(0x7ff8_0000_0000_0011)),
-        Some(19.0),
+        Some(f64::from_bits(0x7ff8_0000_0000_0011)),
         None,
         Some(f64::NEG_INFINITY),
         Some(2.0),
@@ -59,7 +59,7 @@ fn floating_nullsafe_keeps_nan_any_nonnull_and_signed_zero_in_both_operand_order
     let expected = vec![
         Some(true),
         Some(true),
-        Some(true),
+        Some(false),
         Some(true),
         Some(false),
         Some(false),
@@ -275,34 +275,37 @@ fn nullsafe_source_carrier_and_logical_metadata_are_checked_before_selected_null
 
 #[test]
 fn null_safe_equality_never_turns_successful_null_into_a_row_error() {
-    use crate::zero_port;
-    use novarocks_expression_contract::{BinaryOperator, ExprKind};
-    use novarocks_type_contract::SemanticParameters;
-
-    let result = FunctionValueType::new(DataType::Boolean, false);
-    for (left, right, expected) in [
-        (None, None, true),
-        (Some(true), None, false),
-        (None, Some(false), false),
-        (Some(true), Some(true), true),
-    ] {
-        let inputs =
-            [left, right].map(|value| Arc::new(BooleanArray::from(vec![value])) as ArrayRef);
-        let unit = zero_port::primitive(
-            inputs,
-            result.clone(),
-            |children| ExprKind::Binary {
-                left: children[0],
-                op: BinaryOperator::EqForNull,
-                right: children[1],
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
+    let ty = FunctionValueType::new(DataType::Boolean, true);
+    let program = nullsafe_program(ty, NullSafeRight::Column);
+    let inputs = RecordBatch::try_new(
+        program.input_schema().clone(),
+        vec![
+            Arc::new(BooleanArray::from(vec![None, Some(true), None, Some(true)])),
+            Arc::new(BooleanArray::from(vec![
+                None,
+                None,
+                Some(false),
+                Some(true),
+            ])),
+        ],
+    )
+    .unwrap();
+    let selection = Selection::all(inputs.num_rows());
+    let result = instance(&program)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &inputs,
+                source: None,
             },
-            &SemanticParameters::default(),
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
         )
         .unwrap();
-        let output = zero_port::evaluate(unit);
-        assert!(output.errors().is_empty());
-        assert_eq!(boolean_values(&output), vec![Some(expected)]);
-    }
+    assert!(result.errors().is_empty());
+    assert_eq!(
+        boolean_values(&result),
+        vec![Some(true), Some(false), Some(false), Some(true)]
+    );
 }

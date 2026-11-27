@@ -788,7 +788,7 @@ fn rich_effects(domain: EvaluationRegionId) -> CallEffects {
             },
             SemanticParameterRef {
                 id: SemanticParameterId::new(0),
-                expected_key: SemanticParameterKey::AllowThrowException,
+                expected_key: SemanticParameterKey::StatementStartUtc,
             },
         ]),
         proof_scope: CallProofScope::Region(domain),

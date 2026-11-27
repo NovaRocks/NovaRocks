@@ -78,12 +78,25 @@ pub enum BinOp {
     Gt,
     Ge,
     EqForNull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BooleanOp {
     And,
     Or,
     /// AND produced by expanding a single source predicate.
     ExpandedConjunction,
     /// The same expansion with its enclosing NOT in the source position.
     ExpandedNegatedConjunction,
+}
+
+impl BooleanOp {
+    pub(crate) const fn sql(self) -> &'static str {
+        match self {
+            Self::And | Self::ExpandedConjunction | Self::ExpandedNegatedConjunction => "AND",
+            Self::Or => "OR",
+        }
+    }
 }
 
 impl JoinKind {

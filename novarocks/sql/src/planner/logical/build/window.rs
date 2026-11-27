@@ -203,7 +203,7 @@ fn logical_sort_satisfies_window_ordering(
 fn has_window_call(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::WindowCall { .. } => true,
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -404,13 +404,8 @@ fn rewrite_window_calls(
                 )),
             },
         },
-        ExprKind::BinaryOp {
-            left,
-            right,
-            op,
-            decimal_overflow_policy,
-        } => TypedExpr {
-            kind: ExprKind::BinaryOp {
+        ExprKind::BooleanConnective { left, right, op } => TypedExpr {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     left,
                     base_name,
@@ -426,7 +421,6 @@ fn rewrite_window_calls(
                     window_exprs,
                     counter,
                 )),
-                decimal_overflow_policy: *decimal_overflow_policy,
             },
             value_type: expr.value_type.clone(),
         },

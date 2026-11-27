@@ -19,7 +19,7 @@ use crate::{ExprId, ValueId, ValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     FunctionArgumentEvaluation, FunctionArgumentTypes, FunctionFailureBehavior, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionVolatility, SemanticParameterRef,
+    FunctionKind, FunctionOverloadId, FunctionVolatility,
 };
 use std::fmt;
 
@@ -105,53 +105,6 @@ impl BoundFunction {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BinaryOperator {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Modulo,
-    Eq,
-    EqForNull,
-    NotEq,
-    Lt,
-    LtEq,
-    Gt,
-    GtEq,
-}
-
-impl BinaryOperator {
-    /// Borrow the original neutral arithmetic identity. This mapping does not
-    /// authorize a type profile or supply primitive effects.
-    pub const fn arithmetic_operator(self) -> Option<novarocks_type_contract::ArithmeticOperator> {
-        use novarocks_type_contract::ArithmeticOperator as A;
-        Some(match self {
-            Self::Add => A::Add,
-            Self::Subtract => A::Subtract,
-            Self::Multiply => A::Multiply,
-            Self::Divide => A::Divide,
-            Self::Modulo => A::Modulo,
-            _ => return None,
-        })
-    }
-
-    /// Borrow the original ordinary comparison identity. NULL-safe equality
-    /// has its own owner and deliberately supplies no ordinary operator here.
-    pub const fn comparison_operator(self) -> Option<novarocks_type_contract::ComparisonOperator> {
-        use novarocks_type_contract::ComparisonOperator as C;
-        Some(match self {
-            Self::Eq => C::Eq,
-            Self::NotEq => C::Ne,
-            Self::Lt => C::Lt,
-            Self::LtEq => C::Le,
-            Self::Gt => C::Gt,
-            Self::GtEq => C::Ge,
-            _ => return None,
-        })
-    }
-}
-
 /// A checked value address. Local bindings identify their Let definition in
 /// this unit and never enter a physical input port's namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,15 +122,6 @@ pub enum ExprKind {
     },
     /// Exact address in the sole immutable plan/package checked pool table.
     Constant(crate::ConstantReference),
-    Binary {
-        left: ExprId,
-        op: BinaryOperator,
-        right: ExprId,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        /// Required for arithmetic; absent for comparisons and bitwise operators.
-        /// The value is supplied by the plan's immutable parameter table.
-        allow_throw_exception: Option<SemanticParameterRef>,
-    },
     /// SQL `AND` over an ordered argument list.
     ///
     /// Boolean connectives are n-ary rather than binary so that the number of
@@ -221,7 +165,8 @@ pub enum ExprKind {
         negated: bool,
     },
     Case {
-        /// Use ordinary IEEE equality for the original floating comparison domain.
+        /// A subject matches its typed labels by ordinary equality. Float32
+        /// and Float64 use the IEEE equality of the selected comparison.
         ieee_float_equality: bool,
         operand: Option<ExprId>,
         when_then: Box<[(ExprId, ExprId)]>,
@@ -274,7 +219,6 @@ impl ExprKind {
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Constant(_)
-            | ExprKind::Binary { .. }
             | ExprKind::Cast { .. }
             | ExprKind::IsNull { .. } => Some(ControlShape::Eager),
         })
@@ -288,19 +232,6 @@ impl ExprKind {
         self.expression_references_observed(visit)
     }
 
-    /// Actual primitive parameter consumers, independent of function-call
-    /// occurrence environments and legacy binding migration fields.
-    pub fn intrinsic_parameter_references(&self) -> impl Iterator<Item = &SemanticParameterRef> {
-        match self {
-            Self::Binary {
-                allow_throw_exception,
-                ..
-            } => allow_throw_exception.as_ref(),
-            _ => None,
-        }
-        .into_iter()
-    }
-
     /// Visit actual ordered children without copying the DAG edge table.
     /// The caller meters each callback and admits its own output allocations.
     /// This loan uses the same ordered children as definition correspondence.
@@ -311,10 +242,7 @@ impl ExprKind {
         match self {
             Self::Value(_) | Self::LambdaParameter { .. } | Self::Constant(_) => {}
             Self::Cast { expr, .. } | Self::IsNull { expr, .. } => visit(*expr)?,
-            Self::Binary { left, right, .. } => {
-                visit(*left)?;
-                visit(*right)?;
-            }
+
             Self::Let { value, body } => {
                 visit(*value)?;
                 visit(*body)?;

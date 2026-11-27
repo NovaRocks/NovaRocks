@@ -28,10 +28,9 @@ use crate::planner::vocabulary::ApplyKeySource;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::DataType;
+use novarocks_type_contract::OperatorFunction;
 
-use crate::analysis::{
-    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
-};
+use crate::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -41,7 +40,7 @@ use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::planner::imv_rewrite::annotation::ImvExtension;
 use crate::planner::imv_rewrite::column_alloc::allocate_imv_column;
-use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
+use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result_typed, opt_expr_to_plan};
 use crate::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::{PlanProjectNode, PlanScanNode};
 use crate::planner::table::{
@@ -94,7 +93,7 @@ impl LogicalRewriteRule for InjectTargetLocatorJoinRule {
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
-        bridge_apply_result(expr, ctx, |plan, ctx| {
+        bridge_apply_result_typed(expr, ctx, |plan, ctx| {
             let Some(input) = target_locator_join_input(&plan, ctx)? else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
@@ -237,14 +236,14 @@ fn build_target_locator_join(
     left: LogicalPlanNode,
     input: LocatorJoinInput,
     ctx: &RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, SqlCompileError> {
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectTargetLocatorJoin requires ImvExtension".to_string())?;
     if ext.annotation.target_read
         == crate::planner::imv_rewrite::annotation::TargetReadRequirement::NewOutputRowsOnly
     {
-        return build_new_output_locator_projection(left, input, ctx);
+        return Ok(build_new_output_locator_projection(left, input, ctx)?);
     }
     let right_apply_key_id = allocate_imv_column(
         ctx,
@@ -312,6 +311,7 @@ fn build_target_locator_join(
                 &input,
                 right_apply_key_id,
                 right_branch_id,
+                ctx,
             )?),
         }),
         vec![left, right_scan],
@@ -585,20 +585,31 @@ fn target_locator_join_condition(
     input: &LocatorJoinInput,
     right_apply_key_id: ColumnId,
     right_branch_id: Option<ColumnId>,
-) -> Result<TypedExpr, String> {
-    let delete_only = binary(
+    ctx: &RewriteContext,
+) -> Result<TypedExpr, SqlCompileError> {
+    let compare = |left, operator, right| {
+        crate::analyzer::type_optimizer_operator(
+            ctx.function_catalog(),
+            operator,
+            [left, right],
+            ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
+            &ctx.control_view(),
+        )
+    };
+    let delete_only = compare(
         column_ref(&input.action),
-        BinOp::Eq,
+        OperatorFunction::Equal,
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(i64::from(
                 crate::common::CHANGE_OP_DELETE,
             ))),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
-    );
-    let apply_key_eq = binary(
+    )?;
+    let apply_key_eq = compare(
         column_ref(&input.left_apply_key),
-        BinOp::Eq,
+        OperatorFunction::Equal,
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: right_apply_key_id,
@@ -607,15 +618,15 @@ fn target_locator_join_condition(
             },
             value_type: input.target_apply_key_type.clone(),
         },
-    );
-    let mut condition = binary(delete_only, BinOp::And, apply_key_eq);
+    )?;
+    let mut condition = binary(delete_only, crate::common::BooleanOp::And, apply_key_eq);
     if let Some(branch) = &input.branch {
         let right_branch_id = right_branch_id.ok_or_else(|| {
             "target locator branch join missing right branch column id".to_string()
         })?;
-        let branch_eq = binary(
+        let branch_eq = compare(
             column_ref(&branch.left),
-            BinOp::Eq,
+            OperatorFunction::Equal,
             TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: right_branch_id,
@@ -624,8 +635,8 @@ fn target_locator_join_condition(
                 },
                 value_type: branch.target_value_type.clone(),
             },
-        );
-        condition = binary(condition, BinOp::And, branch_eq);
+        )?;
+        condition = binary(condition, crate::common::BooleanOp::And, branch_eq);
     }
     Ok(condition)
 }
@@ -737,13 +748,12 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
     }
 }
 
-fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
+fn binary(left: TypedExpr, op: crate::common::BooleanOp, right: TypedExpr) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(left),
             op,
             right: novarocks_parser::ast::AstBox::new(right),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
@@ -803,6 +813,10 @@ mod tests {
             branch_id_column_name: BRANCH_ID_COLUMN_NAME.to_string(),
         });
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(
+            crate::optimizer::scalar::ScalarArena::new(),
+        )));
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         let mut factory = ColumnRefFactory::new();
         factory.reserve_until(100);
         ctx.set_column_ref_factory(Rc::new(RefCell::new(factory)));
@@ -842,12 +856,15 @@ mod tests {
     fn find_ref_type(expr: &TypedExpr, id: ColumnId) -> Option<&FunctionValueType> {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } if *column_id == id => Some(&expr.value_type),
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
                 ..
             } => find_ref_type(left, id).or_else(|| find_ref_type(right, id)),
+            ExprKind::FunctionCall { args, .. } => {
+                args.iter().find_map(|arg| find_ref_type(arg, id))
+            }
             _ => None,
         }
     }

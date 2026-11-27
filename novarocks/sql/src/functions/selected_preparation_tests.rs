@@ -320,12 +320,14 @@ fn sql_selected_port_checks_exact_result_environment_and_lifecycle_without_rebin
     let parameter_id = novarocks_type_contract::SemanticParameterId::new(0);
     let parameters = SemanticParameters::try_new([(
         parameter_id,
-        novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
+        novarocks_type_contract::SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+        ),
     )])
     .unwrap();
     let environment = [novarocks_type_contract::SemanticParameterRef {
         id: parameter_id,
-        expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+        expected_key: novarocks_type_contract::SemanticParameterKey::StatementStartUtc,
     }];
     let mut environment_call = call;
     environment_call.environment = &environment;

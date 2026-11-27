@@ -83,7 +83,6 @@ impl SqlAnalyzedQuery {
             self.decimal_overflow_policy,
             control,
         );
-        rewrite.set_root_allow_throw_exception(self.root_allow_throw_exception);
         rewrite.set_fold_dependency_observer(control.fold_dependency_observer().cloned());
         rewrite.set_function_catalog(Arc::clone(&self.function_catalog));
         rewrite.set_sealed_functions(Arc::clone(&self.sealed_functions));

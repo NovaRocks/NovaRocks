@@ -18,7 +18,6 @@
 //! Exact, observed MV expression identity. Bucket keys are not semantic proofs.
 use crate::{
     column_id::ColumnId,
-    common::BinOp,
     compiler::SqlCompileError,
     optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode},
 };
@@ -210,51 +209,25 @@ fn normalize_inner(
                 value_type: value_type.clone(),
             }
         }
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => {
-            let mut l = required!(normalize_inner(arena, *left, base_names, control, work)?);
-            let mut r = required!(normalize_inner(arena, *right, base_names, control, work)?);
-            // Canonicalize comparisons: Gt/Ge become flipped Lt/Le.
-            let (name, commutative) = match op {
-                BinOp::Add => ("add", true),
-                BinOp::Mul => ("mul", true),
-                BinOp::Sub => ("sub", false),
-                BinOp::Div => ("div", false),
-                BinOp::Mod => ("mod", false),
-                BinOp::Eq => ("eq", true),
-                BinOp::Ne => ("ne", true),
-                BinOp::EqForNull => ("eq_for_null", true),
-                BinOp::And => ("and", true),
-                BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => ("and", false),
-                BinOp::Or => ("or", true),
-                BinOp::Lt => ("lt", false),
-                BinOp::Le => ("le", false),
-                BinOp::Gt => {
-                    std::mem::swap(&mut l, &mut r);
-                    ("lt", false)
-                }
-                BinOp::Ge => {
-                    std::mem::swap(&mut l, &mut r);
-                    ("le", false)
+        ScalarNode::BooleanConnective { left, op, right } => {
+            let left = required!(normalize_inner(arena, *left, base_names, control, work)?);
+            let right = required!(normalize_inner(arena, *right, base_names, control, work)?);
+            let (name, argument_order) = match op {
+                crate::common::BooleanOp::And => ("and", NormArgumentOrder::Multiset),
+                crate::common::BooleanOp::Or => ("or", NormArgumentOrder::Multiset),
+                crate::common::BooleanOp::ExpandedConjunction
+                | crate::common::BooleanOp::ExpandedNegatedConjunction => {
+                    ("and", NormArgumentOrder::Ordered)
                 }
             };
-            let args = vec![l, r];
             NormExpr::Call {
                 value_type: value_type.clone(),
-                argument_order: if commutative {
-                    NormArgumentOrder::Multiset
-                } else {
-                    NormArgumentOrder::Ordered
-                },
-                name: name.to_string(),
+                argument_order,
+                name: name.to_owned(),
                 distinct: false,
-                args,
+                args: vec![left, right],
                 binding: None,
-                decimal_overflow_policy: Some(*decimal_overflow_policy),
+                decimal_overflow_policy: None,
                 cast_mode: None,
                 order_by: vec![],
             }

@@ -17,9 +17,7 @@
 
 use novarocks_expression::*;
 use novarocks_failure_contract::{FailureProjection, FailureReason, domain};
-use novarocks_functions::{
-    ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B, KernelFailure,
-};
+use novarocks_functions::{CastPrepareError as C, ComparisonPrepareError as B, KernelFailure};
 use novarocks_type_contract::{CompileControlError, ValueLogicalType};
 use std::{error::Error, num::NonZeroU16};
 
@@ -42,7 +40,6 @@ fn primitive_preparation_keeps_bare_kernel_stops_capacity_and_domain_sources() {
     ] {
         let expected = original.failure_fact();
         for error in [
-            PrimitiveError::from(A::Kernel(original.clone())),
             PrimitiveError::from(B::Kernel(original.clone())),
             PrimitiveError::from(C::Kernel(original.clone())),
         ] {
@@ -72,10 +69,8 @@ fn primitive_preparation_unwraps_only_actual_caller_control_channels() {
     ] {
         let expected = original.failure_fact();
         for error in [
-            PrimitiveError::from(A::Control(original.clone())),
             PrimitiveError::from(B::Control(original.clone())),
             PrimitiveError::from(C::Control(original.clone())),
-            PrimitiveError::from(A::Kernel(KernelFailure::CompileControl(original.clone()))),
             PrimitiveError::from(B::Kernel(KernelFailure::CompileControl(original.clone()))),
             PrimitiveError::from(C::Kernel(KernelFailure::CompileControl(original.clone()))),
         ] {
@@ -104,99 +99,32 @@ impl novarocks_type_contract::PureCompileControl for RecipeControl {
 }
 
 #[test]
-fn every_unsupported_recipe_keeps_its_exact_owner() {
-    use arrow::datatypes::{DataType, Field};
-    use novarocks_functions::{CastOperation, FunctionValueType};
-    use novarocks_type_contract::{ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy};
-    use std::sync::Arc;
-
-    let integer = FunctionValueType::new(DataType::Int64, true);
-    let boolean = FunctionValueType::new(DataType::Boolean, false);
-    let nested = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-        true,
-    );
-    let errors = [
-        prepare_arithmetic_node(
-            ArithmeticOperator::Add,
-            &boolean,
-            &boolean,
-            &integer,
-            DecimalOverflowPolicy::OutputNull,
-            true,
-            &RecipeControl,
-        )
-        .unwrap_err(),
-        prepare_cast_node(
-            CastOperation::Carrier,
-            &FunctionValueType::new(DataType::Date32, true),
-            &FunctionValueType::new(DataType::Int8, true),
-            novarocks_type_contract::TrinoCastMode::Explicit,
-            &RecipeControl,
-        )
-        .unwrap_err(),
-        prepare_comparison_node(ComparisonOperator::Eq, &nested, &nested, &RecipeControl)
-            .unwrap_err(),
-        prepare_null_safe_comparison_node(&nested, &nested, &RecipeControl).unwrap_err(),
-    ];
-    assert!(matches!(
-        errors[0],
-        PrimitiveError::Arithmetic(A::Unsupported)
-    ));
-    assert!(matches!(errors[1], PrimitiveError::Cast(C::Illegal)));
-    assert!(matches!(
-        errors[2],
-        PrimitiveError::Comparison(B::Unsupported)
-    ));
-    assert!(matches!(
-        errors[3],
-        PrimitiveError::Comparison(B::Unsupported)
-    ));
-}
-
-#[test]
-fn every_recipe_type_mismatch_preserves_original_primitive_error() {
+fn cast_recipe_keeps_illegal_and_type_mismatch_failures() {
     use arrow::datatypes::DataType;
     use novarocks_functions::{CastOperation, FunctionValueType};
-    use novarocks_type_contract::{ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy};
+    use novarocks_type_contract::TrinoCastMode;
 
-    let integer = FunctionValueType::new(DataType::Int64, false);
-    let nullable = FunctionValueType::new(DataType::Int64, true);
-    let boolean = FunctionValueType::new(DataType::Boolean, false);
-    let errors = [
-        prepare_arithmetic_node(
-            ArithmeticOperator::Add,
-            &integer,
-            &integer,
-            &integer,
-            DecimalOverflowPolicy::OutputNull,
-            true,
-            &RecipeControl,
-        )
-        .unwrap_err(),
-        prepare_cast_node(
-            CastOperation::Carrier,
-            &nullable,
-            &integer,
-            novarocks_type_contract::TrinoCastMode::Explicit,
-            &RecipeControl,
-        )
-        .unwrap_err(),
-        prepare_comparison_node(ComparisonOperator::Eq, &integer, &boolean, &RecipeControl)
-            .unwrap_err(),
-        prepare_null_safe_comparison_node(&integer, &boolean, &RecipeControl).unwrap_err(),
-    ];
-    assert!(matches!(
-        errors[0],
-        PrimitiveError::Arithmetic(A::TypeMismatch)
-    ));
-    assert!(matches!(errors[1], PrimitiveError::Cast(C::TypeMismatch)));
-    assert!(matches!(
-        errors[2],
-        PrimitiveError::Comparison(B::TypeMismatch)
-    ));
-    assert!(matches!(
-        errors[3],
-        PrimitiveError::Comparison(B::TypeMismatch)
-    ));
+    let date = FunctionValueType::new(DataType::Date32, true);
+    let tinyint = FunctionValueType::new(DataType::Int8, true);
+    let illegal = prepare_cast_node(
+        CastOperation::Carrier,
+        &date,
+        &tinyint,
+        TrinoCastMode::Explicit,
+        &RecipeControl,
+    )
+    .unwrap_err();
+    assert!(matches!(illegal, PrimitiveError::Cast(C::Illegal)));
+
+    let required = FunctionValueType::new(DataType::Int64, false);
+    let nullable = required.with_nullable(true).unwrap();
+    let narrow = prepare_cast_node(
+        CastOperation::Carrier,
+        &nullable,
+        &required,
+        TrinoCastMode::Explicit,
+        &RecipeControl,
+    )
+    .unwrap_err();
+    assert!(matches!(narrow, PrimitiveError::Cast(C::TypeMismatch)));
 }

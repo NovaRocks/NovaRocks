@@ -47,9 +47,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use {
-    novarocks_expression_contract::{
-        BinaryOperator, BoundFunction, ExprKind, RootOrdinal, RootScope,
-    },
+    novarocks_expression_contract::{BoundFunction, ExprKind, RootOrdinal, RootScope},
     novarocks_physical_plan::{
         AggregateBinding, AggregateCallId, AggregateGrouping, AggregatePhase, AggregateSequenceId,
         ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprId, FragmentId,
@@ -284,19 +282,13 @@ impl Fixture {
                     ty(DataType::Int64, false),
                     checked::i64(1),
                 );
-                let add = b
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, true),
-                        ExprKind::Binary {
-                            op: BinaryOperator::Add,
-                            left: a,
-                            right: c,
-                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                            allow_throw_exception: Some(allow_ref()),
-                        },
-                    )
-                    .unwrap();
+                let add = novarocks_expression::testkit::add_catalogue_predicate(
+                    b.unit(owner).unwrap(),
+                    &mut pools,
+                    novarocks_type_contract::OperatorFunction::Add,
+                    vec![a, c],
+                )
+                .unwrap();
                 let test = b
                     .add_expression(
                         owner,
@@ -478,20 +470,24 @@ fn seal_fixture_units(
         .construction_nodes()
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
-    let parameters = SemanticParameters::try_new([(
-        allow_ref().id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let mut effects = BTreeMap::new();
     for node in nodes {
         if builder.construction_unit(node).is_none() {
             continue;
         }
         let ports = builder.node_ports(node).unwrap();
-        let draft = builder.take_unit_builder(node).unwrap();
+        let mut draft = builder.take_unit_builder(node).unwrap();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        novarocks_expression::testkit::declare_call_controls(
+            &mut draft,
+            &functions,
+            pools,
+            &parameters,
+            &mut work,
+        );
         let sealed = draft.seal(ports, &mut work).unwrap();
         let authored = super::super::expression_component_test_fixture::author_component_calls(
             &sealed,
@@ -532,7 +528,7 @@ fn summaries(fixture: &Fixture) -> BTreeMap<NodeId, NodeExpressionEffects> {
 fn allow_ref() -> SemanticParameterRef {
     SemanticParameterRef {
         id: SemanticParameterId::new(71),
-        expected_key: SemanticParameterKey::AllowThrowException,
+        expected_key: SemanticParameterKey::StatementStartUtc,
     }
 }
 fn request_at<'a>(
@@ -964,7 +960,9 @@ fn aggregate_occurrences_genuine_composed_arithmetic_child_error_survives_lifecy
     let o = f.occurrences();
     let p = SemanticParameters::try_new([(
         allow_ref().id,
-        SemanticParameterValue::AllowThrowException(false),
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+        ),
     )])
     .unwrap();
     let e = summaries(&f);
@@ -1637,7 +1635,9 @@ fn aggregate_fragment_composer_single_partial_complete_coverage_keeps_real_child
             let scopes = fragment_scopes(&f, &o);
             let p = SemanticParameters::try_new([(
                 allow_ref().id,
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+                ),
             )])
             .unwrap();
             let result = fragment_run(&f, &o, &p, &scopes, &Control::default()).unwrap();

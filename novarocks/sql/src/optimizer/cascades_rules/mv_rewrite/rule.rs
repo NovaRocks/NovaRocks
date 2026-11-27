@@ -1096,60 +1096,47 @@ mod tests {
     }
 
     fn ge(left: TypedExpr, v: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Ge,
-                right: novarocks_parser::ast::AstBox::new(int_lit(v)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Ge,
+            left,
+            int_lit(v),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn gt(left: TypedExpr, v: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(int_lit(v)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            left,
+            int_lit(v),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn lt(left: TypedExpr, v: i64) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Lt,
-                right: novarocks_parser::ast::AstBox::new(int_lit(v)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Lt,
+            left,
+            int_lit(v),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Or,
+                op: crate::common::BooleanOp::Or,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }

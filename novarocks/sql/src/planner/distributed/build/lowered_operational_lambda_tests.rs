@@ -81,7 +81,6 @@ fn observe_original_lambda(
         dop(),
         None,
         lambda_fixture_catalog(),
-        false,
         policy(),
         &control,
         &mut observer,

@@ -143,7 +143,7 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
     match scalars.node(id) {
         // Nothing inside this activation may be hoisted by this traversal.
         ScalarNode::Let { .. } => Vec::new(),
-        ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
+        ScalarNode::BooleanConnective { left, right, .. } => vec![*left, *right],
         ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
         | ScalarNode::Nested(child) => vec![*child],
@@ -356,7 +356,7 @@ fn collect_column_refs_inner(
                 refs.push((*column_id, scalars.value_type(id).clone()));
             }
         }
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -446,16 +446,10 @@ fn substitute(
     let node = scalars.node(id).clone();
     let value_type = scalars.value_type(id).clone();
     let rewritten = match node {
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective { op, left, right } => ScalarNode::BooleanConnective {
             op,
             left: substitute(scalars, left, subst, control)?,
             right: substitute(scalars, right, subst, control)?,
-            decimal_overflow_policy,
         },
         ScalarNode::FunctionCall {
             name,
@@ -1482,60 +1476,47 @@ mod tests {
     }
 
     fn add(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Add,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        arena.test_intern_operator(
+            BinOp::Add,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
     fn mul(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Mul,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        arena.test_intern_operator(
+            BinOp::Mul,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
     fn gt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Gt,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        arena.test_intern_operator(
+            BinOp::Gt,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
     fn lt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Lt,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        arena.test_intern_operator(
+            BinOp::Lt,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
     fn and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
         arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
@@ -1839,7 +1820,7 @@ mod tests {
         .unwrap();
 
         match arena.node(rewritten) {
-            ScalarNode::BinaryOp { left, right, .. } => {
+            ScalarNode::BooleanConnective { left, right, .. } => {
                 assert!(matches!(
                     arena.node(*left),
                     ScalarNode::ColumnRef(ColumnId(99))
@@ -1874,7 +1855,7 @@ mod tests {
         let first_cse = items[0].output_column_id;
         assert!(matches!(
             arena.node(items[1].expr),
-            ScalarNode::BinaryOp { left, right, .. }
+            ScalarNode::BooleanConnective { left, right, .. }
                 if !matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
                     && !matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
         ));
@@ -1989,7 +1970,7 @@ mod tests {
         let common_col = cse_project.items[2].output_column_id;
         assert!(matches!(
             arena.node(cse_project.items[2].expr),
-            ScalarNode::BinaryOp { .. }
+            ScalarNode::BooleanConnective { .. }
         ));
         assert!(matches!(
             arena.node(project.items[0].expr),
@@ -1997,7 +1978,7 @@ mod tests {
         ));
         assert!(matches!(
             arena.node(project.items[1].expr),
-            ScalarNode::BinaryOp { left, right, .. }
+            ScalarNode::BooleanConnective { left, right, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
                     && matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
         ));
@@ -2636,7 +2617,7 @@ mod tests {
             .expr;
         assert!(matches!(
             arena.node(cse_expr),
-            ScalarNode::BinaryOp { left, right, .. }
+            ScalarNode::BooleanConnective { left, right, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(ColumnId(101)))
                     && matches!(arena.node(*right), ScalarNode::ColumnRef(ColumnId(102)))
         ));
@@ -2717,17 +2698,17 @@ mod tests {
         let Operator::PhysicalFilter(filter) = &node.op else {
             panic!("expected physical filter");
         };
-        let ScalarNode::BinaryOp { left, right, .. } = arena.node(filter.predicate) else {
+        let ScalarNode::BooleanConnective { left, right, .. } = arena.node(filter.predicate) else {
             panic!("expected conjunction");
         };
         assert!(matches!(
             arena.node(*left),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert!(matches!(
             arena.node(*right),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert_eq!(
@@ -2908,17 +2889,17 @@ mod tests {
         let Operator::PhysicalFilter(filter) = &node.op else {
             panic!("expected physical filter");
         };
-        let ScalarNode::BinaryOp { left, right, .. } = arena.node(filter.predicate) else {
+        let ScalarNode::BooleanConnective { left, right, .. } = arena.node(filter.predicate) else {
             panic!("expected conjunction");
         };
         assert!(matches!(
             arena.node(*left),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert!(matches!(
             arena.node(*right),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert_eq!(
@@ -3004,8 +2985,8 @@ mod tests {
             .find(|item| item.output_name == "__cse_0")
             .expect("CSE project item");
         assert!(matches!(
-            arena.node(cse_item.expr),
-            ScalarNode::BinaryOp { op: BinOp::Mul, .. }
+            crate::common::binary_operator::scalar_operands(&arena, cse_item.expr),
+            Some((novarocks_type_contract::OperatorFunction::Multiply, _))
         ));
         let cse_column = cse_item.output_column_id;
         let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
@@ -3542,19 +3523,19 @@ mod tests {
         let Operator::PhysicalNestLoopJoin(join) = &node.op else {
             panic!("expected nested loop join");
         };
-        let ScalarNode::BinaryOp { left, right, .. } =
+        let ScalarNode::BooleanConnective { left, right, .. } =
             arena.node(join.condition.expect("join condition"))
         else {
             panic!("expected conjunction");
         };
         assert!(matches!(
             arena.node(*left),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert!(matches!(
             arena.node(*right),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
     }
@@ -3626,19 +3607,19 @@ mod tests {
         let Operator::PhysicalHashJoin(join) = &node.op else {
             panic!("expected hash join");
         };
-        let ScalarNode::BinaryOp { left, right, .. } =
+        let ScalarNode::BooleanConnective { left, right, .. } =
             arena.node(join.condition.residual().expect("join other condition"))
         else {
             panic!("expected conjunction");
         };
         assert!(matches!(
             arena.node(*left),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
         assert!(matches!(
             arena.node(*right),
-            ScalarNode::BinaryOp { left, .. }
+            ScalarNode::BooleanConnective { left, .. }
                 if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
         ));
     }
@@ -4003,21 +3984,18 @@ mod intrinsic_eligibility_tests {
     #[test]
     fn legacy_nullable_decimal_multiply_cannot_be_hoisted_as_an_error_free_expression() {
         use crate::analysis::BinOp;
-        use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
+
         let mut arena = ScalarArena::new();
         let child = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
             novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
         );
         for (op, expected) in [(BinOp::Mul, false), (BinOp::Add, true)] {
-            let expr = arena.intern(
-                ScalarNode::BinaryOp {
-                    op,
-                    left: child,
-                    right: child,
-                    decimal_overflow_policy: OutputNull,
-                },
-                novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), true),
+            let expr = arena.test_intern_operator(
+                op,
+                child,
+                child,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );
             assert_eq!(eligible(&arena, expr), expected, "{op:?}");
         }

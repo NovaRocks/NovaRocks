@@ -62,7 +62,7 @@ fn invoke(
     })
 }
 #[test]
-fn caller_owned_sender_preserves_all_original_sixteen_scalar_payloads_and_facts() {
+fn caller_owned_sender_preserves_all_scalar_payload_kinds_and_facts() {
     let f = all_kinds();
     let legacy = f.run(&Control::default(), SOURCE, limits(), true).unwrap();
     let actual = invoke(&f, &Control::default(), limits()).unwrap();

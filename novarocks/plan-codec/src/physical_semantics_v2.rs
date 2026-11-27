@@ -57,9 +57,7 @@ pub use pruning::{decode_frozen_pruning_observed, encode_frozen_pruning_observed
 
 pub(crate) use calls::{
     decode_expression_claims_in, decode_frozen_call_entries_observed,
-    decode_policy as decode_decimal_policy, decode_site as decode_call_site,
-    encode_expression_claims_in, encode_policy as encode_decimal_policy,
-    encode_site as encode_call_site,
+    decode_site as decode_call_site, encode_expression_claims_in, encode_site as encode_call_site,
 };
 pub use parameters::{
     CreatedWriterSemanticParameters, decode_writer_semantic_parameters_with_creator_in,
@@ -68,7 +66,6 @@ pub use parameters::{
     decode_reference as decode_semantic_parameter_reference_in,
     encode_reference as encode_semantic_parameter_reference_in,
 };
-pub(crate) use parameters::{decode_reference, encode_reference};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticsCodecError {

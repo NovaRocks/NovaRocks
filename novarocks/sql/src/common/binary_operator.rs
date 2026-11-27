@@ -37,18 +37,22 @@ pub(crate) fn comparison_op(operator: OperatorFunction) -> BinOp {
     }
 }
 
-pub(crate) fn requires_legacy_wide(value: &ValueTypeRef) -> bool {
+pub(crate) fn contains_internal_wide_type(value: &ValueTypeRef) -> bool {
     match value.kind() {
         ValueKind::Nominal(ValueLogicalType::LargeInt) => true,
         ValueKind::Scalar(DataType::Decimal256(precision, _)) => *precision > 38,
-        ValueKind::List(item) | ValueKind::FixedSizeList { item, .. } => requires_legacy_wide(item),
+        ValueKind::List(item) | ValueKind::FixedSizeList { item, .. } => {
+            contains_internal_wide_type(item)
+        }
         ValueKind::Struct(fields) => fields
             .iter()
-            .any(|field| requires_legacy_wide(field.value_type())),
-        ValueKind::Map { key, value } => requires_legacy_wide(key) || requires_legacy_wide(value),
+            .any(|field| contains_internal_wide_type(field.value_type())),
+        ValueKind::Map { key, value } => {
+            contains_internal_wide_type(key) || contains_internal_wide_type(value)
+        }
         ValueKind::Union(fields) => fields
             .iter()
-            .any(|field| requires_legacy_wide(field.field.value_type())),
+            .any(|field| contains_internal_wide_type(field.field.value_type())),
         _ => false,
     }
 }
@@ -64,14 +68,12 @@ pub(crate) fn uses_structural_comparison(value: &ValueTypeRef) -> bool {
     )
 }
 
-pub(crate) fn typed_call(
-    operator: OperatorFunction,
-    binding: SqlFunctionBinding,
-    operands: Vec<TypedExpr>,
-) -> TypedExpr {
+pub(crate) fn typed_call(binding: SqlFunctionBinding, operands: Vec<TypedExpr>) -> TypedExpr {
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
         unreachable!("binary operator has a scalar result");
     };
+    let operator = OperatorFunction::from_function_id(&binding.function_id)
+        .expect("operator typing selected an installed operator identity");
     TypedExpr {
         value_type: result.clone(),
         kind: ExprKind::FunctionCall {
@@ -134,9 +136,12 @@ pub(crate) fn scalar_inclusive_range(
     arena: &ScalarArena,
     expression: ScalarId,
 ) -> Option<(ScalarId, ScalarId, ScalarId)> {
-    let ScalarNode::BinaryOp {
+    let ScalarNode::BooleanConnective {
         left,
-        op: BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction,
+        op:
+            crate::common::BooleanOp::And
+            | crate::common::BooleanOp::ExpandedConjunction
+            | crate::common::BooleanOp::ExpandedNegatedConjunction,
         right,
         ..
     } = arena.node(expression)
@@ -168,32 +173,16 @@ pub(crate) fn scalar_in_list(
 }
 
 pub(crate) fn typed_comparison(expression: &TypedExpr) -> Option<(BinOp, [&TypedExpr; 2])> {
-    if let Some((operator, operands)) = typed_operands(expression) {
-        return comparison_kind(operator).map(|op| (op, operands));
-    }
-    let ExprKind::BinaryOp {
-        left, op, right, ..
-    } = &expression.kind
-    else {
-        return None;
-    };
-    is_comparison(*op).then_some((*op, [left, right]))
+    let (operator, operands) = typed_operands(expression)?;
+    comparison_kind(operator).map(|op| (op, operands))
 }
 
 pub(crate) fn scalar_comparison(
     arena: &ScalarArena,
     expression: ScalarId,
 ) -> Option<(BinOp, [ScalarId; 2])> {
-    if let Some((operator, operands)) = scalar_operands(arena, expression) {
-        return comparison_kind(operator).map(|op| (op, operands));
-    }
-    let ScalarNode::BinaryOp {
-        left, op, right, ..
-    } = arena.node(expression)
-    else {
-        return None;
-    };
-    is_comparison(*op).then_some((*op, [*left, *right]))
+    let (operator, operands) = scalar_operands(arena, expression)?;
+    comparison_kind(operator).map(|op| (op, operands))
 }
 
 fn comparison_kind(operator: OperatorFunction) -> Option<BinOp> {
@@ -201,18 +190,80 @@ fn comparison_kind(operator: OperatorFunction) -> Option<BinOp> {
         .then(|| comparison_op(operator))
 }
 
-fn is_comparison(operator: BinOp) -> bool {
-    matches!(
-        operator,
-        BinOp::Eq | BinOp::EqForNull | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-    )
-}
-
 pub(crate) fn permits_equality_substitution(data_type: &DataType) -> bool {
     !matches!(
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
     )
+}
+
+#[cfg(test)]
+pub(crate) enum TestOperator {
+    Boolean(crate::common::BooleanOp),
+    Call(OperatorFunction),
+}
+
+#[cfg(test)]
+impl From<crate::common::BooleanOp> for TestOperator {
+    fn from(operator: crate::common::BooleanOp) -> Self {
+        Self::Boolean(operator)
+    }
+}
+
+#[cfg(test)]
+impl From<BinOp> for TestOperator {
+    fn from(operator: BinOp) -> Self {
+        Self::Call(match operator {
+            BinOp::Add => OperatorFunction::Add,
+            BinOp::Sub => OperatorFunction::Subtract,
+            BinOp::Mul => OperatorFunction::Multiply,
+            BinOp::Div => OperatorFunction::Divide,
+            BinOp::Mod => OperatorFunction::Modulo,
+            BinOp::Eq => OperatorFunction::Equal,
+            BinOp::Ne => OperatorFunction::NotEqual,
+            BinOp::Lt => OperatorFunction::LessThan,
+            BinOp::Le => OperatorFunction::LessThanOrEqual,
+            BinOp::Gt => OperatorFunction::GreaterThan,
+            BinOp::Ge => OperatorFunction::GreaterThanOrEqual,
+            BinOp::EqForNull => OperatorFunction::Identical,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_operator(
+    op: impl Into<TestOperator>,
+    left: TypedExpr,
+    right: TypedExpr,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+) -> TypedExpr {
+    use novarocks_type_contract::FunctionValueType;
+
+    let operator = match op.into() {
+        TestOperator::Call(operator) => operator,
+        TestOperator::Boolean(op) => {
+            return TypedExpr {
+                value_type: FunctionValueType::new(
+                    DataType::Boolean,
+                    left.value_type.nullable() || right.value_type.nullable(),
+                ),
+                kind: ExprKind::BooleanConnective {
+                    left: novarocks_parser::ast::AstBox::new(left),
+                    op,
+                    right: novarocks_parser::ast::AstBox::new(right),
+                },
+            };
+        }
+    };
+    crate::analyzer::type_optimizer_operator(
+        crate::functions::builtin_sql_function_catalog(),
+        operator,
+        [left, right],
+        policy,
+        crate::constant::test_constant_policy(),
+        crate::optimizer::test_optimizer_control(),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -273,7 +324,7 @@ pub(crate) fn test_predicate(operator: OperatorFunction, operands: Vec<TypedExpr
         )
         .unwrap()
     };
-    typed_call(operator, binding, operands)
+    typed_call(binding, operands)
 }
 
 #[cfg(test)]
@@ -283,17 +334,13 @@ pub(crate) fn test_inclusive_range(probe: TypedExpr, low: TypedExpr, high: Typed
 
     // These optimizer fixtures include synthetic comparisons outside the
     // catalogue so that unrelated comparison-domain safeguards can be tested.
-    let comparison = |left: TypedExpr, right: TypedExpr| TypedExpr {
-        value_type: FunctionValueType::new(
-            DataType::Boolean,
-            left.value_type.nullable() || right.value_type.nullable(),
-        ),
-        kind: ExprKind::BinaryOp {
-            left: AstBox::new(left),
-            op: BinOp::Le,
-            right: AstBox::new(right),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        },
+    let comparison = |left: TypedExpr, right: TypedExpr| {
+        crate::common::binary_operator::test_operator(
+            BinOp::Le,
+            left,
+            right,
+            DecimalOverflowPolicy::OutputNull,
+        )
     };
     let left = comparison(low, probe.clone());
     let right = comparison(probe, high);
@@ -302,11 +349,10 @@ pub(crate) fn test_inclusive_range(probe: TypedExpr, low: TypedExpr, high: Typed
             DataType::Boolean,
             left.value_type.nullable() || right.value_type.nullable(),
         ),
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: AstBox::new(left),
-            op: BinOp::ExpandedConjunction,
+            op: crate::common::BooleanOp::ExpandedConjunction,
             right: AstBox::new(right),
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
     }
 }

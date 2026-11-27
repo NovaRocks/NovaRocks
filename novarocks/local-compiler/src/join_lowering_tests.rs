@@ -22,16 +22,12 @@
 
 use crate::test_units::PureUnitFixture;
 use novarocks_expression::StaticExprKind;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 
 use super::*;
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_functions::{
-    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi,
-};
+use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_program::{
     JoinType, KernelAbiVersion, LocalOperatorOrigin, LocalProgram, NestedLoopJoinType,
     ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind, ProgramRootRef,
@@ -45,8 +41,8 @@ use novarocks_physical_plan::{
     ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType, PureCompileControl,
+    SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -65,43 +61,9 @@ impl PureCompileControl for Control {
 }
 
 fn functions() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            actual
-                .definition("rand", FunctionKind::Scalar)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    // An actual unused owner; an empty sealed catalogue is refused.
-    builder
-        .seal_pure(
-            [
-                "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i8)->i8;strict;coerce",
-                "builtin.scalar/rand/(i16)->i16;strict;coerce",
-                "builtin.scalar/rand/(i32)->i32;strict;coerce",
-                "builtin.scalar/rand/(i64)->i64;strict;coerce",
-            ]
-            .into_iter()
-            .map(|overload| InstalledPureKernel {
-                function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(overload).unwrap(),
-                    implementation: PureImplementationId::try_new(
-                        "builtin.scalar/rand/selected-v1",
-                    )
-                    .unwrap(),
-                    abi: PureKernelAbi::ScalarV1,
-                },
-                aggregate_state_format: None,
-            }),
-        )
-        .unwrap()
+    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
+        .as_ref()
+        .clone()
 }
 
 fn admission() -> FragmentPackageAdmission {
@@ -361,19 +323,13 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
             let rhs = builder
                 .fixture_definition(JOIN, int64(), ExprKind::input(right[1]))
                 .unwrap();
-            let definition = builder
-                .fixture_definition(
-                    JOIN,
-                    FunctionValueType::new(DataType::Boolean, false),
-                    ExprKind::Binary {
-                        left: lhs,
-                        op: BinaryOperator::Lt,
-                        right: rhs,
-                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: None,
-                    },
-                )
-                .unwrap();
+            let definition = novarocks_expression::testkit::add_catalogue_predicate(
+                builder.unit(JOIN).unwrap(),
+                &mut constants,
+                novarocks_type_contract::OperatorFunction::LessThan,
+                vec![lhs, rhs],
+            )
+            .unwrap();
             // NAA evaluates the nullable predicate value; ordinary join predicates only demand truth.
             let demand = if matches!(kind, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
                 EvaluationDemand::Value
@@ -473,7 +429,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
         .unwrap();
     for node in [LEFT, RIGHT, JOIN] {
         if builder.construction_unit(node).is_some() {
-            builder.finish_fixture_unit(node, &Control).unwrap();
+            crate::scan_lowering_tests::seal_fixture_node(&mut builder, node, &constants, &Control);
         }
     }
     let fragment = builder.finish_definition(
@@ -935,14 +891,18 @@ fn one_definition_shared_by_key_and_residual_keeps_a_source_per_use() {
     let residual = condition.residual_predicate().unwrap();
     let unit = program.unit(residual.unit).unwrap();
     let root = unit.root(residual.root).unwrap();
-    let StaticExprKind::Lt(shared, _) = unit.definitions().node(root.definition).unwrap().kind()
+    let StaticExprKind::BoundCall { args } =
+        unit.definitions().node(root.definition).unwrap().kind()
     else {
-        panic!("the residual is the ordered comparison")
+        panic!("the residual is the selected ordered comparison")
+    };
+    let [shared, _] = args[..] else {
+        panic!("two comparison operands")
     };
     // One definition, two occurrences with different scopes.
     let probe = condition.keys()[0].probe;
     assert_eq!(probe.unit, residual.unit);
-    assert_eq!(*shared, unit.root(probe.root).unwrap().definition);
+    assert_eq!(shared, unit.root(probe.root).unwrap().definition);
     use ProgramChannelLayoutRole as Role;
     let key = left_layout.slots()[0];
     assert_eq!(

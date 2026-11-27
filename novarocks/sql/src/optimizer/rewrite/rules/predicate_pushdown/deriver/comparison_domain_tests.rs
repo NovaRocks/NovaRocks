@@ -54,8 +54,18 @@ fn bound(arena: &mut ScalarArena, value: i64, dtype: DataType) -> ScalarId {
         FunctionValueType::new(dtype, false),
     )
 }
-fn binary(arena: &mut ScalarArena, left: ScalarId, op: BinOp, right: ScalarId) -> ScalarId {
-    binary_bool(arena, left, op, right, control()).unwrap()
+fn binary(
+    arena: &mut ScalarArena,
+    left: ScalarId,
+    op: impl Into<crate::common::binary_operator::TestOperator>,
+    right: ScalarId,
+) -> ScalarId {
+    arena.test_intern_operator(
+        op,
+        left,
+        right,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 fn between(
     arena: &mut ScalarArena,
@@ -68,7 +78,12 @@ fn between(
     let high = bound(arena, high, dtype);
     let lower = binary(arena, low, BinOp::Le, child);
     let upper = binary(arena, child, BinOp::Le, high);
-    binary(arena, lower, BinOp::ExpandedConjunction, upper)
+    binary(
+        arena,
+        lower,
+        crate::common::BooleanOp::ExpandedConjunction,
+        upper,
+    )
 }
 fn branches(
     arena: &mut ScalarArena,
@@ -78,9 +93,9 @@ fn branches(
     second: ScalarId,
 ) -> PredicateGroup {
     let eq = binary(arena, left, BinOp::Eq, right);
-    let first = binary(arena, eq, BinOp::And, first);
-    let second = binary(arena, eq, BinOp::And, second);
-    let expr = binary(arena, first, BinOp::Or, second);
+    let first = binary(arena, eq, crate::common::BooleanOp::And, first);
+    let second = binary(arena, eq, crate::common::BooleanOp::And, second);
+    let expr = binary(arena, first, crate::common::BooleanOp::Or, second);
     PredicateGroup::new(
         arena,
         expr,
@@ -94,6 +109,7 @@ fn derive(
     owner: &dyn PureCompileControl,
 ) -> Result<Vec<PredicateGroup>, crate::compiler::SqlCompileError> {
     derive_inner_join_predicates(
+        crate::functions::builtin_sql_function_catalog(),
         arena,
         &HashSet::from([ColumnId::new_for_test(1)]),
         &HashSet::from([ColumnId::new_for_test(2)]),
@@ -176,7 +192,10 @@ fn every_total_signed_widening_preserves_original_comparison_and_both_necessary_
         );
         assert!(matches!(
             arena.node(original_id),
-            ScalarNode::BinaryOp { op: BinOp::Or, .. }
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::Or,
+                ..
+            }
         ));
     }
 }
@@ -218,18 +237,27 @@ fn one_base_column_in_two_valid_comparison_domains_does_not_merge_branch_bounds(
 fn bounds_outside_the_original_complete_comparison_binding_are_not_retyped() {
     let mut arena = ScalarArena::new();
     let left = column(&mut arena, 1, DataType::Int32, true);
-    let right = column(&mut arena, 2, DataType::Int32, true);
     let comparison = cast(&mut arena, left, DataType::Int64);
-    // Each value has a valid binding, but no comparison author cast these
-    // Int32 bounds into the operand's original Int64 comparison domain.
-    let first = between(&mut arena, comparison, 10, 20, DataType::Int32);
-    let second = between(&mut arena, comparison, 30, 40, DataType::Int32);
-    let original = branches(&mut arena, left, right, first, second);
-    let result = derive(&mut arena, original, control()).unwrap();
+    // Both values can be admitted independently, but the bound transfer has
+    // no original conversion from those values into this comparison.
+    let low = bound(&mut arena, 10, DataType::Int32);
+    let high = bound(&mut arena, 20, DataType::Int32);
+    let constraint = ColumnConstraint {
+        column: comparison,
+        kind: ConstraintKind::Between { low, high },
+    };
+    assert!(!bounds_match_operand(&arena, &constraint, control()).unwrap());
     assert!(
-        result
-            .iter()
-            .all(|group| group.derived != PredicateDerivedKind::RangeEnvelope)
+        substitute_constraint_column(
+            crate::functions::builtin_sql_function_catalog(),
+            &mut arena,
+            &constraint,
+            comparison,
+            PredicateDerivedKind::RangeEnvelope,
+            control(),
+        )
+        .unwrap()
+        .is_none()
     );
 }
 #[test]

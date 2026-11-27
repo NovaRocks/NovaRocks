@@ -27,15 +27,14 @@ use crate::{
         EncodedFunctionBindings, VerifiedSignature, verify_scalar_signature,
         verify_scalar_signature_admitted,
     },
-    physical_semantics_v2::SemanticsCodecError,
     physical_type_v2::EncodedTypeTable,
 };
 use novarocks_expression_contract::BoundExprSet;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode};
+use novarocks_expression_contract::{ExprKind, ExprNode};
 use novarocks_physical_plan::{ConstantPools, ExprId};
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, PureCompileControl, SemanticParameterKey, SemanticParameters,
+    CompileCheckpoints, CompilePhase, PureCompileControl, SemanticParameters,
     arrow_data_types_exact_borrowed_with_profile_observed,
 };
 use std::alloc::Layout;
@@ -1024,41 +1023,6 @@ fn prepare_core<'loan, 'source, 'control>(
                     ));
                 }
             }
-            if let ExprKind::Binary {
-                op,
-                allow_throw_exception,
-                ..
-            } = &node.kind
-            {
-                let arithmetic = matches!(
-                    op,
-                    BinaryOperator::Add
-                        | BinaryOperator::Subtract
-                        | BinaryOperator::Multiply
-                        | BinaryOperator::Divide
-                        | BinaryOperator::Modulo
-                );
-                let same_presence = arithmetic == allow_throw_exception.is_some();
-                work.step()?;
-                if !same_presence {
-                    return Err(shape(
-                        "binary intrinsic parameter presence differs from arithmetic kind",
-                    ));
-                }
-            }
-            for reference in node.kind.intrinsic_parameter_references() {
-                let key_matches =
-                    reference.expected_key == SemanticParameterKey::AllowThrowException;
-                work.step()?;
-                if !key_matches {
-                    return Err(shape("intrinsic parameter has a wrong expected key"));
-                }
-                work.flush()?;
-                let value = parameters.require(*reference);
-                work.step()?;
-                work.flush()?;
-                value.map_err(SemanticsCodecError::from)?;
-            }
             if let ExprKind::Constant(reference) = &node.kind {
                 work.flush()?;
                 let pool = pools.entries().get(&reference.pool);
@@ -1208,7 +1172,7 @@ fn count_kind(
         ExprKind::LambdaParameter { .. } => refs = 1,
         ExprKind::Constant(_) => counts.constant_lookups = numeric_add(counts.constant_lookups, 1)?,
         ExprKind::IsNull { .. } => refs = 1,
-        ExprKind::Binary { .. } => refs = 2,
+
         ExprKind::Cast { .. } => {
             refs = 1;
             facts.type_reference_count = numeric_add(facts.type_reference_count, 1)?;
@@ -1252,10 +1216,6 @@ fn count_kind(
     facts.expression_reference_count = numeric_add(
         facts.expression_reference_count,
         numeric_add(refs, usize::from(node.lambda_scope.is_some()))?,
-    )?;
-    counts.parameter_lookups = numeric_add(
-        counts.parameter_lookups,
-        node.kind.intrinsic_parameter_references().count(),
     )?;
     Ok(())
 }

@@ -61,8 +61,8 @@ fn apply_with_control(
 fn fold_control_observes_real_nodes_cached_edges_and_final_publication() {
     let fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
-    let product = fixture.binary(BinOp::Mul, sum, sum);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
+    let product = fixture.binary(crate::common::BinOp::Mul, sum, sum);
     let trace = TraceControl::default();
     assert_int_literal(
         &fixture,
@@ -106,7 +106,7 @@ fn fold_control_covers_no_evaluator_and_declined_or_failed_folds() {
     let fixture = Fixture::new();
     let one = fixture.int_literal(1);
     let zero = fixture.int_literal(0);
-    let miss = fixture.binary(BinOp::Div, one, zero);
+    let miss = fixture.binary(crate::common::BinOp::Div, one, zero);
     let trace = TraceControl::default();
     assert!(matches!(
         apply_with_control(&fixture, project(miss), &trace).unwrap(),
@@ -135,7 +135,7 @@ fn folded_output_and_arena_do_not_retain_request_control() {
 
     let fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
     let token = Arc::new(());
     let weak: Weak<()> = Arc::downgrade(&token);
     let control = LifetimeControl(token);
@@ -170,7 +170,7 @@ fn evaluator_receives_original_phase_control_and_control_errors_never_decline() 
     }
     let fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
     let mut ctx = RewriteContext::for_query_with_settings(
         Default::default(),
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -331,7 +331,13 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
                 declaration.clone(),
             );
-            let root = fixture.binary_typed(BinOp::EqForNull, null, null, DataType::Boolean, false);
+            let root = fixture.intern(
+                ScalarNode::IsNull {
+                    child: null,
+                    negated: false,
+                },
+                FunctionValueType::new(DataType::Boolean, false),
+            );
             (fixture, root)
         },
         |_, result| assert!(matches!(result, Ok(RewriteResult::Unchanged))),
@@ -341,7 +347,7 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
         || {
             let fixture = Fixture::new();
             let one = fixture.int_literal(1);
-            let root = fixture.binary(BinOp::Add, one, one);
+            let root = fixture.binary(crate::common::BinOp::Add, one, one);
             (fixture, root)
         },
         |fixture, result| assert_int_literal(fixture, project_expr(&changed(result.unwrap())), 2),
@@ -350,14 +356,14 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
 }
 
 #[test]
-fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion() {
+fn ordinary_row_error_and_invalid_operand_observe_exact_original_completion() {
     use novarocks_type_contract::FunctionValueType;
     check_attempt_prefixes(
         || {
             let fixture = Fixture::new();
             let one = fixture.int_literal(1);
             let zero = fixture.int_literal(0);
-            let root = fixture.binary(BinOp::Div, one, zero);
+            let root = fixture.binary(crate::common::BinOp::Div, one, zero);
             (fixture, root)
         },
         |_, result| assert!(matches!(result, Ok(RewriteResult::Unchanged))),
@@ -370,8 +376,16 @@ fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion()
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
                 FunctionValueType::new(DataType::Boolean, false),
             );
-            let one = fixture.int_literal(1);
-            let root = fixture.binary(BinOp::Add, malformed, one);
+            let root = fixture.intern(
+                ScalarNode::Cast {
+                    cast_mode: None,
+                    child: malformed,
+                    target: DataType::Int64,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+                FunctionValueType::new(DataType::Int64, false),
+            );
             (fixture, root)
         },
         |_, result| {

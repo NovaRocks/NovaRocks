@@ -208,7 +208,7 @@ fn collect_scalar_column_id_refs_inner(
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -1094,26 +1094,15 @@ mod tests {
     fn binop_scalar(
         arena: &mut ScalarArena,
         left: crate::optimizer::scalar::ScalarId,
-        op: BinOp,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
         right: crate::optimizer::scalar::ScalarId,
     ) -> crate::optimizer::scalar::ScalarId {
-        let left_typed = crate::planner::optimizer_bridge::scalar::materialize(arena, left);
-        let right_typed = crate::planner::optimizer_bridge::scalar::materialize(arena, right);
-        let expr = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left_typed),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right_typed),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
-        crate::planner::optimizer_bridge::scalar::intern_typed(
-            arena,
-            &expr,
-            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        arena.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
-        .unwrap()
     }
 
     fn make_scan_with_ids(

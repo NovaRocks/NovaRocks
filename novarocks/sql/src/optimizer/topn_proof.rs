@@ -77,7 +77,7 @@ fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<C
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -367,14 +367,11 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(2)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let expr = arena.intern(
-            ScalarNode::BinaryOp {
-                op: crate::common::BinOp::Add,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        let expr = arena.test_intern_operator(
+            crate::common::BinOp::Add,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
 
         let columns = collect_column_ids(&arena, expr);
@@ -395,14 +392,11 @@ mod tests {
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
-        let expr = arena.intern(
-            ScalarNode::BinaryOp {
-                op: crate::common::BinOp::Add,
-                left: unset,
-                right: lit,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        let expr = arena.test_intern_operator(
+            crate::common::BinOp::Add,
+            unset,
+            lit,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
 
         assert!(collect_column_ids(&arena, expr).is_empty());

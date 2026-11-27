@@ -157,7 +157,6 @@ fn authored(
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         control,
     )?
@@ -266,7 +265,6 @@ fn observe_original_min(
         dop(),
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
-        false,
         policy(),
         control,
         &mut observer,

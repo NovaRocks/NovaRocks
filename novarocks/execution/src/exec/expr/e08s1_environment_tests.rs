@@ -75,7 +75,7 @@ fn e08s1_environment_same_original_concat_source_and_parameters_pass_without_pre
         let parameters = source.plan().parameters();
         let unrelated = SemanticParameterRef {
             id: novarocks_type_contract::SemanticParameterId::new(0),
-            expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+            expected_key: novarocks_type_contract::SemanticParameterKey::StatementStartUtc,
         };
         scoped
             .admit_bound_environment_observed(&binding, &[], parameters, &c)

@@ -477,7 +477,7 @@ fn collect_sort_items(items: &[SortItem], max_id: &mut u32) {
 fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
     match &expr.kind {
         ExprKind::ColumnRef { column_id, .. } => collect_column_id(*column_id, max_id),
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -1007,30 +1007,18 @@ pub(crate) mod tests {
             }),
             vec![LogicalPlanNode::new(
                 LogicalPlanKind::Filter(PlanFilterNode {
-                    predicate: TypedExpr {
-                        kind: ExprKind::BinaryOp {
-                            left: novarocks_parser::ast::AstBox::new(column_ref(
-                                first_id,
-                                "k",
-                                DataType::Int64,
+                    predicate: crate::common::binary_operator::test_operator(
+                        BinOp::Ge,
+                        column_ref(first_id, "k", DataType::Int64, false),
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(0)),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int32,
                                 false,
-                            )),
-                            op: BinOp::Ge,
-                            right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                                kind: ExprKind::Literal(LiteralValue::Int(0)),
-                                value_type: novarocks_type_contract::FunctionValueType::new(
-                                    DataType::Int32,
-                                    false,
-                                ),
-                            }),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                            ),
                         },
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Boolean,
-                            false,
-                        ),
-                    },
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
                 }),
                 vec![iceberg_scan_plan_with_column_id(first_id)],
                 None,
@@ -1900,19 +1888,12 @@ pub(crate) mod tests {
                 LogicalPlanKind::Join(LogicalJoinNode {
                     naa_author: None,
                     join_type: JoinKind::Inner,
-                    condition: Some(TypedExpr {
-                        kind: ExprKind::BinaryOp {
-                            left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                            op: BinOp::Eq,
-                            right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        },
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Boolean,
-                            false,
-                        ),
-                    }),
+                    condition: Some(crate::common::binary_operator::test_operator(
+                        BinOp::Eq,
+                        column_expr(1, "k", false),
+                        column_expr(10, "k", false),
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    )),
                 }),
                 vec![left, right],
                 None,
@@ -1928,19 +1909,12 @@ pub(crate) mod tests {
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
+                condition: Some(crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    column_expr(1, "k", false),
+                    column_expr(10, "k", false),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )),
             }),
             vec![left, right],
             None,
@@ -1980,44 +1954,30 @@ pub(crate) mod tests {
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
+                condition: Some(crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    column_expr(1, "k", false),
+                    column_expr(10, "k", false),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )),
             }),
             vec![left, right],
             None,
         );
         let filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                        op: BinOp::Gt,
-                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int64,
-                                false,
-                            ),
-                        }),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                predicate: crate::common::binary_operator::test_operator(
+                    BinOp::Gt,
+                    column_expr(1, "k", false),
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             vec![join],
             None,
@@ -2036,25 +1996,18 @@ pub(crate) mod tests {
         let left_scan = join_base_scan("l", 1, 22);
         let left_filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                        op: BinOp::Gt,
-                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int64,
-                                false,
-                            ),
-                        }),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                predicate: crate::common::binary_operator::test_operator(
+                    BinOp::Gt,
+                    column_expr(1, "k", false),
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             vec![left_scan],
             None,
@@ -2065,19 +2018,12 @@ pub(crate) mod tests {
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
+                condition: Some(crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    column_expr(1, "k", false),
+                    column_expr(10, "k", false),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )),
             }),
             vec![left, right],
             None,
@@ -3798,6 +3744,7 @@ crate::constant::test_constant_policy(),
 
         let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(["FoldConstant".into()]);
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_query_stats_input(
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
@@ -4001,7 +3948,7 @@ crate::constant::test_constant_policy(),
                     refs.insert(*column_id);
                 }
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,

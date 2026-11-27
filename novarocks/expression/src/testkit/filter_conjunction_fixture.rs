@@ -31,8 +31,7 @@ use arrow::{
 };
 use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression_contract::{
-    BinaryOperator, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope,
-    UnitLimits, ValueId,
+    BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
     FunctionArgument, KernelEvaluationControl, KernelFailure, PureEngineFunctionCatalog,
@@ -40,8 +39,7 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameterValue, SemanticParameters, TrinoCastMode,
+    FunctionValueType, OperatorFunction, SemanticParameters, TrinoCastMode,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -60,10 +58,6 @@ const POLICY: ConstantValidation = novarocks_constant_contract::ConstantValidati
     },
 );
 const OUTPUT_NULL: DecimalOverflowPolicy = DecimalOverflowPolicy::OutputNull;
-const ALLOW_THROW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(0),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
 
 pub struct Control;
 
@@ -140,24 +134,12 @@ fn cast(
 
 fn comparison(
     draft: &mut BoundExprSetBuilder,
+    pools: &mut ConstantPools,
     left: ExprId,
-    op: BinaryOperator,
+    op: OperatorFunction,
     right: ExprId,
 ) -> ExprId {
-    let nullable = draft.definition(left).unwrap().ty.nullable()
-        || draft.definition(right).unwrap().ty.nullable();
-    draft
-        .add(
-            None,
-            FunctionValueType::new(DataType::Boolean, nullable),
-            ExprKind::Binary {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: OUTPUT_NULL,
-                allow_throw_exception: None,
-            },
-        )
+    crate::testkit::claim_author::add_catalogue_predicate(draft, pools, op, vec![left, right])
         .unwrap()
 }
 
@@ -176,7 +158,7 @@ fn count_eq_zero(
         FunctionValueType::new(DataType::Int64, false),
         TrinoCastMode::Implicit,
     );
-    comparison(draft, left, BinaryOperator::Eq, right)
+    comparison(draft, pools, left, OperatorFunction::Equal, right)
 }
 
 fn present_date(draft: &mut BoundExprSetBuilder, max: &(ValueId, FunctionValueType)) -> ExprId {
@@ -256,7 +238,7 @@ fn rand_lt_half(
         FunctionValueType::new(DataType::Float64, false),
         TrinoCastMode::Implicit,
     );
-    comparison(draft, random, BinaryOperator::Lt, half)
+    comparison(draft, pools, random, OperatorFunction::LessThan, half)
 }
 
 pub fn fixture(shape: FilterShape) -> Fixture {
@@ -315,11 +297,7 @@ pub fn fixture(shape: FilterShape) -> Fixture {
             .collect::<Vec<_>>(),
     ));
     let scope = fixture_scope(&port, schema);
-    let parameters = SemanticParameters::try_new([(
-        ALLOW_THROW.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     register_call_requests(&mut draft, &authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     declare_call_controls(&mut draft, &catalog, &constants, &parameters, &mut work);

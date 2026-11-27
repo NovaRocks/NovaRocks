@@ -33,7 +33,7 @@ use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand, FunctionV
 fn missing_or_foreign_guarded_child_summary_is_refused() {
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let policy = constant_policy();
-    let parameters = SemanticParameters::default();
+    let parameters = novarocks_type_contract::SemanticParameters::default();
     let ty = FunctionValueType::new(DataType::Boolean, false);
     let mut constants = ConstantPools::empty();
     let value = ConstantValue::from_boolean(

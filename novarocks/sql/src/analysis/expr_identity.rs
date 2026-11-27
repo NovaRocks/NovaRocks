@@ -44,7 +44,6 @@ pub(crate) fn typed_expr_semantically_eq(
 /// Whether a separately written occurrence can share evaluation in the same row domain.
 #[recursive::recursive]
 pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
-    use super::BinOp;
     use novarocks_functions::PreparedCompositeComparisonRecipe;
     let comparison_can_fail = |value: &TypedExpr| {
         PreparedCompositeComparisonRecipe::equal_may_raise_row_error(&value.value_type)
@@ -65,24 +64,7 @@ pub(crate) fn expression_can_share_evaluation(expr: &TypedExpr) -> bool {
                 && !crate::optimizer::scalar_expr::scalar_call_can_fail(binding)
                 && args.iter().all(share)
         }
-        ExprKind::BinaryOp {
-            left, op, right, ..
-        } => {
-            matches!(
-                op,
-                BinOp::And
-                    | BinOp::ExpandedConjunction
-                    | BinOp::ExpandedNegatedConjunction
-                    | BinOp::Or
-                    | BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::Lt
-                    | BinOp::Le
-                    | BinOp::Gt
-                    | BinOp::Ge
-            ) && share(left)
-                && share(right)
-        }
+        ExprKind::BooleanConnective { left, right, .. } => share(left) && share(right),
         ExprKind::Nested(expr)
         | ExprKind::IsNull { expr, .. }
         | ExprKind::LambdaFunction { body: expr, .. }
@@ -220,21 +202,18 @@ fn typed_expr_semantically_eq_with(
             left_value.equals_observed(right_value, CompilePhase::LowerProgram, work.control())?
         }
         (
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left: left_left,
                 op: left_op,
                 right: left_right,
-                decimal_overflow_policy: left_policy,
             },
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left: right_left,
                 op: right_op,
                 right: right_right,
-                decimal_overflow_policy: right_policy,
             },
         ) => {
-            left_policy == right_policy
-                && left_op == right_op
+            left_op == right_op
                 && typed_expr_semantically_eq_with(left_left, right_left, work)?
                 && typed_expr_semantically_eq_with(left_right, right_right, work)?
         }

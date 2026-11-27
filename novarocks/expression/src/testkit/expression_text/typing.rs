@@ -754,7 +754,7 @@ impl<'a> TextTyping<'a> {
     fn type_call(
         &self,
         shape: NodeShape<'_>,
-        children: Vec<TextNode>,
+        mut children: Vec<TextNode>,
         span: Span,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<TextNode, TextError> {
@@ -765,6 +765,7 @@ impl<'a> TextTyping<'a> {
         else {
             unreachable!("call typing returned an incompatible node");
         };
+        selected.operand_order().apply(&mut children);
         let children = apply_conversions(conversions, children);
         let facts = children
             .iter()
@@ -1327,29 +1328,18 @@ mod tests {
     use super::*;
     use crate::testkit::{HarnessControl, constant_policy};
     use novarocks_type_contract::{
-        CompilePhase, DecimalOverflowPolicy, SemanticParameterId, SemanticParameterKey,
-        SemanticParameterRef, SemanticParameterValue, SemanticParameters, TemporalPrecision,
-        TemporalType,
+        CompilePhase, DecimalOverflowPolicy, SemanticParameters, TemporalPrecision, TemporalType,
     };
 
     #[test]
     fn temporal_text_literals_emit_a_typed_constant_before_call_authorship() {
         let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
-        let allow_throw_exception = SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        };
-        let parameters = SemanticParameters::try_new([(
-            allow_throw_exception.id,
-            SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap();
+        let parameters = SemanticParameters::default();
         let context = TextContext {
             functions: &functions,
             constant_policy: constant_policy(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             parameters: &parameters,
-            allow_throw_exception,
         };
         let precision = TemporalPrecision::WHOLE_SECONDS;
         for (source, expected) in [

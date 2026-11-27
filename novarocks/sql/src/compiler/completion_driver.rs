@@ -354,7 +354,6 @@ pub(crate) struct SqlStatisticsCompletionState {
 }
 
 pub(crate) struct SqlProviderReadCompletionState {
-    root_allow_throw_exception: bool,
     common: FinalPlanCommon,
     root_semantics: super::root_output::RootOutputSemantics,
     physical: PhysicalPlanNode,
@@ -862,7 +861,6 @@ fn optimize_and_prepare_provider(
 /// together until final-plan completion. Provider negotiation cannot replace them.
 struct OptimizedPhysicalPlan {
     functions: Arc<dyn SqlFunctionCatalog>,
-    root_allow_throw_exception: bool,
     physical: PhysicalPlanNode,
     root_semantics: super::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -881,7 +879,6 @@ fn optimize_to_physical(
         settings,
         semantic_settings: _,
         decimal_overflow_policy,
-        root_allow_throw_exception,
         change_stream: _,
         mv_rewrite,
         function_catalog,
@@ -926,7 +923,6 @@ fn optimize_to_physical(
         Arc::clone(&function_catalog),
         Arc::clone(&sealed_functions),
         decimal_overflow_policy,
-        root_allow_throw_exception,
         control,
     )
     .with_fold_dependency_observer(control.fold_dependency_observer().cloned());
@@ -956,7 +952,6 @@ fn optimize_to_physical(
         .map_err(SqlCompileError::Compilation)?;
     Ok(OptimizedPhysicalPlan {
         functions: function_catalog,
-        root_allow_throw_exception,
         root_semantics,
         physical,
         query_statistics: statistics.snapshot,
@@ -971,7 +966,6 @@ fn provider_or_ready_step(
 ) -> Result<CompilerStep, SqlCompileError> {
     let OptimizedPhysicalPlan {
         functions,
-        root_allow_throw_exception,
         mut physical,
         root_semantics,
         query_statistics,
@@ -1009,7 +1003,6 @@ fn provider_or_ready_step(
                 }
             },
             CompilerContinuation::provider_read(SqlProviderReadCompletionState {
-                root_allow_throw_exception,
                 common,
                 physical,
                 root_semantics,
@@ -1028,7 +1021,6 @@ fn provider_or_ready_step(
             root_semantics,
             common.functions,
             Arc::clone(&common.sealed_functions),
-            root_allow_throw_exception,
             common.constant_policy,
             control,
         )
@@ -1451,7 +1443,6 @@ pub(super) fn resume_provider_read(
             state.root_semantics,
             state.common.functions,
             Arc::clone(&state.common.sealed_functions),
-            state.root_allow_throw_exception,
             state.common.constant_policy,
             control,
         )
@@ -1575,52 +1566,6 @@ mod tests {
                 .try_into_completion();
             assert_eq!(result.is_ok(), expected.len() == 4, "{sql}");
             assert_eq!(observed.lock().unwrap().as_slice(), expected, "{sql}");
-        }
-    }
-
-    #[test]
-    fn completion_optimizer_carries_the_analyzed_root_allow_override() {
-        for (session_mode, sql, expected_allow) in [
-            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
-            (
-                "ERROR_IF_OVERFLOW",
-                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
-                true,
-            ),
-            (
-                "ALLOW_THROW_EXCEPTION",
-                "WITH SESSION sql_mode = 32 SELECT 1",
-                false,
-            ),
-        ] {
-            let mut input = request(sql, SqlCompileIntent::Query);
-            input.session.sql_semantics = input
-                .session
-                .sql_semantics
-                .clone()
-                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
-            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
-            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                input.statement,
-                input.intent,
-                input.session,
-                input.environment,
-                &snapshot,
-                input.functions.as_ref(),
-                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                None,
-                crate::constant::test_constant_policy(),
-                input.control.clone(),
-            ))
-            .unwrap()
-            .into_pending()
-            .unwrap();
-            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
-            let optimized =
-                optimize_to_physical(analyzed, &DmlStatisticsSnapshot::empty(), &input.control)
-                    .unwrap();
-            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
         }
     }
 
@@ -2476,13 +2421,6 @@ mod tests {
                     .filter_map(|node| node.expressions.as_ref())
                     .flat_map(|unit| unit.definitions())
                 {
-                    assert!(
-                        expression
-                            .kind
-                            .intrinsic_parameter_references()
-                            .next()
-                            .is_none()
-                    );
                     match &expression.kind {
                         ExprKind::FunctionCall { function, .. }
                             if OperatorFunction::from_function_id(&function.function_id)
@@ -2523,13 +2461,6 @@ mod tests {
                 .filter_map(|node| node.expressions.as_ref())
                 .flat_map(|unit| unit.definitions())
             {
-                assert!(
-                    expression
-                        .kind
-                        .intrinsic_parameter_references()
-                        .next()
-                        .is_none()
-                );
                 match &expression.kind {
                     ExprKind::FunctionCall { function, .. }
                         if OperatorFunction::from_function_id(&function.function_id)
@@ -2558,20 +2489,6 @@ mod tests {
                 let completed = complete_root_intrinsic_fixture(sql, mode);
                 let plan = completed.plan();
                 assert!(plan.parameters().entries().is_empty());
-                assert!(plan.fragments().values().all(|fragment| {
-                    fragment
-                        .nodes()
-                        .values()
-                        .filter_map(|node| node.expressions.as_ref())
-                        .flat_map(|unit| unit.definitions())
-                        .all(|expression| {
-                            expression
-                                .kind
-                                .intrinsic_parameter_references()
-                                .next()
-                                .is_none()
-                        })
-                }));
             }
         }
     }

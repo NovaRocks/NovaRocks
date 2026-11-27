@@ -73,23 +73,33 @@ fn source() -> SemanticParameters {
         ),
         (
             SemanticParameterId::new(2),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(3),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(4),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(5),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
         (
             SemanticParameterId::new(u32::MAX),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
     ])
     .unwrap()
@@ -132,10 +142,7 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
             .map(|(id, value)| reference(id.get(), value.key()))
             .collect();
         refs.push(reference(1, SemanticParameterKey::TimeZone));
-        refs.push(reference(
-            u32::MAX,
-            SemanticParameterKey::AllowThrowException,
-        ));
+        refs.push(reference(u32::MAX, SemanticParameterKey::StatementStartUtc));
         let mut captured = Vec::new();
         let mut header_counts = Vec::new();
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
@@ -193,15 +200,21 @@ fn immutable_projection_actual_unique_entry_loans_preserve_full_values_after_sou
     );
     assert_eq!(
         output.get(SemanticParameterId::new(2)),
-        Some(&SemanticParameterValue::AllowThrowException(false))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(0, 0).unwrap()
+        ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(3)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        ))
     );
     assert_eq!(
         output.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            crate::StatementStartUtc::try_new(1, 0).unwrap()
+        ))
     );
     let Some(SemanticParameterValue::TimeZone(zone)) = output.get(SemanticParameterId::new(1))
     else {
@@ -228,14 +241,11 @@ fn immutable_projection_success_and_ordinary_actual_callbacks_preserve_first_cau
     for refs in [
         vec![
             good,
-            reference(3, SemanticParameterKey::AllowThrowException),
+            reference(3, SemanticParameterKey::StatementStartUtc),
             good,
         ],
         vec![good, reference(100, SemanticParameterKey::TimeZone)],
-        vec![
-            good,
-            reference(1, SemanticParameterKey::AllowThrowException),
-        ],
+        vec![good, reference(1, SemanticParameterKey::StatementStartUtc)],
     ] {
         c.arm(None);
         let outcome = run(&input, &refs, &c);
@@ -337,7 +347,7 @@ fn immutable_projection_captured_clone_and_header_refusals_have_no_after_callbac
 fn immutable_projection_header_admission_precedes_pending255_without_own_scope() {
     let input = source();
     let c = Control::default();
-    let r = reference(u32::MAX, SemanticParameterKey::AllowThrowException);
+    let r = reference(u32::MAX, SemanticParameterKey::StatementStartUtc);
     for cause in CAUSES {
         c.arm(Some((1, cause)));
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();

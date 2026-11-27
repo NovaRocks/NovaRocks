@@ -237,7 +237,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_selected_ro
                     assert_eq!(call.call_contract().logical_argument_count(), 2);
                     assert_eq!(
                         call.call_contract().effects().argument_control,
-                        novarocks_type_contract::ArgumentControl::Eager
+                        novarocks_type_contract::ArgumentControl::OrderedNull
                     );
                     assert_eq!(
                         call.call_contract().effects().null_behavior,

@@ -164,7 +164,6 @@ pub(crate) fn authored_with_catalog(
             },
             functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &setup,
         )
@@ -237,7 +236,6 @@ pub(crate) fn authored_with_catalog(
             },
             functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &setup,
         )

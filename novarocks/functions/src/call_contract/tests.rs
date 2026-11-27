@@ -69,9 +69,24 @@ impl Fixture {
                     novarocks_type_contract::TimeZoneKey::parse("Asia/Shanghai").unwrap(),
                 ),
             ),
-            (7, SemanticParameterValue::AllowThrowException(true)),
-            (300, SemanticParameterValue::AllowThrowException(true)),
-            (19, SemanticParameterValue::AllowThrowException(false)),
+            (
+                7,
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
+            ),
+            (
+                300,
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
+            ),
+            (
+                19,
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+                ),
+            ),
         ];
         let environment = values[..3]
             .iter()
@@ -322,7 +337,9 @@ fn exact_nonempty_frozen_parameter_closure_preserves_values_and_drops_unused_sco
     );
     assert_eq!(
         contract.parameters().get(SemanticParameterId::new(7)),
-        Some(&SemanticParameterValue::AllowThrowException(true))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap()
+        ))
     );
     assert!(Arc::ptr_eq(contract.selected_owner(), &fixture.selected));
     assert_eq!(contract.context(), input.context);

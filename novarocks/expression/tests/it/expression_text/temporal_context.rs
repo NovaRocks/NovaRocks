@@ -21,10 +21,6 @@ use novarocks_type_contract::{StatementStartUtc, TimeZoneKey};
 fn statement_parameters() -> SemanticParameters {
     SemanticParameters::try_new([
         (
-            ALLOW_THROW.id,
-            SemanticParameterValue::AllowThrowException(true),
-        ),
-        (
             SemanticParameterId::new(11),
             SemanticParameterValue::StatementStartUtc(
                 StatementStartUtc::try_new(1_704_067_200, 123_456_789).unwrap(),

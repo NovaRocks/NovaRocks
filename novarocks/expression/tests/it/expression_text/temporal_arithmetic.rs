@@ -233,10 +233,6 @@ fn datetime_subtraction_selects_exact_common_operands_using_the_frozen_zone() {
     let functions = fixture();
     let parameters = SemanticParameters::try_new([
         (
-            ALLOW_THROW.id,
-            SemanticParameterValue::AllowThrowException(true),
-        ),
-        (
             SemanticParameterId::new(11),
             SemanticParameterValue::StatementStartUtc(
                 StatementStartUtc::try_new(1_704_067_200, 0).unwrap(),

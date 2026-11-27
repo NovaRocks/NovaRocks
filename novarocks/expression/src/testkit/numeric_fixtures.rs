@@ -26,86 +26,23 @@ use crate::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, i256};
 use novarocks_constant_contract::{ConstantPools, ConstantValidation, ConstantValue};
 use novarocks_expression_contract::{
-    BinaryOperator, BoundExprSet, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal,
-    RootScope, UnitLimits, ValueId,
+    BoundExprSet, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope,
+    UnitLimits, ValueId,
 };
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_functions::{
-    CastOperation, EngineFunctionCatalogBuilder, FunctionArgument, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-};
+use novarocks_functions::{CastOperation, FunctionArgument, PureEngineFunctionCatalog};
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, FunctionValueType, PureCompileControl, SemanticParameterId,
+    EvaluationDemand, FunctionValueType, OperatorFunction, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
-    ValueLogicalType, arithmetic_result_value_type_with_op,
+    ValueLogicalType,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
 fn catalogue() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    let mut manifest = vec![];
-    for (name, overloads, abi) in [
-        (
-            "if",
-            &["(bool,any<T>,any<T>)->any<T>;widen;legacy"][..],
-            PureKernelAbi::ControlIntrinsicV1,
-        ),
-        (
-            "coalesce",
-            &["(any<T>...)->any<T>;widen;legacy"][..],
-            PureKernelAbi::ControlIntrinsicV1,
-        ),
-        (
-            "rand",
-            &[
-                "()->f64;strict;legacy",
-                "(i8)->i8;strict;coerce",
-                "(i16)->i16;strict;coerce",
-                "(i32)->i32;strict;coerce",
-                "(i64)->i64;strict;coerce",
-            ][..],
-            PureKernelAbi::ScalarV1,
-        ),
-        ("round", &["dynamic-v1"][..], PureKernelAbi::ScalarV1),
-    ] {
-        builder
-            .register(
-                actual
-                    .definition(name, FunctionKind::Scalar)
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-        let implementation = if name == "round" {
-            "selected-v2"
-        } else {
-            "selected-v1"
-        };
-        for overload in overloads {
-            manifest.push(InstalledPureKernel {
-                function: FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(format!(
-                        "builtin.scalar/{name}/{overload}"
-                    ))
-                    .unwrap(),
-                    implementation: PureImplementationId::try_new(format!(
-                        "builtin.scalar/{name}/{implementation}"
-                    ))
-                    .unwrap(),
-                    abi,
-                },
-                aggregate_state_format: None,
-            });
-        }
-    }
-    // Independent exact installed records seal only these actual test owners.
-    builder.seal_pure(manifest).unwrap()
+    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
+        .as_ref()
+        .clone()
 }
 pub fn fixture_constant_policy() -> ConstantValidation {
     novarocks_constant_contract::ConstantValidation::bounded(
@@ -233,7 +170,10 @@ impl SinglePortFixture {
         } = self;
         let parameters = SemanticParameters::try_new([(
             allow_ref().id,
-            SemanticParameterValue::AllowThrowException(allow),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(i64::from(u8::from(allow)), 0)
+                    .unwrap(),
+            ),
         )])
         .unwrap();
         register_call_requests(&mut unit, &authors, &mut constants);
@@ -350,20 +290,20 @@ pub enum Wrap {
     NullParent,
     ConstantRight,
 }
-pub fn operation(op: BinaryOperator) -> ArithmeticOperator {
+pub fn operation(op: OperatorFunction) -> ArithmeticOperator {
     match op {
-        BinaryOperator::Add => ArithmeticOperator::Add,
-        BinaryOperator::Subtract => ArithmeticOperator::Subtract,
-        BinaryOperator::Multiply => ArithmeticOperator::Multiply,
-        BinaryOperator::Divide => ArithmeticOperator::Divide,
-        BinaryOperator::Modulo => ArithmeticOperator::Modulo,
+        OperatorFunction::Add => ArithmeticOperator::Add,
+        OperatorFunction::Subtract => ArithmeticOperator::Subtract,
+        OperatorFunction::Multiply => ArithmeticOperator::Multiply,
+        OperatorFunction::Divide => ArithmeticOperator::Divide,
+        OperatorFunction::Modulo => ArithmeticOperator::Modulo,
         _ => panic!("exact five arithmetic operators only"),
     }
 }
 fn allow_ref() -> SemanticParameterRef {
     SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
-        expected_key: SemanticParameterKey::AllowThrowException,
+        expected_key: SemanticParameterKey::StatementStartUtc,
     }
 }
 fn literal(
@@ -382,23 +322,12 @@ fn literal(
 }
 fn arithmetic(
     builder: &mut BoundExprSetBuilder,
-    op: BinaryOperator,
+    pools: &mut ConstantPools,
+    op: OperatorFunction,
     left: ExprId,
     right: ExprId,
-    result: &FunctionValueType,
 ) -> ExprId {
-    builder
-        .add(
-            None,
-            result.clone(),
-            ExprKind::Binary {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: Some(allow_ref()),
-            },
-        )
+    crate::testkit::claim_author::add_catalogue_predicate(builder, pools, op, vec![left, right])
         .unwrap()
 }
 
@@ -651,7 +580,13 @@ pub fn cast_fixture_in_mode(
             checked_constants::i64(&source_type, 1, fixture_constant_policy()),
             &mut source_pools,
         );
-        child = arithmetic(&mut builder, BinaryOperator::Add, child, rhs, &source_type);
+        child = arithmetic(
+            &mut builder,
+            &mut source_pools,
+            OperatorFunction::Add,
+            child,
+            rhs,
+        );
     }
     if matches!(source, Source::Round) {
         child = add_call(
@@ -869,7 +804,7 @@ pub fn compiled_cast(
     program
 }
 pub fn build_program(
-    op: BinaryOperator,
+    op: OperatorFunction,
     left_carrier: DataType,
     right_carrier: DataType,
     wrap: Wrap,
@@ -906,13 +841,17 @@ pub fn build_program(
             .add(None, right_type.clone(), ExprKind::input(columns[1].0))
             .unwrap()
     };
-    let mut result_type =
-        arithmetic_result_value_type_with_op(&left_type, &right_type, operation(op)).unwrap();
-    result_type = result_type
-        .with_nullable(true)
-        .expect("valid test root nullability");
-    let computed = arithmetic(&mut builder, op, left, right, &result_type);
     let mut authors = BTreeMap::new();
+    let computed = crate::testkit::claim_author::add_catalogue_infix_with_policy(
+        &mut builder,
+        &source_pools,
+        &mut authors,
+        op,
+        [left, right],
+        DecimalOverflowPolicy::ReportError,
+    )
+    .unwrap();
+    let mut result_type = builder.definition(computed).unwrap().ty.clone();
     let root = match wrap {
         Wrap::Bare | Wrap::ConstantRight => computed,
         Wrap::NullParent => {
@@ -924,10 +863,10 @@ pub fn build_program(
             );
             arithmetic(
                 &mut builder,
-                BinaryOperator::Add,
+                &mut source_pools,
+                OperatorFunction::Add,
                 null,
                 computed,
-                &result_type,
             )
         }
         Wrap::Coalesce | Wrap::If => {
@@ -1052,7 +991,7 @@ fn scalar_literal(ty: &FunctionValueType, value: i128) -> novarocks_functions::C
     }
 }
 pub fn typed_program(
-    op: BinaryOperator,
+    op: OperatorFunction,
     left_type: FunctionValueType,
     right_type: FunctionValueType,
     wrap: Wrap,
@@ -1084,25 +1023,17 @@ pub fn typed_program(
             .add(None, right_type.clone(), ExprKind::input(columns[1].0))
             .unwrap()
     };
-    let mut result_type =
-        arithmetic_result_value_type_with_op(&left_type, &right_type, operation(op)).unwrap();
-    result_type = result_type
-        .with_nullable(true)
-        .expect("valid test root nullability");
-    let computed = builder
-        .add(
-            None,
-            result_type.clone(),
-            ExprKind::Binary {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: policy,
-                allow_throw_exception: Some(allow_ref()),
-            },
-        )
-        .unwrap();
     let mut authors = BTreeMap::new();
+    let computed = crate::testkit::claim_author::add_catalogue_infix_with_policy(
+        &mut builder,
+        &source_pools,
+        &mut authors,
+        op,
+        [left, right],
+        policy,
+    )
+    .unwrap();
+    let mut result_type = builder.definition(computed).unwrap().ty.clone();
     let root = match wrap {
         Wrap::Bare | Wrap::ConstantRight => computed,
         Wrap::NullParent => panic!("numeric fixture has no untyped parent result rule"),
@@ -1366,20 +1297,13 @@ pub fn nullsafe_program(ty: FunctionValueType, right_kind: NullSafeRight) -> Com
             )
         }
     };
-    let result_type = FunctionValueType::new(DataType::Boolean, false);
-    let expr = builder
-        .add(
-            None,
-            result_type.clone(),
-            ExprKind::Binary {
-                op: BinaryOperator::EqForNull,
-                left,
-                right,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-        )
-        .unwrap();
+    let expr = crate::testkit::claim_author::add_catalogue_predicate(
+        &mut builder,
+        &mut source_pools,
+        OperatorFunction::Identical,
+        vec![left, right],
+    )
+    .unwrap();
     let output_root = builder
         .root(expr, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();

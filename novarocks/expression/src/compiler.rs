@@ -470,56 +470,6 @@ pub(crate) fn prepare_call_created<H, F: novarocks_type_contract::ValueSchemaCre
             .map_err(Into::into),
     }
 }
-impl<H> From<novarocks_functions::ArithmeticCreationFailure<H>> for ExprCompileFailure<H> {
-    fn from(error: novarocks_functions::ArithmeticCreationFailure<H>) -> Self {
-        use novarocks_functions::{
-            ArithmeticCreationFailure as F, ArithmeticTypeCreationFailure as T,
-        };
-        use novarocks_type_contract::{
-            ControlResourceError, ValueConstructionFailure as C,
-            owned_resources::{hashmap::HashMapResourceError, layout::LayoutResourceError as L},
-        };
-        match error {
-            F::Prepare(cause) => cause.into(),
-            F::Construction(C::Observer(T::Control(cause))) => Self::Control(cause),
-            F::Construction(C::Observer(T::Creator(cause))) => Self::Creator(cause),
-            F::Construction(C::Layout(cause)) => Self::Resource(cause),
-            F::Construction(C::BTree(cause)) => cause.into(),
-            F::Construction(C::Vec(ControlResourceError::Control(cause))) => Self::Control(cause),
-            F::Construction(C::Vec(ControlResourceError::SourceModel(_)))
-            | F::Construction(C::HashMap(HashMapResourceError::SourceModel(_))) => {
-                Self::Resource(L::SourceModel)
-            }
-            F::Construction(C::HashMap(HashMapResourceError::Arithmetic(_))) => {
-                Self::Resource(L::Arithmetic)
-            }
-            F::Construction(C::ValueType(_) | C::Rule(_)) => {
-                novarocks_functions::ArithmeticPrepareError::TypeMismatch.into()
-            }
-        }
-    }
-}
-fn prepare_arithmetic_created<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
-    operator: novarocks_type_contract::ArithmeticOperator,
-    left: &novarocks_type_contract::FunctionValueType,
-    right: &novarocks_type_contract::FunctionValueType,
-    result: &novarocks_type_contract::FunctionValueType,
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-    allow: bool,
-    control: &dyn PureCompileControl,
-    factory: Option<&F>,
-) -> Result<novarocks_functions::PreparedArithmeticRecipe, ExprCompileFailure<H>> {
-    match factory {
-        Some(factory) => novarocks_functions::PreparedArithmeticRecipe::try_new_with_creator_in(
-            operator, left, right, result, policy, allow, factory, control,
-        )
-        .map_err(Into::into),
-        None => novarocks_functions::PreparedArithmeticRecipe::try_new(
-            operator, left, right, result, policy, allow, control,
-        )
-        .map_err(Into::into),
-    }
-}
 impl ExprCompileFailure<std::convert::Infallible> {
     pub(crate) fn into_pure(self) -> ExprCompileError {
         match self {
@@ -569,13 +519,12 @@ fn observe_type_push<H>(
     }
     Ok(())
 }
-pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+pub(crate) fn lower_core<H>(
     unit: &BoundExprSet,
     environment: crate::EvaluationEnvironment<'_>,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
     mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
-    factory: Option<&F>,
 ) -> Result<LoweredExpressions, ExprCompileFailure<H>> {
     let source = unit;
     let count = unit.definitions().len();
@@ -631,7 +580,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr, .. } => {
                     (next == 0).then_some(*expr)
                 }
-                ExprKind::Binary { left, right, .. } => [*left, *right].get(next).copied(),
+
                 ExprKind::Case {
                     operand,
                     when_then,
@@ -776,128 +725,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         cast_mode: *cast_mode,
                     }
                 }
-                ExprKind::Binary {
-                    op,
-                    left,
-                    right,
-                    decimal_overflow_policy,
-                    allow_throw_exception,
-                } if arithmetic_operator(*op).is_some() => {
-                    let local_left = *ids.get(left).ok_or(ExprCompileError::Invalid(
-                        "arithmetic left operand was not lowered",
-                    ))?;
-                    let local_right = *ids.get(right).ok_or(ExprCompileError::Invalid(
-                        "arithmetic right operand was not lowered",
-                    ))?;
-                    let reference = allow_throw_exception.ok_or(ExprCompileError::Invalid(
-                        "arithmetic has no admitted ALLOW_THROW reference",
-                    ))?;
-                    let novarocks_type_contract::SemanticParameterValue::AllowThrowException(
-                        authored_allow,
-                    ) = environment.parameters.require(reference).map_err(|_| {
-                        ExprCompileError::Invalid("arithmetic ALLOW_THROW source differs")
-                    })?
-                    else {
-                        return Err(ExprCompileError::Invalid(
-                            "arithmetic ALLOW_THROW key differs",
-                        )
-                        .into());
-                    };
-                    let operator = arithmetic_operator(*op).expect("checked arithmetic operator");
-                    work.step()?;
-                    work.flush()?;
-                    // Every definition is prepared, even when it has no actual use.
-                    // The source table, never the legacy arena flag, authors this value.
-                    prepare_arithmetic_created(
-                        operator,
-                        &source
-                            .definition(*left)
-                            .ok_or(ExprCompileError::Invalid("missing arithmetic left source"))?
-                            .ty,
-                        &source
-                            .definition(*right)
-                            .ok_or(ExprCompileError::Invalid("missing arithmetic right source"))?
-                            .ty,
-                        &node.ty,
-                        *decimal_overflow_policy,
-                        *authored_allow,
-                        control,
-                        factory,
-                    )?;
-                    StaticExprKind::PreparedArithmetic {
-                        operator,
-                        left: local_left,
-                        right: local_right,
-                        decimal_overflow_policy: *decimal_overflow_policy,
-                        allow_throw_exception: *authored_allow,
-                    }
-                }
-                ExprKind::Binary {
-                    op: novarocks_expression_contract::BinaryOperator::EqForNull,
-                    left,
-                    right,
-                    ..
-                } => {
-                    let local_left = *ids.get(left).ok_or(ExprCompileError::Invalid(
-                        "null-safe left operand was not lowered",
-                    ))?;
-                    let local_right = *ids.get(right).ok_or(ExprCompileError::Invalid(
-                        "null-safe right operand was not lowered",
-                    ))?;
-                    if node.ty.data_type() != &arrow::datatypes::DataType::Boolean
-                        || node.ty.logical_type()
-                            != novarocks_type_contract::ValueLogicalType::Physical
-                        || node.ty.nullable()
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "null-safe comparison requires nonnullable Physical Boolean result",
-                        )
-                        .into());
-                    }
-                    work.flush()?;
-                    novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
-                        &source
-                            .definition(*left)
-                            .ok_or(ExprCompileError::Invalid("missing null-safe left source"))?
-                            .ty,
-                        &source
-                            .definition(*right)
-                            .ok_or(ExprCompileError::Invalid("missing null-safe right source"))?
-                            .ty,
-                        control,
-                    )?;
-                    StaticExprKind::PreparedNullSafeComparison {
-                        left: local_left,
-                        right: local_right,
-                    }
-                }
-                ExprKind::Binary {
-                    op:
-                        novarocks_expression_contract::BinaryOperator::Eq
-                        | novarocks_expression_contract::BinaryOperator::NotEq
-                        | novarocks_expression_contract::BinaryOperator::Lt
-                        | novarocks_expression_contract::BinaryOperator::LtEq
-                        | novarocks_expression_contract::BinaryOperator::Gt
-                        | novarocks_expression_contract::BinaryOperator::GtEq,
-                    left,
-                    right,
-                    ..
-                } => {
-                    let left = *ids.get(left).ok_or(ExprCompileError::Invalid(
-                        "comparison left operand was not lowered",
-                    ))?;
-                    let right = *ids.get(right).ok_or(ExprCompileError::Invalid(
-                        "comparison right operand was not lowered",
-                    ))?;
-                    let ExprKind::Binary { op, .. } = &node.kind else {
-                        unreachable!("checked comparison kind")
-                    };
-                    StaticExprKind::from_comparison(
-                        comparison_operator(*op).expect("checked ordinary comparison operator"),
-                        left,
-                        right,
-                    )
-                }
+
                 ExprKind::Case {
                     ieee_float_equality,
                     operand,
@@ -932,7 +760,6 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     }
                     StaticExprKind::BoundCall { args: local_args }
                 }
-                _ => return Err(ExprCompileError::UnsupportedExpression(id).into()),
             };
             work.flush()?;
             let ty = node.ty.clone_observed(|| work.step())?;
@@ -1558,175 +1385,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                             0,
                         )?
                 }
-                (
-                    ExprKind::Binary {
-                        op,
-                        left,
-                        right,
-                        decimal_overflow_policy,
-                        allow_throw_exception,
-                    },
-                    StaticExprKind::PreparedArithmetic {
-                        operator,
-                        left: local_left,
-                        right: local_right,
-                        decimal_overflow_policy: local_policy,
-                        allow_throw_exception: local_allow,
-                    },
-                ) => {
-                    let reference = allow_throw_exception.ok_or(ExprCompileError::Invalid(
-                        "missing arithmetic parameter reference",
-                    ))?;
-                    let source_allow = environment.parameters.require(reference).map_err(|_| {
-                        ExprCompileError::Invalid("arithmetic parameter source differs")
-                    })?;
-                    if arithmetic_operator(*op) != Some(*operator)
-                        || decimal_overflow_policy != local_policy
-                        || source_allow
-                            != &novarocks_type_contract::SemanticParameterValue::AllowThrowException(
-                                *local_allow,
-                            )
-                        || invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 2
-                        || lowered.ids.get(left) != Some(local_left)
-                        || lowered.ids.get(right) != Some(local_right)
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "arithmetic occurrence differs from its frozen source",
-                        )
-                        .into());
-                    }
-                    let definitions = unit;
-                    work.flush()?;
-                    let recipe = prepare_arithmetic_created(
-                        *operator,
-                        &definitions
-                            .definition(*left)
-                            .ok_or(ExprCompileError::Invalid("missing arithmetic left source"))?
-                            .ty,
-                        &definitions
-                            .definition(*right)
-                            .ok_or(ExprCompileError::Invalid("missing arithmetic right source"))?
-                            .ty,
-                        &source.ty,
-                        *local_policy,
-                        *local_allow,
-                        control,
-                        creation.map(|(factory, _)| factory),
-                    )?;
-                    let mut combined = recipe.own_effects(invocation.context);
-                    for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
-                        let child_use = invocation.arguments[ordinal];
-                        if flow.uses()[&child_use].definition != physical {
-                            return Err(ExprCompileError::Invalid(
-                                "actual ordered arithmetic use differs",
-                            )
-                            .into());
-                        }
-                        combined = combined.join_control_argument(
-                            *effects.get(&child_use).ok_or(ExprCompileError::Invalid(
-                                "arithmetic child effects were not prepared",
-                            ))?,
-                            flow,
-                            ordinal,
-                        )?;
-                        work.step()?;
-                    }
-                    combined
-                }
-                (
-                    ExprKind::Binary {
-                        op, left, right, ..
-                    },
-                    kind,
-                ) if (kind.ordinary_comparison().is_some()
-                    && comparison_operator(*op)
-                        == kind.ordinary_comparison().map(|parts| parts.0))
-                    || (*op == novarocks_expression_contract::BinaryOperator::EqForNull
-                        && matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. })) =>
-                {
-                    let (local_left, local_right) = match kind {
-                        StaticExprKind::PreparedNullSafeComparison { left, right } => {
-                            (*left, *right)
-                        }
-                        _ => {
-                            let (_, left, right) =
-                                kind.ordinary_comparison().expect("checked comparison kind");
-                            (left, right)
-                        }
-                    };
-                    if invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 2
-                        || lowered.ids.get(left) != Some(&local_left)
-                        || lowered.ids.get(right) != Some(&local_right)
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "actual comparison control or operands differ",
-                        )
-                        .into());
-                    }
-                    let mut combined =
-                        if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
-                            work.flush()?;
-                            novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
-                                &unit
-                                    .definition(*left)
-                                    .ok_or(ExprCompileError::Invalid(
-                                        "missing null-safe left source",
-                                    ))?
-                                    .ty,
-                                &unit
-                                    .definition(*right)
-                                    .ok_or(ExprCompileError::Invalid(
-                                        "missing null-safe right source",
-                                    ))?
-                                    .ty,
-                                control,
-                            )?
-                            .own_effects(invocation.context)
-                        } else {
-                            let (operator, _, _) =
-                                kind.ordinary_comparison().expect("checked comparison kind");
-                            let definitions = unit;
-                            work.flush()?;
-                            let recipe = novarocks_functions::PreparedComparisonRecipe::try_new(
-                                operator,
-                                &definitions
-                                    .definition(*left)
-                                    .ok_or(ExprCompileError::Invalid(
-                                        "missing ordinary comparison left source",
-                                    ))?
-                                    .ty,
-                                &definitions
-                                    .definition(*right)
-                                    .ok_or(ExprCompileError::Invalid(
-                                        "missing ordinary comparison right source",
-                                    ))?
-                                    .ty,
-                                control,
-                            )?;
-                            work.flush()?;
-                            recipe.own_effects(invocation.context)
-                        };
-                    for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
-                        let child_use = invocation.arguments[ordinal];
-                        if flow.uses()[&child_use].definition != physical {
-                            return Err(ExprCompileError::Invalid(
-                                "actual ordered comparison use differs",
-                            )
-                            .into());
-                        }
-                        combined = combined.join_control_argument(
-                            *effects.get(&child_use).ok_or(ExprCompileError::Invalid(
-                                "comparison child effects were not prepared",
-                            ))?,
-                            flow,
-                            ordinal,
-                        )?;
-                        work.step()?;
-                    }
-                    combined
-                }
+
                 (
                     ExprKind::Case {
                         ieee_float_equality,
@@ -2168,43 +1827,13 @@ fn literal_argument(
             | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
-            (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
-                if arithmetic_operator(*op) == Some(*operator) =>
-            {
-                Ok(None)
-            }
-            (
-                ExprKind::Binary {
-                    op: novarocks_expression_contract::BinaryOperator::EqForNull,
-                    ..
-                },
-                StaticExprKind::PreparedNullSafeComparison { .. },
-            ) => Ok(None),
-            (ExprKind::Binary { op, .. }, kind)
-                if kind.ordinary_comparison().is_some()
-                    && comparison_operator(*op)
-                        == kind.ordinary_comparison().map(|parts| parts.0) =>
-            {
-                Ok(None)
-            }
+
             _ => Err(ExprCompileError::Invalid(
                 "unsupported call argument projection",
             )),
         }
     })();
     finish(result, &mut work)
-}
-
-fn comparison_operator(
-    operator: novarocks_expression_contract::BinaryOperator,
-) -> Option<novarocks_functions::ComparisonOperator> {
-    operator.comparison_operator()
-}
-
-fn arithmetic_operator(
-    operator: novarocks_expression_contract::BinaryOperator,
-) -> Option<novarocks_type_contract::ArithmeticOperator> {
-    operator.arithmetic_operator()
 }
 
 impl From<novarocks_type_contract::ExpressionControlFlowError> for ExprCompileError {

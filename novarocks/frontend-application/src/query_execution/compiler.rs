@@ -1027,9 +1027,9 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
-    let query_opts = Some(query_opts.unwrap_or_else(|| {
-        crate::query_execution::contract::synthetic_statement_query_options(execution)
-    }));
+    let query_opts = Some(
+        query_opts.unwrap_or_else(|| crate::query_execution::contract::synthetic_query_options()),
+    );
     let capacity = execution
         .result_capacity()
         .cloned()

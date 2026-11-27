@@ -24,9 +24,8 @@ use novarocks_parser::ast;
 use std::sync::Arc;
 
 const ONLY_FULL_GROUP_BY: u64 = 1 << 5;
-const ALLOW_THROW_EXCEPTION: u64 = 1 << 9;
 const ERROR_IF_OVERFLOW: u64 = 1 << 35;
-const CONSUMED_MASK: u64 = ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | ERROR_IF_OVERFLOW;
+const CONSUMED_MASK: u64 = ONLY_FULL_GROUP_BY | ERROR_IF_OVERFLOW;
 const DEFAULT_SQL_MODE_BITS: u64 = ONLY_FULL_GROUP_BY;
 
 /// One complete connection or statement setting. Successive assignments
@@ -51,8 +50,6 @@ impl SqlMode {
         let consumed_bits = value.split(',').map(str::trim).fold(0, |bits, item| {
             let code = match item.to_ascii_uppercase().as_str() {
                 "ONLY_FULL_GROUP_BY" => ONLY_FULL_GROUP_BY,
-                "ALLOW_THROW_EXCEPTION" => ALLOW_THROW_EXCEPTION,
-
                 "ERROR_IF_OVERFLOW" => ERROR_IF_OVERFLOW,
                 _ => item.parse::<u64>().unwrap_or(0) & CONSUMED_MASK,
             };
@@ -66,10 +63,6 @@ impl SqlMode {
 
     pub fn assignment(&self) -> &str {
         &self.assignment
-    }
-
-    pub const fn allow_throw_exception(&self) -> bool {
-        self.consumed_bits & ALLOW_THROW_EXCEPTION != 0
     }
 
     pub const fn error_if_overflow(&self) -> bool {
@@ -362,17 +355,15 @@ mod tests {
             "68719476736",
             "32,group_concat_legacy",
             "FUTURE_MODE",
+            "32,ALLOW_THROW_EXCEPTION",
+            "512",
         ] {
             let mode = SqlMode::from_assignment(setting);
             assert_eq!(mode.assignment(), setting);
             assert!(!mode.error_if_overflow());
-            assert!(!mode.allow_throw_exception());
         }
         let mode = SqlMode::from_assignment("ERROR_IF_OVERFLOW,512,STRUCT_CAST_BY_NAME");
         assert!(mode.error_if_overflow());
-        assert!(mode.allow_throw_exception());
-        assert!(SqlMode::from_assignment("512").allow_throw_exception());
-        assert!(!SqlMode::from_assignment("NOT_ALLOW_THROW_EXCEPTION").allow_throw_exception());
     }
 
     #[test]
@@ -384,15 +375,15 @@ mod tests {
             "WITH SESSION sql_mode = '68719476736', sql_mode = '32' SELECT 1",
         ] {
             let effective = query_sql_semantics(&session, &query(sql)).unwrap();
-            assert!(!effective.sql_mode().allow_throw_exception());
+            assert!(!effective.sql_mode().error_if_overflow());
         }
         let effective = query_sql_semantics(
             &SqlSemanticSettings::default(),
             &query("WITH SESSION sql_mode = 34359738880, query_timeout = 1 SELECT 1"),
         )
         .unwrap();
-        assert!(effective.sql_mode().allow_throw_exception());
-        assert!(session.sql_mode().allow_throw_exception());
+        assert!(effective.sql_mode().error_if_overflow());
+        assert!(session.sql_mode().error_if_overflow());
         for value in [
             "ERROR_IF_OVERFLOW",
             "'ERROR_IF_OVERFLOW, ONLY_full_group_by'",
@@ -417,11 +408,12 @@ mod tests {
             "32",
             "ONLY_FULL_GROUP_BY",
             "32,UNCONSUMED_MODE",
+            "32,ALLOW_THROW_EXCEPTION",
             "ONLY_FULL_GROUP_BY,68719476736",
         ] {
             assert!(semantics(assignment).has_default_computation_semantics());
         }
-        for assignment in ["0", "32,ALLOW_THROW_EXCEPTION", "32,ERROR_IF_OVERFLOW"] {
+        for assignment in ["0", "32,ERROR_IF_OVERFLOW"] {
             assert!(!semantics(assignment).has_default_computation_semantics());
         }
 
@@ -476,23 +468,21 @@ mod tests {
             let statement =
                 novarocks_parser::parser::parse_statement(sql).expect("statement parses");
             let effective = statement_sql_semantics(&session, &statement).unwrap();
-            assert!(!effective.sql_mode().allow_throw_exception());
+            assert!(!effective.sql_mode().error_if_overflow());
         }
-        assert!(session.sql_mode().allow_throw_exception());
+        assert!(session.sql_mode().error_if_overflow());
     }
 
     #[test]
-    fn overflow_error_policy_is_independent_from_allow_throw() {
+    fn overflow_error_policy_ignores_retired_session_token() {
         use novarocks_type_contract::DecimalOverflowPolicy;
         let report = SqlMode::from_assignment("ERROR_IF_OVERFLOW");
         assert!(report.error_if_overflow());
-        assert!(!report.allow_throw_exception());
         assert_eq!(
             report.decimal_overflow_policy(),
             DecimalOverflowPolicy::ReportError
         );
         let allow = SqlMode::from_assignment("ALLOW_THROW_EXCEPTION");
-        assert!(allow.allow_throw_exception());
         assert!(!allow.error_if_overflow());
         assert_eq!(
             allow.decimal_overflow_policy(),

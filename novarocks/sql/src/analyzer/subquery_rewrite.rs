@@ -847,23 +847,19 @@ impl<'a> AnalyzerContext<'a> {
         })?;
 
         // Build the equality condition plus the lifted WHERE.
-        let eq_cond = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(lhs_typed.clone()),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: sub_first_col.column_id,
-                        qualifier: None,
-                        column: sub_first_col.name.clone(),
-                    },
-                    value_type: sub_first_col.value_type.clone(),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let eq_cond = self.analyze_binary_operator(
+            novarocks_type_contract::OperatorFunction::Equal,
+            lhs_typed.clone(),
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: sub_first_col.column_id,
+                    qualifier: None,
+                    column: sub_first_col.name.clone(),
+                },
+                value_type: sub_first_col.value_type.clone(),
             },
-        };
+            in_expr_ast.span(),
+        )?;
         let join_cond = match sub_filter.clone() {
             Some(f) => Some(TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
@@ -871,12 +867,10 @@ impl<'a> AnalyzerContext<'a> {
                     false,
                 ),
 
-                kind: ExprKind::BinaryOp {
+                kind: ExprKind::BooleanConnective {
                     left: novarocks_parser::ast::AstBox::new(eq_cond),
-                    op: BinOp::And,
+                    op: crate::common::BooleanOp::And,
                     right: novarocks_parser::ast::AstBox::new(f),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             }),
             None => Some(eq_cond),
@@ -1215,25 +1209,21 @@ impl<'a> AnalyzerContext<'a> {
             None
         };
 
-        let eq_cond = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(lhs_typed.clone()),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: sub_col.column_id,
-                        qualifier: Some(sq_alias.clone()),
-                        column: sub_col.name.clone(),
-                    },
-                    value_type: (sub_col.value_type.clone())
-                        .with_nullable(true)
-                        .expect("valid value root nullability transform"),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let eq_cond = self.analyze_binary_operator(
+            novarocks_type_contract::OperatorFunction::Equal,
+            lhs_typed.clone(),
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: sub_col.column_id,
+                    qualifier: Some(sq_alias.clone()),
+                    column: sub_col.name.clone(),
+                },
+                value_type: (sub_col.value_type.clone())
+                    .with_nullable(true)
+                    .expect("valid value root nullability transform"),
             },
-        };
+            in_expr_ast.span(),
+        )?;
 
         // Attach the aux LEFT OUTER JOIN to whichever side of the host join
         // exposes the LHS column(s); otherwise default to LEFT.
@@ -1270,15 +1260,13 @@ impl<'a> AnalyzerContext<'a> {
                         false,
                     ),
 
-                    kind: ExprKind::BinaryOp {
+                    kind: ExprKind::BooleanConnective {
                         left: novarocks_parser::ast::AstBox::new(is_null_expr(
                             lhs_typed.clone(),
                             false,
                         )),
-                        op: BinOp::And,
+                        op: crate::common::BooleanOp::And,
                         right: novarocks_parser::ast::AstBox::new(any_exists),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                 },
                 None => is_null_expr(lhs_typed.clone(), false),
@@ -1631,49 +1619,10 @@ impl<'a> AnalyzerContext<'a> {
                     };
                     let same_bare_name = outer_name.is_some() && outer_name == inner_name;
 
-                    // Put the outer column on the left and the inner column
-                    // on the right. Hash join key extraction is input-side
-                    // sensitive; preserving the original inner=outer textual
-                    // order can reverse SEMI/ANTI keys.
-                    let original_left_is_inner = match &pred.full_expr.kind {
-                        ExprKind::BinaryOp { left, .. } => {
-                            exprs_structurally_equal(left, &pred.inner_col)
-                        }
-                        _ => false,
-                    };
-                    let mut outer_expr = maybe_unqualify_col(&pred.outer_col, same_bare_name);
-                    if original_left_is_inner
-                        && outer_expr.value_type.data_type()
-                            != pred.inner_col.value_type.data_type()
-                    {
-                        outer_expr = TypedExpr {
-                            value_type: (pred.inner_col.value_type.clone())
-                                .with_nullable(outer_expr.value_type.nullable())
-                                .expect("valid value root nullability transform"),
-
-                            kind: ExprKind::Cast {
-                                cast_mode: None,
-                                expr: novarocks_parser::ast::AstBox::new(outer_expr),
-                                target: pred.inner_col.value_type.data_type().clone(),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                            },
-                        };
-                    }
-                    TypedExpr {
-                        value_type: pred.full_expr.value_type.clone(),
-
-                        kind: ExprKind::BinaryOp {
-                            left: novarocks_parser::ast::AstBox::new(outer_expr),
-                            op: pred.op,
-                            right: novarocks_parser::ast::AstBox::new(maybe_unqualify_col(
-                                &pred.inner_col,
-                                same_bare_name,
-                            )),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        },
-                    }
+                    pred.with_operands(
+                        maybe_unqualify_col(&pred.outer_col, same_bare_name),
+                        maybe_unqualify_col(&pred.inner_col, same_bare_name),
+                    )
                 };
                 let corr_cond = {
                     let mut c = build_corr_cond(&corr_preds[0]);
@@ -1685,12 +1634,10 @@ impl<'a> AnalyzerContext<'a> {
                                 false,
                             ),
 
-                            kind: ExprKind::BinaryOp {
+                            kind: ExprKind::BooleanConnective {
                                 left: novarocks_parser::ast::AstBox::new(c),
-                                op: BinOp::And,
+                                op: crate::common::BooleanOp::And,
                                 right: novarocks_parser::ast::AstBox::new(build_corr_cond(pred)),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         };
                     }
@@ -1707,12 +1654,10 @@ impl<'a> AnalyzerContext<'a> {
                             false,
                         ),
 
-                        kind: ExprKind::BinaryOp {
+                        kind: ExprKind::BooleanConnective {
                             left: novarocks_parser::ast::AstBox::new(corr_cond),
-                            op: BinOp::And,
+                            op: crate::common::BooleanOp::And,
                             right: novarocks_parser::ast::AstBox::new(rem),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     }),
                     None => Some(corr_cond),
@@ -2031,11 +1976,38 @@ impl<'a> AnalyzerContext<'a> {
                     in_expr_ast.span(),
                 )?);
             }
-            let mark_key_bindings = Some(
-                key_bindings
-                    .try_into()
-                    .expect("two authored JSON key bindings"),
-            );
+            let keys: [crate::binding::SqlFunctionBinding; 2] = key_bindings
+                .try_into()
+                .expect("two authored JSON key bindings");
+            let arguments = keys.each_ref().map(|key| {
+                let novarocks_functions::FunctionResultType::Scalar(value_type) =
+                    &key.selected.result_type
+                else {
+                    unreachable!("JSON key normalization is an installed scalar call");
+                };
+                novarocks_functions::FunctionArgument::Value {
+                    value_type: value_type.clone(),
+                    constant: None,
+                }
+            });
+            let selected = self
+                .function_catalog
+                .resolve_scalar_operator_binding(
+                    novarocks_type_contract::OperatorFunction::Equal,
+                    novarocks_functions::FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                        expected_result_type: None,
+                    },
+                    self.control,
+                )
+                .map_err(AnalyzeError::function_binding)?;
+            let equality = self.binding_finalizer().finish(
+                selected,
+                "JSON IN key equality",
+                in_expr_ast.span(),
+            )?;
+            let mark_key_bindings = Some(crate::analysis::JsonMarkKeyBindings { keys, equality });
             select.apply_specs.push(ApplyScalarSpec {
                 mark_probe: Some(lhs_typed_list[0].clone()),
                 mark_key_bindings,
@@ -2202,20 +2174,13 @@ impl<'a> AnalyzerContext<'a> {
                 negated,
                 in_expr_ast.span(),
             )?;
-            let eq = TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    nullable,
-                ),
-
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(lhs_i.clone()),
-                    op: BinOp::Eq,
-                    right: novarocks_parser::ast::AstBox::new(rhs_ref),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-            };
+            let eq = self.analyze_binary_operator(
+                novarocks_type_contract::OperatorFunction::Equal,
+                lhs_i.clone(),
+                rhs_ref,
+                in_expr_ast.span(),
+            )?;
+            debug_assert_eq!(eq.value_type.nullable(), nullable);
             has_composite_key |= has_composite_comparison(&lhs_i.value_type, &sub_col.value_type);
             eq_conjuncts.push(eq);
         }
@@ -2231,12 +2196,10 @@ impl<'a> AnalyzerContext<'a> {
                         nullable,
                     ),
 
-                    kind: ExprKind::BinaryOp {
+                    kind: ExprKind::BooleanConnective {
                         left: novarocks_parser::ast::AstBox::new(acc),
-                        op: BinOp::And,
+                        op: crate::common::BooleanOp::And,
                         right: novarocks_parser::ast::AstBox::new(next),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                 };
             }
@@ -2408,15 +2371,13 @@ impl<'a> AnalyzerContext<'a> {
                             false,
                         ),
 
-                        kind: ExprKind::BinaryOp {
+                        kind: ExprKind::BooleanConnective {
                             left: novarocks_parser::ast::AstBox::new(is_null_expr(
                                 lhs_typed.clone(),
                                 false,
                             )),
-                            op: BinOp::And,
+                            op: crate::common::BooleanOp::And,
                             right: novarocks_parser::ast::AstBox::new(any_exists),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     },
                     None => is_null_expr(lhs_typed.clone(), false),
@@ -2687,20 +2648,14 @@ impl<'a> AnalyzerContext<'a> {
             )?;
             either_nullable |= nullable;
             has_composite_key |= has_composite_comparison(&left.value_type, &right.expr.value_type);
-            comparisons.push(TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    nullable,
-                ),
-
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(left),
-                    op: BinOp::Eq,
-                    right: novarocks_parser::ast::AstBox::new(right.expr),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-            });
+            let equality = self.analyze_binary_operator(
+                novarocks_type_contract::OperatorFunction::Equal,
+                left,
+                right.expr,
+                subquery_span,
+            )?;
+            debug_assert_eq!(equality.value_type.nullable(), nullable);
+            comparisons.push(equality);
         }
         if negated && has_composite_key && either_nullable {
             return Err(composite_membership_requires_independent_relation(
@@ -2719,12 +2674,10 @@ impl<'a> AnalyzerContext<'a> {
                     DataType::Boolean,
                     nullable,
                 ),
-                kind: ExprKind::BinaryOp {
+                kind: ExprKind::BooleanConnective {
                     left: novarocks_parser::ast::AstBox::new(key_cond),
-                    op: BinOp::And,
+                    op: crate::common::BooleanOp::And,
                     right: novarocks_parser::ast::AstBox::new(right),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
         }
@@ -2782,12 +2735,10 @@ impl<'a> AnalyzerContext<'a> {
                         nullable,
                     ),
 
-                    kind: ExprKind::BinaryOp {
+                    kind: ExprKind::BooleanConnective {
                         left: novarocks_parser::ast::AstBox::new(key_cond),
-                        op: BinOp::And,
+                        op: crate::common::BooleanOp::And,
                         right: novarocks_parser::ast::AstBox::new(f),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                 })
             }
@@ -3405,30 +3356,19 @@ impl<'a> AnalyzerContext<'a> {
                 output_column_id: corr_col_id,
             });
 
-            // Use unqualified column ref for the right side of the join condition.
-            // The physical planner resolves the right side against the subquery's
-            // own scope, which uses the original table names, not __sq_N.
-            join_conds.push(TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    false,
-                ),
-
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(outer_col.clone()),
-                    op: pred.op,
-                    right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: corr_col_id,
-                            qualifier: None,
-                            column: col_name,
-                        },
-                        value_type: inner_col.value_type.clone(),
-                    }),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            // The projected key is a column on the inner relation. Its
+            // source role and the scalar call's evaluated position are independent.
+            join_conds.push(pred.with_operands(
+                outer_col.clone(),
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: corr_col_id,
+                        qualifier: None,
+                        column: col_name,
+                    },
+                    value_type: inner_col.value_type.clone(),
                 },
-            });
+            ));
         }
 
         let mut modified = resolved;
@@ -3541,10 +3481,26 @@ pub(super) struct CorrelationPred {
     pub outer_col: TypedExpr,
     /// The inner column reference (belongs to subquery inner scope).
     pub inner_col: TypedExpr,
-    /// The comparison operator.
-    pub op: BinOp,
+    /// The position of the outer operand in the original selected call.
+    outer_first: bool,
     /// The full expression (for structural equality matching during removal).
     pub full_expr: TypedExpr,
+}
+
+impl CorrelationPred {
+    fn with_operands(&self, outer: TypedExpr, inner: TypedExpr) -> TypedExpr {
+        let mut result = self.full_expr.clone();
+        let ExprKind::FunctionCall { args, .. } = &mut result.kind else {
+            unreachable!("correlation does not admit an unbound comparison");
+        };
+        let evaluated = if self.outer_first {
+            vec![outer, inner]
+        } else {
+            vec![inner, outer]
+        };
+        *args = evaluated.into();
+        result
+    }
 }
 
 /// Extract correlation predicates from an expression.
@@ -3600,15 +3556,10 @@ fn qualify_inner_shadowing_column_refs(
                 },
             }
         }
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => TypedExpr {
+        ExprKind::BooleanConnective { left, op, right } => TypedExpr {
             value_type: expr.value_type,
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
                     left.into_inner(),
                     inner_scope,
@@ -3620,7 +3571,6 @@ fn qualify_inner_shadowing_column_refs(
                     inner_scope,
                     outer_scope,
                 )),
-                decimal_overflow_policy,
             },
         },
         ExprKind::FunctionCall {
@@ -3883,7 +3833,7 @@ fn collect_outer_ref_column_ids(
                 out.push(*column_id);
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -4133,9 +4083,9 @@ fn is_placeholder_top_level_and_conjunct(expr: &TypedExpr, id: usize) -> bool {
         return true;
     }
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -4164,7 +4114,7 @@ fn walk_for_outer_ref(
                 *saw_outer = true;
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -4257,37 +4207,28 @@ fn extract_corr_preds_inner(
     outer_scope: &AnalyzerScope,
     out: &mut Vec<CorrelationPred>,
 ) {
-    if let Some((op, [left, right])) = crate::common::binary_operator::typed_comparison(expr) {
+    if let Some((op, [left, right])) = crate::common::binary_operator::typed_operands(expr)
+        && (op.comparison().is_some() || op == novarocks_type_contract::OperatorFunction::Identical)
+    {
         let left_outer_only = is_outer_only_ref(left, inner_scope, outer_scope);
         let right_outer_only = is_outer_only_ref(right, inner_scope, outer_scope);
-        if left_outer_only && !right_outer_only {
-            out.push(CorrelationPred {
-                outer_col: left.clone(),
-                inner_col: right.clone(),
-                op,
-                full_expr: expr.clone(),
-            });
-        } else if !left_outer_only && right_outer_only {
-            let rev_op = match op {
-                BinOp::Lt => BinOp::Gt,
-                BinOp::Le => BinOp::Ge,
-                BinOp::Gt => BinOp::Lt,
-                BinOp::Ge => BinOp::Le,
-                _ => op,
-            };
-            out.push(CorrelationPred {
-                outer_col: right.clone(),
-                inner_col: left.clone(),
-                op: rev_op,
-                full_expr: expr.clone(),
-            });
-        }
+        let (outer, inner, outer_first) = match (left_outer_only, right_outer_only) {
+            (true, false) => (left, right, true),
+            (false, true) => (right, left, false),
+            _ => return,
+        };
+        out.push(CorrelationPred {
+            outer_col: outer.clone(),
+            inner_col: inner.clone(),
+            outer_first,
+            full_expr: expr.clone(),
+        });
         return;
     }
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And | BinOp::Or,
+            op: crate::common::BooleanOp::And | crate::common::BooleanOp::Or,
             right,
             ..
         } => {
@@ -4343,7 +4284,7 @@ fn collect_column_outer_status(
                 *all_outer_only = false;
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -4644,7 +4585,7 @@ pub(super) fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: u
                     .iter()
                     .any(|item| expr_contains_placeholder(&item.expr, placeholder_id))
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -4817,18 +4758,24 @@ impl MarkDemand<'_, '_> {
             return Ok(guard);
         }
         match &mut expression.kind {
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left, right, op, ..
             } => {
                 if expr_contains_placeholder(left, self.subquery) {
                     self.visit(left, guard)
                 } else {
                     let guard = match op {
-                        BinOp::And | BinOp::Or if !self.before_aggregate_input => {
+                        crate::common::BooleanOp::And | crate::common::BooleanOp::Or
+                            if !self.before_aggregate_input =>
+                        {
                             let condition = self.bind_condition(left, &guard);
                             Self::extend_guard(
                                 guard,
-                                self.truth_test(condition, *op == BinOp::Or, true)?,
+                                self.truth_test(
+                                    condition,
+                                    *op == crate::common::BooleanOp::Or,
+                                    true,
+                                )?,
                             )
                         }
                         _ => guard,
@@ -5116,7 +5063,7 @@ fn collect_column_ids_in_expr(expr: &TypedExpr, out: &mut Vec<crate::column_id::
         ExprKind::ColumnRef { column_id, .. } => {
             out.push(*column_id);
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5154,7 +5101,7 @@ pub(super) fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize)
         return true;
     }
     match &expr.kind {
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5308,7 +5255,7 @@ fn collect_column_refs(expr: &TypedExpr, out: &mut Vec<(Option<String>, String)>
                 out.push(entry);
             }
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5400,13 +5347,13 @@ fn expr_contains_placeholder_in_relation(rel: &Relation, placeholder_id: usize) 
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
     match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } if matches!(op, BinOp::And | BinOp::Or) => {
-            let identity = matches!(op, BinOp::And); // AND identity = true, OR identity = false
+        ExprKind::BooleanConnective { left, op, right }
+            if matches!(
+                op,
+                crate::common::BooleanOp::And | crate::common::BooleanOp::Or
+            ) =>
+        {
+            let identity = matches!(op, crate::common::BooleanOp::And); // AND identity = true, OR identity = false
             let left_is = is_placeholder(left, placeholder_id);
             let right_is = is_placeholder(right, placeholder_id);
             if left_is && right_is {
@@ -5430,11 +5377,10 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                         false,
                     ),
 
-                    kind: ExprKind::BinaryOp {
+                    kind: ExprKind::BooleanConnective {
                         left: novarocks_parser::ast::AstBox::new(new_left),
                         op: *op,
                         right: novarocks_parser::ast::AstBox::new(new_right),
-                        decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }
             }
@@ -5534,15 +5480,10 @@ fn replace_placeholder_in_expr(
                 )),
             },
         },
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => TypedExpr {
+        ExprKind::BooleanConnective { left, op, right } => TypedExpr {
             value_type: expr.value_type.clone(),
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     left,
                     placeholder_id,
@@ -5554,7 +5495,6 @@ fn replace_placeholder_in_expr(
                     placeholder_id,
                     replacement,
                 )),
-                decimal_overflow_policy: *decimal_overflow_policy,
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
@@ -5753,11 +5693,10 @@ fn remove_correlation_preds_from_expr(
     }
 
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
-            decimal_overflow_policy,
         } => {
             let left_remaining = remove_correlation_preds_from_expr(left, corr_preds);
             let right_remaining = remove_correlation_preds_from_expr(right, corr_preds);
@@ -5768,11 +5707,10 @@ fn remove_correlation_preds_from_expr(
                         false,
                     ),
 
-                    kind: ExprKind::BinaryOp {
+                    kind: ExprKind::BooleanConnective {
                         left: novarocks_parser::ast::AstBox::new(l),
-                        op: BinOp::And,
+                        op: crate::common::BooleanOp::And,
                         right: novarocks_parser::ast::AstBox::new(r),
-                        decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }),
                 (Some(l), None) => Some(l),
@@ -5791,13 +5729,13 @@ fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
         return json_placeholder_inside_or(left, id) || json_placeholder_inside_or(right, id);
     }
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right,
             ..
         } if expr_contains_placeholder(left, id) || expr_contains_placeholder(right, id) => true,
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5829,15 +5767,15 @@ fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
 /// Check if a SubqueryPlaceholder with the given id appears under an OR node.
 fn is_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right,
             ..
         } => has_placeholder(left, id) || has_placeholder(right, id),
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => is_placeholder_inside_or(left, id) || is_placeholder_inside_or(right, id),
@@ -5853,7 +5791,7 @@ fn has_placeholder(expr: &TypedExpr, id: usize) -> bool {
     }
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { id: pid, .. } => *pid == id,
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5963,20 +5901,9 @@ fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
         ExprKind::Nested(inner) | ExprKind::IsNull { expr: inner, .. } => {
             correlation_factor_is_total(inner)
         }
-        ExprKind::BinaryOp {
-            left,
-            op:
-                BinOp::And
-                | BinOp::Or
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge,
-            right,
-            ..
-        } => correlation_factor_is_total(left) && correlation_factor_is_total(right),
+        ExprKind::BooleanConnective { left, right, .. } => {
+            correlation_factor_is_total(left) && correlation_factor_is_total(right)
+        }
         ExprKind::Cast {
             expr,
             decimal_overflow_policy,
@@ -6002,9 +5929,9 @@ fn correlation_factor_is_total(expression: &TypedExpr) -> bool {
 /// Split an expression on AND into a flat list of conjuncts.
 fn split_and(expr: &TypedExpr) -> Vec<&TypedExpr> {
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -6020,9 +5947,9 @@ fn split_and(expr: &TypedExpr) -> Vec<&TypedExpr> {
 /// Split an expression on OR into a flat list of disjuncts.
 fn split_or(expr: &TypedExpr) -> Vec<&TypedExpr> {
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right,
             ..
         } => {
@@ -6047,11 +5974,10 @@ fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
             acc.value_type.nullable() || e.value_type.nullable(),
         ),
 
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(acc),
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right: novarocks_parser::ast::AstBox::new(e),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
 }
@@ -6068,11 +5994,10 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
             acc.value_type.nullable() || e.value_type.nullable(),
         ),
 
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(acc),
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right: novarocks_parser::ast::AstBox::new(e),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
 }

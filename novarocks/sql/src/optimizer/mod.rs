@@ -96,7 +96,6 @@ pub(crate) struct OptimizerEnvironment<'a> {
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
 }
 
@@ -107,7 +106,6 @@ impl<'a> OptimizerEnvironment<'a> {
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        root_allow_throw_exception: bool,
         control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
@@ -116,7 +114,6 @@ impl<'a> OptimizerEnvironment<'a> {
             function_catalog,
             sealed_functions,
             decimal_overflow_policy,
-            root_allow_throw_exception,
             control,
             fold_dependency_observer: None,
         }
@@ -221,7 +218,6 @@ pub(crate) fn optimize_with_test_table_statistics(
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            false,
             test_optimizer_control(),
         ),
     )
@@ -256,7 +252,6 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            false,
             test_optimizer_control(),
         ),
     )
@@ -278,7 +273,6 @@ fn optimize_with_root_property(
         function_catalog,
         sealed_functions,
         decimal_overflow_policy,
-        root_allow_throw_exception,
         control,
         fold_dependency_observer,
     } = environment;
@@ -305,7 +299,6 @@ fn optimize_with_root_property(
         decimal_overflow_policy,
         control,
     );
-    rewrite_ctx.set_root_allow_throw_exception(root_allow_throw_exception);
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
@@ -1361,14 +1354,11 @@ mod is_known_rule_name_tests {
         value: i64,
     ) -> crate::optimizer::scalar::ScalarId {
         let right = scalar_int(arena, value);
-        arena.intern(
-            ScalarNode::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        arena.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -1393,11 +1383,10 @@ mod is_known_rule_name_tests {
         right: crate::optimizer::scalar::ScalarId,
     ) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: crate::common::BinOp::Or,
+                op: crate::common::BooleanOp::Or,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
@@ -1585,7 +1574,6 @@ mod is_known_rule_name_tests {
                 crate::functions::test_function_catalog_snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                false,
                 test_optimizer_control(),
             ),
         )

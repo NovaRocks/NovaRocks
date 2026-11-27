@@ -454,16 +454,17 @@ mod tests {
         }
     }
 
-    fn binop_typed(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+    fn binop_typed(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn le_typed(col: TypedExpr, v: i64) -> TypedExpr {
@@ -1386,7 +1387,11 @@ mod tests {
                     false,
                 ),
             };
-            let predicate = binop_typed(le_typed(col_typed(rank), 1), BinOp::And, checked);
+            let predicate = binop_typed(
+                le_typed(col_typed(rank), 1),
+                crate::common::BooleanOp::And,
+                checked,
+            );
             let plan = filter_opt(&mut arena, window, predicate);
             let original_sort = &plan.children[0].children[0];
             let Operator::LogicalSort(original_sort) = &original_sort.op else {

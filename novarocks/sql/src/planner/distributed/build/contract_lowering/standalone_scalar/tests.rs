@@ -68,7 +68,6 @@ fn emit(
         expression,
         functions(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         control,
     )
@@ -282,7 +281,6 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
         &expression,
         functions(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         small,
         &baseline_control,
     );
@@ -302,7 +300,6 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
             &expression,
             functions(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             small,
             &control,
         ) {
@@ -352,7 +349,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
 
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let mut source = StandaloneDraft::new(functions(), false, policy());
+    let mut source = StandaloneDraft::new(functions(), policy());
     let definition = source
         .emission(&control, &mut work)
         .lower_expression(&expression, &BTreeMap::new())
@@ -366,12 +363,7 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
         )
         .unwrap();
     source.rebind_nullability(&control, &mut work).unwrap();
-    let parameters = scalar_emission::freeze_semantic_parameters(
-        source.root_used,
-        source.allow_throw_exception,
-        BTreeMap::new(),
-    )
-    .unwrap();
+    let parameters = scalar_emission::freeze_semantic_parameters(BTreeMap::new()).unwrap();
     let loan = SqlUnitSourceLoan {
         site: ScalarSourceSite::Standalone(source.brand.clone()),
         definitions: UnitDefinitions::from_builder(
@@ -452,7 +444,6 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
             &expression,
             declared.snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             policy(),
             &Control::default(),
         ),

@@ -36,20 +36,17 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_constant_contract::{ConstantPools, ConstantValue};
-use novarocks_expression_contract::{
-    BinaryOperator, ExprKind, ExprPort, RootOrdinal, RootScope, ValueId,
-};
+use novarocks_expression_contract::{ExprKind, ExprPort, RootOrdinal, RootScope, ValueId};
 use novarocks_functions::{
     KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarInvocationActivation,
     ScalarInvocationScope, SelectedValues, Selection,
     opaque_memory::{OpaqueReservation, OpaqueRetainedCharge},
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    SemanticParameters, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    CompilePhase, EvaluationDemand, FunctionValueType, OperatorFunction, SemanticParameters,
+    ValueTypeStorageHold, ValueTypeStorageLifetime,
 };
 use std::{
-    collections::BTreeMap,
     convert::Infallible,
     sync::{Arc, Mutex},
     time::Duration,
@@ -135,19 +132,13 @@ fn fixed_binary_case_unit() -> (Arc<CompiledExprSet>, [RootOrdinal; 2]) {
             checked_constants::kind(&mut constants, ten),
         )
         .unwrap();
-    let condition = builder
-        .add(
-            None,
-            FunctionValueType::new(DataType::Boolean, false),
-            ExprKind::Binary {
-                left: input,
-                op: BinaryOperator::Eq,
-                right: ten,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-        )
-        .unwrap();
+    let condition = crate::testkit::add_catalogue_predicate(
+        &mut builder,
+        &mut constants,
+        OperatorFunction::Equal,
+        vec![input, ten],
+    )
+    .unwrap();
     let roots = std::array::from_fn(|i| {
         let (value, input_ty) = &values[i];
         let result_ty = input_ty.clone().with_nullable(true).unwrap();
@@ -178,18 +169,16 @@ fn fixed_binary_case_unit() -> (Arc<CompiledExprSet>, [RootOrdinal; 2]) {
             .root(case, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap()
     });
-    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    let sealed = builder
-        .seal(
-            vec![ExprPort {
-                values: Box::from(values),
-            }],
-            &mut work,
-        )
-        .unwrap();
-    let unit = sealed.finish(BTreeMap::new(), &mut work).unwrap();
-    work.finish().unwrap();
-    let parameters = SemanticParameters::try_new([]).unwrap();
+    let parameters = SemanticParameters::default();
+    let unit = crate::testkit::seal_catalogue_fixture(
+        builder,
+        vec![ExprPort {
+            values: Box::from(values),
+        }],
+        &constants,
+        &parameters,
+        &HarnessControl,
+    );
     (
         compile_fixture_unit(
             &unit,

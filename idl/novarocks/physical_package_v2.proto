@@ -359,16 +359,15 @@ enum WriterDerivedKind {
 }
 message ExpressionDefinition {
   uint32 id = 1;
-  reserved 2, 8, 16 to 18, 20, 21;
+  reserved 2, 8, 9, 16 to 18, 20, 21;
   reserved "owner_node_id", "window_call", "literal";
-  reserved "unary", "in_list", "between", "like", "is_truth_value";
+  reserved "unary", "binary", "in_list", "between", "like", "is_truth_value";
   optional uint32 lambda_scope_expr_id = 3;
   optional uint32 value_type_id = 4;
   oneof kind {
     uint32 value_id = 5;
     LambdaParameter lambda_parameter = 6;
     novarocks.call_request.ConstantReference constant = 7;
-    BinaryExpression binary = 9;
     ExpressionIds conjunction = 10;
     ExpressionIds disjunction = 11;
     FunctionCall function_call = 12;
@@ -391,33 +390,6 @@ message ValueIds { repeated uint32 value_ids = 1; }
 message LambdaParameter {
   optional uint32 lambda_expr_id = 1;
   uint32 ordinal = 2;
-}
-message BinaryExpression {
-  optional uint32 left_expr_id = 1;
-  BinaryOperator op = 2;
-  optional uint32 right_expr_id = 3;
-  novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 4;
-  // Required for all five arithmetic operations; absent for comparisons.
-  // The typed decoder checks the closed AllowThrowException key and resolves
-  // this exact lexical reference from the package's sole parameter table.
-  novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 5;
-}
-enum BinaryOperator {
-  reserved 13 to 15;
-  reserved "BINARY_OPERATOR_BIT_AND", "BINARY_OPERATOR_BIT_OR", "BINARY_OPERATOR_BIT_XOR";
-  BINARY_OPERATOR_UNSPECIFIED = 0;
-  BINARY_OPERATOR_ADD = 1;
-  BINARY_OPERATOR_SUBTRACT = 2;
-  BINARY_OPERATOR_MULTIPLY = 3;
-  BINARY_OPERATOR_DIVIDE = 4;
-  BINARY_OPERATOR_MODULO = 5;
-  BINARY_OPERATOR_EQ = 6;
-  BINARY_OPERATOR_EQ_FOR_NULL = 7;
-  BINARY_OPERATOR_NOT_EQ = 8;
-  BINARY_OPERATOR_LT = 9;
-  BINARY_OPERATOR_LT_EQ = 10;
-  BINARY_OPERATOR_GT = 11;
-  BINARY_OPERATOR_GT_EQ = 12;
 }
 message FunctionCall {
   optional uint32 function_binding_id = 1;

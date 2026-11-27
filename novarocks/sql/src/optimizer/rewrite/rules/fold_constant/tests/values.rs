@@ -23,7 +23,7 @@ use crate::optimizer::scalar::HashableLiteral;
 fn folds_integer_addition_to_single_literal() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
     let plan = project(sum);
 
     assert!(fixture.matches(&plan));
@@ -33,7 +33,7 @@ fn folds_integer_addition_to_single_literal() {
     assert_int_literal(&fixture, folded, 2);
     // Type metadata is preserved verbatim.
     assert_eq!(fixture.data_type(folded), DataType::Int64);
-    assert!(fixture.nullable(folded));
+    assert!(!fixture.nullable(folded));
 }
 
 #[test]
@@ -41,10 +41,10 @@ fn preserves_non_default_type_metadata_of_the_folded_node() {
     let mut fixture = Fixture::new();
     let one = fixture.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-        novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
     );
     // The result retains its nullable arena type.
-    let sum = fixture.binary_typed(BinOp::Add, one, one, DataType::Int32, true);
+    let sum = fixture.binary_typed(crate::common::BinOp::Add, one, one, DataType::Int32);
     let plan = project(sum);
 
     let rewritten = changed(fixture.apply(plan));
@@ -61,8 +61,8 @@ fn folds_nested_arithmetic_fully() {
     let one = fixture.int_literal(1);
     let two = fixture.int_literal(2);
     let three = fixture.int_literal(3);
-    let sum = fixture.binary(BinOp::Add, one, two);
-    let product = fixture.binary(BinOp::Mul, sum, three);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, two);
+    let product = fixture.binary(crate::common::BinOp::Mul, sum, three);
     let plan = project(product);
 
     let rewritten = changed(fixture.apply(plan));
@@ -110,39 +110,44 @@ fn throwing_fold_request_retains_original_node_and_try_cast_sibling_folds() {
         FunctionValueType::new(wide.clone(), false),
     );
     for cast in [false, true] {
-        let node = |decimal_overflow_policy, cast_mode| {
-            if cast {
-                ScalarNode::Cast {
-                    cast_mode: Some(cast_mode),
-                    child,
-                    target: narrow.clone(),
-                    decimal_overflow_policy,
-                }
-            } else {
-                ScalarNode::BinaryOp {
-                    op: BinOp::Add,
-                    left: child,
-                    right: child,
-                    decimal_overflow_policy,
-                }
-            }
+        let node = |decimal_overflow_policy, cast_mode| ScalarNode::Cast {
+            cast_mode: Some(cast_mode),
+            child,
+            target: narrow.clone(),
+            decimal_overflow_policy,
         };
         let carrier = if cast { narrow.clone() } else { wide.clone() };
-        let throwing = fixture.intern(
-            node(ReportError, TrinoCastMode::Explicit),
-            FunctionValueType::new(carrier.clone(), !cast),
-        );
-        let nullable = fixture.intern(
-            node(OutputNull, TrinoCastMode::Try),
-            FunctionValueType::new(carrier, true),
-        );
-        let original = fixture.node(throwing);
+        let (throwing, nullable) = if cast {
+            (
+                fixture.intern(
+                    node(ReportError, TrinoCastMode::Explicit),
+                    FunctionValueType::new(carrier.clone(), false),
+                ),
+                fixture.intern(
+                    node(OutputNull, TrinoCastMode::Try),
+                    FunctionValueType::new(carrier, true),
+                ),
+            )
+        } else {
+            let mut arena = fixture.arena.borrow_mut();
+            (
+                arena.test_intern_operator(crate::common::BinOp::Add, child, child, ReportError),
+                arena.test_intern_operator(crate::common::BinOp::Add, child, child, OutputNull),
+            )
+        };
         assert!(matches!(
             fixture.apply(project(throwing)),
             RewriteResult::Unchanged
         ));
         let value_type = fixture.arena.borrow().value_type(throwing).clone();
-        assert_eq!(fixture.intern(original, value_type), throwing);
+        assert_eq!(fixture.intern(fixture.node(throwing), value_type), throwing);
+        if !cast {
+            assert!(matches!(
+                fixture.apply(project(nullable)),
+                RewriteResult::Unchanged
+            ));
+            continue;
+        }
         let folded = project_expr(&changed(fixture.apply(project(nullable))));
         let ScalarNode::Constant(value) = fixture.node(folded) else {
             panic!("checked NULL expected")
@@ -156,26 +161,6 @@ fn throwing_fold_request_retains_original_node_and_try_cast_sibling_folds() {
                 .unwrap()
         );
     }
-}
-
-#[test]
-fn legacy_allow_disables_numeric_fold_without_disabling_pure_ast_reduction() {
-    use novarocks_type_contract::FunctionValueType;
-    let mut fixture = Fixture::new();
-    fixture.ctx.set_root_allow_throw_exception(true);
-    let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
-    assert!(matches!(
-        fixture.apply(project(sum)),
-        RewriteResult::Unchanged
-    ));
-    let nested = fixture.intern(
-        ScalarNode::Nested(one),
-        FunctionValueType::new(DataType::Int64, false),
-    );
-    let folded = project_expr(&changed(fixture.apply(project(nested))));
-    assert_eq!(folded, one);
-    assert_eq!(fixture.calls(), 0);
 }
 
 #[test]
@@ -229,7 +214,7 @@ fn constant_inputs_share_outcomes_across_operators_and_rounds() {
     let one = fixture.int_literal(1);
     let two = fixture.int_literal(2);
     let zero = fixture.int_literal(0);
-    let kept = fixture.binary(BinOp::Div, one, zero);
+    let kept = fixture.binary(crate::common::BinOp::Div, one, zero);
     for _round in 0..2 {
         assert!(matches!(
             fixture.apply(project(kept)),
@@ -238,16 +223,16 @@ fn constant_inputs_share_outcomes_across_operators_and_rounds() {
     }
     assert_eq!(fixture.calls(), 1);
 
-    let both_ones = fixture.binary(BinOp::Add, one, one);
-    let original = fixture.binary(BinOp::Add, both_ones, both_ones);
+    let both_ones = fixture.binary(crate::common::BinOp::Add, one, one);
+    let original = fixture.binary(crate::common::BinOp::Add, both_ones, both_ones);
     let first = project_expr(&changed(fixture.apply(project(original))));
     assert_eq!(fixture.calls(), 3, "division, 1 + 1, and 2 + 2");
 
-    // Both computations of 2 have the same complete nullable type. They
+    // Both computations of 2 have the same complete type. They
     // share the lowered input for the outer addition across operator visits.
     let four = fixture.int_literal(4);
-    let difference = fixture.binary(BinOp::Sub, four, two);
-    let equivalent = fixture.binary(BinOp::Add, difference, both_ones);
+    let difference = fixture.binary(crate::common::BinOp::Sub, four, two);
+    let equivalent = fixture.binary(crate::common::BinOp::Add, difference, both_ones);
     let second = project_expr(&changed(fixture.apply(project(equivalent))));
     assert_eq!(first, second);
     assert_int_literal(&fixture, first, 4);

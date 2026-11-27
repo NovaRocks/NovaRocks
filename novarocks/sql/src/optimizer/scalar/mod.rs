@@ -34,7 +34,7 @@ use std::hash::{Hash, Hasher};
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, LambdaParam, LiteralValue, WindowFrame};
+use crate::common::{LambdaParam, LiteralValue, WindowFrame};
 use crate::functions::FunctionVolatility;
 use novarocks_type_contract::FunctionValueType;
 
@@ -103,11 +103,10 @@ pub(crate) enum ScalarNode {
     Literal(HashableLiteral),
     /// A materialized value retains its checked owner; syntax is never rebuilt.
     Constant(novarocks_functions::ConstantValue),
-    BinaryOp {
-        op: BinOp,
+    BooleanConnective {
+        op: crate::common::BooleanOp,
         left: ScalarId,
         right: ScalarId,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     FunctionCall {
         name: String,
@@ -253,19 +252,37 @@ impl ScalarArena {
             .expect("explicit test scalar interning control")
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_intern_operator(
+        &mut self,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        left: ScalarId,
+        right: ScalarId,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> ScalarId {
+        use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
+
+        let left = materialize(self, left);
+        let right = materialize(self, right);
+        let expression = crate::common::binary_operator::test_operator(op, left, right, policy);
+        intern_typed(
+            self,
+            &expression,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+    }
+
     /// Canonicalize only directly read values. Composed operands retain their
     /// original evaluation order: Boolean algebra alone does not prove that
     /// swapping required-error or conditional work is valid. The leaf proof
     /// is constant work and does not rescan an ever-growing expression tree.
     fn normalize(&self, node: ScalarNode) -> ScalarNode {
-        if let ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } = node
-        {
-            let commutative = matches!(op, BinOp::And | BinOp::Or | BinOp::Eq);
+        if let ScalarNode::BooleanConnective { op, left, right } = node {
+            let commutative = matches!(
+                op,
+                crate::common::BooleanOp::And | crate::common::BooleanOp::Or
+            );
             let direct_value = |id: ScalarId| {
                 self.nodes.get(id.0 as usize).is_some_and(|node| {
                     matches!(
@@ -275,19 +292,13 @@ impl ScalarArena {
                 })
             };
             if commutative && left.0 > right.0 && direct_value(left) && direct_value(right) {
-                return ScalarNode::BinaryOp {
+                return ScalarNode::BooleanConnective {
                     op,
                     left: right,
                     right: left,
-                    decimal_overflow_policy,
                 };
             }
-            return ScalarNode::BinaryOp {
-                op,
-                left,
-                right,
-                decimal_overflow_policy,
-            };
+            return ScalarNode::BooleanConnective { op, left, right };
         }
         node
     }
@@ -447,6 +458,29 @@ pub(in crate::optimizer) fn resolve_function_binding(
             )
         })
         .map_err(crate::compiler::SqlCompileError::from)
+}
+
+pub(crate) fn intern_scalar_operator(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &mut ScalarArena,
+    operator: novarocks_type_contract::OperatorFunction,
+    operands: [ScalarId; 2],
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
+
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let operands = operands.map(|operand| materialize(arena, operand));
+    let operator = crate::analyzer::type_optimizer_operator(
+        catalog,
+        operator,
+        operands,
+        policy,
+        arena.constant_policy(),
+        control,
+    )?;
+    intern_typed(arena, &operator, control)
 }
 
 pub(crate) fn function_argument(
@@ -735,23 +769,17 @@ mod tests {
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
             FunctionValueType::new(int(), false),
         );
-        let add1 = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Add,
-                left: c,
-                right: lit,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(int(), false),
+        let add1 = a.test_intern_operator(
+            BinOp::Add,
+            c,
+            lit,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
-        let add2 = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Add,
-                left: c,
-                right: lit,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(int(), false),
+        let add2 = a.test_intern_operator(
+            BinOp::Add,
+            c,
+            lit,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         assert_eq!(
             add1, add2,
@@ -824,42 +852,34 @@ mod tests {
         );
         let b = DataType::Boolean;
         let xy = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left: x,
                 right: y,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             FunctionValueType::new(b.clone(), false),
         );
         let yx = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left: y,
                 right: x,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             FunctionValueType::new(b.clone(), false),
         );
         assert_eq!(xy, yx, "AND must be commutative-normalized to one id");
 
-        let sub_xy = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Sub,
-                left: x,
-                right: y,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(int(), false),
+        let sub_xy = a.test_intern_operator(
+            BinOp::Sub,
+            x,
+            y,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
-        let sub_yx = a.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Sub,
-                left: y,
-                right: x,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(int(), false),
+        let sub_yx = a.test_intern_operator(
+            BinOp::Sub,
+            y,
+            x,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         assert_ne!(sub_xy, sub_yx, "Sub must NOT be normalized");
     }
@@ -904,15 +924,12 @@ mod bridge_tests {
     }
 
     fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(l),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(r),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            l,
+            r,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn typed(kind: ExprKind, data_type: DataType, nullable: bool) -> TypedExpr {
@@ -1407,17 +1424,14 @@ mod bridge_tests {
         let lambda_function = typed(
             ExprKind::LambdaFunction {
                 params: vec![lambda_param],
-                body: novarocks_parser::ast::AstBox::new(typed(
-                    ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(lambda_param_ref.clone()),
-                        op: BinOp::Add,
-                        right: novarocks_parser::ast::AstBox::new(lit_int(1)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    DataType::Int64,
-                    false,
-                )),
+                body: novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_operator(
+                        BinOp::Add,
+                        lambda_param_ref.clone(),
+                        lit_int(1),
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
+                ),
             },
             DataType::Int64,
             false,
@@ -1604,15 +1618,7 @@ mod overflow_policy_tests {
         );
         let mut ids = Vec::new();
         for policy in [OutputNull, ReportError] {
-            ids.push(arena.intern(
-                ScalarNode::BinaryOp {
-                    op: BinOp::Add,
-                    left: child,
-                    right: child,
-                    decimal_overflow_policy: policy,
-                },
-                FunctionValueType::new(DataType::Decimal128(38, 0), true),
-            ));
+            ids.push(arena.test_intern_operator(crate::common::BinOp::Add, child, child, policy));
             ids.push(arena.intern(
                 ScalarNode::Cast {
                     cast_mode: None,
@@ -1637,22 +1643,16 @@ mod overflow_policy_tests {
                 id
             );
             let expected = match arena.node(id) {
-                ScalarNode::BinaryOp {
-                    decimal_overflow_policy,
-                    ..
-                }
-                | ScalarNode::Cast {
+                ScalarNode::FunctionCall { binding, .. } => binding.decimal_overflow_policy(),
+                ScalarNode::Cast {
                     decimal_overflow_policy,
                     ..
                 } => *decimal_overflow_policy,
                 _ => panic!("arithmetic or cast"),
             };
             let actual = match typed.kind {
-                ExprKind::BinaryOp {
-                    decimal_overflow_policy,
-                    ..
-                }
-                | ExprKind::Cast {
+                ExprKind::FunctionCall { binding, .. } => binding.decimal_overflow_policy(),
+                ExprKind::Cast {
                     decimal_overflow_policy,
                     ..
                 } => decimal_overflow_policy,

@@ -1280,8 +1280,6 @@ pub struct SqlAnalyzedQuery {
     /// Policy of the admitted root scope for calls synthesized after analysis.
     /// Existing calls retain their own scope policy in `SqlFunctionBinding`.
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    /// The admitted root option, independent of lexical decimal policies.
-    root_allow_throw_exception: bool,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
     function_catalog: Arc<dyn SqlFunctionCatalog>,
@@ -1295,10 +1293,6 @@ impl SqlAnalyzedQuery {
     pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
-    pub(crate) fn root_allow_throw_exception(&self) -> bool {
-        self.root_allow_throw_exception
-    }
-
     pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.decimal_overflow_policy
     }
@@ -1354,10 +1348,6 @@ impl<'a> SqlOptimizeRequest<'a> {
         self.analyzed.constant_policy
     }
 
-    pub fn root_allow_throw_exception(&self) -> bool {
-        self.analyzed.root_allow_throw_exception()
-    }
-
     pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.analyzed.decimal_overflow_policy()
     }
@@ -1409,7 +1399,6 @@ pub(crate) struct SqlAnalysisOutput {
     reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
 )]
 pub(crate) struct SqlOptimizedOutput {
-    pub(crate) root_allow_throw_exception: bool,
     pub(crate) root_semantics: root_output::RootOutputSemantics,
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
@@ -1844,7 +1833,6 @@ impl SqlCompiler {
             mut root_semantics,
             logical_input,
             consumer_requires_semantic_snapshot,
-            legacy_allow_throw_exception,
             decimal_overflow_policy,
         ) = match &request.statement.kind {
             SqlStatementInputKind::LogicalPlan {
@@ -1860,11 +1848,6 @@ impl SqlCompiler {
                     .session
                     .sql_semantics
                     .has_default_computation_semantics(),
-                request
-                    .session
-                    .sql_semantics
-                    .sql_mode()
-                    .allow_throw_exception(),
                 request
                     .session
                     .sql_semantics
@@ -1950,7 +1933,6 @@ impl SqlCompiler {
                     root_semantics,
                     false,
                     consumer_requires_semantic_snapshot,
-                    effective.sql_mode().allow_throw_exception(),
                     effective.sql_mode().decimal_overflow_policy(),
                 )
             }
@@ -2104,7 +2086,6 @@ impl SqlCompiler {
             settings,
             semantic_settings: request.session.sql_semantics.clone(),
             decimal_overflow_policy,
-            root_allow_throw_exception: legacy_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -2122,7 +2103,6 @@ impl SqlCompiler {
             settings,
             semantic_settings: _,
             decimal_overflow_policy,
-            root_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
@@ -2176,7 +2156,6 @@ impl SqlCompiler {
                     Arc::clone(&function_catalog),
                     Arc::clone(&sealed_functions),
                     decimal_overflow_policy,
-                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -2192,7 +2171,6 @@ impl SqlCompiler {
                     Arc::clone(&function_catalog),
                     Arc::clone(&sealed_functions),
                     decimal_overflow_policy,
-                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -2204,7 +2182,6 @@ impl SqlCompiler {
             .domains(&optimized_tree.output_columns)
             .map_err(SqlCompileError::Compilation)?;
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
-            root_allow_throw_exception,
             root_semantics,
             optimized_tree,
             function_catalog,
@@ -3213,7 +3190,6 @@ mod tests {
                 },
                 optimized.function_catalog,
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                optimized.root_allow_throw_exception,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
@@ -3378,7 +3354,6 @@ mod tests {
             },
             optimized.function_catalog,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            optimized.root_allow_throw_exception,
             crate::constant::test_constant_policy(),
             &SqlCompileControl::unbounded(),
         )
@@ -3719,56 +3694,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzed_root_allow_mode_survives_optimization_independently_of_decimal_policy() {
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-        for (session_mode, sql, expected_allow, expected_policy) in [
-            ("32", "SELECT 1", false, OutputNull),
-            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true, OutputNull),
-            ("ERROR_IF_OVERFLOW", "SELECT 1", false, ReportError),
-            (
-                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
-                "SELECT 1",
-                true,
-                ReportError,
-            ),
-            (
-                "ERROR_IF_OVERFLOW",
-                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
-                true,
-                OutputNull,
-            ),
-            (
-                "ALLOW_THROW_EXCEPTION",
-                "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1",
-                false,
-                ReportError,
-            ),
-        ] {
-            let cancellation = Arc::new(Cancellation::default());
-            let request_control = control(None, &cancellation);
-            let mut input = request(request_control.clone());
-            input.statement = SqlStatementInput::parsed_query(mv_analysis_query(sql));
-            input.session.sql_semantics = input
-                .session
-                .sql_semantics
-                .clone()
-                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
-            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
-            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
-            assert_eq!(analyzed.decimal_overflow_policy(), expected_policy);
-            let optimize = SqlOptimizeRequest::new(analyzed, &STATISTICS, request_control);
-            assert_eq!(optimize.root_allow_throw_exception(), expected_allow);
-            assert_eq!(optimize.decimal_overflow_policy(), expected_policy);
-            let optimized = SqlCompiler::optimize(optimize)
-                .unwrap()
-                .into_optimized_output()
-                .unwrap();
-            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
-        }
-    }
-
-    #[test]
-    fn derived_query_inherits_the_admitted_root_allow_and_decimal_policy() {
+    fn derived_query_inherits_the_admitted_decimal_policy() {
         use crate::analysis::ExprKind;
         use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
         use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
@@ -3801,12 +3727,11 @@ mod tests {
             crate::sql_mode::SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"),
         );
         let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
-        assert!(analyzed.root_allow_throw_exception());
         assert_eq!(analyzed.decimal_overflow_policy(), OutputNull);
         let mut policies = Vec::new();
         cast_policies(&analyzed.logical_plan, &mut policies);
         assert_eq!(policies, [OutputNull]);
-        let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
+        SqlCompiler::optimize(SqlOptimizeRequest::new(
             analyzed,
             &STATISTICS,
             request_control,
@@ -3814,27 +3739,20 @@ mod tests {
         .unwrap()
         .into_optimized_output()
         .unwrap();
-        assert!(optimized.root_allow_throw_exception);
     }
 
     #[test]
     fn strict_cast_overflow_survives_folding_in_each_legacy_session_mode() {
-        for (session_mode, sql, disabled) in [
-            ("32", "SELECT CAST(1000 AS DECIMAL(3,0))", false),
+        for (session_mode, sql) in [
+            ("32", "SELECT CAST(1000 AS DECIMAL(3,0))"),
             (
                 "32",
                 "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT CAST(1000 AS DECIMAL(3,0))",
-                true,
             ),
-            (
-                "ALLOW_THROW_EXCEPTION",
-                "SELECT CAST(1000 AS DECIMAL(3,0))",
-                true,
-            ),
+            ("ALLOW_THROW_EXCEPTION", "SELECT CAST(1000 AS DECIMAL(3,0))"),
             (
                 "ALLOW_THROW_EXCEPTION",
                 "WITH SESSION sql_mode = 32 SELECT CAST(1000 AS DECIMAL(3,0))",
-                false,
             ),
         ] {
             let cancellation = Arc::new(Cancellation::default());
@@ -3847,7 +3765,6 @@ mod tests {
                 .clone()
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
             let pending = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
-            assert_eq!(pending.root_allow_throw_exception(), disabled);
             let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
                 pending,
                 &STATISTICS,

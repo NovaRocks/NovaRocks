@@ -207,45 +207,6 @@ pub(super) fn string_literal(
     )
 }
 
-pub(super) fn binary_op(
-    arena: &mut ScalarArena,
-    op: BinOp,
-    left: ScalarId,
-    right: ScalarId,
-    data_type: DataType,
-    nullable: bool,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    arena.intern_observed(
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-        control,
-    )
-}
-
-pub(super) fn eq(
-    arena: &mut ScalarArena,
-    left: ScalarId,
-    right: ScalarId,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let nullable = arena.nullable(left) || arena.nullable(right);
-    binary_op(
-        arena,
-        BinOp::Eq,
-        left,
-        right,
-        DataType::Boolean,
-        nullable,
-        control,
-    )
-}
-
 pub(super) fn combine_and(
     arena: &mut ScalarArena,
     exprs: Vec<ScalarId>,
@@ -442,16 +403,10 @@ where
             initializer: candidate_or_none!(rewrite(arena, initializer)?),
             body: candidate_or_none!(rewrite(arena, body)?),
         },
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective { op, left, right } => ScalarNode::BooleanConnective {
             op,
             left: candidate_or_none!(rewrite(arena, left)?),
             right: candidate_or_none!(rewrite(arena, right)?),
-            decimal_overflow_policy,
         },
         ScalarNode::FunctionCall {
             name,
@@ -1097,14 +1052,11 @@ mod tests {
         .unwrap();
         assert_eq!(arena.value_type(rebuilt), &json);
         assert!(matches!(arena.node(rebuilt),ScalarNode::Nested(id) if *id==replacement));
-        let pair = arena.intern(
-            ScalarNode::BinaryOp {
-                left: source,
-                right: replacement,
-                op: BinOp::Eq,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(DataType::Boolean, false),
+        let pair = arena.test_intern_operator(
+            BinOp::Eq,
+            source,
+            replacement,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let mut calls = 0;
         let rejected = remap_column_refs(

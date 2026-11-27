@@ -23,7 +23,6 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Query options resolved by core before ownership crosses into frontend.
 ///
@@ -82,27 +81,12 @@ impl ResolvedQueryOptions {
     }
 }
 
-/// Project admitted statement semantics for synthetic executions that previously
-/// supplied no options. Existing sealed options must not pass through this path.
-pub(crate) fn synthetic_statement_query_options(execution: &QueryExecutionContext) -> QueryOptions {
-    synthetic_query_options(execution.sql_semantics())
-}
-
-pub(crate) fn synthetic_mv_query_options(execution: &QueryExecutionContext) -> QueryOptions {
-    let semantics = execution
-        .sql_semantics()
-        .clone()
-        .with_default_computation_semantics();
-    synthetic_query_options(&semantics)
-}
-
-fn synthetic_query_options(
-    semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-) -> QueryOptions {
-    let mut runtime = RuntimeQueryOptions::default();
-    runtime.set_allow_throw_exception(semantics.sql_mode().allow_throw_exception());
+/// Supply the runtime defaults for synthetic executions.
+pub(crate) fn synthetic_query_options() -> QueryOptions {
     QueryOptions::from_proto(
-        crate::native::fragment_encoder::instance::encode_query_options(&runtime),
+        crate::native::fragment_encoder::instance::encode_query_options(
+            &RuntimeQueryOptions::default(),
+        ),
     )
 }
 
@@ -145,7 +129,6 @@ fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOpti
         enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
-        allow_throw_exception: src.allow_throw_exception,
 
         enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
         global_runtime_filter_build_max_size: (src.global_runtime_filter_build_max_size > 0)

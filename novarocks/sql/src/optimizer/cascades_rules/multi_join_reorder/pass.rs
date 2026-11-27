@@ -151,8 +151,9 @@ fn reorder_chain(
             break;
         }
     }
+    let functions = memo.function_catalog().snapshot();
     let candidates = observe_opaque(work, control, || {
-        enumerate_orders(&graph, caps, &mut memo.scalars, control)
+        enumerate_orders(functions.as_ref(), &graph, caps, &mut memo.scalars, control)
     })??;
     for tree in candidates {
         work.step()?;
@@ -293,18 +294,12 @@ mod tests {
     }
 
     fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(l),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(r),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Boolean,
-                false,
-            ),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            l,
+            r,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn leaf(memo: &mut Memo, col_id: u32, rows: f64, conf: Confidence) -> GroupId {
@@ -379,6 +374,7 @@ mod tests {
     #[test]
     fn pass_injects_alternatives_for_large_chain() {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         let root = build_path_chain(&mut memo, 6, Confidence::Estimated);
         let before = memo.groups[root].logical_exprs.len();
         assert_eq!(before, 1, "root starts with the single converted order");
@@ -411,6 +407,7 @@ mod tests {
         // A chain larger than the exhaustive threshold is reorder-owned: its
         // join groups are recorded so explore's JoinAssociativity skips them (D2).
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         let root = build_path_chain(&mut memo, 6, Confidence::Estimated);
         run_multi_join_reorder(
             &mut memo,
@@ -435,6 +432,7 @@ mod tests {
         // A chain <= the exhaustive threshold is left to JoinAssociativity, so it
         // must NOT be marked reorder-owned.
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         build_path_chain(&mut memo, 3, Confidence::Estimated);
         run_multi_join_reorder(
             &mut memo,
@@ -453,6 +451,7 @@ mod tests {
     #[test]
     fn pass_skips_small_chain_left_to_associativity() {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         // 3 atoms <= exhaustive threshold (4) -> reorder pass leaves it alone.
         let root = build_path_chain(&mut memo, 3, Confidence::Estimated);
         let before = memo.groups[root].logical_exprs.len();
@@ -481,6 +480,7 @@ mod tests {
     #[test]
     fn pass_degrades_to_left_deep_when_stats_unknown() {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         // Fallback confidence on the atoms -> only the LeftDeep candidate is
         // enumerated (DP/Greedy disabled), so at most one alternative is added.
         let root = build_path_chain(&mut memo, 6, Confidence::Fallback);
@@ -542,6 +542,7 @@ mod tests {
     }
     fn wide_leaf_memo() -> Memo {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         for column in 1..=320 {
             leaf(&mut memo, column, 100.0, Confidence::Estimated);
         }
@@ -594,6 +595,7 @@ mod tests {
     #[test]
     fn roots_preserve_real_ordered_edges_and_non_inner_parent_boundary() {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         let first = build_path_chain(&mut memo, 3, Confidence::Estimated);
         let second = build_path_chain(&mut memo, 6, Confidence::Estimated);
         memo.new_group(MExpr {
@@ -626,6 +628,7 @@ mod tests {
     }
     fn candidate_comparison_fixture() -> (Memo, GroupId, JoinTree) {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         let left = leaf(&mut memo, 1, 100.0, Confidence::Estimated);
         let right = leaf(&mut memo, 2, 100.0, Confidence::Estimated);
         // INNER without a predicate and CROSS are equivalent here. The memo
@@ -725,6 +728,7 @@ mod tests {
     #[test]
     fn empty_pass_observes_entry_and_finish_and_memo_does_not_retain_control() {
         let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
         let control = std::sync::Arc::new(observed_control(None));
         let weak = std::sync::Arc::downgrade(&control);
         run_multi_join_reorder(

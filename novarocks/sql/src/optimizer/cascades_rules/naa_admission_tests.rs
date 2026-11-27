@@ -1,6 +1,6 @@
 use super::*;
 use crate::common::naa::NaaAuthorFacts;
-use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+use novarocks_type_contract::FunctionValueType;
 
 fn intern(arena: &mut ScalarArena, node: ScalarNode, ty: DataType, nullable: bool) -> ScalarId {
     arena
@@ -22,27 +22,29 @@ fn column(arena: &mut ScalarArena, id: u32, nullable: bool) -> ScalarId {
 fn binary(
     arena: &mut ScalarArena,
     left: ScalarId,
-    op: BinOp,
+    op: impl Into<crate::common::binary_operator::TestOperator>,
     right: ScalarId,
     ty: DataType,
     nullable: bool,
 ) -> ScalarId {
-    intern(
-        arena,
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        },
-        ty,
-        nullable,
+    arena.test_intern_operator(
+        op,
+        left,
+        right,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )
 }
 fn comparison(arena: &mut ScalarArena) -> ScalarId {
     let left = column(arena, 1, true);
     let right = column(arena, 2, true);
-    binary(arena, left, BinOp::Eq, right, DataType::Boolean, true)
+    binary(
+        arena,
+        left,
+        crate::common::BinOp::Eq,
+        right,
+        DataType::Boolean,
+        true,
+    )
 }
 fn scope(arena: &mut ScalarArena, nullable: bool, null_safe: bool) -> ScalarId {
     let left = column(arena, 3, nullable);
@@ -51,9 +53,9 @@ fn scope(arena: &mut ScalarArena, nullable: bool, null_safe: bool) -> ScalarId {
         arena,
         left,
         if null_safe {
-            BinOp::EqForNull
+            crate::common::BinOp::EqForNull
         } else {
-            BinOp::Eq
+            crate::common::BinOp::Eq
         },
         right,
         DataType::Boolean,
@@ -76,12 +78,19 @@ fn throwing(arena: &mut ScalarArena) -> ScalarId {
     let product = binary(
         arena,
         left,
-        BinOp::Mul,
+        crate::common::BinOp::Mul,
         right,
         DataType::Decimal128(9, 0),
         false,
     );
-    binary(arena, product, BinOp::Eq, left, DataType::Boolean, false)
+    binary(
+        arena,
+        product,
+        crate::common::BinOp::Eq,
+        left,
+        DataType::Boolean,
+        false,
+    )
 }
 fn admit(arena: &mut ScalarArena, op: &LogicalJoinOp) -> Option<ScalarJoinCondition> {
     null_aware_hash_condition(
@@ -99,7 +108,16 @@ fn authored(
     eligibility: Option<ScalarId>,
 ) -> LogicalJoinOp {
     let predicate = eligibility
-        .map(|e| binary(arena, comparison, BinOp::And, e, DataType::Boolean, true))
+        .map(|e| {
+            binary(
+                arena,
+                comparison,
+                crate::common::BooleanOp::And,
+                e,
+                DataType::Boolean,
+                true,
+            )
+        })
         .unwrap_or(comparison);
     LogicalJoinOp {
         join_type: JoinKind::NullAwareLeftAnti,
@@ -155,7 +173,14 @@ fn nullable_scope_before_required_error_stays_in_value_demand_eligibility() {
     let s = scope(&mut arena, true, false);
     let r = throwing(&mut arena);
     assert!(scalar_expr::can_fail(&arena, r));
-    let e = binary(&mut arena, s, BinOp::And, r, DataType::Boolean, true);
+    let e = binary(
+        &mut arena,
+        s,
+        crate::common::BooleanOp::And,
+        r,
+        DataType::Boolean,
+        true,
+    );
     let op = authored(&mut arena, c, Some(e));
     let condition = admit(&mut arena, &op).unwrap();
     assert!(condition.scope_keys().unwrap().is_empty());
@@ -169,7 +194,14 @@ fn nonnullable_safe_scope_prefix_can_exclude_without_skipping_required_error() {
         let c = comparison(&mut arena);
         let s = scope(&mut arena, null_safe, null_safe);
         let r = throwing(&mut arena);
-        let e = binary(&mut arena, s, BinOp::And, r, DataType::Boolean, false);
+        let e = binary(
+            &mut arena,
+            s,
+            crate::common::BooleanOp::And,
+            r,
+            DataType::Boolean,
+            false,
+        );
         let op = authored(&mut arena, c, Some(e));
         let condition = admit(&mut arena, &op).unwrap();
         assert_eq!(condition.scope_keys().unwrap().len(), 1);
@@ -182,7 +214,14 @@ fn comparison_must_remain_the_original_guard_prefix() {
     let mut arena = ScalarArena::new();
     let c = comparison(&mut arena);
     let e = scope(&mut arena, false, false);
-    let predicate = binary(&mut arena, e, BinOp::And, c, DataType::Boolean, true);
+    let predicate = binary(
+        &mut arena,
+        e,
+        crate::common::BooleanOp::And,
+        c,
+        DataType::Boolean,
+        true,
+    );
     let mut op = authored(&mut arena, c, Some(e));
     op.condition = Some(predicate);
     assert!(admit(&mut arena, &op).is_none());
@@ -206,7 +245,14 @@ fn nullable_scope_operands_cannot_be_proved_total_by_boolean_annotation() {
     // Boolean result annotation alone cannot establish NULL exclusion.
     let scope = intern(&mut arena, node, DataType::Boolean, false);
     let r = throwing(&mut arena);
-    let e = binary(&mut arena, scope, BinOp::And, r, DataType::Boolean, true);
+    let e = binary(
+        &mut arena,
+        scope,
+        crate::common::BooleanOp::And,
+        r,
+        DataType::Boolean,
+        true,
+    );
     let op = authored(&mut arena, c, Some(e));
     let admitted = admit(&mut arena, &op).unwrap();
     let novarocks_physical_plan::HashJoinCondition::NullAwareEqual {

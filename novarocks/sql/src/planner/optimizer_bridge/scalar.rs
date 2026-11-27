@@ -896,19 +896,13 @@ pub(crate) fn intern_typed(
         },
         ExprKind::Literal(v) => ScalarNode::Literal(HashableLiteral(v.clone())),
         ExprKind::Constant(value) => ScalarNode::Constant(value.clone()),
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => {
+        ExprKind::BooleanConnective { left, op, right } => {
             let l = intern_typed(arena, left, control)?;
             let r = intern_typed(arena, right, control)?;
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 op: *op,
                 left: l,
                 right: r,
-                decimal_overflow_policy: *decimal_overflow_policy,
             }
         }
         ExprKind::FunctionCall {
@@ -1077,16 +1071,10 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
         },
         ScalarNode::Literal(HashableLiteral(v)) => ExprKind::Literal(v.clone()),
         ScalarNode::Constant(value) => ExprKind::Constant(value.clone()),
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ExprKind::BinaryOp {
+        ScalarNode::BooleanConnective { op, left, right } => ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(materialize(arena, *left)),
             op: *op,
             right: novarocks_parser::ast::AstBox::new(materialize(arena, *right)),
-            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ScalarNode::FunctionCall {
             name,

@@ -52,7 +52,7 @@ fn invalid(parts: UnitParts, message: &str) {
     assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     assert!(error.to_string().contains(message), "{error}");
 }
-fn arithmetic(repeated: bool) -> BoundExprSet {
+fn ordered_pair(repeated: bool) -> BoundExprSet {
     let mut b = BoundExprSetBuilder::new(limits());
     let left = b
         .add(None, integer(true), ExprKind::input(ValueId::new(0)))
@@ -63,39 +63,61 @@ fn arithmetic(repeated: bool) -> BoundExprSet {
         b.add(None, integer(true), ExprKind::input(ValueId::new(1)))
             .unwrap()
     };
+    let pair = function(
+        "fixture/ordered-pair",
+        vec![FunctionArgumentType::Value(integer(true)); 2],
+        integer(true),
+    );
+    let call_request = request(&pair);
     let expression = b
         .add(
             None,
             integer(true),
-            ExprKind::Binary {
-                left,
-                right,
-                op: BinaryOperator::Subtract,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: Some(SemanticParameterRef {
-                    id: SemanticParameterId::new(0),
-                    expected_key: SemanticParameterKey::AllowThrowException,
-                }),
+            ExprKind::FunctionCall {
+                function: pair,
+                args: Box::new([left, right]),
             },
         )
         .unwrap();
+    b.request(expression, call_request).unwrap();
+    b.definition_control(
+        expression,
+        DefinitionControl {
+            shape: ControlShape::Eager,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
     b.root(expression, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
-    no_calls(
-        b,
-        vec![ExprPort {
-            values: if repeated {
-                Box::new([(ValueId::new(0), integer(true))])
-            } else {
-                Box::new([
-                    (ValueId::new(0), integer(true)),
-                    (ValueId::new(1), integer(true)),
-                ])
-            },
-        }],
-        &Control::good(),
-    )
-    .unwrap()
+    let values = if repeated {
+        vec![(ValueId::new(0), integer(true))]
+    } else {
+        vec![
+            (ValueId::new(0), integer(true)),
+            (ValueId::new(1), integer(true)),
+        ]
+    };
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let sealed = b
+        .seal(
+            vec![ExprPort {
+                values: values.into_boxed_slice(),
+            }],
+            &mut work,
+        )
+        .unwrap();
+    let use_id = sealed.root_use_ids()[0];
+    let context = sealed.uses()[&use_id].context;
+    let unit = sealed
+        .finish(
+            std::collections::BTreeMap::from([(use_id, claim(context, ArgumentControl::Eager))]),
+            &mut work,
+        )
+        .unwrap();
+    work.finish().unwrap();
+    unit
 }
 #[test]
 fn checked_constant_cannot_invent_a_child_from_an_existing_definition() {
@@ -122,8 +144,8 @@ fn checked_constant_cannot_invent_a_child_from_an_existing_definition() {
     );
 }
 #[test]
-fn arithmetic_order_is_checked_even_when_full_input_types_match() {
-    let unit = arithmetic(false);
+fn call_order_is_checked_even_when_full_input_types_match() {
+    let unit = ordered_pair(false);
     let mut parts = unit.into_parts();
     let root = parts.root_uses[0];
     rewrite_flow(&mut parts, |uses| {
@@ -140,7 +162,7 @@ fn arithmetic_order_is_checked_even_when_full_input_types_match() {
 }
 #[test]
 fn repeated_definition_keeps_two_uses_and_shared_use_is_refused_by_flow_owner() {
-    let unit = arithmetic(true);
+    let unit = ordered_pair(true);
     let root = unit.root_use(RootOrdinal::new(0)).unwrap();
     let flow = unit.control_flow();
     let arguments = &flow.uses()[&root].arguments;

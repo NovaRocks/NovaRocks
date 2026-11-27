@@ -180,7 +180,7 @@ fn lower(
 ) -> Result<LoweredExpressions, ExprCompileError> {
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core::<std::convert::Infallible, crate::creation::NoFactory>(
+    let result = lower_core::<std::convert::Infallible>(
         &package.0,
         crate::EvaluationEnvironment {
             constants: &package.1,
@@ -188,7 +188,6 @@ fn lower(
         },
         control,
         &mut work,
-        None,
         None,
     )
     .map_err(ExprCompileFailure::into_pure);

@@ -28,7 +28,7 @@ use novarocks_type_contract::{
 };
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, JoinKind, binary_operator};
+use crate::common::{JoinKind, binary_operator};
 use crate::optimizer::operator::{
     FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
 };
@@ -378,9 +378,9 @@ fn collect_join_equality_pairs(
     right_names: &HashMap<ColumnId, String>,
     pairs: &mut Vec<(String, String)>,
 ) -> Option<()> {
-    if let ScalarNode::BinaryOp {
+    if let ScalarNode::BooleanConnective {
         left,
-        op: BinOp::And,
+        op: crate::common::BooleanOp::And,
         right,
         ..
     } = arena.node(expr)
@@ -405,15 +405,7 @@ fn collect_join_equality_pairs(
         );
     }
 
-    let (left, right) = match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } => (*left, *right),
-        _ => selected_equality_columns(arena, expr)?,
-    };
+    let (left, right) = selected_equality_columns(arena, expr)?;
     let left_ref = classify_column_ref(arena, left, left_ids, right_ids, left_names, right_names)?;
     let right_ref =
         classify_column_ref(arena, right, left_ids, right_ids, left_names, right_names)?;
@@ -981,14 +973,11 @@ mod tests {
         let right = scan_expr("right_t", &[(2, "right_key")]);
         let left_key = col(&mut arena, 1);
         let right_key = col(&mut arena, 2);
-        let expr = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Add,
-                left: left_key,
-                right: right_key,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        let expr = arena.test_intern_operator(
+            crate::common::BinOp::Add,
+            left_key,
+            right_key,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let items = vec![ScalarProjectItem {
             expr,
@@ -1023,14 +1012,11 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
-        let condition = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: nested_left,
-                right: cast_right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        let condition = arena.test_intern_operator(
+            crate::common::BinOp::Eq,
+            nested_left,
+            cast_right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let join = LogicalJoinOp {
             naa_author: None,
@@ -1218,14 +1204,11 @@ mod tests {
                 },
                 target.clone(),
             );
-            let condition = arena.intern(
-                ScalarNode::BinaryOp {
-                    left: left_key,
-                    op: BinOp::Eq,
-                    right: cast,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                },
-                FunctionValueType::new(DataType::Boolean, true),
+            let condition = arena.test_intern_operator(
+                crate::common::BinOp::Eq,
+                left_key,
+                cast,
+                DecimalOverflowPolicy::OutputNull,
             );
             let join = LogicalJoinOp {
                 naa_author: None,

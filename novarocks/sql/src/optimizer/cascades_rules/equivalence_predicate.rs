@@ -359,6 +359,7 @@ fn apply_inner(
     expand_literals_with_equivalence(&right_props, &mut literal_by_column);
 
     let join_literals = literal_equalities_from_join(memo, join);
+    let functions = memo.function_catalog().snapshot();
     let mut left_new = Vec::new();
     let mut right_new = Vec::new();
     for (raw_left, raw_right) in join_column_pairs(memo, join) {
@@ -380,6 +381,7 @@ fn apply_inner(
             && let Some(column) = right_columns.get(&right_id)
         {
             right_new.push(make_eq_literal_predicate(
+                functions.as_ref(),
                 &mut memo.scalars,
                 column,
                 literal,
@@ -398,6 +400,7 @@ fn apply_inner(
             && let Some(column) = left_columns.get(&left_id)
         {
             left_new.push(make_eq_literal_predicate(
+                functions.as_ref(),
                 &mut memo.scalars,
                 column,
                 literal,
@@ -461,15 +464,17 @@ mod tests {
         )
     }
 
-    fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
-        memo.scalars.intern(
-            ScalarNode::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+    fn binary(
+        memo: &mut Memo,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        left: ScalarId,
+        right: ScalarId,
+    ) -> ScalarId {
+        memo.scalars.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -482,7 +487,7 @@ mod tests {
     }
 
     fn and(memo: &mut Memo, left: ScalarId, right: ScalarId) -> ScalarId {
-        binary(memo, BinOp::And, left, right)
+        binary(memo, crate::common::BooleanOp::And, left, right)
     }
 
     fn eq_cols(memo: &mut Memo, left: u32, right: u32) -> ScalarId {
@@ -584,9 +589,15 @@ mod tests {
         group
     }
 
+    fn memo_with_catalogue() -> Memo {
+        let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
+        memo
+    }
+
     #[test]
     fn propagates_literal_from_left_to_right() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
         let join_pair = eq_cols(&mut memo, 1, 2);
@@ -619,7 +630,7 @@ mod tests {
 
     #[test]
     fn does_not_propagate_literal_across_null_safe_join_pair() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
         let null_safe_pair = null_safe_eq_cols(&mut memo, 1, 2);
@@ -642,7 +653,7 @@ mod tests {
 
     #[test]
     fn does_not_fire_for_left_outer_join() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
         let join_pair = eq_cols(&mut memo, 1, 2);
@@ -664,7 +675,7 @@ mod tests {
 
     #[test]
     fn does_not_duplicate_existing_target_predicate() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let left = scan_group(&mut memo, 1, "lk");
         let right_scan = scan_group(&mut memo, 2, "rk");
         let right_filter_id = memo.next_expr_id();
@@ -701,7 +712,7 @@ mod tests {
 
     #[test]
     fn does_not_duplicate_literal_already_present_below_inner_join_side() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let left_a_predicate = eq_col_lit(&mut memo, 1, 7);
         let left_a = scan_group_with_predicates(&mut memo, 1, "ak", vec![left_a_predicate]);
         let left_b_predicate = eq_col_lit(&mut memo, 2, 7);
@@ -740,7 +751,7 @@ mod tests {
     fn add_filter_group_propagates_column_statistics() {
         use crate::optimizer::statistics::{ColumnStatistic, Confidence};
 
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         // Build a scan group with non-empty column_statistics in its logical_props.
         let child = scan_group(&mut memo, 1, "a");
         let mut child_props = LogicalProperties::new(vec![output(1, "a")], 100.0);
@@ -834,7 +845,7 @@ mod tests {
 
     #[test]
     fn actual_equivalence_rule_deduplicates_selected_cv_and_keeps_first_match_before_syntax_leaf() {
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let value = materialized_text(&mut memo, vec!["unused", "same"], 1);
         let second = materialized_text(&mut memo, vec!["same", "different"], 0);
         let left_column = text_column(&mut memo, 1);
@@ -907,7 +918,7 @@ mod tests {
                 Ok(())
             }
         }
-        let mut memo = Memo::new();
+        let mut memo = memo_with_catalogue();
         let payload = "x".repeat(320 * 1024);
         let value = materialized_text(&mut memo, vec!["unused", &payload], 1);
         let l = text_column(&mut memo, 1);

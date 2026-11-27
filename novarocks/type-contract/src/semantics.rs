@@ -73,7 +73,6 @@ impl AggregateStateInterpretation {
 pub enum SemanticParameterKey {
     StatementStartUtc,
     TimeZone,
-    AllowThrowException,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -139,7 +138,6 @@ impl StatementTimeEnvironment {
                 Some(SemanticParameterValue::StatementStartUtc(self.start))
             }
             SemanticParameterKey::TimeZone => Some(SemanticParameterValue::TimeZone(self.zone)),
-            _ => None,
         }
     }
 }
@@ -152,7 +150,6 @@ pub enum SemanticParameterValue {
     StatementStartUtc(StatementStartUtc),
     /// The exact zone identity in the frozen rule index.
     TimeZone(crate::TimeZoneKey),
-    AllowThrowException(bool),
 }
 
 impl SemanticParameterValue {
@@ -160,7 +157,6 @@ impl SemanticParameterValue {
         match self {
             Self::StatementStartUtc(_) => SemanticParameterKey::StatementStartUtc,
             Self::TimeZone(_) => SemanticParameterKey::TimeZone,
-            Self::AllowThrowException(_) => SemanticParameterKey::AllowThrowException,
         }
     }
 }
@@ -532,7 +528,9 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(9),
-                SemanticParameterValue::AllowThrowException(true),
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
             ),
         ])
         .unwrap();
@@ -571,11 +569,15 @@ mod tests {
             [
                 (
                     SemanticParameterId::new(1),
-                    SemanticParameterValue::AllowThrowException(true),
+                    SemanticParameterValue::StatementStartUtc(
+                        crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                    ),
                 ),
                 (
                     SemanticParameterId::new(1),
-                    SemanticParameterValue::AllowThrowException(false),
+                    SemanticParameterValue::StatementStartUtc(
+                        crate::StatementStartUtc::try_new(0, 0).unwrap(),
+                    ),
                 ),
             ],
             [
@@ -601,21 +603,30 @@ mod tests {
     fn lexical_scopes_keep_distinct_values_for_the_same_key() {
         let first = SemanticParameterRef {
             id: SemanticParameterId::new(7),
-            expected_key: SemanticParameterKey::AllowThrowException,
+            expected_key: SemanticParameterKey::StatementStartUtc,
         };
         let second = SemanticParameterRef {
             id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterKey::AllowThrowException,
+            expected_key: SemanticParameterKey::StatementStartUtc,
         };
         let table = SemanticParameters::try_new([
-            (first.id, SemanticParameterValue::AllowThrowException(true)),
+            (
+                first.id,
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
+            ),
             (
                 second.id,
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(0, 0).unwrap(),
+                ),
             ),
             (
                 SemanticParameterId::new(2),
-                SemanticParameterValue::AllowThrowException(true),
+                SemanticParameterValue::StatementStartUtc(
+                    crate::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
             ),
         ])
         .unwrap();
@@ -623,15 +634,21 @@ mod tests {
         assert_eq!(projected.entries().len(), 2);
         assert_eq!(
             projected.require(first).unwrap(),
-            &SemanticParameterValue::AllowThrowException(true)
+            &SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap()
+            )
         );
         assert_eq!(
             projected.require(second).unwrap(),
-            &SemanticParameterValue::AllowThrowException(false)
+            &SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(0, 0).unwrap()
+            )
         );
         assert_eq!(
             table.get(SemanticParameterId::new(2)),
-            Some(&SemanticParameterValue::AllowThrowException(true))
+            Some(&SemanticParameterValue::StatementStartUtc(
+                crate::StatementStartUtc::try_new(1, 0).unwrap()
+            ))
         );
         assert!(matches!(
             table.project([
@@ -660,10 +677,7 @@ mod tests {
             env.parameter(SemanticParameterKey::TimeZone),
             Some(SemanticParameterValue::TimeZone(zone))
         );
-        assert_eq!(
-            env.parameter(SemanticParameterKey::AllowThrowException),
-            None
-        );
+        assert_eq!(env.parameter(SemanticParameterKey::StatementStartUtc), None);
     }
 
     #[test]
@@ -672,7 +686,10 @@ mod tests {
             .map(|index| {
                 (
                     SemanticParameterId::new(u32::MAX - index as u32),
-                    SemanticParameterValue::AllowThrowException(index % 2 == 0),
+                    SemanticParameterValue::StatementStartUtc(
+                        crate::StatementStartUtc::try_new(i64::from(u8::from(index % 2 == 0)), 0)
+                            .unwrap(),
+                    ),
                 )
             })
             .collect::<Vec<_>>();

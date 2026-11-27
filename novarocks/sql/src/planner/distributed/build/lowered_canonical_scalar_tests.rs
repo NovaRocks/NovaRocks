@@ -102,7 +102,6 @@ pub(in crate::planner::distributed::build) fn lower_draft_with_control(
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         control,
     )
@@ -427,7 +426,6 @@ fn canonical_scalar_actual_emission_preserves_each_success_and_ordinary_control_
                 dop(),
                 functions.clone(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                false,
                 policy(),
                 control,
             )

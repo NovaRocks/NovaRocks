@@ -2074,7 +2074,7 @@ mod conditional_compiled_selection {
     use super::*;
     use arrow::{array::Int64Array, record_batch::RecordBatch};
     use novarocks_connector_contract::PureProviderProgramCatalog;
-    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
+    use novarocks_expression_contract::{ExprKind, RootScope};
     use novarocks_functions::{
         ConstantValidation, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
         PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
@@ -2090,9 +2090,8 @@ mod conditional_compiled_selection {
         ResultValueDomain, StagePlacementPolicy, ValueId, ValueOrigin,
     };
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-        FunctionValueType, PureCompileControl, SemanticParameterId, SemanticParameterKey,
-        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+        CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType, PureCompileControl,
+        SemanticParameters,
     };
     use std::{collections::BTreeMap, num::NonZeroUsize};
 
@@ -2166,25 +2165,11 @@ mod conditional_compiled_selection {
             .unwrap()
             .add(None, integer.clone(), ExprKind::input(input_ids[1]))
             .unwrap();
-        let parameter = SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        };
-        let key = builder
-            .unit(output)
-            .unwrap()
-            .add(
-                None,
-                integer.clone(),
-                ExprKind::Binary {
-                    op: BinaryOperator::Add,
-                    left,
-                    right,
-                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    allow_throw_exception: Some(parameter),
-                },
-            )
-            .unwrap();
+        let key = builder.operator(
+            output,
+            novarocks_type_contract::OperatorFunction::Add,
+            [left, right],
+        );
         let applies = builder
             .unit(output)
             .unwrap()
@@ -2219,7 +2204,7 @@ mod conditional_compiled_selection {
                 output_ids.into_boxed_slice(),
             )
             .unwrap();
-        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
+        builder.seal_catalogue_units();
         let fragment = builder
             .finish_definition(
                 output,
@@ -2251,11 +2236,7 @@ mod conditional_compiled_selection {
                         .unwrap(),
                     cuts: FragmentCuts::default(),
                     result: Some(result),
-                    parameters: SemanticParameters::try_new([(
-                        parameter.id,
-                        SemanticParameterValue::AllowThrowException(false),
-                    )])
-                    .unwrap(),
+                    parameters: SemanticParameters::default(),
                     scans: BTreeMap::new(),
                     writes: BTreeMap::new(),
                     annotations: Box::default(),

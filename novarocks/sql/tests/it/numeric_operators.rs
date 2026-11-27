@@ -64,14 +64,14 @@ fn numeric_comparison_requires_an_explicit_text_to_integer_cast() {
         let ExprKind::FunctionCall { function, args } = &expression.kind else {
             return false;
         };
-        if function.function_id != OperatorFunction::GreaterThan.function_id() {
+        if function.function_id != OperatorFunction::LessThan.function_id() {
             return false;
         }
         let converted = node
             .expressions
             .as_ref()
             .unwrap()
-            .definition(args[0])
+            .definition(args[1])
             .unwrap();
         matches!(
             &converted.kind,

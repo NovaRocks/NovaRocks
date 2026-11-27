@@ -42,7 +42,6 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, OperatorFunction,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
     SemanticParameters,
 };
 use std::{
@@ -156,15 +155,7 @@ fn compile_ownerless_fixture(
 }
 
 fn signed_in_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
-    let allow_throw = SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        allow_throw.id,
-        SemanticParameterValue::AllowThrowException(false),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     comparison_root("k", DataType::Int64, &parameters, |draft, pools, source| {
         // The original SQL harness selects INTEGER syntax literals, widens
         // their carriers to the probe's BIGINT, and uses a declining fold
@@ -603,22 +594,13 @@ fn dynamic_scalar_booleans_keep_ordered_errors_and_try_scope() {
         ],
     )
     .unwrap();
-    let allow_throw_exception = SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        allow_throw_exception.id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let context = TextContext {
         functions: &functions,
         constant_policy: SQL_LITERAL_POLICY,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters: &parameters,
-        allow_throw_exception,
     };
     for (sql, expected, error_ordinals) in [
         (
@@ -705,22 +687,13 @@ fn try_any_match_keeps_actual_body_resource_refusal_and_skips_undemanded_tail() 
             value_type: FunctionValueType::new(DataType::Int64, false),
         },
     ];
-    let allow_throw_exception = SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        allow_throw_exception.id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let context = TextContext {
         functions: &functions,
         constant_policy: SQL_LITERAL_POLICY,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters: &parameters,
-        allow_throw_exception,
     };
     let typed = type_expression_text(
         "TRY(any_match(items, x -> cardinality(repeat(1, x)) = goal))",

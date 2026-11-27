@@ -278,6 +278,7 @@ fn retired_query_option_fields_remain_reserved() {
     for (field_number, field_name) in [
         (1, "batch_size"),
         (6, "connector_io_tasks_per_scan_operator"),
+        (9, "allow_throw_exception"),
         (11, "enable_spill"),
         (12, "spill_options"),
     ] {

@@ -54,6 +54,8 @@ mod control_expression_tests;
 pub(crate) mod declaration_widening;
 mod definition_effects;
 mod expression_typing;
+pub(crate) use expression_typing::type_optimizer_operator;
+
 pub(crate) use definition_effects::FinalizedAnalysisCall;
 use definition_effects::{BindingFinalizer, DefinitionEffects};
 #[cfg(any(test, novarocks_dev_controls))]
@@ -1959,15 +1961,10 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 expr
             }
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } => TypedExpr {
+            ExprKind::BooleanConnective { left, op, right } => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::BinaryOp {
+                kind: ExprKind::BooleanConnective {
                     left: novarocks_parser::ast::AstBox::new(
                         self.substitute_select_aliases_for_select_inner(
                             left.into_inner(),
@@ -1985,7 +1982,6 @@ impl<'a> AnalyzerContext<'a> {
                             inside_agg,
                         ),
                     ),
-                    decimal_overflow_policy,
                 },
             },
             ExprKind::FunctionCall {
@@ -2197,15 +2193,10 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 expr
             }
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } => TypedExpr {
+            ExprKind::BooleanConnective { left, op, right } => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::BinaryOp {
+                kind: ExprKind::BooleanConnective {
                     left: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
                         left.into_inner(),
                         projection,
@@ -2219,7 +2210,6 @@ impl<'a> AnalyzerContext<'a> {
                             inside_agg,
                         ),
                     ),
-                    decimal_overflow_policy,
                 },
             },
             ExprKind::FunctionCall {
@@ -3601,12 +3591,7 @@ impl<'a> AnalyzerContext<'a> {
                     .collect(),
                 resolved,
             },
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } => ExprKind::BinaryOp {
+            ExprKind::BooleanConnective { left, op, right } => ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
                     left.into_inner(),
                     from_scope,
@@ -3618,7 +3603,6 @@ impl<'a> AnalyzerContext<'a> {
                     from_scope,
                     inside_agg,
                 )),
-                decimal_overflow_policy,
             },
             ExprKind::FunctionCall {
                 name,
@@ -3710,7 +3694,7 @@ impl<'a> AnalyzerContext<'a> {
 fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { .. } => true,
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -5608,7 +5592,7 @@ mod tests {
                 column: c,
                 ..
             } => q.eq_ignore_ascii_case(qualifier) && c.eq_ignore_ascii_case(column),
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -5651,7 +5635,7 @@ mod tests {
                 column: c,
                 ..
             } => c.eq_ignore_ascii_case(column),
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -5765,8 +5749,12 @@ mod tests {
             let bindings = spec
                 .mark_key_bindings
                 .as_ref()
-                .expect("two original key bindings");
-            for binding in bindings {
+                .expect("two original key bindings and key equality");
+            assert_eq!(
+                bindings.equality.function_id,
+                novarocks_type_contract::OperatorFunction::Equal.function_id(),
+            );
+            for binding in &bindings.keys {
                 assert_eq!(
                     binding.function_id.as_str(),
                     novarocks_functions::json_canonical::FUNCTION_ID
@@ -6012,21 +6000,21 @@ mod tests {
 
         fn pairs(expr: &TypedExpr, result: &mut Vec<(String, String)>) {
             match &expr.kind {
-                ExprKind::BinaryOp {
+                ExprKind::BooleanConnective {
                     left,
-                    op: BinOp::And,
+                    op: crate::common::BooleanOp::And,
                     right,
                     ..
                 } => {
                     pairs(left, result);
                     pairs(right, result);
                 }
-                ExprKind::BinaryOp {
-                    left,
-                    op: BinOp::Eq,
-                    right,
-                    ..
-                } => {
+                other => {
+                    let Some((BinOp::Eq, [left, right])) =
+                        crate::common::binary_operator::typed_comparison(expr)
+                    else {
+                        panic!("unexpected original comparison {other:?}")
+                    };
                     let (
                         ExprKind::ColumnRef { column: left, .. },
                         ExprKind::ColumnRef { column: right, .. },
@@ -6036,7 +6024,6 @@ mod tests {
                     };
                     result.push((left.clone(), right.clone()));
                 }
-                other => panic!("unexpected original comparison {other:?}"),
             }
         }
         for (sql, correlated) in [
@@ -6315,7 +6302,7 @@ mod tests {
     fn expr_has_placeholder(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -6330,7 +6317,7 @@ mod tests {
     fn expr_has_placeholder_deep(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -6831,7 +6818,7 @@ mod tests {
                 ExprKind::ColumnRef {
                     qualifier, column, ..
                 } => qualifier.is_none() && column.eq_ignore_ascii_case("l"),
-                ExprKind::BinaryOp { left, right, .. }
+                ExprKind::BooleanConnective { left, right, .. }
                 | ExprKind::Let {
                     initializer: left,
                     body: right,
@@ -7091,7 +7078,7 @@ mod tests {
             ExprKind::ColumnRef {
                 column_id, column, ..
             } if column == name => Some(*column_id),
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -7162,7 +7149,7 @@ mod tests {
     fn expr_contains_column_id(expr: &TypedExpr, target: crate::column_id::ColumnId) -> bool {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } => *column_id == target,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -7224,7 +7211,7 @@ mod tests {
     fn contains_grouping_marker_literal(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) if *v <= -9000 => true,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -9005,9 +8992,9 @@ mod tests {
             .filter
             .as_ref()
             .expect("expected scalar Apply inner filter");
-        let ExprKind::BinaryOp {
+        let ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } = &filter.kind
@@ -9022,7 +9009,13 @@ mod tests {
             "left conjunct should be the common equality correlation: {left:?}"
         );
         assert!(
-            matches!(&right.kind, ExprKind::BinaryOp { op: BinOp::Or, .. }),
+            matches!(
+                &right.kind,
+                ExprKind::BooleanConnective {
+                    op: crate::common::BooleanOp::Or,
+                    ..
+                }
+            ),
             "right conjunct should retain the residual OR predicate: {right:?}"
         );
     }
@@ -9050,9 +9043,9 @@ mod tests {
             .filter
             .as_ref()
             .expect("expected scalar Apply inner filter");
-        let ExprKind::BinaryOp {
+        let ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } = &filter.kind
@@ -9067,7 +9060,13 @@ mod tests {
             "left conjunct should be the common equality correlation: {left:?}"
         );
         assert!(
-            matches!(&right.kind, ExprKind::BinaryOp { op: BinOp::Or, .. }),
+            matches!(
+                &right.kind,
+                ExprKind::BooleanConnective {
+                    op: crate::common::BooleanOp::Or,
+                    ..
+                }
+            ),
             "right conjunct should retain the residual OR predicate: {right:?}"
         );
     }
@@ -9092,7 +9091,10 @@ mod tests {
             assert!(
                 matches!(
                     &inner.filter.as_ref().expect("expected filter").kind,
-                    ExprKind::BinaryOp { op: BinOp::Or, .. }
+                    ExprKind::BooleanConnective {
+                        op: crate::common::BooleanOp::Or,
+                        ..
+                    }
                 ),
                 "{fallible}"
             );
@@ -9163,7 +9165,7 @@ mod tests {
                 (cast_target == target && expr_refs_column(inner, column_id))
                     || expr_casts_column_to_type(inner, column_id, target)
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -9185,7 +9187,7 @@ mod tests {
             ExprKind::Cast { expr: inner, .. }
             | ExprKind::Nested(inner)
             | ExprKind::IsNull { expr: inner, .. } => expr_refs_column(inner, column_id),
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -9227,7 +9229,7 @@ mod tests {
     fn expr_has_subquery_placeholder(expr: &TypedExpr) -> bool {
         match &expr.kind {
             ExprKind::SubqueryPlaceholder { .. } => true,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,

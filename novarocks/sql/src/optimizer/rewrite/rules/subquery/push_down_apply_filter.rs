@@ -345,36 +345,29 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn gt_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
@@ -559,12 +552,8 @@ mod tests {
             "must have exactly 1 correlation conjunct"
         );
         let conj = &new_apply.correlation_conjuncts[0];
-        let ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } = &conj.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(&conj)
         else {
             panic!("correlation conjunct must be a BinaryOp(Eq), got: {conj:?}");
         };

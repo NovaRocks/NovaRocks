@@ -314,21 +314,15 @@ mod tests {
         let Operator::LogicalScan(mut scan_op) = scan.op else {
             unreachable!("scan_with_stats returns a scan");
         };
-        let predicate = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_typed("k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(crate::analysis::TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(7)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let predicate = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_ref_typed("k"),
+            crate::analysis::TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(7)),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         scan_op.predicates.push(
             intern_typed(
                 arena,

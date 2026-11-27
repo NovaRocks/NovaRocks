@@ -263,18 +263,18 @@ fn logical_term_paths_borrow_only_the_authored_occurrence_and_reject_wrong_edges
         &arrow::datatypes::DataType::Boolean
     );
     assert!(expression.value_type.nullable());
-    let crate::analysis::ExprKind::BinaryOp {
+    let crate::analysis::ExprKind::BooleanConnective {
         left, right, op, ..
     } = &expression.kind
     else {
         panic!("balanced root")
     };
-    assert_eq!(*op, crate::analysis::BinOp::And);
+    assert_eq!(*op, crate::common::BooleanOp::And);
     assert!(matches!(
         right.kind,
         crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Null)
     ));
-    let crate::analysis::ExprKind::BinaryOp { right, .. } = &left.kind else {
+    let crate::analysis::ExprKind::BooleanConnective { right, .. } = &left.kind else {
         panic!("first adjacent pair")
     };
     let crate::analysis::ExprKind::Constant(retained) = &right.kind else {

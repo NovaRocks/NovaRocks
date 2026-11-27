@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, JoinKind};
+use crate::common::JoinKind;
 use crate::optimizer::operator::{FilterOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -206,11 +206,10 @@ fn combine_and_scalar(
     while let Some(left) = exprs.pop() {
         let nullable = arena.nullable(left) || arena.nullable(result);
         result = arena.intern_observed(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: result,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
             control,
@@ -303,9 +302,9 @@ fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<C
 
 fn record_not_null_conjuncts(arena: &ScalarArena, expr: ScalarId, ids: &mut HashSet<ColumnId>) {
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -403,24 +402,20 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
@@ -478,9 +473,9 @@ mod tests {
 
     fn not_null_count_scalar(arena: &ScalarArena, expr: ScalarId) -> usize {
         match arena.node(expr) {
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right,
                 ..
             } => not_null_count_scalar(arena, *left) + not_null_count_scalar(arena, *right),
@@ -866,19 +861,12 @@ mod tests {
         }
         {
             let mut arena = ScalarArena::new();
-            let gt = TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(col_typed("l", "a", 1, true)),
-                    op: BinOp::Gt,
-                    right: novarocks_parser::ast::AstBox::new(col_typed("r", "b", 2, true)),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    true,
-                ),
-            };
+            let gt = crate::common::binary_operator::test_operator(
+                BinOp::Gt,
+                col_typed("l", "a", 1, true),
+                col_typed("r", "b", 2, true),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
             let plan = join_opt(
                 &mut arena,
                 JoinKind::Inner,

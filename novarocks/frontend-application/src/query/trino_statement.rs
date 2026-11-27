@@ -288,8 +288,7 @@ impl FrontendQuerySession {
             optimizer.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
-        let options =
-            with_query_sql_semantics(query_options_from_session_settings(&settings), &semantics);
+        let options = query_options_from_session_settings(&settings);
         let entered = (|| {
             let window = statement
                 .result_window_alias()

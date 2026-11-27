@@ -244,7 +244,7 @@ fn admitted_predicates_keep_original_child_bindings_and_three_valued_declaration
                     },
                     ast::Predicate::Between(p),
                 ) => {
-                    let ExprKind::BinaryOp { left, right, .. } = &body.kind else {
+                    let ExprKind::BooleanConnective { left, right, .. } = &body.kind else {
                         panic!("BETWEEN uses the original ordered pair of comparisons");
                     };
                     let Some((OperatorFunction::LessThanOrEqual, [minimum, first_probe])) =

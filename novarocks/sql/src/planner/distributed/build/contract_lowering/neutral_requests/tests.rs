@@ -450,7 +450,6 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
             } else {
                 scalar::lambda_fixture_catalog()
             },
-            false,
             scalar::policy(),
             &control,
             &mut observer,
@@ -676,7 +675,6 @@ fn finish(source: &PhysicalPlanNode, control: &Control) -> Result<(), ContractLo
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         scalar::policy(),
         control,
     )?
@@ -752,7 +750,6 @@ fn without_actual_canonical_source_at(
         None,
         Arc::clone(functions),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         scalar::policy(),
         control,
     )?;

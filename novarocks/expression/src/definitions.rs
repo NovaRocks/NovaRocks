@@ -18,8 +18,7 @@
 //! Immutable expression facts shared by local-program instances.
 use arrow::datatypes::DataType;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    PureCompileControl, ValueTypeRef,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeRef,
 };
 use std::{fmt, sync::Arc};
 
@@ -70,25 +69,6 @@ pub enum StaticExprKind {
         child: CompiledExprId,
         cast_mode: novarocks_type_contract::TrinoCastMode,
     },
-    /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
-    PreparedArithmetic {
-        operator: novarocks_type_contract::ArithmeticOperator,
-        left: CompiledExprId,
-        right: CompiledExprId,
-        decimal_overflow_policy: DecimalOverflowPolicy,
-        allow_throw_exception: bool,
-    },
-    Eq(CompiledExprId, CompiledExprId),
-    /// Compiled null-safe equality owns a mandatory recipe.
-    PreparedNullSafeComparison {
-        left: CompiledExprId,
-        right: CompiledExprId,
-    },
-    Ne(CompiledExprId, CompiledExprId),
-    Lt(CompiledExprId, CompiledExprId),
-    Le(CompiledExprId, CompiledExprId),
-    Gt(CompiledExprId, CompiledExprId),
-    Ge(CompiledExprId, CompiledExprId),
     /// Ordered physical Boolean occurrences, without introducing binary
     /// intermediate definitions or changing the checked invocation graph.
     NaryAnd {
@@ -113,53 +93,6 @@ pub enum StaticExprKind {
 }
 
 impl StaticExprKind {
-    /// Exact ordinary comparison identity and ordered source references.
-    /// Null-safe comparison has its own semantics and is excluded.
-    pub const fn ordinary_comparison(
-        &self,
-    ) -> Option<(
-        novarocks_functions::ComparisonOperator,
-        CompiledExprId,
-        CompiledExprId,
-    )> {
-        use novarocks_functions::ComparisonOperator;
-        let (operator, left, right) = match self {
-            Self::Eq(left, right) => (ComparisonOperator::Eq, *left, *right),
-            Self::Ne(left, right) => (ComparisonOperator::Ne, *left, *right),
-            Self::Lt(left, right) => (ComparisonOperator::Lt, *left, *right),
-            Self::Le(left, right) => (ComparisonOperator::Le, *left, *right),
-            Self::Gt(left, right) => (ComparisonOperator::Gt, *left, *right),
-            Self::Ge(left, right) => (ComparisonOperator::Ge, *left, *right),
-            _ => return None,
-        };
-        Some((operator, left, right))
-    }
-
-    pub const fn from_comparison(
-        operator: novarocks_functions::ComparisonOperator,
-        left: CompiledExprId,
-        right: CompiledExprId,
-    ) -> Self {
-        use novarocks_functions::ComparisonOperator;
-        match operator {
-            ComparisonOperator::Eq => Self::Eq(left, right),
-            ComparisonOperator::Ne => Self::Ne(left, right),
-            ComparisonOperator::Lt => Self::Lt(left, right),
-            ComparisonOperator::Le => Self::Le(left, right),
-            ComparisonOperator::Gt => Self::Gt(left, right),
-            ComparisonOperator::Ge => Self::Ge(left, right),
-        }
-    }
-
-    pub fn decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
-        match self {
-            Self::PreparedArithmetic {
-                decimal_overflow_policy,
-                ..
-            } => Some(*decimal_overflow_policy),
-            _ => None,
-        }
-    }
     fn try_for_each_reference<E>(
         &self,
         mut visit: impl FnMut(CompiledExprId) -> Result<(), E>,
@@ -175,17 +108,7 @@ impl StaticExprKind {
             | Self::IsNotNull(child) => visit(*child)?,
             Self::Let {
                 value: a, body: b, ..
-            }
-            | Self::PreparedArithmetic {
-                left: a, right: b, ..
-            }
-            | Self::PreparedNullSafeComparison { left: a, right: b }
-            | Self::Eq(a, b)
-            | Self::Ne(a, b)
-            | Self::Lt(a, b)
-            | Self::Le(a, b)
-            | Self::Gt(a, b)
-            | Self::Ge(a, b) => {
+            } => {
                 visit(*a)?;
                 visit(*b)?;
             }

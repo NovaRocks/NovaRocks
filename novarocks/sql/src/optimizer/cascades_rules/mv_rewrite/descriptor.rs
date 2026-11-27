@@ -915,16 +915,10 @@ pub(crate) fn substitute_scalar(
         | ScalarNode::Constant(_) => {
             return Ok(expr);
         }
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective { op, left, right } => ScalarNode::BooleanConnective {
             op,
             left: substitute_scalar(arena, left, defs, control)?,
             right: substitute_scalar(arena, right, defs, control)?,
-            decimal_overflow_policy,
         },
         ScalarNode::FunctionCall {
             name,
@@ -1064,7 +1058,7 @@ fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
         | ScalarNode::Constant(_) => {
             vec![]
         }
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -1157,15 +1151,12 @@ mod tests {
     }
 
     fn cmp(left: TypedExpr, op: crate::analysis::BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     /// Simplest `ScanSource` to construct in unit tests. The descriptor logic
@@ -1273,30 +1264,23 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(2)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let eq = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: a_ref,
-                right: b_ref,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let eq = arena.test_intern_operator(
+            BinOp::Eq,
+            a_ref,
+            b_ref,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
-        let gt = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Gt,
-                left: a_ref,
-                right: b_ref,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let gt = arena.test_intern_operator(
+            BinOp::Gt,
+            a_ref,
+            b_ref,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let cond = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left: eq,
                 right: gt,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
@@ -1335,14 +1319,11 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(3)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let cond = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: c_ref,
-                right: a_ref,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let cond = arena.test_intern_operator(
+            BinOp::Eq,
+            c_ref,
+            a_ref,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
@@ -1368,14 +1349,11 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(2)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
-        let cond = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: a_ref,
-                right: b_ref,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        let cond = arena.test_intern_operator(
+            BinOp::Eq,
+            a_ref,
+            b_ref,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);

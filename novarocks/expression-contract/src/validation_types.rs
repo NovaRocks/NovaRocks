@@ -19,9 +19,7 @@ use crate::unit_creation::{UnitValidationCreation, ValidationFailure};
 use crate::{ExprId, ExprKind, ValueType};
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
-use novarocks_type_contract::{
-    FunctionArgumentType, FunctionKind, OperatorFunction, arithmetic_result_value_shape_with_op,
-};
+use novarocks_type_contract::{FunctionArgumentType, FunctionKind, OperatorFunction};
 use std::collections::BTreeSet;
 
 /// Borrow the first original diagnosis until the enclosing validator returns.
@@ -371,54 +369,7 @@ pub(crate) fn validate_expression_types<'a, H>(
                 ));
             }
         }
-        ExprKind::Binary {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-            allow_throw_exception,
-        } => {
-            let arithmetic = matches!(
-                op,
-                crate::BinaryOperator::Add
-                    | crate::BinaryOperator::Subtract
-                    | crate::BinaryOperator::Multiply
-                    | crate::BinaryOperator::Divide
-                    | crate::BinaryOperator::Modulo
-            );
-            if arithmetic != allow_throw_exception.is_some()
-                || allow_throw_exception.is_some_and(|reference| {
-                    reference.expected_key
-                        != novarocks_type_contract::SemanticParameterKey::AllowThrowException
-                })
-            {
-                errors.push(TypeIssue::new(
-                    path,
-                    "binary ALLOW_THROW_EXCEPTION reference differs from its operator profile",
-                ));
-            }
-            if !matches!(
-                op,
-                crate::BinaryOperator::Add
-                    | crate::BinaryOperator::Subtract
-                    | crate::BinaryOperator::Multiply
-                    | crate::BinaryOperator::Divide
-                    | crate::BinaryOperator::Modulo
-            ) && *decimal_overflow_policy
-                != novarocks_type_contract::DecimalOverflowPolicy::OutputNull
-            {
-                errors.push(TypeIssue::new(
-                    path,
-                    "non-arithmetic binary expression requires OutputNull decimal policy",
-                ));
-            }
-            if let (Some(left), Some(right)) = (
-                definitions.get((*left).get() as usize),
-                definitions.get((*right).get() as usize),
-            ) {
-                validate_binary_types(left, *op, right, expression, path, errors, work)?;
-            }
-        }
+
         ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
             validate_boolean_connective_types(definitions, args, expression, path, errors, work)?;
         }
@@ -597,81 +548,6 @@ pub(crate) fn validate_boolean_connective_types<'a, H>(
     Ok(())
 }
 
-pub(crate) fn validate_binary_types<'a, H>(
-    left: &crate::ExprNode,
-    op: crate::BinaryOperator,
-    right: &crate::ExprNode,
-    output: &'a crate::ExprNode,
-    path: ExprId,
-    errors: &mut TypeChecks<'a>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ValidationFailure<'a, H>> {
-    let same_inputs = same_domain(&left.ty, &right.ty, work)?;
-    // An operator may admit null neither operand does -- arithmetic answers
-    // with null where it cannot answer with a number, and a plan's nullability
-    // widens on the way out. It may not admit less than its operands do.
-    let nullable = left.ty.nullable() || right.ty.nullable();
-    let nullability_widens = |output: bool| output || !nullable;
-    let valid = match op {
-        crate::BinaryOperator::Add
-        | crate::BinaryOperator::Subtract
-        | crate::BinaryOperator::Multiply
-        | crate::BinaryOperator::Divide
-        | crate::BinaryOperator::Modulo => {
-            let operation = match op {
-                crate::BinaryOperator::Add => novarocks_type_contract::ArithmeticOperator::Add,
-                crate::BinaryOperator::Subtract => {
-                    novarocks_type_contract::ArithmeticOperator::Subtract
-                }
-                crate::BinaryOperator::Multiply => {
-                    novarocks_type_contract::ArithmeticOperator::Multiply
-                }
-                crate::BinaryOperator::Divide => {
-                    novarocks_type_contract::ArithmeticOperator::Divide
-                }
-                crate::BinaryOperator::Modulo => {
-                    novarocks_type_contract::ArithmeticOperator::Modulo
-                }
-                _ => unreachable!(),
-            };
-            arithmetic_result_value_shape_with_op(&left.ty, &right.ty, operation).is_some_and(
-                |(carrier, domain)| {
-                    output.ty.logical_type() == domain
-                        && novarocks_type_contract::arrow_data_types_exact(
-                            output.ty.data_type(),
-                            &carrier,
-                        )
-                        && nullability_widens(output.ty.nullable())
-                },
-            )
-        }
-        crate::BinaryOperator::Eq
-        | crate::BinaryOperator::NotEq
-        | crate::BinaryOperator::Lt
-        | crate::BinaryOperator::LtEq
-        | crate::BinaryOperator::Gt
-        | crate::BinaryOperator::GtEq => {
-            same_inputs
-                && *output.ty.data_type() == DataType::Boolean
-                && nullability_widens(output.ty.nullable())
-                // A Null carrier produces SQL NULL even when the source's
-                // outer declaration is required. TruthOnly cannot erase it.
-                && (output.ty.nullable()
-                    || (*left.ty.data_type()!=DataType::Null && *right.ty.data_type()!=DataType::Null))
-        }
-        crate::BinaryOperator::EqForNull => {
-            same_inputs && *output.ty.data_type() == DataType::Boolean && !output.ty.nullable()
-        }
-    };
-    if !valid {
-        errors.push(TypeIssue::new(
-            path,
-            "binary expression types are inconsistent with its operator",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_case_types<'a, H>(
     definitions: &'a [crate::ExprNode],
     expression: &'a crate::ExprNode,
@@ -688,15 +564,14 @@ pub(crate) fn validate_case_types<'a, H>(
     }
     let operand_type =
         operand.and_then(|id| definitions.get((id).get() as usize).map(|node| &node.ty));
-    if ieee_float_equality
-        && !operand_type.is_some_and(|ty| {
-            ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
-                && matches!(ty.data_type(), DataType::Float32 | DataType::Float64)
-        })
-    {
+    let floating_comparison = operand_type.is_some_and(|ty| {
+        ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && matches!(ty.data_type(), DataType::Float32 | DataType::Float64)
+    });
+    if ieee_float_equality != floating_comparison {
         errors.push(TypeIssue::new(
             path,
-            "CASE IEEE equality requires a floating operand",
+            "CASE equality differs from the original floating declaration",
         ));
     }
     for (when, then) in when_then {

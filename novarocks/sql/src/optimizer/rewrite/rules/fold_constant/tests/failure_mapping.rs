@@ -26,25 +26,35 @@ fn evaluator_error_leaves_expression_unchanged_without_planning_error() {
     let one = fixture.int_literal(1);
     let zero = fixture.int_literal(0);
     assert!(matches!(
-        fixture.apply(project(fixture.binary(BinOp::Div, one, zero))),
+        fixture.apply(project(fixture.binary(
+            crate::common::BinOp::Div,
+            one,
+            zero
+        ))),
         RewriteResult::Unchanged
     ));
     assert_eq!(fixture.calls(), 1);
 }
 
 #[test]
-fn evaluator_declining_leaves_expression_unchanged() {
+fn called_on_null_comparison_folds_unknown_identity() {
     let mut fixture = Fixture::new();
     let null = fixture.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
         FunctionValueType::new(DataType::Null, true),
     );
-    let equal = fixture.binary_typed(BinOp::EqForNull, null, null, DataType::Boolean, false);
-    assert!(matches!(
-        fixture.apply(project(equal)),
-        RewriteResult::Unchanged
-    ));
-    assert_eq!(fixture.calls(), 0);
+    let equal = fixture.binary_typed(
+        crate::common::BinOp::EqForNull,
+        null,
+        null,
+        DataType::Boolean,
+    );
+    let result = changed(fixture.apply(project(equal)));
+    let ScalarNode::Constant(value) = fixture.node(project_expr(&result)) else {
+        panic!("expected the selected NULL-safe comparison to fold");
+    };
+    assert_eq!(value.try_boolean().unwrap(), Some(true));
+    assert_eq!(fixture.calls(), 1);
 }
 
 #[test]
@@ -84,11 +94,15 @@ fn invalid_frozen_type_is_fatal_in_the_real_fold_rule() {
         ))),
         FunctionValueType::new(DataType::Boolean, false),
     );
-    let valid = fixture.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
+    let root = fixture.intern(
+        ScalarNode::Cast {
+            cast_mode: None,
+            child: malformed,
+            target: DataType::Boolean,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        },
         FunctionValueType::new(DataType::Boolean, false),
     );
-    let root = fixture.binary_typed(BinOp::Eq, malformed, valid, DataType::Boolean, false);
     let failure = FoldConstant
         .apply(project(root), &mut fixture.ctx)
         .unwrap_err();

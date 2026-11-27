@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantError;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_functions::{
-    ArithmeticPrepareError, CastPrepareError, ComparisonPrepareError, FunctionBindingError,
-    FunctionSpecializationFailure, KernelFailure,
+    CastPrepareError, ComparisonPrepareError, FunctionBindingError, FunctionSpecializationFailure,
+    KernelFailure,
 };
 use novarocks_type_contract::{CompileControlError, ValueTypeError};
 use std::fmt;
@@ -117,16 +117,6 @@ pub(crate) fn comparison_author_error(error: ComparisonPrepareError) -> CallAuth
     match error {
         ComparisonPrepareError::Control(cause)
         | ComparisonPrepareError::Kernel(KernelFailure::CompileControl(cause)) => {
-            CallAuthorError::Control(cause)
-        }
-        other => primitive(SharedFailureCause::new(other), None),
-    }
-}
-
-pub(crate) fn arithmetic_author_error(error: ArithmeticPrepareError) -> CallAuthorError {
-    match error {
-        ArithmeticPrepareError::Control(cause)
-        | ArithmeticPrepareError::Kernel(KernelFailure::CompileControl(cause)) => {
             CallAuthorError::Control(cause)
         }
         other => primitive(SharedFailureCause::new(other), None),

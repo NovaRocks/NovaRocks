@@ -495,7 +495,6 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
                     | novarocks_expression_contract::ExprKind::Let { .. }
                     | novarocks_expression_contract::ExprKind::LambdaParameter { .. }
                     | novarocks_expression_contract::ExprKind::Constant(_)
-                    | novarocks_expression_contract::ExprKind::Binary { .. }
                     | novarocks_expression_contract::ExprKind::Conjunction { .. }
                     | novarocks_expression_contract::ExprKind::Disjunction { .. }
                     | novarocks_expression_contract::ExprKind::IsNull { .. }

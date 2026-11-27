@@ -61,11 +61,8 @@ pub(crate) struct CompiledParts {
 }
 #[derive(Debug)]
 pub struct UnitRecipes {
-    arithmetic: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedArithmeticRecipe>,
     casts: CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedCastRecipe>,
     comparisons: CreatedPrimitiveMap<ComparisonSite, PreparedNodeComparison>,
-    null_safe:
-        CreatedPrimitiveMap<ExpressionUseId, novarocks_functions::PreparedNullSafeComparisonRecipe>,
 }
 #[derive(Debug)]
 pub struct CompiledExprSet {
@@ -235,7 +232,6 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         control,
         work,
         crate::creation::borrow_scope(&mut retained),
-        factory,
     )?;
     let creation = factory.map(|f| (f, &policy));
     let (calls, effects, lambdas) = crate::compiler::prepare_core(
@@ -386,18 +382,11 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
         flow,
         types: lowered.types,
     };
-    let arithmetic =
-        crate::primitives::compile_arithmetic_with_factory(&parts, None, factory, control)
-            .map_err(publication)?;
     let casts = crate::primitives::compile_casts_with_factory(&parts, None, factory, control)
         .map_err(publication)?;
     let comparisons =
         crate::primitives::compile_comparisons_with_factory(&parts, None, factory, control)
             .map_err(publication)?;
-    let null_safe = crate::primitives::compile_null_safe_comparisons_with_factory(
-        &parts, None, factory, control,
-    )
-    .map_err(publication)?;
     let mut owner = ProgramCreation { creator: retained };
     owner
         .before_arc::<ProgramPrimitiveError, CompiledExprSet>(work)
@@ -417,12 +406,7 @@ fn compile_core<H, F: ValueSchemaCreationFactory<H>>(
     Ok(Arc::new(CompiledExprSet {
         parts,
         calls: calls.into_iter().collect(),
-        recipes: UnitRecipes {
-            arithmetic,
-            casts,
-            comparisons,
-            null_safe,
-        },
+        recipes: UnitRecipes { casts, comparisons },
         inputs,
         owners,
         scopes: scopes.ports.into(),

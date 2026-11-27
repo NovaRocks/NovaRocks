@@ -31,9 +31,6 @@ pub(super) fn encode_key(key: SemanticParameterKey) -> i32 {
     (match key {
         SemanticParameterKey::StatementStartUtc => wire::SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone => wire::SemanticParameterKey::TimeZone,
-        SemanticParameterKey::AllowThrowException => {
-            wire::SemanticParameterKey::AllowThrowException
-        }
     }) as i32
 }
 
@@ -43,9 +40,6 @@ pub(super) fn decode_key(key: i32) -> Result<SemanticParameterKey, SemanticsCode
             Ok(SemanticParameterKey::StatementStartUtc)
         }
         Ok(wire::SemanticParameterKey::TimeZone) => Ok(SemanticParameterKey::TimeZone),
-        Ok(wire::SemanticParameterKey::AllowThrowException) => {
-            Ok(SemanticParameterKey::AllowThrowException)
-        }
         _ => Err(SemanticsCodecError::InvalidShape(
             "unknown or unspecified semantic parameter key",
         )),
@@ -147,9 +141,6 @@ fn emit_parameter_entries(
                 }
                 wire::semantic_parameter::Value::TimeZone(name)
             }
-            SemanticParameterValue::AllowThrowException(value) => {
-                wire::semantic_parameter::Value::AllowThrowException(*value)
-            }
         };
         entries.push(wire::SemanticParameter {
             id: id.get(),
@@ -182,9 +173,6 @@ fn decode_value(
                 .filter(|key| key.name() == value)
                 .ok_or(SemanticParameterError::InvalidTimeZone)?;
             Ok(SemanticParameterValue::TimeZone(key))
-        }
-        Some(Value::AllowThrowException(value)) => {
-            Ok(SemanticParameterValue::AllowThrowException(*value))
         }
         None => Err(SemanticsCodecError::InvalidShape(
             "semantic parameter is missing its value variant",
@@ -414,13 +402,13 @@ mod tests {
         }
     }
 
-    fn repeated_booleans(count: usize) -> wire::SemanticParameters {
+    fn repeated_zones(count: usize) -> wire::SemanticParameters {
         wire::SemanticParameters {
             entries: (0..count)
                 .map(|ordinal| {
                     entry(
                         u32::try_from(ordinal).unwrap(),
-                        wire::semantic_parameter::Value::AllowThrowException(ordinal % 2 == 0),
+                        wire::semantic_parameter::Value::TimeZone("UTC".into()),
                     )
                 })
                 .collect(),
@@ -440,9 +428,9 @@ mod tests {
                     }),
                 ),
                 entry(9, Value::TimeZone("-07:30".into())),
-                entry(11, Value::AllowThrowException(false)),
-                entry(15, Value::AllowThrowException(false)),
-                entry(u32::MAX, Value::AllowThrowException(true)),
+                entry(11, Value::TimeZone("UTC".into())),
+                entry(15, Value::TimeZone("UTC".into())),
+                entry(u32::MAX, Value::TimeZone("+08:00".into())),
             ],
         };
         let before = dto.clone();
@@ -461,15 +449,15 @@ mod tests {
             ),
             (
                 SemanticParameterId::new(11),
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::TimeZone(TimeZoneKey::parse("UTC").unwrap()),
             ),
             (
                 SemanticParameterId::new(15),
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::TimeZone(TimeZoneKey::parse("UTC").unwrap()),
             ),
             (
                 SemanticParameterId::new(u32::MAX),
-                SemanticParameterValue::AllowThrowException(true),
+                SemanticParameterValue::TimeZone(TimeZoneKey::parse("+08:00").unwrap()),
             ),
         ])
         .unwrap();
@@ -495,82 +483,6 @@ mod tests {
                 ))
             );
         }
-    }
-
-    #[test]
-    fn intrinsic_allow_throw_parameter_author_keeps_scoped_boolean_refs_and_exact_keys() {
-        use wire::semantic_parameter::Value;
-        let dto = wire::SemanticParameters {
-            entries: vec![
-                entry(0, Value::AllowThrowException(false)),
-                entry(u32::MAX, Value::AllowThrowException(true)),
-            ],
-        };
-        let table = decode(&dto, &Control::default()).unwrap();
-        assert_eq!(encode(&table, &Control::default()).unwrap(), dto);
-        for (id, value) in [(0, false), (u32::MAX, true)] {
-            let reference = SemanticParameterRef {
-                id: SemanticParameterId::new(id),
-                expected_key: SemanticParameterKey::AllowThrowException,
-            };
-            let encoded = projected(&Control::default(), CompilePhase::Encode, |work| {
-                encode_reference(&reference, work)
-            })
-            .unwrap();
-            assert_eq!(encoded.id, Some(id));
-            assert_eq!(
-                encoded.expected_key,
-                wire::SemanticParameterKey::AllowThrowException as i32
-            );
-            let decoded = projected(&Control::default(), CompilePhase::Decode, |work| {
-                decode_reference(&encoded, work)
-            })
-            .unwrap();
-            assert_eq!(decoded, reference);
-            assert_eq!(
-                table.require(decoded).unwrap(),
-                &SemanticParameterValue::AllowThrowException(value)
-            );
-            let wrong = SemanticParameterRef {
-                expected_key: SemanticParameterKey::TimeZone,
-                ..decoded
-            };
-            assert!(table.require(wrong).is_err());
-        }
-        assert!(
-            table
-                .require(SemanticParameterRef {
-                    id: SemanticParameterId::new(71),
-                    expected_key: SemanticParameterKey::AllowThrowException
-                })
-                .is_err()
-        );
-        for expected_key in [0, i32::MAX] {
-            assert!(matches!(
-                projected(&Control::default(), CompilePhase::Decode, |work| {
-                    decode_reference(
-                        &wire::SemanticParameterRef {
-                            id: Some(0),
-                            expected_key,
-                        },
-                        work,
-                    )
-                }),
-                Err(SemanticsCodecError::InvalidShape(_))
-            ));
-        }
-        assert!(matches!(
-            projected(&Control::default(), CompilePhase::Decode, |work| {
-                decode_reference(
-                    &wire::SemanticParameterRef {
-                        id: None,
-                        expected_key: wire::SemanticParameterKey::AllowThrowException as i32,
-                    },
-                    work,
-                )
-            }),
-            Err(SemanticsCodecError::InvalidShape(_))
-        ));
     }
 
     #[test]
@@ -606,7 +518,7 @@ mod tests {
         assert!(matches!(
             table.require(SemanticParameterRef {
                 id: SemanticParameterId::new(0),
-                expected_key: SemanticParameterKey::AllowThrowException,
+                expected_key: SemanticParameterKey::StatementStartUtc,
             }),
             Err(SemanticParameterError::KeyMismatch(_))
         ));
@@ -625,14 +537,6 @@ mod tests {
                 wire::SemanticParameterKey::TimeZone,
             ),
             (
-                SemanticParameterKey::AllowThrowException,
-                wire::SemanticParameterKey::AllowThrowException,
-            ),
-            (
-                SemanticParameterKey::AllowThrowException,
-                wire::SemanticParameterKey::AllowThrowException,
-            ),
-            (
                 SemanticParameterKey::StatementStartUtc,
                 wire::SemanticParameterKey::StatementStartUtc,
             ),
@@ -641,7 +545,7 @@ mod tests {
             assert_eq!(encode_key(typed), wire_key as i32);
             assert_eq!(decode_key(wire_key as i32).unwrap(), typed);
         }
-        for bad_key in [0, -1, 4, 7, i32::MAX] {
+        for bad_key in [0, -1, 3, 4, 7, i32::MAX] {
             let reference = wire::SemanticParameterRef {
                 id: Some(0),
                 expected_key: bad_key,
@@ -670,8 +574,8 @@ mod tests {
         use wire::semantic_parameter::Value;
         let duplicate = wire::SemanticParameters {
             entries: vec![
-                entry(0, Value::AllowThrowException(false)),
-                entry(0, Value::AllowThrowException(true)),
+                entry(0, Value::TimeZone("UTC".into())),
+                entry(0, Value::TimeZone("+08:00".into())),
             ],
         };
         assert!(
@@ -703,7 +607,7 @@ mod tests {
         ));
         let missing = wire::SemanticParameters {
             entries: vec![
-                entry(0, Value::AllowThrowException(false)),
+                entry(0, Value::TimeZone("UTC".into())),
                 wire::SemanticParameter { id: 1, value: None },
             ],
         };
@@ -788,7 +692,7 @@ mod tests {
 
     #[test]
     fn parameter_count_precedes_item_projection_and_allocation() {
-        let mut too_many = repeated_booleans(MAX_SEMANTIC_PARAMETERS + 1);
+        let mut too_many = repeated_zones(MAX_SEMANTIC_PARAMETERS + 1);
         // This earlier item is invalid too. The count gate must run first.
         too_many.entries[0].value = None;
         let control = Control::default();
@@ -802,7 +706,7 @@ mod tests {
             *control.events.lock().unwrap(),
             [(CompilePhase::Decode, 0), (CompilePhase::Decode, 0)]
         );
-        let dto = repeated_booleans(MAX_SEMANTIC_PARAMETERS);
+        let dto = repeated_zones(MAX_SEMANTIC_PARAMETERS);
         let control = Control::default();
         let table = decode(&dto, &control).unwrap();
         assert_eq!(table.entries().len(), MAX_SEMANTIC_PARAMETERS);
@@ -831,7 +735,7 @@ mod tests {
             *control.events.lock().unwrap(),
             [(CompilePhase::Decode, 0), (CompilePhase::Decode, 0)]
         );
-        let dto = repeated_booleans(259);
+        let dto = repeated_zones(259);
         let control = Control::default();
         let table = decode(&dto, &control).unwrap();
         assert_eq!(
@@ -856,7 +760,7 @@ mod tests {
 
     #[test]
     fn parameter_projection_preserves_all_control_categories_at_entry_quantum_and_tail() {
-        let dto = repeated_booleans(259);
+        let dto = repeated_zones(259);
         let table = decode(&dto, &Control::default()).unwrap();
         for error in [
             CompileControlError::Cancelled,
@@ -891,7 +795,7 @@ mod tests {
 
     #[test]
     fn parameter_lazy_owner_never_publishes_a_prefix_after_projection_refusal() {
-        let mut dto = repeated_booleans(259);
+        let mut dto = repeated_zones(259);
         dto.entries[256].value = None;
         let control = Control {
             events: Mutex::default(),

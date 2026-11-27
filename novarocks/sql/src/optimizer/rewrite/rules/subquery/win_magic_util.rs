@@ -22,7 +22,6 @@
 use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
-use crate::common::BinOp;
 use crate::optimizer::operator::{Operator, ScanOp};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -179,26 +178,17 @@ pub(super) fn expr_phys_eq(
             }
         }
         (
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left: la,
                 op: oa,
                 right: ra,
-                decimal_overflow_policy: pa,
             },
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left: lb,
                 op: ob,
                 right: rb,
-                decimal_overflow_policy: pb,
             },
-        ) => {
-            pa == pb
-                && oa == ob
-                && ((expr_phys_eq(arena, *la, *lb, map) && expr_phys_eq(arena, *ra, *rb, map))
-                    || (matches!(oa, BinOp::Eq | BinOp::Ne)
-                        && expr_phys_eq(arena, *la, *rb, map)
-                        && expr_phys_eq(arena, *ra, *lb, map)))
-        }
+        ) => oa == ob && expr_phys_eq(arena, *la, *lb, map) && expr_phys_eq(arena, *ra, *rb, map),
         (
             ScalarNode::FunctionCall {
                 name: na,
@@ -348,15 +338,12 @@ mod tests {
     }
 
     fn binop(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
@@ -643,7 +630,6 @@ mod tests {
                 )
                 .unwrap();
             crate::common::binary_operator::typed_call(
-                operator,
                 crate::binding::SqlFunctionBinding::from_plan(
                     crate::binding::PlanBindingAuthority::Optimizer(
                         crate::optimizer::BindingAuthority(()),

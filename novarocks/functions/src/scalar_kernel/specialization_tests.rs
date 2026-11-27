@@ -502,7 +502,7 @@ fn every_frozen_effect_field_and_environment_reference_is_compared_before_prepar
             facts.environment[0].id = SemanticParameterId::new(8)
         }),
         ("environment key", |facts| {
-            facts.environment[0].expected_key = SemanticParameterKey::AllowThrowException
+            facts.environment[0].expected_key = SemanticParameterKey::StatementStartUtc
         }),
         ("environment additional", |facts| {
             facts.environment = Box::from([facts.environment[0], facts.environment[0]])

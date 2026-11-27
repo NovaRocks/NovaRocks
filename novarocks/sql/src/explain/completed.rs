@@ -1806,15 +1806,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                     |arg: &ExprId, out: &mut fmt::Formatter<'_>| expr(*arg).fmt(out)
                 )
             ),
-            ExprKind::Binary {
-                left, op, right, ..
-            } => write!(
-                formatter,
-                "({} {} {})",
-                expr(*left),
-                binary_operator(*op),
-                expr(*right)
-            ),
+
             ExprKind::FunctionCall { function, args } if is_negation(&function.function_id) => {
                 let [operand] = args.as_ref() else {
                     return Err(fmt::Error);
@@ -1923,23 +1915,6 @@ fn format_expr_definition<'a>(
         fragment: fragment_id,
         node,
         expression,
-    }
-}
-
-fn binary_operator(operator: novarocks_expression_contract::BinaryOperator) -> &'static str {
-    match operator {
-        novarocks_expression_contract::BinaryOperator::Add => "+",
-        novarocks_expression_contract::BinaryOperator::Subtract => "-",
-        novarocks_expression_contract::BinaryOperator::Multiply => "*",
-        novarocks_expression_contract::BinaryOperator::Divide => "/",
-        novarocks_expression_contract::BinaryOperator::Modulo => "%",
-        novarocks_expression_contract::BinaryOperator::Eq => "=",
-        novarocks_expression_contract::BinaryOperator::EqForNull => "<=>",
-        novarocks_expression_contract::BinaryOperator::NotEq => "!=",
-        novarocks_expression_contract::BinaryOperator::Lt => "<",
-        novarocks_expression_contract::BinaryOperator::LtEq => "<=",
-        novarocks_expression_contract::BinaryOperator::Gt => ">",
-        novarocks_expression_contract::BinaryOperator::GtEq => ">=",
     }
 }
 

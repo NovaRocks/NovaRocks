@@ -241,23 +241,21 @@ fn zero_port_constants_keep_sparse_original_backing_ordinal_null_and_complete_ty
 }
 #[test]
 fn two_ports_combined_scope_and_repeated_value_definition_bind_each_real_use() {
-    let left = [(ValueId::new(10), int(false))];
-    let right = [(ValueId::new(20), int(false))];
+    let left = [(ValueId::new(10), boolean(false))];
+    let right = [(ValueId::new(20), boolean(false))];
     let mut b = builder();
-    let a = b.add(None, int(false), ExprKind::input(left[0].0)).unwrap();
+    let a = b
+        .add(None, boolean(false), ExprKind::input(left[0].0))
+        .unwrap();
     let z = b
-        .add(None, int(false), ExprKind::input(right[0].0))
+        .add(None, boolean(false), ExprKind::input(right[0].0))
         .unwrap();
     let eq = b
         .add(
             None,
             boolean(false),
-            ExprKind::Binary {
-                left: a,
-                op: BinaryOperator::Eq,
-                right: z,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
+            ExprKind::Conjunction {
+                args: Box::from([a, z]),
             },
         )
         .unwrap();
@@ -311,11 +309,6 @@ fn two_ports_combined_scope_and_repeated_value_definition_bind_each_real_use() {
             scope: RootScope::AllPorts,
             ordinal: 0
         })
-    );
-    assert!(
-        p.recipes()
-            .comparison(ComparisonSite::Binary(p.roots()[1].use_id))
-            .is_some()
     );
     assert_eq!(p.roots()[1].demand, EvaluationDemand::TruthOnly);
 }
@@ -427,15 +420,22 @@ fn higher_order_compilation_keeps_exact_captures_and_ancestor_reuse() {
         .unwrap()
     });
     let mut compare = |left, right| {
+        let pair = b
+            .add(
+                Some(inner),
+                int(false),
+                ExprKind::Let {
+                    value: left,
+                    body: right,
+                },
+            )
+            .unwrap();
         b.add(
             Some(inner),
-            boolean(true),
-            ExprKind::Binary {
-                left,
-                right,
-                op: BinaryOperator::Eq,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
+            boolean(false),
+            ExprKind::IsNull {
+                expr: pair,
+                negated: false,
             },
         )
         .unwrap()
@@ -1520,28 +1520,14 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
     let mut b = builder();
     let a = constant(&mut b, 0);
     let z = constant(&mut b, 2);
-    let parameter = SemanticParameterRef {
-        id: SemanticParameterId::new(71),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        parameter.id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
+    let parameters = SemanticParameters::default();
+    let arithmetic = novarocks_expression::testkit::add_catalogue_predicate(
+        &mut b,
+        &mut pools,
+        OperatorFunction::Add,
+        vec![a, z],
+    )
     .unwrap();
-    let arithmetic = b
-        .add(
-            None,
-            int(true),
-            ExprKind::Binary {
-                left: a,
-                right: z,
-                op: BinaryOperator::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: Some(parameter),
-            },
-        )
-        .unwrap();
     let cast = b
         .add(
             None,
@@ -1613,7 +1599,10 @@ fn each_intrinsic_recipe_keeps_its_actual_full_types_and_use_site() {
     let (unit, compiled) = compile_catalogue_predicate_fixture(b, &pools, &parameters);
     let uses: Vec<_> = compiled.roots().iter().map(|r| r.use_id).collect();
     let recipes = compiled.recipes();
-    assert!(recipes.arithmetic(uses[0]).is_some());
+    assert_eq!(
+        compiled.calls()[&uses[0]].call_contract().function_id(),
+        &OperatorFunction::Add.function_id()
+    );
     assert!(recipes.cast(uses[1]).is_some());
     assert!(matches!(
         compiled.calls()[&uses[2]].prepared(),
@@ -3402,103 +3391,14 @@ fn sparse_non_dfs_nested_shared_calls_keep_actual_edges_claims_and_compile_prefi
 }
 
 #[test]
-fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
+fn zero_port_compiler_keeps_unsupported_cast_capabilities() {
     use crate::zero_port;
-    use arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array,
-        TimestampSecondArray, new_null_array,
-    };
+    use arrow::array::{ArrayRef, Date32Array, TimestampSecondArray};
     use arrow::datatypes::TimeUnit;
-    use novarocks_functions::{ArithmeticPrepareError, CastPrepareError, ComparisonPrepareError};
+    use novarocks_functions::CastPrepareError;
     use novarocks_type_contract::TrinoCastMode;
 
-    let allow_id = SemanticParameterId::new(0);
-    let parameters = SemanticParameters::try_new([(
-        allow_id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap();
-    let allow = SemanticParameterRef {
-        id: allow_id,
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let add = |left, right| ExprKind::Binary {
-        left,
-        op: BinaryOperator::Add,
-        right,
-        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        allow_throw_exception: Some(allow),
-    };
-
-    let mut draft = builder();
-    let mut pools = ConstantPools::empty();
-    let flag = zero_port::add_constant(
-        &mut draft,
-        &mut pools,
-        Arc::new(BooleanArray::from(vec![true])),
-        boolean(false),
-    );
-    let root = draft.add(None, int(true), add(flag, flag)).unwrap();
-    draft
-        .root(root, EvaluationDemand::Value, RootScope::AllPorts)
-        .unwrap();
-    let control = Control::good();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    assert!(matches!(
-        draft.seal(Vec::new(), &mut work),
-        Err(UnitError::Invalid { definition: Some(id), root: None, message })
-            if id == root && message.ends_with("binary expression types are inconsistent with its operator")
-    ));
-    work.finish().unwrap();
-
-    // LARGEINT + DOUBLE has a frozen DOUBLE result. The arithmetic recipe
-    // declines the mixed carrier when the compiler prepares the sealed unit.
-    let mut draft = builder();
-    let largeint = zero_port::add_constant(
-        &mut draft,
-        &mut pools,
-        Arc::new(FixedSizeBinaryArray::try_from_iter([1_i128.to_be_bytes()].into_iter()).unwrap()),
-        FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            false,
-            ValueLogicalType::LargeInt,
-        )
-        .unwrap(),
-    );
-    let double = zero_port::add_constant(
-        &mut draft,
-        &mut pools,
-        Arc::new(Float64Array::from(vec![2.0])),
-        FunctionValueType::new(DataType::Float64, false),
-    );
-    let root = draft
-        .add(
-            None,
-            FunctionValueType::new(DataType::Float64, true),
-            add(largeint, double),
-        )
-        .unwrap();
-    draft
-        .root(root, EvaluationDemand::Value, RootScope::AllPorts)
-        .unwrap();
-    let unit = finish(draft, Vec::new());
-    let result = compile(
-        &unit,
-        &pools,
-        &parameters,
-        ScopeLayouts {
-            ports: &[],
-            all_ports: None,
-        },
-        &control,
-    );
-    assert!(matches!(
-        result,
-        Err(ExprCompileError::Arithmetic(
-            ArithmeticPrepareError::Unsupported
-        ))
-    ));
-
+    let parameters = SemanticParameters::default();
     let result = zero_port::primitive(
         [Arc::new(Date32Array::from(vec![1])) as ArrayRef],
         FunctionValueType::new(DataType::Int8, true),
@@ -3529,29 +3429,6 @@ fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
         result,
         Err(ExprCompileError::Cast(CastPrepareError::Unsupported))
     ));
-
-    // Signed integer ARRAY equality has an installed recipe. VARCHAR items do not.
-    let ty = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-    for op in [BinaryOperator::Eq, BinaryOperator::EqForNull] {
-        let result = zero_port::primitive(
-            [new_null_array(&ty, 1), new_null_array(&ty, 1)],
-            boolean(op == BinaryOperator::Eq),
-            |args| ExprKind::Binary {
-                left: args[0],
-                op,
-                right: args[1],
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-            &parameters,
-        );
-        assert!(matches!(
-            result,
-            Err(ExprCompileError::Comparison(
-                ComparisonPrepareError::Unsupported
-            ))
-        ));
-    }
 }
 
 #[test]

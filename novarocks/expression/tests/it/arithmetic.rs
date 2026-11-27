@@ -16,27 +16,22 @@
 // under the License.
 
 use arrow::{
-    array::{
-        Array, ArrayRef, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    },
+    array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
-use novarocks_expression::testkit::numeric_fixtures::operation;
 use novarocks_expression::testkit::numeric_fixtures::{
-    CompiledFixture, Control, Wrap, build_program, causes, errors, input, instance,
+    Control, Wrap, build_program, causes, errors, input, instance,
 };
 use novarocks_expression::testkit::{CallbackControl, PassThroughCallHost};
 use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
-use novarocks_expression_contract::BinaryOperator;
 use novarocks_functions::{
     KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
-use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+use novarocks_type_contract::OperatorFunction;
 use std::sync::Arc;
 
 mod float_required;
-mod numeric;
 
 fn integral(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<i64>> {
     let array = output.values();
@@ -72,19 +67,19 @@ fn integral(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<i64>
     }
 }
 #[test]
-fn five_signed_operators_keep_frozen_mixed_widths_and_sparse_selected_addresses() {
+fn five_signed_operators_keep_selected_widths_and_sparse_addresses() {
     for (left, right, expected_carrier) in [
         (DataType::Int8, DataType::Int8, DataType::Int8),
-        (DataType::Int16, DataType::Int8, DataType::Int16),
-        (DataType::Int16, DataType::Int32, DataType::Int32),
-        (DataType::Int32, DataType::Int64, DataType::Int64),
+        (DataType::Int16, DataType::Int16, DataType::Int16),
+        (DataType::Int32, DataType::Int32, DataType::Int32),
+        (DataType::Int64, DataType::Int64, DataType::Int64),
     ] {
         for (op, integral_expected) in [
-            (BinaryOperator::Add, vec![Some(4), Some(-4), None]),
-            (BinaryOperator::Subtract, vec![Some(10), Some(-10), None]),
-            (BinaryOperator::Multiply, vec![Some(-21), Some(-21), None]),
-            (BinaryOperator::Divide, vec![Some(-2), Some(-2), None]),
-            (BinaryOperator::Modulo, vec![Some(1), Some(-1), None]),
+            (OperatorFunction::Add, vec![Some(4), Some(-4), None]),
+            (OperatorFunction::Subtract, vec![Some(10), Some(-10), None]),
+            (OperatorFunction::Multiply, vec![Some(-21), Some(-21), None]),
+            (OperatorFunction::Divide, vec![Some(-2), Some(-2), None]),
+            (OperatorFunction::Modulo, vec![Some(1), Some(-1), None]),
         ] {
             let program = build_program(op, left.clone(), right.clone(), Wrap::Bare, true);
             let batch = input(
@@ -113,18 +108,9 @@ fn five_signed_operators_keep_frozen_mixed_widths_and_sparse_selected_addresses(
             assert!(output.errors().is_empty());
             let unit = &program.unit;
             let actual = unit.root(program.root).unwrap();
-            let recipe = unit.recipes().arithmetic(actual.use_id).unwrap();
-            assert_eq!(recipe.operator(), operation(op));
-            assert_eq!(recipe.left_type().data_type().clone(), left);
-            assert_eq!(recipe.right_type().data_type().clone(), right);
-            assert!(recipe.allow_throw_exception());
-            assert_eq!(
-                recipe.decimal_overflow_policy(),
-                DecimalOverflowPolicy::ReportError
-            );
             assert!(matches!(
                 unit.definitions().node(actual.definition).unwrap().kind(),
-                StaticExprKind::PreparedArithmetic { .. }
+                StaticExprKind::BoundCall { .. }
             ));
         }
     }
@@ -135,28 +121,28 @@ fn signed_overflow_and_modulo_faults_use_selected_row_errors_independent_of_allo
     for allow in [false, true] {
         for (op, left, right, expected, error_ordinals) in [
             (
-                BinaryOperator::Add,
+                OperatorFunction::Add,
                 vec![Some(8), Some(i64::MAX), None, Some(i64::MIN), Some(7)],
                 vec![Some(9), Some(1), Some(1), Some(-1), Some(-3)],
                 vec![None, None, None, Some(4)],
                 vec![0, 2],
             ),
             (
-                BinaryOperator::Subtract,
+                OperatorFunction::Subtract,
                 vec![Some(8), Some(i64::MIN), None, Some(i64::MAX), Some(7)],
                 vec![Some(9), Some(1), Some(1), Some(-1), Some(-3)],
                 vec![None, None, None, Some(10)],
                 vec![0, 2],
             ),
             (
-                BinaryOperator::Multiply,
+                OperatorFunction::Multiply,
                 vec![Some(8), Some(i64::MAX), None, Some(i64::MIN), Some(7)],
                 vec![Some(9), Some(2), Some(2), Some(-1), Some(-3)],
                 vec![None, None, None, Some(-21)],
                 vec![0, 2],
             ),
             (
-                BinaryOperator::Modulo,
+                OperatorFunction::Modulo,
                 vec![Some(8), Some(i64::MIN), None, Some(7), Some(7)],
                 vec![Some(9), Some(-1), Some(0), Some(0), Some(-3)],
                 vec![Some(0), None, None, Some(1)],
@@ -191,7 +177,7 @@ fn signed_overflow_and_modulo_faults_use_selected_row_errors_independent_of_allo
             );
         }
         let program = build_program(
-            BinaryOperator::Divide,
+            OperatorFunction::Divide,
             DataType::Int64,
             DataType::Int64,
             Wrap::Bare,
@@ -238,37 +224,37 @@ fn narrow_signed_boundaries_reach_original_selected_error_journal() {
         for allow in [false, true] {
             for (op, left, right, reason) in [
                 (
-                    BinaryOperator::Add,
+                    OperatorFunction::Add,
                     max,
                     1,
                     novarocks_functions::DataFailureReason::NumericOutOfRange,
                 ),
                 (
-                    BinaryOperator::Subtract,
+                    OperatorFunction::Subtract,
                     min,
                     1,
                     novarocks_functions::DataFailureReason::NumericOutOfRange,
                 ),
                 (
-                    BinaryOperator::Multiply,
+                    OperatorFunction::Multiply,
                     max,
                     2,
                     novarocks_functions::DataFailureReason::NumericOutOfRange,
                 ),
                 (
-                    BinaryOperator::Divide,
+                    OperatorFunction::Divide,
                     min,
                     -1,
                     novarocks_functions::DataFailureReason::NumericOutOfRange,
                 ),
                 (
-                    BinaryOperator::Divide,
+                    OperatorFunction::Divide,
                     7,
                     0,
                     novarocks_functions::DataFailureReason::DivisionByZero,
                 ),
                 (
-                    BinaryOperator::Modulo,
+                    OperatorFunction::Modulo,
                     7,
                     0,
                     novarocks_functions::DataFailureReason::DivisionByZero,
@@ -309,7 +295,7 @@ fn narrow_signed_boundaries_reach_original_selected_error_journal() {
 #[test]
 fn literal_broadcast_and_sliced_columns_use_real_compiled_constant_and_original_rows() {
     let program = build_program(
-        BinaryOperator::Add,
+        OperatorFunction::Add,
         DataType::Int64,
         DataType::Int64,
         Wrap::ConstantRight,
@@ -353,10 +339,10 @@ fn literal_broadcast_and_sliced_columns_use_real_compiled_constant_and_original_
 }
 
 #[test]
-fn eager_required_child_error_survives_parent_strict_null_and_is_null_or_coalesce() {
+fn first_strict_null_skips_right_while_is_null_and_coalesce_keep_demanded_errors() {
     for wrap in [Wrap::NullParent, Wrap::IsNull, Wrap::Coalesce] {
         let program = build_program(
-            BinaryOperator::Add,
+            OperatorFunction::Add,
             DataType::Int64,
             DataType::Int64,
             wrap,
@@ -380,7 +366,14 @@ fn eager_required_child_error_survives_parent_strict_null_and_is_null_or_coalesc
                 &mut PassThroughCallHost,
             )
             .unwrap();
-        assert_eq!(errors(&output), vec![0]);
+        assert_eq!(
+            errors(&output),
+            if matches!(wrap, Wrap::NullParent) {
+                vec![]
+            } else {
+                vec![0]
+            }
+        );
         match wrap {
             Wrap::NullParent => assert_eq!(integral(&output), vec![None, None, None]),
             Wrap::Coalesce => assert_eq!(integral(&output), vec![None, Some(71), Some(10)]),
@@ -402,7 +395,7 @@ fn eager_required_child_error_survives_parent_strict_null_and_is_null_or_coalesc
 #[test]
 fn actual_if_and_pure_boolean_domains_control_arithmetic_error_demand() {
     let program = build_program(
-        BinaryOperator::Add,
+        OperatorFunction::Add,
         DataType::Int64,
         DataType::Int64,
         Wrap::If,
@@ -430,7 +423,7 @@ fn actual_if_and_pure_boolean_domains_control_arithmetic_error_demand() {
     assert_eq!(errors(&output), vec![1]);
     for wrap in [Wrap::And, Wrap::Or] {
         let program = build_program(
-            BinaryOperator::Add,
+            OperatorFunction::Add,
             DataType::Int64,
             DataType::Int64,
             wrap,
@@ -471,7 +464,7 @@ fn actual_if_and_pure_boolean_domains_control_arithmetic_error_demand() {
 #[test]
 fn actual_arithmetic_rows_preserve_primary_controls_every_quantum_and_failed_instance_latch() {
     let program = build_program(
-        BinaryOperator::Add,
+        OperatorFunction::Add,
         DataType::Int64,
         DataType::Int64,
         Wrap::Coalesce,

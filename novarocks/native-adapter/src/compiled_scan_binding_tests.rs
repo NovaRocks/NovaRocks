@@ -826,11 +826,11 @@ pub(crate) fn system_scan_producer_package() -> (Vec<u8>, u32) {
 }
 
 fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32) {
-    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
+    use novarocks_expression_contract::{ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
 
-    use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
+    use novarocks_type_contract::EvaluationDemand;
     use prost::Message;
 
     const PRODUCER: FragmentId = FragmentId::new(1);
@@ -865,34 +865,62 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    let unit = builder.unit(SCAN).unwrap();
-    let column = unit
+    // Explicit fixture admission; these values are not production defaults.
+    let constants =
+        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        });
+    let column = builder
+        .unit(SCAN)
+        .unwrap()
         .add(None, int64(), ExprKind::input(provider[0]))
         .unwrap();
     // The v2 encoder publishes literals only as checked constants: `7` is
     // the one row of its own pool.
     let pool = ConstantPoolId::new(7007);
-    let literal = unit
+    let literal = builder
+        .unit(SCAN)
+        .unwrap()
         .add(
             None,
             int64(),
             ExprKind::Constant(ConstantReference { pool, ordinal: 0 }),
         )
         .unwrap();
-    let comparison = unit
-        .add(
-            None,
-            ValueType::new(DataType::Boolean, false),
-            ExprKind::Binary {
-                left: column,
-                op: BinaryOperator::Gt,
-                right: literal,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
+    let mut pools = novarocks_physical_plan::ConstantPools::empty();
+    pools
+        .insert(
+            pool,
+            ConstantPool::try_new(
+                Arc::new(int64().try_to_field("literal").unwrap()),
+                int64(),
+                arrow::array::Array::to_data(&arrow::array::Int64Array::from(vec![7_i64])),
+                constants,
+                CompilePhase::Validate,
+                &Unbounded,
+            )
+            .unwrap(),
         )
         .unwrap();
-    let residual = unit
+    let comparison = novarocks_expression::testkit::add_catalogue_predicate(
+        builder.unit(SCAN).unwrap(),
+        &mut pools,
+        novarocks_type_contract::OperatorFunction::GreaterThan,
+        vec![column, literal],
+    )
+    .unwrap();
+    let residual = builder
+        .unit(SCAN)
+        .unwrap()
         .root(comparison, EvaluationDemand::TruthOnly, RootScope::Port(0))
         .unwrap();
     builder
@@ -971,45 +999,20 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         max: 1,
         requires_power_of_two: false,
     };
-    // Explicit fixture admission; these values are not production defaults.
-    let constants =
-        novarocks_functions::ConstantValidation::bounded(novarocks_functions::ConstantPolicy {
-            max_rows: 16,
-            max_array_nodes: 128,
-            max_logical_elements: 1024,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        });
     let ports = builder.node_ports(SCAN).unwrap();
-    let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Validate).unwrap();
-    let unit = builder
-        .take_unit_builder(SCAN)
-        .unwrap()
-        .seal(ports, &mut work)
-        .unwrap()
-        .finish(BTreeMap::new(), &mut work)
-        .unwrap();
-    work.finish().unwrap();
+    let draft = builder.take_unit_builder(SCAN).unwrap();
+    let unit = novarocks_expression::testkit::seal_catalogue_fixture(
+        draft,
+        ports,
+        &pools,
+        &novarocks_type_contract::SemanticParameters::default(),
+        &Unbounded,
+    );
     builder.install_unit(SCAN, Arc::new(unit)).unwrap();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
-    plan.insert_constant_pool(
-        pool,
-        ConstantPool::try_new(
-            Arc::new(int64().try_to_field("literal").unwrap()),
-            int64(),
-            arrow::array::Array::to_data(&arrow::array::Int64Array::from(vec![7_i64])),
-            constants,
-            CompilePhase::Validate,
-            &Unbounded,
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    for (&id, pool) in pools.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(
         builder
             .finish_definition(

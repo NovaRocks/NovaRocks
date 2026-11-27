@@ -36,7 +36,6 @@ pub fn decode_query_options(src: &novarocks::QueryOptions) -> QueryOptions {
         enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
-        allow_throw_exception: src.allow_throw_exception,
 
         enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
         global_runtime_filter_build_max_size: (src.global_runtime_filter_build_max_size > 0)

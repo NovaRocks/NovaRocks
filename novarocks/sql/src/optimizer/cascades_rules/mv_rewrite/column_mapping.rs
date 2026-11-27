@@ -132,16 +132,10 @@ fn rewrite_children(
             initializer: mapped!(rewrite(arena, initializer)),
             body: mapped!(rewrite(arena, body)),
         },
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective { op, left, right } => ScalarNode::BooleanConnective {
             op,
             left: mapped!(rewrite(arena, left)),
             right: mapped!(rewrite(arena, right)),
-            decimal_overflow_policy,
         },
         ScalarNode::FunctionCall {
             name,
@@ -298,20 +292,17 @@ mod tests {
         }
     }
 
-    fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        let data_type = match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => DataType::Int64,
-            _ => DataType::Boolean,
-        };
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
-        }
+    fn bin(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn names(pairs: &[(u32, &str)]) -> HashMap<ColumnId, String> {
@@ -486,14 +477,11 @@ mod tests {
         );
 
         let rewritten = rewrite_typed(&map, &query_expr, &q_names).expect("rewrite ok");
-        // Expect mv_s * 2: top is a Mul whose left is a ColumnRef to mv_s.
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &rewritten.kind
+        let Some((novarocks_type_contract::OperatorFunction::Multiply, [left, right])) =
+            crate::common::binary_operator::typed_operands(&rewritten)
         else {
-            panic!("expected BinaryOp, got {:?}", rewritten.kind);
+            panic!("expected selected multiplication, got {:?}", rewritten.kind);
         };
-        assert_eq!(*op, BinOp::Mul);
         match &left.kind {
             ExprKind::ColumnRef {
                 column_id, column, ..
@@ -689,14 +677,11 @@ mod tests {
             ScalarNode::ColumnRef(present.column_id),
             present.value_type.clone(),
         );
-        let source = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Sub,
-                left,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        let source = arena.test_intern_operator(
+            BinOp::Sub,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let map = test_map(vec![(
             NormExpr::Column {
@@ -881,16 +866,12 @@ mod tests {
         let query_names = names(&[(9, "a"), (8, "b")]);
         for policy in [OutputNull, ReportError] {
             let binary = |a: &OutputColumn, b: &OutputColumn, policy| {
-                let mut expression = bin(col_ref(a), BinOp::Add, col_ref(b));
-                let ExprKind::BinaryOp {
-                    decimal_overflow_policy,
-                    ..
-                } = &mut expression.kind
-                else {
-                    panic!("binary");
-                };
-                *decimal_overflow_policy = policy;
-                expression
+                crate::common::binary_operator::test_operator(
+                    BinOp::Add,
+                    col_ref(a),
+                    col_ref(b),
+                    policy,
+                )
             };
             let cast = |a: &OutputColumn, policy| TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(

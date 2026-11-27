@@ -37,6 +37,8 @@ mod like;
 mod scan_residual_conjunction;
 
 mod fixed_binary_case;
+mod ordered_comparison;
+mod retraction_count;
 mod simple_case;
 
 #[cfg(debug_assertions)]

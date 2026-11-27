@@ -214,15 +214,12 @@ mod tests {
     }
 
     fn equality_with_ten(expr: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(expr),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(int_literal(10)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            expr,
+            int_literal(10),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn rewrite(
@@ -263,7 +260,7 @@ mod tests {
     /// so after a round-trip through the arena the left/right positions may swap.
     fn binary_column_ref_side(expr: &TypedExpr) -> &TypedExpr {
         match &expr.kind {
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,

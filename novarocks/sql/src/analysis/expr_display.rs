@@ -20,7 +20,7 @@
 //! These labels preserve SQL/path spelling. Expression identity belongs to
 //! `expr_identity` and ColumnId; diagnostic text is never a selected-value key.
 
-use crate::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
+use crate::analysis::{self as query_ir, ExprKind, TypedExpr};
 use crate::common::negation::{
     negation_delimiters, typed_operand, typed_operand_has_lower_precedence,
 };
@@ -370,12 +370,12 @@ fn expression(
             with_parens(inner, out)?;
             out.append(if *negated { " IS NOT NULL" } else { " IS NULL" })
         }
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left, op, right, ..
         } => {
             with_parens(left, out)?;
             out.append(" ")?;
-            out.append(bin_op_display(*op))?;
+            out.append(op.sql())?;
             out.append(" ")?;
             with_parens(right, out)
         }
@@ -693,25 +693,6 @@ fn bound(
         }
     }
 }
-fn bin_op_display(op: BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Mod => "%",
-        BinOp::Eq => "=",
-        BinOp::Ne => "!=",
-        BinOp::Lt => "<",
-        BinOp::Le => "<=",
-        BinOp::Gt => ">",
-        BinOp::Ge => ">=",
-        BinOp::EqForNull => "<=>",
-        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => "AND",
-        BinOp::Or => "OR",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
@@ -809,16 +790,12 @@ mod tests {
                 value_type: ty,
             }
         };
-        let addition = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col("a")),
-                right: novarocks_parser::ast::AstBox::new(col("b")),
-                op: BinOp::Add,
-                decimal_overflow_policy:
-                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-            },
-            value_type: col("a").value_type,
-        };
+        let addition = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col("a"),
+            col("b"),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        );
         for (operand, expected) in [
             (col("x"), "-x"),
             (addition, "-(a + b)"),
@@ -878,19 +855,14 @@ mod tests {
     fn typed_expr_display_name_formats_is_not_null_with_inner_parens() {
         let expr = TypedExpr {
             kind: ExprKind::IsNull {
-                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col("v4")),
-                        op: BinOp::Add,
-                        right: novarocks_parser::ast::AstBox::new(col("v4")),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        true,
+                expr: novarocks_parser::ast::AstBox::new(
+                    crate::common::binary_operator::test_operator(
+                        BinOp::Add,
+                        col("v4"),
+                        col("v4"),
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     ),
-                }),
+                ),
                 negated: true,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

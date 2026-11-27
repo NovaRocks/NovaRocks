@@ -30,10 +30,7 @@ pub use call_authorship::{
 };
 mod original_requests;
 mod primitives;
-pub use primitives::{
-    ComparisonSite, ProgramPrimitiveError as PrimitiveError, prepare_arithmetic_node,
-    prepare_cast_node, prepare_comparison_node, prepare_null_safe_comparison_node,
-};
+pub use primitives::{ComparisonSite, ProgramPrimitiveError as PrimitiveError, prepare_cast_node};
 mod scopes;
 pub mod typing;
 pub use scopes::*;

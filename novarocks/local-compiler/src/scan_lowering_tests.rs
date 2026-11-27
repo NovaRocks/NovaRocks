@@ -27,18 +27,14 @@ use crate::test_units::{PureUnitFixture, compiled_root};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
-use novarocks_functions::{
-    ComparisonOperator, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi,
-};
+use novarocks_expression_contract::{ExprKind, RootScope};
+use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_program::{
     BindingRequirement, CompiledScanInput, KernelAbiVersion, LocalProgram, ProgramNodeId,
     ProgramNodeKind, ScanSourceKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::*;
-use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
+use novarocks_type_contract::EvaluationDemand;
 use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
@@ -145,9 +141,6 @@ impl Spec {
 
 pub(super) fn int64() -> ValueType {
     ValueType::new(DataType::Int64, false)
-}
-fn boolean() -> ValueType {
-    ValueType::new(DataType::Boolean, false)
 }
 pub(super) fn binding() -> ConnectorReadBinding {
     let instance = ConnectorInstanceId::parse("lake").unwrap();
@@ -305,19 +298,13 @@ fn fixture(spec: Spec) -> Fixture {
             )
             .unwrap();
         residuals.push(
-            builder
-                .fixture_definition(
-                    SCAN,
-                    boolean(),
-                    ExprKind::Binary {
-                        left: column,
-                        op: BinaryOperator::Gt,
-                        right: literal,
-                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                        allow_throw_exception: None,
-                    },
-                )
-                .unwrap(),
+            novarocks_expression::testkit::add_catalogue_predicate(
+                builder.unit(SCAN).unwrap(),
+                &mut constants,
+                novarocks_type_contract::OperatorFunction::GreaterThan,
+                vec![column, literal],
+            )
+            .unwrap(),
         );
     }
     let residuals: Vec<_> = residuals
@@ -429,7 +416,7 @@ fn fixture(spec: Spec) -> Fixture {
         )
         .unwrap();
     if spec.residuals != 0 || spec.derived {
-        builder.finish_fixture_unit(SCAN, &FixtureControl).unwrap();
+        seal_fixture_node(&mut builder, SCAN, &constants, &FixtureControl);
     }
     let mut root = SCAN;
     if spec.filter {
@@ -444,19 +431,13 @@ fn fixture(spec: Spec) -> Fixture {
                 crate::test_constants::i64(&mut constants, &int64(), 3, options(None).constants),
             )
             .unwrap();
-        let predicate = builder
-            .fixture_definition(
-                FILTER,
-                boolean(),
-                ExprKind::Binary {
-                    left: column,
-                    op: BinaryOperator::Gt,
-                    right: literal,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap();
+        let predicate = novarocks_expression::testkit::add_catalogue_predicate(
+            builder.unit(FILTER).unwrap(),
+            &mut constants,
+            novarocks_type_contract::OperatorFunction::GreaterThan,
+            vec![column, literal],
+        )
+        .unwrap();
         let predicate = builder
             .fixture_occurrence(
                 FILTER,
@@ -468,9 +449,7 @@ fn fixture(spec: Spec) -> Fixture {
         builder
             .add_filter(FILTER, SCAN, Box::from([predicate]))
             .unwrap();
-        builder
-            .finish_fixture_unit(FILTER, &FixtureControl)
-            .unwrap();
+        seal_fixture_node(&mut builder, FILTER, &constants, &FixtureControl);
         root = FILTER;
     }
     let dop = PipelineDopDomain {
@@ -969,44 +948,30 @@ pub(super) fn providers() -> PureProviderProgramCatalog<ConnectorError> {
     .unwrap()
 }
 
-// A real RAND-only sealed subset; the fixtures call no function.
-pub(super) fn functions() -> PureEngineFunctionCatalog {
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
+pub(super) fn seal_fixture_node(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    constants: &ConstantPools,
+    control: &dyn PureCompileControl,
+) {
+    let ports = builder.node_ports(node).unwrap();
+    let draft = builder.take_unit_builder(node).unwrap();
+    let unit = novarocks_expression::testkit::seal_catalogue_fixture(
+        draft,
+        ports,
+        constants,
+        &novarocks_type_contract::SemanticParameters::default(),
+        control,
+    );
     builder
-        .register(
-            actual
-                .definition("rand", FunctionKind::Scalar)
-                .unwrap()
-                .clone(),
-        )
+        .install_unit(node, std::sync::Arc::new(unit))
         .unwrap();
-    builder
-        .seal_pure(
-            [
-                "builtin.scalar/rand/()->f64;strict;legacy",
-                "builtin.scalar/rand/(i8)->i8;strict;coerce",
-                "builtin.scalar/rand/(i16)->i16;strict;coerce",
-                "builtin.scalar/rand/(i32)->i32;strict;coerce",
-                "builtin.scalar/rand/(i64)->i64;strict;coerce",
-            ]
-            .into_iter()
-            .map(|overload| InstalledPureKernel {
-                function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
-                kind: FunctionKind::Scalar,
-                implementation: PureImplementationDeclaration {
-                    overload: FunctionOverloadId::try_new(overload).unwrap(),
-                    implementation: PureImplementationId::try_new(
-                        "builtin.scalar/rand/selected-v1",
-                    )
-                    .unwrap(),
-                    abi: PureKernelAbi::ScalarV1,
-                },
-                aggregate_state_format: None,
-            }),
-        )
-        .unwrap()
+}
+
+pub(super) fn functions() -> PureEngineFunctionCatalog {
+    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
+        .as_ref()
+        .clone()
 }
 
 pub(super) fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
@@ -1159,12 +1124,16 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
     let invocation = &unit.control_flow().uses()[&root.use_id];
     assert_eq!(invocation.definition, root.definition);
     assert_eq!(invocation.context.demand, EvaluationDemand::TruthOnly);
-    let StaticExprKind::Gt(column, _) = unit.definitions().node(root.definition).unwrap().kind()
+    let StaticExprKind::BoundCall { args } =
+        unit.definitions().node(root.definition).unwrap().kind()
     else {
-        panic!("ordered comparison survives lowering")
+        panic!("selected comparison survives lowering")
+    };
+    let [column, _] = args[..] else {
+        panic!("two comparison operands")
     };
     assert!(matches!(
-        unit.definitions().node(*column).unwrap().kind(),
+        unit.definitions().node(column).unwrap().kind(),
         StaticExprKind::Input
     ));
     let input = unit.input(invocation.arguments[0]).unwrap();
@@ -1173,11 +1142,15 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
         unit.scope(input.scope).unwrap().schema(),
         layout.schema()
     ));
-    let comparison = unit
-        .recipes()
-        .comparison(novarocks_expression::ComparisonSite::Binary(root.use_id))
-        .expect("mandatory comparison recipe");
-    assert_eq!(comparison.operator(), ComparisonOperator::Gt);
+    let Some(novarocks_expression::evaluator_view::UnitStateTemplate::Scalar { kernel, .. }) =
+        novarocks_expression::evaluator_view::state_template(unit, root.use_id)
+    else {
+        panic!("installed ordered comparison")
+    };
+    assert_eq!(
+        kernel.contract().call().function_id(),
+        &novarocks_type_contract::OperatorFunction::GreaterThan.function_id()
+    );
 }
 
 #[test]

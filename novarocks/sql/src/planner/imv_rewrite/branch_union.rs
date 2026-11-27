@@ -744,7 +744,7 @@ mod tests {
                 func.eq_ignore_ascii_case(name)
                     || args.iter().any(|arg| expr_contains_function(arg, name))
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -957,25 +957,18 @@ mod tests {
     fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col_expr(column_id, column)),
-                        op: BinOp::Ge,
-                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int32,
-                                false,
-                            ),
-                        }),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                predicate: crate::common::binary_operator::test_operator(
+                    BinOp::Ge,
+                    col_expr(column_id, column),
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            false,
+                        ),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             vec![input],
             None,
@@ -1027,15 +1020,12 @@ mod tests {
         right_region_id: u32,
     ) -> LogicalPlanNode {
         // An inner equi-join on caller-selected region column ids.
-        let condition = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_expr(left_region_id, "region")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_expr(right_region_id, "region")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let condition = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_expr(left_region_id, "region"),
+            col_expr(right_region_id, "region"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,

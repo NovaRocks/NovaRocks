@@ -30,8 +30,7 @@ use novarocks_expression::{
     },
 };
 use novarocks_expression_contract::{
-    BinaryOperator, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope,
-    UnitLimits, ValueId,
+    BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope, UnitLimits, ValueId,
 };
 use novarocks_functions::{
     AggregateStateAllocator, FunctionArgument, KernelEvaluationControl, KernelFailure,
@@ -315,7 +314,6 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
         EvaluationDemand::TruthOnly,
         |_, draft, constants, _, column| {
             let nonnull = FunctionValueType::new(DataType::Boolean, false);
-            let boolean = FunctionValueType::new(DataType::Boolean, true);
             let literal_type = FunctionValueType::new(DataType::Int32, false);
             let input = draft
                 .add(None, column_type.clone(), ExprKind::input(column))
@@ -347,25 +345,22 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
                 let right = draft
                     .add(None, literal_type.clone(), ExprKind::Constant(reference))
                     .unwrap();
-                draft
-                    .add(
-                        None,
-                        boolean.clone(),
-                        ExprKind::Binary {
-                            left,
-                            op,
-                            right,
-                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                            allow_throw_exception: None,
-                        },
-                    )
-                    .unwrap()
+                novarocks_expression::testkit::add_catalogue_predicate(
+                    draft,
+                    constants,
+                    op,
+                    vec![left, right],
+                )
+                .unwrap()
             };
             // The original scan emits three roots in this order.
             [
                 not_null,
-                comparison(BinaryOperator::GtEq, 10),
-                comparison(BinaryOperator::Lt, 20),
+                comparison(
+                    novarocks_type_contract::OperatorFunction::GreaterThanOrEqual,
+                    10,
+                ),
+                comparison(novarocks_type_contract::OperatorFunction::LessThan, 20),
             ]
         },
     );

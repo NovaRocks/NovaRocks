@@ -38,8 +38,8 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CharacterKind, CharacterType, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy,
-    FunctionValueType, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-    SemanticParameters, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    FunctionValueType, SemanticParameters, ValueKind, ValueLayout, ValueTypeRef,
+    ValueTypeStorageLifetime,
 };
 use std::{convert::Infallible, sync::Arc};
 
@@ -81,10 +81,6 @@ fn text_program(
         constant_policy: constant_policy(),
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters: &parameters,
-        allow_throw_exception: SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        },
     };
     let typed = type_expression_text(sql, columns, &context, &HarnessControl)?;
     let unit = typed.unit();

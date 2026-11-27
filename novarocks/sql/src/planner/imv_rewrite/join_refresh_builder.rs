@@ -18,10 +18,9 @@
 use std::collections::BTreeSet;
 
 use arrow::datatypes::DataType;
+use novarocks_type_contract::OperatorFunction;
 
-use crate::analysis::{
-    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
-};
+use crate::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::binding::SqlTableBindingId;
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::planner::imv_rewrite::join_refresh_descriptor::{
@@ -292,6 +291,12 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     #[cfg(test)]
     let function_catalog = crate::functions::builtin_sql_function_catalog();
+    let expressions = JoinRefreshExpressions {
+        functions: function_catalog,
+        overflow: policy,
+        constants: constant_policy,
+        control,
+    };
     desc.validate()?;
     if desc.mode != JoinRefreshMode::Coalesce {
         return Err("join refresh coalesce builder requires coalesce descriptor"
@@ -436,6 +441,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         locator_apply_key.column_id,
         &locator_columns,
+        &expressions,
     )?;
     let locator_checked = build_locator_assert_filter(
         locator_join,
@@ -455,8 +461,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &apply_key_output,
         &net_column,
         &locator_columns,
+        &expressions,
     )
-    .map_err(crate::compiler::SqlCompileError::from)
 }
 
 fn build_payload_coalesce_aggregate(
@@ -586,11 +592,17 @@ fn build_payload_coalesce_assert_filter(
     constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
-    let net_ne_zero = binary(
+    let expressions = JoinRefreshExpressions {
+        functions: function_catalog,
+        overflow: policy,
+        constants: constant_policy,
+        control,
+    };
+    let net_ne_zero = expressions.compare(
         column_ref(net_column),
-        BinOp::Ne,
+        OperatorFunction::NotEqual,
         int_literal(0, DataType::Int64),
-    );
+    )?;
     let abs_args = vec![column_ref(net_column)];
     let abs_binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
         crate::planner::BINDING_AUTHORITY,
@@ -617,7 +629,11 @@ fn build_payload_coalesce_assert_filter(
         },
         value_type,
     };
-    let abs_net_le_one = binary(abs_net, BinOp::Le, int_literal(1, DataType::Int64));
+    let abs_net_le_one = expressions.compare(
+        abs_net,
+        OperatorFunction::LessThanOrEqual,
+        int_literal(1, DataType::Int64),
+    )?;
     let payload_assert = assert_true_call(
         function_catalog,
         abs_net_le_one,
@@ -628,7 +644,7 @@ fn build_payload_coalesce_assert_filter(
     )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
-            predicate: binary(net_ne_zero, BinOp::And, payload_assert),
+            predicate: binary(net_ne_zero, crate::common::BooleanOp::And, payload_assert),
         }),
         vec![aggregate],
         None,
@@ -647,8 +663,22 @@ fn build_key_shape_assert_join(
     constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
-    let insert_args = vec![pending_count_expr(net_column, BinOp::Gt)];
-    let delete_args = vec![pending_count_expr(net_column, BinOp::Lt)];
+    let expressions = JoinRefreshExpressions {
+        functions: function_catalog,
+        overflow: policy,
+        constants: constant_policy,
+        control,
+    };
+    let insert_args = vec![pending_count_expr(
+        net_column,
+        OperatorFunction::GreaterThan,
+        &expressions,
+    )?];
+    let delete_args = vec![pending_count_expr(
+        net_column,
+        OperatorFunction::LessThan,
+        &expressions,
+    )?];
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
         "sum",
@@ -718,17 +748,17 @@ fn build_key_shape_assert_join(
     let shape_guard = assert_true_call(
         function_catalog,
         binary(
-            binary(
+            expressions.compare(
                 column_ref(pending_insert_count),
-                BinOp::Le,
+                OperatorFunction::LessThanOrEqual,
                 int_literal(1, DataType::Int64),
-            ),
-            BinOp::And,
-            binary(
+            )?,
+            crate::common::BooleanOp::And,
+            expressions.compare(
                 column_ref(pending_delete_count),
-                BinOp::Le,
+                OperatorFunction::LessThanOrEqual,
                 int_literal(1, DataType::Int64),
-            ),
+            )?,
         ),
         "join delta multiple pending payloads for key",
         policy,
@@ -742,11 +772,11 @@ fn build_key_shape_assert_join(
         vec![key_shape],
         None,
     );
-    let join_condition = binary(
+    let join_condition = expressions.compare(
         column_ref(apply_key_output),
-        BinOp::Eq,
+        OperatorFunction::Equal,
         column_ref(key_shape_apply_key),
-    );
+    )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
             naa_author: None,
@@ -758,13 +788,17 @@ fn build_key_shape_assert_join(
     ))
 }
 
-fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
-    TypedExpr {
+fn pending_count_expr(
+    net_column: &OutputColumn,
+    op: OperatorFunction,
+    expressions: &JoinRefreshExpressions<'_>,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
+    Ok(TypedExpr {
         kind: ExprKind::Case {
             ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
-                binary(column_ref(net_column), op, int_literal(0, DataType::Int64)),
+                expressions.compare(column_ref(net_column), op, int_literal(0, DataType::Int64))?,
                 int_literal(1, DataType::Int64),
             )])
             .into(),
@@ -774,7 +808,7 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
             ))),
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-    }
+    })
 }
 
 fn build_locator_join_shell(
@@ -785,7 +819,8 @@ fn build_locator_join_shell(
     net_column: &OutputColumn,
     right_apply_key_id: ColumnId,
     locator_columns: &JoinRefreshLocatorColumns<'_>,
-) -> Result<LogicalPlanNode, String> {
+    expressions: &JoinRefreshExpressions<'_>,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let right_apply_key = target_apply_key_declaration(locator, left_apply_key)?;
     let right_scan = build_target_locator_scan(
         desc,
@@ -798,14 +833,14 @@ fn build_locator_join_shell(
         locator_columns.last_updated_sequence,
         locator_columns.file_metadata,
     )?;
-    let delete_only = binary(
+    let delete_only = expressions.compare(
         column_ref(net_column),
-        BinOp::Lt,
+        OperatorFunction::LessThan,
         int_literal(0, DataType::Int64),
-    );
-    let apply_key_eq = binary(
+    )?;
+    let apply_key_eq = expressions.compare(
         column_ref(left_apply_key),
-        BinOp::Eq,
+        OperatorFunction::Equal,
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: right_apply_key_id,
@@ -816,12 +851,16 @@ fn build_locator_join_shell(
                 .declared_value_type()
                 .map_err(|error| error.to_string())?,
         },
-    );
+    )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
             naa_author: None,
             join_type: JoinKind::LeftOuter,
-            condition: Some(binary(delete_only, BinOp::And, apply_key_eq)),
+            condition: Some(binary(
+                delete_only,
+                crate::common::BooleanOp::And,
+                apply_key_eq,
+            )),
         }),
         vec![left, right_scan],
         None,
@@ -992,18 +1031,24 @@ fn build_locator_assert_filter(
     constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
-    let insert_or_noop = binary(
+    let expressions = JoinRefreshExpressions {
+        functions: function_catalog,
+        overflow: policy,
+        constants: constant_policy,
+        control,
+    };
+    let insert_or_noop = expressions.compare(
         column_ref(net_column),
-        BinOp::Ge,
+        OperatorFunction::GreaterThanOrEqual,
         int_literal(0, DataType::Int64),
-    );
+    )?;
     let locator_present = binary(
         is_not_null(locator_column_ref(
             locator_file_column_id,
             crate::common::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
         )),
-        BinOp::And,
+        crate::common::BooleanOp::And,
         is_not_null(locator_column_ref(
             locator_pos_column_id,
             crate::common::ICEBERG_ROW_POS_COL,
@@ -1012,7 +1057,11 @@ fn build_locator_assert_filter(
     );
     let predicate = assert_true_call(
         function_catalog,
-        binary(insert_or_noop, BinOp::Or, locator_present),
+        binary(
+            insert_or_noop,
+            crate::common::BooleanOp::Or,
+            locator_present,
+        ),
         "join delta DELETE row missing target locator",
         policy,
         constant_policy,
@@ -1033,7 +1082,8 @@ fn build_final_coalesce_project(
     apply_key_output: &OutputColumn,
     net_column: &OutputColumn,
     locator_columns: &JoinRefreshLocatorColumns<'_>,
-) -> Result<LogicalPlanNode, String> {
+    expressions: &JoinRefreshExpressions<'_>,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let action_output = mapped_output_column(
         desc,
         JoinRefreshOutputSource::Action(desc.action_column.column_id),
@@ -1099,7 +1149,7 @@ fn build_final_coalesce_project(
         items.push(item);
     }
     items.push(ProjectItem {
-        expr: coalesced_action_expr(net_column),
+        expr: coalesced_action_expr(net_column, expressions)?,
         output_name: action_output.name,
         output_column_id: action_output.column_id,
     });
@@ -1113,17 +1163,20 @@ fn build_final_coalesce_project(
     ))
 }
 
-fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
+fn coalesced_action_expr(
+    net_column: &OutputColumn,
+    expressions: &JoinRefreshExpressions<'_>,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let case = TypedExpr {
         kind: ExprKind::Case {
             ieee_float_equality: false,
             operand: None,
             when_then: (vec![(
-                binary(
+                expressions.compare(
                     column_ref(net_column),
-                    BinOp::Gt,
+                    OperatorFunction::GreaterThan,
                     int_literal(0, DataType::Int64),
-                ),
+                )?,
                 int_literal(i64::from(crate::common::CHANGE_OP_INSERT), DataType::Int8),
             )])
             .into(),
@@ -1134,7 +1187,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
-    TypedExpr {
+    Ok(TypedExpr {
         kind: ExprKind::Cast {
             cast_mode: None,
             expr: novarocks_parser::ast::AstBox::new(case),
@@ -1142,7 +1195,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-    }
+    })
 }
 
 fn payload_source_output_columns(
@@ -1253,13 +1306,37 @@ fn output_column_from_factory(
     output_column(column_id, name, value_type, is_internal)
 }
 
-fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
+struct JoinRefreshExpressions<'a> {
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    overflow: novarocks_type_contract::DecimalOverflowPolicy,
+    constants: novarocks_functions::ConstantValidation,
+    control: &'a dyn novarocks_type_contract::PureCompileControl,
+}
+
+impl JoinRefreshExpressions<'_> {
+    fn compare(
+        &self,
+        left: TypedExpr,
+        operator: OperatorFunction,
+        right: TypedExpr,
+    ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
+        Ok(crate::analyzer::type_optimizer_operator(
+            self.functions,
+            operator,
+            [left, right],
+            self.overflow,
+            self.constants,
+            self.control,
+        )?)
+    }
+}
+
+fn binary(left: TypedExpr, op: crate::common::BooleanOp, right: TypedExpr) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(left),
             op,
             right: novarocks_parser::ast::AstBox::new(right),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
@@ -2360,7 +2437,7 @@ mod tests {
     fn expr_contains_string_literal(expr: &crate::analysis::TypedExpr, needle: &str) -> bool {
         match &expr.kind {
             ExprKind::Literal(LiteralValue::String(value)) => value == needle,
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -2516,6 +2593,7 @@ mod tests {
     fn run_query_rewrite_pipeline(plan: LogicalPlanNode) -> LogicalPlanNode {
         let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(["FoldConstant".into()]);
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_query_stats_input(
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
@@ -2585,7 +2663,7 @@ mod tests {
                     refs.insert(*column_id);
                 }
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,

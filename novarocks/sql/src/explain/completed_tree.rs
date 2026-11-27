@@ -955,15 +955,7 @@ impl ExprText<'_> {
             },
             ExprKind::LambdaParameter { ordinal, .. } => write!(formatter, "arg{ordinal}"),
             ExprKind::Lambda { body, .. } => write!(formatter, "-> {}", inner(*body)),
-            ExprKind::Binary {
-                left, op, right, ..
-            } => write!(
-                formatter,
-                "{} {} {}",
-                operand(*left),
-                binary_operator_text(*op),
-                operand(*right)
-            ),
+
             ExprKind::Conjunction { args } => {
                 write_joined(formatter, args, " AND ", |arg| inner(*arg))
             }
@@ -1015,10 +1007,8 @@ impl ExprText<'_> {
                     .and_then(|unit| unit.definition(*operand))
                     .ok_or(fmt::Error)?
                     .kind;
-                let needs_parentheses = matches!(
-                    operand_kind,
-                    ExprKind::Binary { .. } | ExprKind::Lambda { .. }
-                ) || needs_operand_group(operand_kind);
+                let needs_parentheses = matches!(operand_kind, ExprKind::Lambda { .. })
+                    || needs_operand_group(operand_kind);
                 write_negation(formatter, needs_parentheses, |out| {
                     write!(out, "{}", inner(*operand))
                 })
@@ -1097,7 +1087,6 @@ impl ExprText<'_> {
 }
 
 fn needs_operand_group(kind: &ExprKind) -> bool {
-    use novarocks_expression_contract::BinaryOperator;
     use novarocks_type_contract::OperatorFunction;
 
     match kind {
@@ -1108,16 +1097,7 @@ fn needs_operand_group(kind: &ExprKind) -> bool {
                     || operator.is_null_safe_comparison()
             })
         }
-        ExprKind::Binary { op, .. } => matches!(
-            op,
-            BinaryOperator::Eq
-                | BinaryOperator::EqForNull
-                | BinaryOperator::NotEq
-                | BinaryOperator::Lt
-                | BinaryOperator::LtEq
-                | BinaryOperator::Gt
-                | BinaryOperator::GtEq
-        ),
+
         ExprKind::Conjunction { .. } | ExprKind::IsNull { .. } => true,
         // Disjunction already groups at non-root rendering depth.
         _ => false,
@@ -1162,24 +1142,6 @@ fn function_text(function: &novarocks_physical_plan::FunctionId) -> &str {
     // wrote the middle part and that is what names it here.
     let id = function.as_str();
     id.split('/').nth(1).unwrap_or(id)
-}
-
-fn binary_operator_text(op: novarocks_expression_contract::BinaryOperator) -> &'static str {
-    use novarocks_expression_contract::BinaryOperator;
-    match op {
-        BinaryOperator::Eq => "=",
-        BinaryOperator::EqForNull => "<=>",
-        BinaryOperator::NotEq => "!=",
-        BinaryOperator::Lt => "<",
-        BinaryOperator::LtEq => "<=",
-        BinaryOperator::Gt => ">",
-        BinaryOperator::GtEq => ">=",
-        BinaryOperator::Add => "+",
-        BinaryOperator::Subtract => "-",
-        BinaryOperator::Multiply => "*",
-        BinaryOperator::Divide => "/",
-        BinaryOperator::Modulo => "%",
-    }
 }
 
 fn sort_items_text<'a>(

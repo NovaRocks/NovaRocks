@@ -96,13 +96,15 @@ pub(crate) enum PrimitiveBuilderOutput {
     Real,
     Double,
     Decimal128,
+    Decimal256,
+    FixedSizeBinary16,
 }
 
 impl PrimitiveBuilderOutput {
     fn layout(self) -> Result<(Option<usize>, usize), ScalarResourceError> {
         use arrow_array::{
-            BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-            Int32Array,
+            BooleanArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array,
+            Float64Array, Int8Array, Int16Array, Int32Array,
         };
 
         Ok(match self {
@@ -114,6 +116,8 @@ impl PrimitiveBuilderOutput {
             Self::Real => (Some(4), array_arc_bytes_for::<Float32Array>()?),
             Self::Double => (Some(8), array_arc_bytes_for::<Float64Array>()?),
             Self::Decimal128 => (Some(16), array_arc_bytes_for::<Decimal128Array>()?),
+            Self::Decimal256 => (Some(32), array_arc_bytes_for::<Decimal256Array>()?),
+            Self::FixedSizeBinary16 => (Some(16), array_arc_bytes_for::<FixedSizeBinaryArray>()?),
         })
     }
 }

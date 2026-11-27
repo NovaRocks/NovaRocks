@@ -69,7 +69,6 @@ impl FailureProjection for PrimitiveError {
         match self {
             Self::Control(e) => e.failure_fact(),
             Self::Comparison(e) => e.failure_fact(),
-            Self::Arithmetic(e) => e.failure_fact(),
             Self::Cast(e) => e.failure_fact(),
             Self::Invalid(_) => fact(FailureClass::Invariant, 20),
         }

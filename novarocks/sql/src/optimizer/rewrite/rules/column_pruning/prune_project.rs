@@ -595,17 +595,11 @@ mod tests {
                         true,
                     ),
                 );
-                let expr = arena.intern(
-                    ScalarNode::BinaryOp {
-                        op,
-                        left: source,
-                        right: source,
-                        decimal_overflow_policy: policy,
-                    },
-                    novarocks_type_contract::FunctionValueType::new(
-                        DataType::Decimal128(38, 0),
-                        true,
-                    ),
+                let expr = arena.test_intern_operator(
+                    op,
+                    source,
+                    source,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 );
                 vec![
                     plain,

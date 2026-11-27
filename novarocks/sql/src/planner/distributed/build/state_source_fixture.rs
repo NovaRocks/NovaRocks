@@ -268,7 +268,6 @@ pub fn ordinary_union_source(
         },
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         crate::constant::test_constant_policy(),
         control,
     )
@@ -320,7 +319,6 @@ pub fn ordinary_extrema_constant_state_source_for_test(
         },
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         crate::constant::test_constant_policy(),
         control,
     )
@@ -437,7 +435,6 @@ pub fn ordered_array_state_source_for_test(
         },
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         crate::constant::test_constant_policy(),
         control,
     )

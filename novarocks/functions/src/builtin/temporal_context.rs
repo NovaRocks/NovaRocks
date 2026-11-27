@@ -401,7 +401,6 @@ impl TemporalSyntax {
             match parameters.require(*reference).ok()? {
                 SemanticParameterValue::TimeZone(zone) => facts.zone = Some(*zone),
                 SemanticParameterValue::StatementStartUtc(start) => facts.start = Some(*start),
-                _ => return None,
             }
         }
         Some(facts)

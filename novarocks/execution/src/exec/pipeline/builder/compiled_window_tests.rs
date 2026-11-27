@@ -800,7 +800,7 @@ fn aggregate_over_without_a_window_kernel_is_refused_before_running() {
 
 #[test]
 fn a_row_error_of_an_argument_root_fails_the_query() {
-    // 1 * i64::MAX fits; 5 * i64::MAX overflows under ALLOW_THROW. A NULL
+    // 1 * i64::MAX fits; 5 * i64::MAX overflows. A NULL
     // argument row raises nothing, so the error comes from a value row.
     let shape = Shape {
         partition: vec![P],

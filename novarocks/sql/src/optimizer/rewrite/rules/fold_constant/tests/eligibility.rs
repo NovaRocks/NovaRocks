@@ -26,7 +26,7 @@ fn does_not_fold_expression_referencing_a_column() {
     let mut fixture = Fixture::new();
     let column = fixture.column(7);
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, column, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, column, one);
     let plan = project(sum);
 
     assert!(matches!(fixture.apply(plan), RewriteResult::Unchanged));
@@ -39,8 +39,8 @@ fn folds_constant_subtree_under_a_column_reference() {
     let one = fixture.int_literal(1);
     let two = fixture.int_literal(2);
     let column = fixture.column(7);
-    let constant_sum = fixture.binary(BinOp::Add, one, two);
-    let outer = fixture.binary(BinOp::Add, constant_sum, column);
+    let constant_sum = fixture.binary(crate::common::BinOp::Add, one, two);
+    let outer = fixture.binary(crate::common::BinOp::Add, constant_sum, column);
     let plan = project(outer);
 
     let rewritten = changed(fixture.apply(plan));
@@ -48,13 +48,16 @@ fn folds_constant_subtree_under_a_column_reference() {
 
     // `1 + 2 + col` becomes `3 + col`: the constant sub-tree collapsed but
     // the outer node still references a column and stays put.
-    let ScalarNode::BinaryOp {
-        op, left, right, ..
-    } = fixture.node(folded)
-    else {
-        panic!("expected a BinaryOp root, got {:?}", fixture.node(folded));
+    let ScalarNode::FunctionCall { binding, args, .. } = fixture.node(folded) else {
+        panic!("expected selected addition");
     };
-    assert_eq!(op, BinOp::Add);
+    assert_eq!(
+        binding.function_id,
+        novarocks_type_contract::OperatorFunction::Add.function_id()
+    );
+    let [left, right] = args[..] else {
+        panic!("exact add operands")
+    };
     assert_int_literal(&fixture, left, 3);
     assert!(matches!(fixture.node(right), ScalarNode::ColumnRef(_)));
 }
@@ -161,12 +164,15 @@ fn does_not_fold_denylisted_function_even_when_marked_immutable() {
 fn does_not_fold_node_whose_output_type_is_not_wire_encodable() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary_typed(
-        BinOp::Add,
-        one,
-        one,
-        DataType::Timestamp(TimeUnit::Microsecond, None),
-        false,
+    let target = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let sum = fixture.intern(
+        ScalarNode::Cast {
+            cast_mode: None,
+            child: one,
+            target: target.clone(),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        },
+        FunctionValueType::new(target, false),
     );
     let plan = project(sum);
 
@@ -246,7 +252,7 @@ fn matches_requires_at_least_one_scalar_field() {
 fn folds_filter_predicate() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
     let plan = OptExpr::leaf(Operator::LogicalFilter(FilterOp { predicate: sum }));
 
     let rewritten = changed(fixture.apply(plan));
@@ -261,7 +267,7 @@ fn folds_values_rows_join_condition_and_sort_keys() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
     let two = fixture.int_literal(2);
-    let sum = fixture.binary(BinOp::Add, one, two);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, two);
 
     let values = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
         rows: vec![vec![sum]],
@@ -342,11 +348,9 @@ fn collapsing_nested_constant_preserves_the_authored_json_domain() {
 fn folds_through_nested_wrapper() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
-    let nested = fixture.intern(
-        ScalarNode::Nested(sum),
-        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
-    );
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
+    let declared = fixture.arena.borrow().value_type(sum).clone();
+    let nested = fixture.intern(ScalarNode::Nested(sum), declared);
     let plan = project(nested);
 
     let rewritten = changed(fixture.apply(plan));
@@ -359,8 +363,8 @@ fn folds_constants_inside_a_case_without_folding_the_case_itself() {
     let one = fixture.int_literal(1);
     let two = fixture.int_literal(2);
     let column = fixture.column(7);
-    let when = fixture.binary_typed(BinOp::Eq, column, one, DataType::Boolean, true);
-    let then = fixture.binary(BinOp::Add, one, two);
+    let when = fixture.binary_typed(crate::common::BinOp::Eq, column, one, DataType::Boolean);
+    let then = fixture.binary(crate::common::BinOp::Add, one, two);
     let case = fixture.intern(
         ScalarNode::Case {
             ieee_float_equality: false,
@@ -384,7 +388,7 @@ fn folds_constants_inside_a_case_without_folding_the_case_itself() {
 fn second_pass_over_a_folded_plan_reports_unchanged() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
-    let sum = fixture.binary(BinOp::Add, one, one);
+    let sum = fixture.binary(crate::common::BinOp::Add, one, one);
     let plan = project(sum);
 
     let rewritten = changed(fixture.apply(plan));
@@ -400,7 +404,7 @@ fn short_circuit_does_not_fold_over_an_unfolded_child() {
     let mut fixture = Fixture::new();
     let one = fixture.int_literal(1);
     let zero = fixture.int_literal(0);
-    let division = fixture.binary(BinOp::Div, one, zero);
+    let division = fixture.binary(crate::common::BinOp::Div, one, zero);
     let bool_type = FunctionValueType::new(DataType::Boolean, false);
     let falsity = fixture.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(false))),
@@ -410,17 +414,32 @@ fn short_circuit_does_not_fold_over_an_unfolded_child() {
         ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
         bool_type,
     );
-    let comparison = fixture.binary_typed(BinOp::Eq, division, one, DataType::Boolean, true);
-    let conjunction =
-        fixture.binary_typed(BinOp::And, falsity, comparison, DataType::Boolean, true);
+    let comparison =
+        fixture.binary_typed(crate::common::BinOp::Eq, division, one, DataType::Boolean);
+    let conjunction = fixture.binary_typed(
+        crate::common::BooleanOp::And,
+        falsity,
+        comparison,
+        DataType::Boolean,
+    );
     assert!(matches!(
         fixture.apply(project(conjunction)),
         RewriteResult::Unchanged
     ));
-    let nested = fixture.binary_typed(BinOp::And, truth, falsity, DataType::Boolean, false);
-    let outer = fixture.binary_typed(BinOp::And, nested, comparison, DataType::Boolean, true);
+    let nested = fixture.binary_typed(
+        crate::common::BooleanOp::And,
+        truth,
+        falsity,
+        DataType::Boolean,
+    );
+    let outer = fixture.binary_typed(
+        crate::common::BooleanOp::And,
+        nested,
+        comparison,
+        DataType::Boolean,
+    );
     let folded = project_expr(&changed(fixture.apply(project(outer))));
-    let ScalarNode::BinaryOp { left, right, .. } = fixture.node(folded) else {
+    let ScalarNode::BooleanConnective { left, right, .. } = fixture.node(folded) else {
         panic!("outer conjunction must stay")
     };
     assert!([left, right].contains(&comparison));

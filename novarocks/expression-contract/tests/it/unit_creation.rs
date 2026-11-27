@@ -175,15 +175,9 @@ fn graph_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
             .add(
                 None,
                 integer(false),
-                ExprKind::Binary {
-                    left: root,
-                    right: leaf,
-                    op: BinaryOperator::Add,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: Some(SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    }),
+                ExprKind::Let {
+                    value: root,
+                    body: leaf,
                 },
             )
             .unwrap();
@@ -246,7 +240,6 @@ fn call_unit(environment: bool) -> BoundExprSet {
         claim.effects.environment = [
             SemanticParameterKey::StatementStartUtc,
             SemanticParameterKey::TimeZone,
-            SemanticParameterKey::AllowThrowException,
         ]
         .into_iter()
         .enumerate()
@@ -371,15 +364,9 @@ fn lexical_unit() -> BoundExprSet {
         .add(
             Some(inner),
             integer(false),
-            ExprKind::Binary {
-                left: outer_parameter,
-                right: inner_parameter,
-                op: BinaryOperator::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: Some(SemanticParameterRef {
-                    id: SemanticParameterId::new(0),
-                    expected_key: SemanticParameterKey::AllowThrowException,
-                }),
+            ExprKind::Let {
+                value: outer_parameter,
+                body: inner_parameter,
             },
         )
         .unwrap();

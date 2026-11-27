@@ -903,10 +903,10 @@ fn estimate_selectivity_scalar(
         };
     }
     Ok(match node {
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left, op, right, ..
         } => match *op {
-            BinOp::And => {
+            crate::common::BooleanOp::And => {
                 let mut conjuncts = Vec::new();
                 flatten_and_scalar(arena, expr, &mut conjuncts, work)?;
                 let mut sels = Vec::new();
@@ -921,16 +921,16 @@ fn estimate_selectivity_scalar(
                 }
                 observed_damped_conjunction(&sels, work)?
             }
-            BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
+            crate::common::BooleanOp::ExpandedConjunction
+            | crate::common::BooleanOp::ExpandedNegatedConjunction => {
                 estimate_selectivity_scalar(arena, *left, column_stats, work)?
                     * estimate_selectivity_scalar(arena, *right, column_stats, work)?
             }
-            BinOp::Or => {
+            crate::common::BooleanOp::Or => {
                 let l = estimate_selectivity_scalar(arena, *left, column_stats, work)?;
                 let r = estimate_selectivity_scalar(arena, *right, column_stats, work)?;
                 l + r - l * r
             }
-            _ => PREDICATE_UNKNOWN_FILTER,
         },
         ScalarNode::IsNull { child, negated } => {
             let col_id = extract_column_id_scalar(arena, *child);
@@ -974,8 +974,8 @@ fn flatten_and_scalar(
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
         match arena.node(expr) {
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left,
                 right,
                 ..
@@ -1369,8 +1369,8 @@ fn inner_join_conjunct_count(
     while let Some(id) = stack.pop() {
         work.step()?;
         match scalars.node(id) {
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left,
                 right,
                 ..
@@ -2111,9 +2111,9 @@ fn collect_equi_join_column_pairs_inner_scalar(
         return;
     }
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -2347,9 +2347,9 @@ fn collect_join_conjuncts_scalar(
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
         match arena.node(expr) {
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right,
                 ..
             } => {
@@ -4319,16 +4319,12 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: crate::analysis::BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
+        crate::common::binary_operator::test_operator(
+            crate::analysis::BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn selected_comparison(
@@ -4355,7 +4351,6 @@ mod tests {
             )
             .expect("installed comparison for exact fixture arguments");
         crate::common::binary_operator::typed_call(
-            operator,
             crate::binding::SqlFunctionBinding::from_plan(
                 crate::binding::PlanBindingAuthority::Optimizer(
                     crate::optimizer::BindingAuthority(()),
@@ -4371,11 +4366,10 @@ mod tests {
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: crate::analysis::BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -6684,12 +6678,10 @@ mod tests {
                     false,
                 ),
 
-                kind: ExprKind::BinaryOp {
-                    op: BinOp::And,
+                kind: ExprKind::BooleanConnective {
+                    op: crate::common::BooleanOp::And,
                     left: novarocks_parser::ast::AstBox::new(lit(1)),
                     right: novarocks_parser::ast::AstBox::new(lit(2)),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
             intern_typed(

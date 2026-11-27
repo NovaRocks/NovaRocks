@@ -123,7 +123,6 @@ pub(in crate::planner::distributed::build) fn finish(
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         &control,
     )
@@ -169,7 +168,6 @@ where
         dop(),
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
-        false,
         policy(),
         control,
         &mut observer,
@@ -985,7 +983,6 @@ fn window_and_table_actual_capture_recording_preserve_every_lowering_control_pre
             dop(),
             functions.clone(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             policy(),
             control,
         )
@@ -1053,7 +1050,6 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         &control,
     )

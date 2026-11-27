@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::binding::SqlFunctionBinding;
-use crate::common::{BinOp, LiteralValue};
+use crate::common::LiteralValue;
 use crate::compiler::SqlAuthoredScalarUnit;
 use novarocks_functions::PureCallLifecycle;
 
@@ -558,7 +558,7 @@ fn fold_scalar_uncached(
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -742,22 +742,9 @@ fn try_fold_node_current(
             _ => Ok(None),
         };
     }
-    if ctx.root_allow_throw_exception() {
-        return Ok(None);
-    }
 
     let children = match node {
-        ScalarNode::BinaryOp {
-            op, left, right, ..
-        } => {
-            if *op == BinOp::EqForNull
-                && arena.data_type(*left) == &DataType::Null
-                && arena.data_type(*right) == &DataType::Null
-            {
-                return Ok(None);
-            }
-            &[*left, *right][..]
-        }
+        ScalarNode::BooleanConnective { left, right, .. } => &[*left, *right][..],
         ScalarNode::Cast { child, .. } => std::slice::from_ref(child),
         ScalarNode::FunctionCall {
             name,

@@ -141,9 +141,16 @@ fn apply_expr(
         })?;
     let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc, control)?;
 
-    let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable();
+    let in_key = crate::optimizer::scalar::intern_scalar_operator(
+        function_catalog,
+        arena,
+        novarocks_type_contract::OperatorFunction::Equal,
+        [lhs, inner_col_ref],
+        policy,
+        control,
+    )?;
     let join_type = if negated {
-        if either_nullable {
+        if arena.nullable(in_key) {
             JoinKind::NullAwareLeftAnti
         } else {
             JoinKind::LeftAnti
@@ -151,8 +158,6 @@ fn apply_expr(
     } else {
         JoinKind::LeftSemi
     };
-
-    let in_key = scalar_utils::eq(arena, lhs, inner_col_ref, control)?;
 
     let (right, condition, eligibility) = if a.correlation_column_ids.is_empty() {
         (apply_right, in_key, None)
@@ -313,18 +318,13 @@ mod tests {
     }
 
     fn correlation_predicate(nullable: bool) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(INNER_K, "k", nullable)),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k", false)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-        }
+        crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::Equal,
+            vec![
+                col_ref(INNER_K, "k", nullable),
+                col_ref(OUTER_K, "k", false),
+            ],
+        )
     }
 
     fn projected_correlated_inner(
@@ -448,16 +448,11 @@ mod tests {
     }
 
     fn assert_eq_condition(condition: &TypedExpr, expected_a: ColumnId, expected_b: ColumnId) {
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &condition.kind
+        let Some((novarocks_type_contract::OperatorFunction::Equal, [left, right])) =
+            crate::common::binary_operator::typed_operands(condition)
         else {
-            panic!("expected bare Eq condition, got: {condition:?}");
+            panic!("expected installed Eq condition, got: {condition:?}");
         };
-        assert_eq!(*op, BinOp::Eq);
-        // The arena normalizes commutative Eq by ScalarId order, so left/right
-        // assignment is an implementation detail. Check that the expected pair
-        // of column ids appears in either order.
         let left_id = match &left.kind {
             ExprKind::ColumnRef { column_id, .. } => *column_id,
             other => panic!("expected column ref on left, got: {other:?}"),
@@ -467,24 +462,16 @@ mod tests {
             other => panic!("expected column ref on right, got: {other:?}"),
         };
         let pair = (left_id, right_id);
-        assert!(
-            pair == (expected_a, expected_b) || pair == (expected_b, expected_a),
-            "expected Eq condition to reference {expected_a:?} and {expected_b:?}; got {pair:?}"
-        );
+        assert_eq!(pair, (expected_a, expected_b));
     }
 
-    /// Returns true if `condition` is `a = b` (Eq BinaryOp) with the two
-    /// expected column ids in either order.
+    /// Recognize the original comparison and both relation columns.
     fn eq_condition_has_pair(condition: &TypedExpr, a: ColumnId, b: ColumnId) -> bool {
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &condition.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(condition)
         else {
             return false;
         };
-        if *op != BinOp::Eq {
-            return false;
-        }
         let left_id = match &left.kind {
             ExprKind::ColumnRef { column_id, .. } => *column_id,
             _ => return false,
@@ -631,7 +618,7 @@ mod tests {
             .position(|c| eq_condition_has_pair(c, OUTER_A, INNER_B))
             .expect("expected OUTER_A=INNER_B conjunct");
         let coalesce_idx = if outer_a_inner_b_idx == 0 { 1 } else { 0 };
-        assert_coalesce_false(&conjuncts[coalesce_idx], OUTER_K, INNER_K);
+        assert_coalesce_false(&conjuncts[coalesce_idx], INNER_K, OUTER_K);
         let right = plan.right();
         let LogicalPlanKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);

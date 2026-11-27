@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use arrow::array::{BooleanArray, Int64Array};
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BinaryOperator, ExprId, ExprKind};
+use novarocks_expression_contract::{ExprId, ExprKind};
 use novarocks_type_contract::{CompileControlError, DecimalOverflowPolicy, FunctionValueType};
 
 use super::*;
@@ -50,20 +50,24 @@ fn integer(arena: &mut ScalarArena, value: i64, data_type: DataType) -> ScalarId
 
 fn binary(
     arena: &mut ScalarArena,
-    op: BinOp,
+    op: impl Into<crate::common::binary_operator::TestOperator>,
     left: ScalarId,
     right: ScalarId,
     ty: FunctionValueType,
 ) -> ScalarId {
-    arena.intern(
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-        },
-        ty,
+    let expression = crate::common::binary_operator::test_operator(
+        op,
+        crate::planner::optimizer_bridge::scalar::materialize(arena, left),
+        crate::planner::optimizer_bridge::scalar::materialize(arena, right),
+        DecimalOverflowPolicy::OutputNull,
+    );
+    let original = crate::planner::optimizer_bridge::scalar::intern_typed(
+        arena,
+        &expression,
+        crate::optimizer::test_optimizer_control(),
     )
+    .unwrap();
+    arena.intern(arena.node(original).clone(), ty)
 }
 
 #[test]
@@ -71,7 +75,7 @@ fn candidate_and_two_constants_lower_to_one_root() {
     let mut arena = ScalarArena::new();
     let left = integer(&mut arena, 19, DataType::Int64);
     let right = integer(&mut arena, 23, DataType::Int64);
-    let ty = FunctionValueType::new(DataType::Int64, true);
+    let ty = FunctionValueType::new(DataType::Int64, false);
     let root = binary(&mut arena, BinOp::Add, left, right, ty);
 
     let evaluated = fold_node(root, &arena, &context()).unwrap();
@@ -81,18 +85,20 @@ fn candidate_and_two_constants_lower_to_one_root() {
     assert_eq!(unit.roots().len(), 1);
     assert_eq!(unit.definitions().len(), 3);
     let root = unit.root(source.root()).unwrap();
-    let ExprKind::Binary {
-        left,
-        right,
-        op: BinaryOperator::Add,
-        ..
-    } = unit.definition(root.definition).unwrap().kind
+    let ExprKind::FunctionCall { function, args } = &unit.definition(root.definition).unwrap().kind
     else {
         panic!("expected the arithmetic candidate as the sole root")
     };
+    assert_eq!(
+        function.function_id,
+        novarocks_type_contract::OperatorFunction::Add.function_id()
+    );
+    let [left, right] = args.as_ref() else {
+        panic!("exact add operands")
+    };
     for child in [left, right] {
         assert!(matches!(
-            unit.definition(child).unwrap().kind,
+            unit.definition(*child).unwrap().kind,
             ExprKind::Constant(_)
         ));
     }
@@ -123,16 +129,18 @@ fn comparison_coercion_is_inside_the_boolean_root() {
         .definition(unit.root(source.root()).unwrap().definition)
         .unwrap();
     assert_eq!(root.ty.data_type(), &DataType::Boolean);
-    let ExprKind::Binary {
-        left,
-        op: BinaryOperator::Lt,
-        ..
-    } = root.kind
-    else {
+    let ExprKind::FunctionCall { function, args } = &root.kind else {
         panic!("the comparison owns the root after child coercion")
     };
+    assert_eq!(
+        function.function_id,
+        novarocks_type_contract::OperatorFunction::LessThan.function_id()
+    );
+    let [left, _] = args.as_ref() else {
+        panic!("exact comparison operands")
+    };
     assert!(matches!(
-        unit.definition(left).unwrap().kind,
+        unit.definition(*left).unwrap().kind,
         ExprKind::Cast {
             target: DataType::Int64,
             ..
@@ -160,7 +168,13 @@ fn widened_nullable_root_does_not_admit_null_to_required_arena_type() {
         LiteralValue::Null,
         FunctionValueType::new(DataType::Boolean, true),
     );
-    let input = binary(&mut arena, BinOp::And, truth, null, required);
+    let input = binary(
+        &mut arena,
+        crate::common::BooleanOp::And,
+        truth,
+        null,
+        required,
+    );
 
     let evaluated = fold_node(input, &arena, &context()).unwrap();
     assert!(evaluated.unit.unwrap().value_type().nullable());
@@ -178,7 +192,7 @@ fn row_data_error_keeps_the_compiled_candidate() {
         BinOp::Div,
         left,
         zero,
-        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Int64, false),
     );
     let evaluated = fold_node(input, &arena, &context()).unwrap();
     assert!(evaluated.unit.is_some());
@@ -242,12 +256,13 @@ fn malformed_literal_is_a_fatal_lowering_error() {
         LiteralValue::Int(1),
         FunctionValueType::new(DataType::Boolean, false),
     );
-    let other = integer(&mut arena, 2, DataType::Int64);
-    let input = binary(
-        &mut arena,
-        BinOp::Add,
-        wrong,
-        other,
+    let input = arena.intern(
+        ScalarNode::Cast {
+            cast_mode: None,
+            child: wrong,
+            target: DataType::Int64,
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        },
         FunctionValueType::new(DataType::Int64, false),
     );
     assert!(matches!(

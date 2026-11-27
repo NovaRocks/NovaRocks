@@ -207,20 +207,16 @@ fn normalization_preserves_membership_multiplicity_and_candidate_and_case_arm_or
     let integer = FunctionValueType::new(DataType::Int64, false);
     let boolean = FunctionValueType::new(DataType::Boolean, false);
     let add = |arena: &mut ScalarArena, left, right| {
-        intern(
-            arena,
-            ScalarNode::BinaryOp {
-                left,
-                right,
-                op: BinOp::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            },
-            integer.clone(),
+        arena.test_intern_operator(
+            crate::common::BinOp::Add,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     };
     let first = add(&mut arena, one, two);
     let flipped = add(&mut arena, two, one);
-    assert!(same(
+    assert!(!same(
         &normalized(&arena, first, &HashMap::new()),
         &normalized(&arena, flipped, &HashMap::new())
     ));

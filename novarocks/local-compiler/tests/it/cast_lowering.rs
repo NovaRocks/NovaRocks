@@ -19,7 +19,7 @@ use super::fragment_fixture::{compile, numeric_catalogue, options, package};
 use arrow_schema::{DataType, Field, TimeUnit};
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression::testkit::checked_constants;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::PureEngineFunctionCatalog;
 use novarocks_local_compiler::FragmentCompileError;
 use novarocks_physical_plan::{
@@ -27,8 +27,8 @@ use novarocks_physical_plan::{
     ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    PureCompileControl, SemanticParameters, TrinoCastMode,
+    CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType, PureCompileControl,
+    SemanticParameters, TrinoCastMode,
 };
 use std::sync::{Arc, Mutex};
 
@@ -244,21 +244,13 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
         .add(None, ty, ExprKind::input(ids[1]))
         .unwrap();
     let result_type = FunctionValueType::new(DataType::Boolean, false);
-    let expr = builder
-        .unit(output)
-        .unwrap()
-        .add(
-            None,
-            result_type.clone(),
-            ExprKind::Binary {
-                op: BinaryOperator::EqForNull,
-                left,
-                right,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-        )
-        .unwrap();
+    let expr = novarocks_expression::testkit::add_catalogue_predicate(
+        builder.unit(output).unwrap(),
+        &mut source_pools,
+        novarocks_type_contract::OperatorFunction::Identical,
+        vec![left, right],
+    )
+    .unwrap();
     let output_root = builder
         .unit(output)
         .unwrap()
@@ -288,8 +280,20 @@ fn nullsafe_fixture(ty: FunctionValueType) -> (PureEngineFunctionCatalog, Arc<Fr
         value: result,
         ty: result_type,
     }]);
+    let ports = builder.node_ports(output).unwrap();
+    let draft = builder.take_unit_builder(output).unwrap();
+    let unit = novarocks_expression::testkit::seal_catalogue_fixture(
+        draft,
+        ports,
+        &source_pools,
+        &SemanticParameters::default(),
+        &novarocks_expression::testkit::HarnessControl,
+    );
+    builder.install_unit(output, Arc::new(unit)).unwrap();
     (
-        numeric_catalogue(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
+            .as_ref()
+            .clone(),
         package(
             193,
             builder,

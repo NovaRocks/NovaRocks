@@ -329,8 +329,7 @@ async fn make_explain_preparation(
         if optimizer.optimizer_query_mem_limit_bytes.is_none() {
             optimizer.optimizer_query_mem_limit_bytes = Some(input.optimizer_limit as f64);
         }
-        let options =
-            with_query_sql_semantics(query_options_from_session_settings(&execution), &semantics);
+        let options = query_options_from_session_settings(&execution);
         let options = if !input.explain.is_analyze() {
             // The outer EXPLAIN deadline already belongs to RequestContext.
             // A missing outer deadline uses the original connector bound.

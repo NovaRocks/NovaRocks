@@ -105,7 +105,7 @@ pub(crate) fn typed_operand_has_lower_precedence(operand: &crate::analysis::Type
         || typed_boolean_operand(operand).is_some()
         || matches!(
             operand.kind,
-            ExprKind::BinaryOp { .. }
+            ExprKind::BooleanConnective { .. }
                 | ExprKind::IsNull { .. }
                 | ExprKind::Let { .. }
                 | ExprKind::LambdaFunction { .. }

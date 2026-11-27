@@ -35,10 +35,9 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
-use novarocks_proto_models::{physical_control_v2::Empty, physical_semantics_v2 as semantics};
+use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, FunctionArgumentType, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterValue, SemanticParameters,
+    FunctionArgumentType, SemanticParameterId, SemanticParameterValue, SemanticParameters,
 };
 use std::{
     alloc::Layout,
@@ -164,12 +163,6 @@ fn definition(
         kind: Some(kind),
     }
 }
-fn allow() -> semantics::SemanticParameterRef {
-    semantics::SemanticParameterRef {
-        id: Some(0),
-        expected_key: semantics::SemanticParameterKey::AllowThrowException as i32,
-    }
-}
 struct Fixture {
     types: DecodedTypeTable,
     carrier_i64: u32,
@@ -273,7 +266,9 @@ impl Fixture {
             .collect();
         let parameters = SemanticParameters::try_new([(
             SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         )])
         .unwrap();
         let mut pools = p::ConstantPools::empty();
@@ -415,12 +410,9 @@ impl Fixture {
             definition(
                 2,
                 1,
-                K::Binary(wire::BinaryExpression {
-                    left_expr_id: Some(0),
-                    right_expr_id: Some(16),
-                    op: wire::BinaryOperator::Add as i32,
-                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::OutputNull as i32,
-                    allow_throw_exception: Some(allow()),
+                K::LetExpression(wire::LetExpression {
+                    value_expr_id: Some(16),
+                    body_expr_id: Some(0),
                 }),
             ),
             definition(
@@ -608,7 +600,7 @@ fn lexical_value_materialization_preserves_the_let_edges_and_address() {
 }
 
 #[test]
-fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_payload_oracles() {
+fn owned_expressions_materialize_scalar_kinds_with_independent_payload_oracles() {
     let control = Control::default();
     let f = Fixture::new(&control);
     let defs = f.all();
@@ -616,10 +608,6 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
     assert_eq!(arena.len(), 17);
     let id = p::ExprId::new;
     let get = |i: u32| &arena[i as usize].kind;
-    let allow = novarocks_type_contract::SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
     for (i, expected) in [
         (
             16,
@@ -641,12 +629,9 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         ),
         (
             2,
-            novarocks_expression_contract::ExprKind::Binary {
-                left: id(0),
-                op: novarocks_expression_contract::BinaryOperator::Add,
-                right: id(16),
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: Some(allow),
+            novarocks_expression_contract::ExprKind::Let {
+                value: id(16),
+                body: id(0),
             },
         ),
         (

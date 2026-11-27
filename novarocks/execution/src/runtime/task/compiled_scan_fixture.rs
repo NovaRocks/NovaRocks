@@ -38,7 +38,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::future::BoxFuture;
 use novarocks_connector_contract::*;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
@@ -46,8 +46,7 @@ use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::*;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
 };
 
 use crate::exec::chunk::Chunk;
@@ -71,10 +70,6 @@ impl PureCompileControl for FixtureControl {
 
 fn int64() -> ValueType {
     ValueType::new(DataType::Int64, false)
-}
-
-fn boolean() -> ValueType {
-    ValueType::new(DataType::Boolean, false)
 }
 
 fn binding() -> ConnectorReadBinding {
@@ -372,21 +367,11 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             int64(),
             crate::exec::operators::family_fixture::constant_sources::i64(7),
         );
-        let predicate = builder
-            .unit(SCAN)
-            .unwrap()
-            .add(
-                None,
-                boolean(),
-                ExprKind::Binary {
-                    left: column,
-                    op: BinaryOperator::Gt,
-                    right: literal,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap();
+        let predicate = builder.operator(
+            SCAN,
+            novarocks_type_contract::OperatorFunction::GreaterThan,
+            [column, literal],
+        );
         residuals.push(
             builder
                 .unit(SCAN)
@@ -479,7 +464,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             projected.clone().into_boxed_slice(),
         )
         .unwrap();
-    crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     if residual {
         let unit = builder
             .construction_node(SCAN)

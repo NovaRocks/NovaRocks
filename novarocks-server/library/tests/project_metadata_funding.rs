@@ -148,7 +148,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
     let expression = builder
         .unit(project)
         .unwrap()
-        .add(None, ty.clone(), ExprKind::Value(input))
+        .add(None, ty.clone(), ExprKind::input(input))
         .unwrap();
     let root = builder
         .unit(project)

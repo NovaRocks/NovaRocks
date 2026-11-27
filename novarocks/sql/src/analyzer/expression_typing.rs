@@ -180,7 +180,11 @@ impl AnalyzerContext<'_> {
                 self.binding_finalizer()
                     .finish(binding, "higher-order function", span)?;
             args.push(lambda);
-            Ok(BoundScalarCall { args, binding })
+            Ok(BoundScalarCall {
+                args,
+                binding,
+                operand_order: Default::default(),
+            })
         })
     }
 
@@ -244,7 +248,7 @@ impl AnalyzerContext<'_> {
         originals: &[&ast::Expr],
         span: Span,
     ) -> Result<BoundScalarCall, AnalyzeError> {
-        let ordinals = self.described_arguments(&args);
+        let mut ordinals = self.described_arguments(&args);
         let result = type_scalar_call_with_finalizer(
             &self.binding_finalizer(),
             shape,
@@ -253,6 +257,9 @@ impl AnalyzerContext<'_> {
             self.constant_policy,
             span,
         )?;
+        if let Some(ordinals) = &mut ordinals {
+            result.operand_order.apply(ordinals);
+        }
         self.observe_argument_types(
             ordinals,
             result.args.iter().map(|arg| Some(&arg.value_type)),
@@ -667,6 +674,29 @@ pub(super) fn type_scalar_call_with_catalog(
     )
 }
 
+pub(crate) fn type_optimizer_operator(
+    catalog: &dyn SqlFunctionCatalog,
+    operator: OperatorFunction,
+    operands: [TypedExpr; 2],
+    decimal_overflow_policy: DecimalOverflowPolicy,
+    constant_policy: ConstantValidation,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    let call = type_scalar_call_with_catalog(
+        catalog,
+        NodeShape::Operator(operator),
+        operands.into(),
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+        novarocks_parser::SYNTHETIC,
+    )?;
+    Ok(crate::common::binary_operator::typed_call(
+        call.binding,
+        call.args,
+    ))
+}
+
 fn type_scalar_call_with_finalizer(
     finalizer: &BindingFinalizer<'_>,
     shape: NodeShape<'_>,
@@ -691,6 +721,18 @@ fn type_scalar_call_with_finalizer(
             else {
                 return Err(TypingError::InvalidShape("expected a bound scalar call").into());
             };
+            let operand_order = selected.operand_order();
+            let mut args = args;
+            operand_order.apply(&mut args);
+            let reordered_sources;
+            let originals = if operand_order == typing::CallOperandOrder::ReversedPair
+                && let [left, right] = originals
+            {
+                reordered_sources = [*right, *left];
+                &reordered_sources[..]
+            } else {
+                originals
+            };
             let args = apply_conversions(args, conversions, finalizer, originals, span, work)?;
             let converted = typed_children(context, &args, true, work)?;
             let binding = typing::finish_call(context, &selected, &converted, work)?;
@@ -712,7 +754,11 @@ fn type_scalar_call_with_finalizer(
             } else {
                 finalizer.finish(binding, name, span)
             }?;
-            Ok(BoundScalarCall { args, binding })
+            Ok(BoundScalarCall {
+                args,
+                binding,
+                operand_order,
+            })
         },
     )
 }

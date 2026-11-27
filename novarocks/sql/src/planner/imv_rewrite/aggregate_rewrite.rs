@@ -19,9 +19,7 @@ use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 use std::collections::HashSet;
 
-use crate::analysis::{
-    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
-};
+use crate::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::compiler::mv_rewrite::SqlImvAggregateStateRole;
 use crate::mv_refresh::AggregateFunctionKind;
@@ -216,8 +214,8 @@ pub(crate) fn build_aggregate_state_merge(
         old_source,
         ctx,
     )?;
-    let old_input = branch_scoped_old_input(old_scan, branch_scope.clone(), &aggregate_layout)
-        .map_err(SqlCompileError::from)?;
+    let old_input =
+        branch_scoped_old_input(ctx, old_scan, branch_scope.clone(), &aggregate_layout)?;
 
     let action_column = match action_column {
         Some(action_column) => action_column,
@@ -442,17 +440,18 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
 }
 
 fn branch_scoped_old_input(
+    ctx: &RewriteContext,
     old_scan: LogicalPlanNode,
     branch_scope: Option<crate::planner::table::BranchScope>,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, SqlCompileError> {
     let Some(scope) = branch_scope else {
         return Ok(old_scan);
     };
     let old_outputs = plan_output_columns(&old_scan)?;
     let filtered = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
-            predicate: branch_scope_predicate(&scope, &old_outputs)?,
+            predicate: branch_scope_predicate(ctx, &scope, &old_outputs)?,
         }),
         vec![old_scan],
         None,
@@ -485,19 +484,11 @@ fn build_relational_aggregate_change_stream(
         LogicalPlanKind::Join(LogicalJoinNode {
             naa_author: None,
             join_type: JoinKind::LeftOuter,
-            condition: Some(TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(column_ref(&delta_row_id)),
-                    op: BinOp::Eq,
-                    right: novarocks_parser::ast::AstBox::new(column_ref(&old_row_id)),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    false,
-                ),
-            }),
+            condition: Some(selected_scalar_operator(
+                ctx,
+                novarocks_type_contract::OperatorFunction::Equal,
+                vec![column_ref(&delta_row_id), column_ref(&old_row_id)],
+            )?),
         }),
         vec![delta_with_row_id, old_input],
         None,
@@ -527,7 +518,7 @@ fn build_relational_aggregate_change_stream(
         &old_outputs,
     )?;
     let delete_predicate = bool_and(
-        branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
+        branch_marker_eq(ctx, branch_marker, CHANGE_BRANCH_DELETE)?,
         TypedExpr {
             kind: ExprKind::IsNull {
                 expr: novarocks_parser::ast::AstBox::new(column_ref(old_row_id_join)),
@@ -556,20 +547,13 @@ fn build_relational_aggregate_change_stream(
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     };
-    let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
-    let args = vec![zero_state];
-    let binding = crate::binding::SqlFunctionBinding::resolve_operator_for_plan(
-        crate::planner::BINDING_AUTHORITY,
-        ctx.function_catalog(),
-        operator,
-        &args,
-        ctx.decimal_overflow_policy(),
-        ctx.scalar_arena().borrow().constant_policy(),
-        &ctx.control_view(),
-    )?;
     let insert_predicate = bool_and(
-        branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
-        crate::common::binary_operator::typed_call(operator, binding, args),
+        branch_marker_eq(ctx, branch_marker, CHANGE_BRANCH_INSERT)?,
+        selected_scalar_operator(
+            ctx,
+            novarocks_type_contract::OperatorFunction::BooleanNot,
+            vec![zero_state],
+        )?,
     );
     let filtered = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -619,16 +603,35 @@ fn change_branch_values(column: OutputColumn) -> LogicalPlanNode {
     )
 }
 
-fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: novarocks_parser::ast::AstBox::new(column_ref(branch_marker)),
-            op: BinOp::Eq,
-            right: novarocks_parser::ast::AstBox::new(tinyint_literal(branch)),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-    }
+fn selected_scalar_operator(
+    ctx: &RewriteContext,
+    operator: novarocks_type_contract::OperatorFunction,
+    operands: Vec<TypedExpr>,
+) -> Result<TypedExpr, SqlCompileError> {
+    let binding = crate::binding::SqlFunctionBinding::resolve_operator_for_plan(
+        crate::planner::BINDING_AUTHORITY,
+        ctx.function_catalog(),
+        operator,
+        &operands,
+        ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view(),
+    )?;
+    Ok(crate::common::binary_operator::typed_call(
+        binding, operands,
+    ))
+}
+
+fn branch_marker_eq(
+    ctx: &RewriteContext,
+    branch_marker: &OutputColumn,
+    branch: i8,
+) -> Result<TypedExpr, SqlCompileError> {
+    selected_scalar_operator(
+        ctx,
+        novarocks_type_contract::OperatorFunction::Equal,
+        vec![column_ref(branch_marker), tinyint_literal(branch)],
+    )
 }
 
 fn tinyint_literal(value: i8) -> TypedExpr {
@@ -640,11 +643,10 @@ fn tinyint_literal(value: i8) -> TypedExpr {
 
 fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(left),
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right: novarocks_parser::ast::AstBox::new(right),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
@@ -652,11 +654,10 @@ fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
 
 fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::BinaryOp {
+        kind: ExprKind::BooleanConnective {
             left: novarocks_parser::ast::AstBox::new(left),
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             right: novarocks_parser::ast::AstBox::new(right),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
@@ -770,41 +771,48 @@ fn merged_state_expr(
                 ),
             })
         }
-        SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
-            kind: ExprKind::Case {
-                ieee_float_equality: false,
-                operand: None,
-                when_then: (vec![(
-                    TypedExpr {
-                        kind: ExprKind::IsNull {
-                            expr: novarocks_parser::ast::AstBox::new(column_ref(old)),
-                            negated: false,
-                        },
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Boolean,
-                            false,
-                        ),
-                    },
-                    column_ref(delta),
-                )])
-                .into(),
-                else_expr: Some(novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(column_ref(old)),
-                        op: BinOp::Add,
-                        right: novarocks_parser::ast::AstBox::new(column_ref(delta)),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: (state_column.value_type.clone())
-                        .with_nullable(false)
-                        .expect("valid value root nullability transform"),
-                })),
-            },
-            value_type: (state_column.value_type.clone())
+        SqlImvAggregateStateRole::RetractionCount => {
+            let old = column_ref(old);
+            let delta = column_ref(delta);
+            let previous = coalesce_retraction_count(ctx, old.clone())?;
+            let sum = selected_scalar_operator(
+                ctx,
+                novarocks_type_contract::OperatorFunction::Add,
+                vec![previous, delta.clone()],
+            )?;
+            let result = state_column
+                .value_type
                 .with_nullable(false)
-                .expect("valid value root nullability transform"),
-        }),
+                .expect("valid retraction count declaration");
+            if sum.value_type != result || delta.value_type != result {
+                return Err(SqlCompileError::Compilation(
+                    "IMV retraction count requires both count branches to preserve required BIGINT"
+                        .into(),
+                ));
+            }
+            Ok(TypedExpr {
+                kind: ExprKind::Case {
+                    ieee_float_equality: false,
+                    operand: None,
+                    when_then: vec![(
+                        TypedExpr {
+                            kind: ExprKind::IsNull {
+                                expr: novarocks_parser::ast::AstBox::new(old),
+                                negated: false,
+                            },
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
+                        },
+                        delta,
+                    )]
+                    .into(),
+                    else_expr: Some(novarocks_parser::ast::AstBox::new(sum)),
+                },
+                value_type: result,
+            })
+        }
     }
 }
 
@@ -832,11 +840,12 @@ fn aggregate_change_stream_project(
     } = projection;
     let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
     let mut items = Vec::with_capacity(output_columns.len());
+    let delete_branch = branch_marker_eq(ctx, branch_marker, CHANGE_BRANCH_DELETE)?;
     for output in output_columns {
         if output.name.eq_ignore_ascii_case(ImvActionColumn::NAME) {
             items.push(ProjectItem {
                 expr: branch_case_expr(
-                    branch_marker,
+                    &delete_branch,
                     tinyint_literal(ImvActionColumn::DELETE_VALUE),
                     tinyint_literal(ImvActionColumn::INSERT_VALUE),
                     novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
@@ -877,7 +886,7 @@ fn aggregate_change_stream_project(
         )?;
         items.push(ProjectItem {
             expr: branch_case_expr(
-                branch_marker,
+                &delete_branch,
                 delete_expr,
                 insert_expr,
                 output.value_type.clone(),
@@ -1070,7 +1079,7 @@ fn source_expr_by_name(
 }
 
 fn branch_case_expr(
-    branch_marker: &OutputColumn,
+    delete_branch: &TypedExpr,
     delete_expr: TypedExpr,
     insert_expr: TypedExpr,
     value_type: novarocks_type_contract::FunctionValueType,
@@ -1081,11 +1090,7 @@ fn branch_case_expr(
         kind: ExprKind::Case {
             ieee_float_equality: false,
             operand: None,
-            when_then: (vec![(
-                branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
-                delete_expr,
-            )])
-            .into(),
+            when_then: (vec![(delete_branch.clone(), delete_expr)]).into(),
             else_expr: Some(novarocks_parser::ast::AstBox::new(insert_expr)),
         },
         value_type,
@@ -1445,31 +1450,23 @@ fn int64_literal(value: i64) -> TypedExpr {
 }
 
 fn branch_scope_predicate(
+    ctx: &RewriteContext,
     scope: &crate::planner::table::BranchScope,
     outputs: &[OutputColumn],
-) -> Result<TypedExpr, String> {
+) -> Result<TypedExpr, SqlCompileError> {
     let branch_column = find_output_column_by_name(outputs, &scope.branch_id_column_name)?;
-    Ok(TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: novarocks_parser::ast::AstBox::new(TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: branch_column.column_id,
-                    qualifier: None,
-                    column: branch_column.name.clone(),
-                },
-                value_type: branch_column.value_type.clone(),
-            }),
-            op: BinOp::Eq,
-            right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
-                value_type: (branch_column.value_type.clone())
-                    .with_nullable(false)
-                    .expect("valid value root nullability transform"),
-            }),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-    })
+    let branch = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
+        value_type: branch_column
+            .value_type
+            .with_nullable(false)
+            .expect("valid value root nullability transform"),
+    };
+    selected_scalar_operator(
+        ctx,
+        novarocks_type_contract::OperatorFunction::Equal,
+        vec![column_ref(branch_column), branch],
+    )
 }
 
 fn aggregate_old_state_passthrough_items(
@@ -1981,7 +1978,7 @@ fn align_expr_column_refs_to_child(
             }
             Ok(())
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -2160,7 +2157,7 @@ fn signed_aggregate_project_items(
     ctx: &RewriteContext,
     aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
-) -> Result<Vec<crate::analysis::ProjectItem>, String> {
+) -> Result<Vec<crate::analysis::ProjectItem>, SqlCompileError> {
     use crate::mv_refresh::VisibleAggregateOutput;
 
     let mut items = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
@@ -2222,7 +2219,7 @@ fn signed_aggregate_project_items(
                 if state_columns.is_empty() {
                     return Err(format!(
                         "Iceberg IMV aggregate rewrite missing state column for aggregate index {aggregate_index}"
-                    ));
+                    ).into());
                 }
                 for state_column in state_columns {
                     let state_index = layout
@@ -2273,15 +2270,13 @@ fn signed_aggregate_project_items(
         })?;
         let child_output = signed_aggregate_child_output(aggregate_output_columns, state_column)?;
         if call.output_column_id != child_output.column_id {
-            return Err("Iceberg IMV retraction count call and output identity differ".to_string());
+            return Err("Iceberg IMV retraction count call and output identity differ".into());
         }
         if *child_output.value_type.data_type() != DataType::Int64 {
-            return Err(
-                "Iceberg IMV retraction count aggregate did not produce BIGINT".to_string(),
-            );
+            return Err("Iceberg IMV retraction count aggregate did not produce BIGINT".into());
         }
         items.push(crate::analysis::ProjectItem {
-            expr: nonnull_retraction_count_expr(child_output, call.output_column_id),
+            expr: coalesce_retraction_count(ctx, column_ref(child_output))?,
             output_name: state_column.name.clone(),
             output_column_id: allocate_imv_column(
                 ctx,
@@ -2295,44 +2290,41 @@ fn signed_aggregate_project_items(
     Ok(items)
 }
 
-fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> TypedExpr {
-    let value = TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id,
-            qualifier: None,
-            column: child.name.clone(),
-        },
-        value_type: child.value_type.clone(),
+fn coalesce_retraction_count(
+    ctx: &RewriteContext,
+    source: TypedExpr,
+) -> Result<TypedExpr, SqlCompileError> {
+    let operands = vec![source, int64_literal(0)];
+    let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
+        ctx.function_catalog(),
+        "coalesce",
+        &operands,
+        ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view(),
+    )?;
+    let novarocks_functions::FunctionResultType::Scalar(value_type) = &binding.selected.result_type
+    else {
+        return Err(SqlCompileError::Compilation(
+            "COALESCE did not produce an IMV count".into(),
+        ));
     };
-    TypedExpr {
-        kind: ExprKind::Case {
-            ieee_float_equality: false,
-            operand: None,
-            when_then: (vec![(
-                TypedExpr {
-                    kind: ExprKind::IsNull {
-                        expr: novarocks_parser::ast::AstBox::new(value.clone()),
-                        negated: false,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
-                TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    value_type: (child.value_type.clone())
-                        .with_nullable(false)
-                        .expect("valid value root nullability transform"),
-                },
-            )])
-            .into(),
-            else_expr: Some(novarocks_parser::ast::AstBox::new(value)),
-        },
-        value_type: (child.value_type.clone())
-            .with_nullable(false)
-            .expect("valid value root nullability transform"),
+    if value_type.data_type() != &DataType::Int64 || value_type.nullable() {
+        return Err(SqlCompileError::Compilation(
+            "IMV count normalization must produce required BIGINT".into(),
+        ));
     }
+    Ok(TypedExpr {
+        value_type: value_type.clone(),
+        kind: ExprKind::FunctionCall {
+            name: "coalesce".into(),
+            volatility: binding.semantics.volatility,
+            args: operands.into(),
+            distinct: false,
+            binding,
+        },
+    })
 }
 
 fn signed_aggregate_child_output<'a>(
@@ -3524,20 +3516,18 @@ mod tests {
         for item in &project.items {
             let child_expr = if item.output_name == "__agg_state___ivm_row_count" {
                 assert!(!item.expr.value_type.nullable());
-                let ExprKind::Case {
-                    when_then,
-                    else_expr: Some(value),
-                    ..
-                } = &item.expr.kind
-                else {
+                let ExprKind::FunctionCall { binding, args, .. } = &item.expr.kind else {
                     panic!("retraction count must normalize a nullable SUM result");
                 };
-                assert_eq!(when_then.len(), 1);
+                assert_eq!(binding.function_id.as_str(), "builtin.scalar/coalesce/v1");
+                let [value, absent] = &args[..] else {
+                    panic!("retraction count normalization has two original values");
+                };
                 assert!(matches!(
-                    &when_then[0].1.kind,
+                    &absent.kind,
                     ExprKind::Literal(LiteralValue::Int(0))
                 ));
-                value.as_ref()
+                value
             } else {
                 &item.expr
             };
@@ -3651,7 +3641,7 @@ mod tests {
         );
         assert!(matches!(
             aggregate_change_stream_filter(&changed).predicate.kind,
-            ExprKind::BinaryOp { .. }
+            ExprKind::BooleanConnective { .. }
         ));
         assert!(
             expr_contains_function(
@@ -3979,7 +3969,7 @@ mod tests {
                 name.eq_ignore_ascii_case(target)
                     || args.iter().any(|arg| expr_contains_function(arg, target))
             }
-            ExprKind::BinaryOp { left, right, .. }
+            ExprKind::BooleanConnective { left, right, .. }
             | ExprKind::Let {
                 initializer: left,
                 body: right,
@@ -4088,7 +4078,9 @@ mod tests {
         let branch_output =
             find_output_column_by_name(old_scan.columns.as_slice(), "__branch_id__")
                 .expect("branch id output column");
-        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+        let Some((novarocks_type_contract::OperatorFunction::Equal, [left, _])) =
+            crate::common::binary_operator::typed_operands(&filter.predicate)
+        else {
             panic!("expected branch equality predicate");
         };
         let ExprKind::ColumnRef { column_id, .. } = &left.kind else {

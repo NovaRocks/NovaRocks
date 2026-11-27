@@ -16,7 +16,7 @@
 // under the License.
 
 use super::{
-    Fixture, GUARDED_CONTROL, Shape, add_call, argument, author, catalogue, compile_project_unit,
+    Fixture, GUARDED_CONTROL, add_call, argument, author, compile_project_unit,
     fixture_constant_policy, literal, project_port, random, round_value, unit_draft,
 };
 use crate::{CompiledExpressionInstance, testkit::checked_constants};
@@ -26,9 +26,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_constant_contract::ConstantPools;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope, ValueId};
+use novarocks_expression_contract::{ExprKind, RootScope, ValueId};
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
+    ControlShape, EvaluationDemand, FunctionValueType, OperatorFunction,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -39,7 +39,7 @@ pub enum Source {
     Rounded,
 }
 pub fn ordered_program(
-    op: BinaryOperator,
+    op: OperatorFunction,
     ty: DataType,
     source_kind: Source,
     truth_only: bool,
@@ -52,13 +52,13 @@ pub fn ordered_program(
     )
 }
 pub fn ordered_value_program(
-    op: BinaryOperator,
+    op: OperatorFunction,
     scalar: FunctionValueType,
     source_kind: Source,
     truth_only: bool,
 ) -> Fixture {
     let mut source_pools = ConstantPools::empty();
-    let functions = catalogue(Shape::Decimal);
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let mut builder = unit_draft();
     let flag = FunctionValueType::new(DataType::Boolean, true);
     let columns = [
@@ -127,20 +127,13 @@ pub fn ordered_value_program(
             (left, right)
         }
     };
-    let result_type = FunctionValueType::new(DataType::Boolean, true);
-    let expr = builder
-        .add(
-            None,
-            result_type,
-            ExprKind::Binary {
-                op,
-                left,
-                right,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                allow_throw_exception: None,
-            },
-        )
-        .unwrap();
+    let expr = crate::testkit::claim_author::add_catalogue_predicate(
+        &mut builder,
+        &mut source_pools,
+        op,
+        vec![left, right],
+    )
+    .unwrap();
     let expr = builder
         .root(
             expr,

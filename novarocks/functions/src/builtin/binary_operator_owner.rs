@@ -20,9 +20,9 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, AssignmentCommonTypeError, CallEffects, CallProofScope, CompileCheckpoints,
-    CompilePhase, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
-    ObservableEffects, OperatorFunction, PureCompileControl, ValueLogicalType,
-    assignment_common_value_type,
+    CompilePhase, DecimalOverflowPolicy, FunctionEffectDeclaration, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects, OperatorFunction, PureCompileControl,
+    ValueLogicalType, arithmetic_result_value_shape_with_op, assignment_common_value_type,
 };
 
 use super::binding_control;
@@ -80,8 +80,9 @@ fn operator_definition(
             subject: "builtin binary operator declaration",
             value: error.to_string().into(),
         };
+    let internal_wide = visibility == FunctionVisibility::Hidden;
     let overloads = if operator.arithmetic().is_some() {
-        ArithmeticSignature::ALL
+        let mut overloads = ArithmeticSignature::ALL
             .iter()
             .map(|signature| {
                 overload(
@@ -93,7 +94,18 @@ fn operator_definition(
                     signature.row_error(),
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        if internal_wide {
+            overloads.push(overload(
+                operator,
+                name,
+                "internal-wide",
+                WIDE_ARITHMETIC_PATTERN,
+                "internal numeric result",
+                FunctionIntrinsicRowError::MayRaise,
+            )?);
+        }
+        overloads
     } else {
         vec![overload(
             operator,
@@ -152,6 +164,7 @@ fn operator_definition(
         .collect();
     let owner = BinaryOperatorOwner {
         operator,
+        internal_wide,
         declaration,
         implementations,
     };
@@ -203,9 +216,12 @@ fn overload(
 
 pub(crate) struct BinaryOperatorOwner {
     operator: OperatorFunction,
+    internal_wide: bool,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
+
+const WIDE_ARITHMETIC_PATTERN: &str = "(internal largeint or numeric,internal largeint or numeric)";
 
 struct ResolvedTypes {
     pattern: &'static str,
@@ -252,6 +268,29 @@ impl BinaryOperatorOwner {
             })
     }
 
+    fn wide_result_shape(
+        &self,
+        [left, right]: [&FunctionValueType; 2],
+    ) -> Result<Option<(DataType, ValueLogicalType)>, FunctionBindingError> {
+        let Some(operation) = self.operator.arithmetic() else {
+            return Ok(None);
+        };
+        let is_largeint =
+            |value: &FunctionValueType| value.logical_type() == ValueLogicalType::LargeInt;
+        if !self.internal_wide || ![left, right].into_iter().any(is_largeint) {
+            return Ok(None);
+        }
+        let signed_operand = |value: &FunctionValueType| {
+            is_largeint(value) || crate::arithmetic::SignedWidth::from_type(value).is_some()
+        };
+        arithmetic_result_value_shape_with_op(left, right, operation)
+            .filter(|(carrier, _)| {
+                *carrier != DataType::Float64 || [left, right].into_iter().all(signed_operand)
+            })
+            .map(Some)
+            .ok_or(FunctionBindingError::NoMatchingOverload)
+    }
+
     fn select(
         &self,
         request: FunctionBindingRequest<'_>,
@@ -262,7 +301,14 @@ impl BinaryOperatorOwner {
         let nullable =
             |value: &FunctionValueType| value.nullable() || *value.data_type() == DataType::Null;
         let [left_null, right_null] = inputs.map(nullable);
-        let types = if let Some(operation) = self.operator.arithmetic() {
+        let types = if let Some((carrier, logical)) = self.wide_result_shape(inputs)? {
+            let [left, right] = inputs;
+            ResolvedTypes {
+                pattern: WIDE_ARITHMETIC_PATTERN,
+                arguments: [left.clone(), right.clone()],
+                result: FunctionValueType::try_with_logical_type(carrier, true, logical)?,
+            }
+        } else if let Some(operation) = self.operator.arithmetic() {
             let types = arithmetic_types(operation, inputs)?;
             let [left, right] = types.arguments;
             ResolvedTypes {
@@ -357,7 +403,19 @@ impl BinaryOperatorOwner {
         let base = self
             .declaration
             .effect_declaration(&input.selected.overload)?;
-        let own_row_error = if matches!(
+        let own_row_error = if self.operator.arithmetic().is_some()
+            && self.internal_wide
+            && &input.selected.overload == self.declared_overload(WIDE_ARITHMETIC_PATTERN)?
+        {
+            if matches!(&input.selected.result_type, FunctionResultType::Scalar(result)
+                if matches!(result.data_type(), DataType::Decimal256(..)))
+                && input.decimal_overflow_policy == DecimalOverflowPolicy::ReportError
+            {
+                FunctionIntrinsicRowError::MayRaise
+            } else {
+                FunctionIntrinsicRowError::NoRowError
+            }
+        } else if matches!(
             self.operator,
             OperatorFunction::Equal | OperatorFunction::NotEqual
         ) {
@@ -479,38 +537,43 @@ impl FunctionBindingResolver for BinaryOperatorOwner {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 }
             }
-            let (pattern, carrier, nullable) = if let Some(operation) = self.operator.arithmetic() {
-                let types = arithmetic_types(operation, inputs)?;
-                if inputs
-                    .iter()
-                    .zip(&types.arguments)
-                    .any(|(input, target)| input.data_type() != target)
-                {
-                    return Err(FunctionBindingError::NoMatchingOverload);
-                }
-                (
-                    types.signature.pattern(),
-                    types.result,
-                    left.nullable() || right.nullable(),
-                )
-            } else {
-                work.flush()?;
-                let nullable = BinaryOperatorKernel::validate_comparison(
-                    self.operator,
-                    inputs,
-                    work.control(),
-                )?;
-                (
-                    "(comparable T,comparable T)",
-                    DataType::Boolean,
-                    !self.operator.is_null_safe_comparison() && nullable,
-                )
-            };
+            let (pattern, carrier, logical, nullable) =
+                if let Some((carrier, logical)) = self.wide_result_shape(inputs)? {
+                    (WIDE_ARITHMETIC_PATTERN, carrier, logical, true)
+                } else if let Some(operation) = self.operator.arithmetic() {
+                    let types = arithmetic_types(operation, inputs)?;
+                    if inputs
+                        .iter()
+                        .zip(&types.arguments)
+                        .any(|(input, target)| input.data_type() != target)
+                    {
+                        return Err(FunctionBindingError::NoMatchingOverload);
+                    }
+                    (
+                        types.signature.pattern(),
+                        types.result,
+                        ValueLogicalType::Physical,
+                        left.nullable() || right.nullable(),
+                    )
+                } else {
+                    work.flush()?;
+                    let nullable = BinaryOperatorKernel::validate_comparison(
+                        self.operator,
+                        inputs,
+                        work.control(),
+                    )?;
+                    (
+                        "(comparable T,comparable T)",
+                        DataType::Boolean,
+                        ValueLogicalType::Physical,
+                        !self.operator.is_null_safe_comparison() && nullable,
+                    )
+                };
             work.step()?;
             if &selected.overload == self.declared_overload(pattern)?
                 && selected.aggregate.is_none()
                 && matches!(&selected.result_type, FunctionResultType::Scalar(result)
-                    if result.logical_type() == ValueLogicalType::Physical
+                    if result.logical_type() == logical
                         && result.data_type() == &carrier && result.nullable() == nullable)
             {
                 Ok(())

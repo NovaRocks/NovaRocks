@@ -541,7 +541,6 @@ fn build_statistics_plan_parts(
             .sql_semantics()
             .sql_mode()
             .decimal_overflow_policy(),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         constant_policy,
         &completion_control,
     )
@@ -600,16 +599,7 @@ fn build_statistics_plan_parts(
         ),
     )
     .map_err(contract_violation)?;
-    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
-    let resolved = crate::query_execution::contract::ResolvedQueryOptions::from_upstream(Some(
-        options.clone(),
-    ));
-    description
-        .validate_legacy_intrinsic_allow_throw_exception(
-            resolved.runtime_options().allow_throw_exception,
-            &completion_control,
-        )
-        .map_err(DistributedQueryError::from_compile)?;
+    let options = crate::query_execution::contract::synthetic_query_options();
     Ok(StatisticsPlanParts {
         encoded,
         description,

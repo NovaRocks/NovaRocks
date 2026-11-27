@@ -681,22 +681,11 @@ fn compiled_ordered_source_actual_residual_finishes_before_live_key_evaluation()
             FunctionValueType::new(DataType::Int64, false),
             crate::exec::operators::family_fixture::constant_sources::i64(7),
         );
-        let definition = builder
-            .unit(scan)
-            .unwrap()
-            .add(
-                None,
-                FunctionValueType::new(DataType::Boolean, true),
-                ExprKind::Binary {
-                    left: input,
-                    op: novarocks_expression_contract::BinaryOperator::Gt,
-                    right: seven,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap();
+        let definition = builder.operator(
+            scan,
+            novarocks_type_contract::OperatorFunction::GreaterThan,
+            [input, seven],
+        );
         Box::from([builder
             .unit(scan)
             .unwrap()
@@ -809,16 +798,7 @@ fn compiled_ordered_source_empty_actual_residual_never_polls_an_invalid_live_sna
 
 #[test]
 fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_snapshot() {
-    use novarocks_type_contract::{
-        SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-        SemanticParameters,
-    };
-    fn allow_ref() -> SemanticParameterRef {
-        SemanticParameterRef {
-            id: SemanticParameterId::new(73),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        }
-    }
+    use novarocks_type_contract::SemanticParameters;
     fn residual(
         builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
         scan: NodeId,
@@ -838,38 +818,16 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
             FunctionValueType::new(DataType::Int64, false),
             crate::exec::operators::family_fixture::constant_sources::i64(0),
         );
-        let modulo = builder
-            .unit(scan)
-            .unwrap()
-            .add(
-                None,
-                FunctionValueType::new(DataType::Int64, true),
-                ExprKind::Binary {
-                    left: input,
-                    op: novarocks_expression_contract::BinaryOperator::Modulo,
-                    right: zero,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: Some(allow_ref()),
-                },
-            )
-            .unwrap();
-        let definition = builder
-            .unit(scan)
-            .unwrap()
-            .add(
-                None,
-                FunctionValueType::new(DataType::Boolean, true),
-                ExprKind::Binary {
-                    left: modulo,
-                    op: novarocks_expression_contract::BinaryOperator::Gt,
-                    right: zero,
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap();
+        let modulo = builder.operator(
+            scan,
+            novarocks_type_contract::OperatorFunction::Modulo,
+            [input, zero],
+        );
+        let definition = builder.operator(
+            scan,
+            novarocks_type_contract::OperatorFunction::GreaterThan,
+            [modulo, zero],
+        );
         Box::from([builder
             .unit(scan)
             .unwrap()
@@ -878,11 +836,7 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
     }
     let fixture = super::super::ordered_fixture_with_parameters(
         Some(residual),
-        SemanticParameters::try_new([(
-            allow_ref().id,
-            SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap(),
+        SemanticParameters::default(),
     );
     let consumer = Consumer::with_fixture(Bind::Live, fixture);
     let query = LiteralQuery::new();

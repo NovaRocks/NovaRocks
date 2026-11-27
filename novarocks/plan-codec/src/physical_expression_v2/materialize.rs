@@ -18,12 +18,12 @@
 //! Owned projection from the original checked expression namespace.
 //! Original Fragment validation still owns graph, lexical and call semantics.
 
+use super::namespace::finish;
 use super::owner_admission::{Admission, Admit, lookup_facts, same_control};
 use super::{
     DecodedExpressions, ExpressionCodecError as Error, ExpressionNamespaceWriteFacts as Facts,
     ExpressionProjectionLimits as Limits,
 };
-use super::{namespace::finish, receiving_grammar};
 use crate::{
     btree_resources_v2::{self, BTreeResourceError},
     physical_aggregate_binding_v2::MaterializedAggregateBindings,
@@ -32,7 +32,6 @@ use crate::{
         MaterializedFunctionBindings, add, boxed, cap, copy_scalar_signature_observed, mul,
         preflight_scalar_signature_copy, preflight_scalar_signature_copy_in, reserve,
     },
-    physical_semantics_v2::{decode_decimal_policy, decode_reference},
     physical_type_v2::{DecodedTypeTable, clone_value_type_observed},
 };
 use novarocks_physical_plan as p;
@@ -394,7 +393,6 @@ fn preflight(
             | K::LetExpression(_)
             | K::Constant(_)
             | K::LambdaParameter(_)
-            | K::Binary(_)
             | K::IsNull(_) => {}
         }
         check_model(&mut model, refs, bl, admission)?;
@@ -476,7 +474,6 @@ fn preflight(
             | K::LetExpression(_)
             | K::Constant(_)
             | K::LambdaParameter(_)
-            | K::Binary(_)
             | K::Conjunction(_)
             | K::Disjunction(_)
             | K::IsNull(_)
@@ -645,20 +642,7 @@ fn owned_kind(
                 lambda: expr(v.lambda_expr_id, "lambda parameter owner is absent", w)?,
                 ordinal: v.ordinal,
             },
-            K::Binary(v) => novarocks_expression_contract::ExprKind::Binary {
-                left: expr(v.left_expr_id, "binary left operand is absent", w)?,
-                op: completed(receiving_grammar::decode_binary(v.op), w)?,
-                right: expr(v.right_expr_id, "binary right operand is absent", w)?,
-                decimal_overflow_policy: completed(
-                    decode_decimal_policy(v.decimal_overflow_policy).map_err(Error::from),
-                    w,
-                )?,
-                allow_throw_exception: v
-                    .allow_throw_exception
-                    .as_ref()
-                    .map(|r| decode_reference(r, w).map_err(Error::from))
-                    .transpose()?,
-            },
+
             K::Conjunction(v) => novarocks_expression_contract::ExprKind::Conjunction {
                 args: ids(&v.expr_ids, w)?,
             },

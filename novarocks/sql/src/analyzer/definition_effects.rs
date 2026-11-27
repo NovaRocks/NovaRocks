@@ -49,7 +49,6 @@ impl Dependency {
         match key {
             SemanticParameterKey::StatementStartUtc => Some(Self::StatementStart),
             SemanticParameterKey::TimeZone => Some(Self::TimeZone),
-            SemanticParameterKey::AllowThrowException => None,
         }
     }
 

@@ -3992,7 +3992,9 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         ),
         (
             SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         ),
     ])
     .unwrap();
@@ -4018,7 +4020,9 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
     );
     let wrong_key = SemanticParameters::try_new([(
         reference.id,
-        SemanticParameterValue::AllowThrowException(true),
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+        ),
     )])
     .unwrap();
     assert_eq!(

@@ -16,20 +16,12 @@
 // under the License.
 
 //! Borrowed recipes for one expression node, independent of program traversal.
-use crate::{ComparisonSite, CompiledExprSet};
+use crate::CompiledExprSet;
 use novarocks_functions::*;
 use novarocks_type_contract::ExpressionUseId;
 
-#[derive(Clone, Copy)]
-pub(super) enum ComparisonPosition {
-    Binary,
-}
-
 pub(super) trait NodeRecipes {
-    fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe>;
     fn case_comparison(&self, arm: u32) -> Option<&crate::primitives::PreparedNodeComparison>;
-    fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe>;
-    fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe>;
     fn cast_recipe(&self) -> Option<&PreparedCastRecipe>;
     fn prepared_call(&self) -> Option<&PreparedPureKernel>;
 }
@@ -39,20 +31,8 @@ pub(super) struct UnitNodeRecipes<'a> {
     pub occurrence: ExpressionUseId,
 }
 impl NodeRecipes for UnitNodeRecipes<'_> {
-    fn comparison_recipe(&self, position: ComparisonPosition) -> Option<&PreparedComparisonRecipe> {
-        let site = match position {
-            ComparisonPosition::Binary => ComparisonSite::Binary(self.occurrence),
-        };
-        self.unit.recipes().comparison(site)
-    }
     fn case_comparison(&self, arm: u32) -> Option<&crate::primitives::PreparedNodeComparison> {
         self.unit.recipes().case_comparison(self.occurrence, arm)
-    }
-    fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe> {
-        self.unit.recipes().null_safe_comparison(self.occurrence)
-    }
-    fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe> {
-        self.unit.recipes().arithmetic(self.occurrence)
     }
     fn cast_recipe(&self) -> Option<&PreparedCastRecipe> {
         self.unit.recipes().cast(self.occurrence)

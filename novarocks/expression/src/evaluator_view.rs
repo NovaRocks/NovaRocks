@@ -160,19 +160,7 @@ impl UnitRecipes {
         self.comparisons
             .get(&ComparisonSite::CaseWhen { occurrence, arm })
     }
-    pub fn null_safe_comparison(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedNullSafeComparisonRecipe> {
-        self.null_safe.get(&id)
-    }
     pub fn cast(&self, id: ExpressionUseId) -> Option<&novarocks_functions::PreparedCastRecipe> {
         self.casts.get(&id)
-    }
-    pub fn arithmetic(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
-        self.arithmetic.get(&id)
     }
 }

@@ -188,7 +188,6 @@ pub fn writer_state_source_for_test(
             },
             functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &setup,
         )
@@ -264,7 +263,6 @@ pub fn writer_state_source_for_test(
             },
             functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            false,
             crate::constant::test_constant_policy(),
             &setup,
         )

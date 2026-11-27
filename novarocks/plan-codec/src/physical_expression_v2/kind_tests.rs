@@ -19,7 +19,7 @@ use super::*;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ValueType};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, SemanticParameterId,
+    CompileControlError, CompilePhase, PureCompileControl,
 };
 use std::sync::Mutex;
 
@@ -93,7 +93,7 @@ fn lexical_value_and_input_have_distinct_wire_addresses() {
 }
 
 #[test]
-fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
+fn kind_projection_preserves_sparse_constant_ids_and_null_predicate() {
     use wire::expression_definition::Kind;
     assert_eq!(
         encoded(ExprKind::Constant(ConstantReference {
@@ -115,37 +115,6 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
             expr_id: Some(0)
         })
     );
-    for (source, expected) in [
-        (BinaryOperator::Add, wire::BinaryOperator::Add),
-        (BinaryOperator::Subtract, wire::BinaryOperator::Subtract),
-        (BinaryOperator::Multiply, wire::BinaryOperator::Multiply),
-        (BinaryOperator::Divide, wire::BinaryOperator::Divide),
-        (BinaryOperator::Modulo, wire::BinaryOperator::Modulo),
-        (BinaryOperator::Eq, wire::BinaryOperator::Eq),
-        (BinaryOperator::EqForNull, wire::BinaryOperator::EqForNull),
-        (BinaryOperator::NotEq, wire::BinaryOperator::NotEq),
-        (BinaryOperator::Lt, wire::BinaryOperator::Lt),
-        (BinaryOperator::LtEq, wire::BinaryOperator::LtEq),
-        (BinaryOperator::Gt, wire::BinaryOperator::Gt),
-        (BinaryOperator::GtEq, wire::BinaryOperator::GtEq),
-    ] {
-        let result = encoded(ExprKind::Binary {
-            left: ExprId::new(u32::MAX),
-            op: source,
-            right: ExprId::new(0),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: None,
-        });
-        let Kind::Binary(result) = result else {
-            panic!("expected binary")
-        };
-        assert_eq!(
-            (result.left_expr_id, result.right_expr_id),
-            (Some(u32::MAX), Some(0))
-        );
-        assert_eq!(result.op, expected as i32);
-        assert!(result.allow_throw_exception.is_none());
-    }
 }
 
 #[test]
@@ -283,7 +252,7 @@ fn ordered_ids_case_and_lambda_vocabulary_are_not_canonicalized() {
 }
 
 #[test]
-fn kind_refuses_mismatched_lambda_and_wrong_parameter_key() {
+fn kind_refuses_mismatched_lambda_and_missing_call_binding() {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
     assert!(matches!(
@@ -293,16 +262,6 @@ fn kind_refuses_mismatched_lambda_and_wrong_parameter_key() {
                 body: ExprId::new(0),
             }),
             &ids(&[]),
-            &mut work
-        ),
-        Err(ExpressionCodecError::InvalidShape(_))
-    ));
-    assert!(matches!(
-        allow_throw(
-            &SemanticParameterRef {
-                id: SemanticParameterId::new(0),
-                expected_key: SemanticParameterKey::TimeZone
-            },
             &mut work
         ),
         Err(ExpressionCodecError::InvalidShape(_))

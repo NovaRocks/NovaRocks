@@ -235,9 +235,9 @@ fn collect_strict_column_equalities_inner(
     }
     match scalars.node(expr) {
         ScalarNode::Nested(inner) => collect_strict_column_equalities_inner(scalars, *inner, out),
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -301,9 +301,9 @@ fn collect_literal_equalities_inner(
     }
     match scalars.node(expr) {
         ScalarNode::Nested(inner) => collect_literal_equalities_inner(scalars, *inner, out),
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -330,23 +330,19 @@ pub(crate) fn make_column_ref_expr(
 }
 
 pub(crate) fn make_eq_literal_predicate(
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     column: &OutputColumn,
     literal: ScalarId,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let left = make_column_ref_expr(arena, column, control)?;
-    arena.intern_observed(
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right: literal,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(
-            DataType::Boolean,
-            column.value_type.nullable() || arena.nullable(literal),
-        ),
+    crate::optimizer::scalar::intern_scalar_operator(
+        functions,
+        arena,
+        novarocks_type_contract::OperatorFunction::Equal,
+        [left, literal],
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         control,
     )
 }
@@ -363,11 +359,10 @@ pub(crate) fn combine_with_and(
     };
     for right in predicates {
         left = arena.intern_observed(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(
                 DataType::Boolean,
@@ -492,15 +487,17 @@ mod tests {
         )
     }
 
-    fn binary(arena: &mut ScalarArena, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
-        arena.intern(
-            ScalarNode::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+    fn binary(
+        arena: &mut ScalarArena,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        left: ScalarId,
+        right: ScalarId,
+    ) -> ScalarId {
+        arena.test_intern_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )
     }
 
@@ -513,7 +510,7 @@ mod tests {
     }
 
     fn and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
-        binary(arena, BinOp::And, left, right)
+        binary(arena, crate::common::BooleanOp::And, left, right)
     }
 
     fn eq_cols(arena: &mut ScalarArena, left: u32, right: u32) -> ScalarId {

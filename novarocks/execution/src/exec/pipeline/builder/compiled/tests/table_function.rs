@@ -31,7 +31,7 @@ use novarocks_expression::{
     EvaluationEnvironment, ScopeColumn, ScopeLayout, ScopeLayouts, compile_expr_set_pure,
 };
 use novarocks_expression_contract::{
-    BinaryOperator, ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootScope,
+    ExprKind, LegacyBindingMetadata, PhysicalCallRequest, RootScope,
 };
 use novarocks_functions::{
     CallEffectInput, ConstantPool, EngineFunctionCatalogBuilder, FunctionArgument,
@@ -52,8 +52,7 @@ use novarocks_physical_plan::{
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     ExpressionEffects, FunctionValueType, RelationCallId, RelationEffectContext,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters, ValueTypeStorageLifetime, arithmetic_result_value_type_with_op,
+    SemanticParameters, ValueTypeStorageLifetime,
 };
 
 use novarocks_types::UniqueId;
@@ -78,10 +77,6 @@ const TO_CONSUMER: EdgeId = EdgeId::new(9);
 const SOURCE_FINST: UniqueId = UniqueId::new(0xa1, 0x01);
 const CONSUMER_FINST: UniqueId = UniqueId::new(0xa2, 0x01);
 const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
-const ALLOW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(3),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
 
 /// One row: its key and one optional array per list column.
 type Row = (i64, Vec<Option<Vec<Option<i64>>>>);
@@ -415,16 +410,6 @@ fn faulty_argument(
     list: ValueId,
 ) -> ExprId {
     let operand = int64(false);
-    // The prepared arithmetic owner publishes a nullable result.
-    let mut sum_type = arithmetic_result_value_type_with_op(
-        &operand,
-        &operand,
-        novarocks_type_contract::ArithmeticOperator::Add,
-    )
-    .unwrap();
-    sum_type = sum_type
-        .with_nullable(true)
-        .expect("valid test root nullability");
     let left = builder
         .unit(node)
         .unwrap()
@@ -435,21 +420,11 @@ fn faulty_argument(
         operand,
         crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
     );
-    let sum = builder
-        .unit(node)
-        .unwrap()
-        .add(
-            None,
-            sum_type,
-            ExprKind::Binary {
-                op: BinaryOperator::Add,
-                left,
-                right,
-                decimal_overflow_policy: POLICY,
-                allow_throw_exception: Some(ALLOW),
-            },
-        )
-        .unwrap();
+    let sum = builder.operator(
+        node,
+        novarocks_type_contract::OperatorFunction::Add,
+        [left, right],
+    );
     let condition = builder
         .unit(node)
         .unwrap()
@@ -498,7 +473,7 @@ fn finish(
     source_pools: &ConstantPools,
     parameters: &SemanticParameters,
 ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
-    super::super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_structure(
             root,
@@ -686,8 +661,7 @@ fn admission() -> FragmentPackageAdmission {
 /// The authored parameter table: ALLOW only when a faulty argument cites it.
 fn parameters(spec: &Spec) -> SemanticParameters {
     if spec.args.iter().any(|arg| matches!(arg, Arg::Faulty(_))) {
-        SemanticParameters::try_new([(ALLOW.id, SemanticParameterValue::AllowThrowException(true))])
-            .unwrap()
+        SemanticParameters::default()
     } else {
         SemanticParameters::try_new([]).unwrap()
     }

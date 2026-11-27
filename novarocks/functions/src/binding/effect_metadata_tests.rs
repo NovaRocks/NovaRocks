@@ -158,7 +158,7 @@ fn keys() -> [SemanticParameterKey; 3] {
     [
         SemanticParameterKey::StatementStartUtc,
         SemanticParameterKey::TimeZone,
-        SemanticParameterKey::AllowThrowException,
+        SemanticParameterKey::StatementStartUtc,
     ]
 }
 
@@ -359,7 +359,7 @@ fn all_environment_keys_and_dependency_membership_change_digest_but_reorder_is_c
         SemanticParameterKey::TimeZone,
     ]);
     let pair_digest = digest(FunctionKind::Scalar, pair.clone());
-    pair.environment_dependencies[1] = SemanticParameterKey::AllowThrowException;
+    pair.environment_dependencies[1] = SemanticParameterKey::StatementStartUtc;
     assert_ne!(pair_digest, digest(FunctionKind::Scalar, pair));
 }
 

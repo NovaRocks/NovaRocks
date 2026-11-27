@@ -317,10 +317,37 @@ pub enum Conversion {
     ValueDomain(Box<ValueDomainConversion>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CallOperandOrder {
+    #[default]
+    Source,
+    ReversedPair,
+}
+
+impl CallOperandOrder {
+    /// Apply the selected order to values or provenance indexed by the same
+    /// source operands. Reversing a second time restores source order.
+    pub fn apply<T>(self, operands: &mut [T]) {
+        if self == Self::ReversedPair {
+            let [left, right] = operands else {
+                unreachable!("comparison typing validated exactly two operands");
+            };
+            std::mem::swap(left, right);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SelectedCall {
     binding: ResolvedFunctionBinding,
     expected_result: Option<FunctionValueType>,
+    operand_order: CallOperandOrder,
+}
+
+impl SelectedCall {
+    pub fn operand_order(&self) -> CallOperandOrder {
+        self.operand_order
+    }
 }
 
 #[derive(Debug)]
@@ -742,6 +769,7 @@ pub fn type_node(
                 selected: SelectedCall {
                     binding,
                     expected_result: None,
+                    operand_order: CallOperandOrder::Source,
                 },
                 conversions: (0..children.len()).map(|_| Conversion::Keep).collect(),
             }
@@ -765,6 +793,25 @@ pub fn type_node(
                     "operator has the wrong number of operands",
                 ));
             }
+            let source_operator = operator;
+            let source_children = children;
+            let (operator, order) = match source_operator {
+                OperatorFunction::GreaterThan => {
+                    (OperatorFunction::LessThan, CallOperandOrder::ReversedPair)
+                }
+                OperatorFunction::GreaterThanOrEqual => (
+                    OperatorFunction::LessThanOrEqual,
+                    CallOperandOrder::ReversedPair,
+                ),
+                _ => (source_operator, CallOperandOrder::Source),
+            };
+            let reordered;
+            let children = if order == CallOperandOrder::ReversedPair {
+                reordered = [source_children[1].clone(), source_children[0].clone()];
+                &reordered[..]
+            } else {
+                source_children
+            };
             if operator == OperatorFunction::Negation
                 && children[0].value_type.data_type() == &DataType::Null
             {
@@ -818,14 +865,19 @@ pub fn type_node(
                     }
                     return Err(TypingError::TypeMismatch(format!(
                         "operator {} does not accept {:?} and {:?}",
-                        operator.sql(),
-                        children[0].value_type.data_type(),
-                        children[1].value_type.data_type()
+                        source_operator.sql(),
+                        source_children[0].value_type.data_type(),
+                        source_children[1].value_type.data_type()
                     )));
                 }
                 result => result?,
             };
-            type_selected_call(context, binding, None, children, work)?
+            let mut typed = type_selected_call(context, binding, None, children, work)?;
+            let NodeTyping::Call { selected, .. } = &mut typed else {
+                unreachable!("selected operator emits an ordinary call");
+            };
+            selected.operand_order = order;
+            typed
         }
         NodeShape::UnaryPlus => {
             let [child] = children else {
@@ -1025,6 +1077,7 @@ fn type_selected_call(
         selected: SelectedCall {
             binding,
             expected_result: expected_result.cloned(),
+            operand_order: CallOperandOrder::Source,
         },
         conversions,
     })

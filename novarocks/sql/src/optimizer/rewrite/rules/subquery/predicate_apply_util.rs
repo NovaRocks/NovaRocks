@@ -24,10 +24,9 @@ use std::collections::HashSet;
 
 use super::scalar_utils;
 use crate::column_id::ColumnId;
-use crate::common::BinOp;
 use crate::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
 use crate::optimizer::opt_expr::OptExpr;
-use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::optimizer::scalar::{ScalarArena, ScalarId};
 
 pub(super) struct LiftedInnerOpt {
     pub right: OptExpr,
@@ -73,12 +72,7 @@ pub(super) fn lift_correlated_inner_opt(
                 return Ok(None);
             }
             let input = children.remove(0);
-            let predicate = normalize_correlated_on_predicate_opt(
-                arena,
-                filter.predicate,
-                outer_correlation_column_ids,
-                control,
-            )?;
+            let predicate = filter.predicate;
             let items = candidate_or_none!(expose_predicate_inner_columns_opt(
                 arena,
                 project.items,
@@ -105,12 +99,7 @@ pub(super) fn lift_correlated_inner_opt(
                 return Ok(None);
             }
             let input = children.remove(0);
-            let predicate = normalize_correlated_on_predicate_opt(
-                arena,
-                filter.predicate,
-                outer_correlation_column_ids,
-                control,
-            )?;
+            let predicate = filter.predicate;
             if !candidate_or_none!(predicate_inner_refs_available_opt(
                 arena,
                 predicate,
@@ -126,118 +115,6 @@ pub(super) fn lift_correlated_inner_opt(
         }
         _ => None,
     })
-}
-
-fn normalize_correlated_on_predicate_opt(
-    arena: &mut ScalarArena,
-    predicate: ScalarId,
-    outer_correlation_column_ids: &[ColumnId],
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let outer_ids: HashSet<ColumnId> = outer_correlation_column_ids.iter().copied().collect();
-    normalize_correlated_on_predicate_inner_opt(arena, predicate, &outer_ids, control)
-}
-
-fn normalize_correlated_on_predicate_inner_opt(
-    arena: &mut ScalarArena,
-    predicate: ScalarId,
-    outer_ids: &HashSet<ColumnId>,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<ScalarId, crate::compiler::SqlCompileError> {
-    let node = arena.node(predicate).clone();
-    let value_type = arena.value_type(predicate).clone();
-    Ok(match node {
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } if matches!(op, BinOp::And | BinOp::Or) => {
-            let left =
-                normalize_correlated_on_predicate_inner_opt(arena, left, outer_ids, control)?;
-            let right =
-                normalize_correlated_on_predicate_inner_opt(arena, right, outer_ids, control)?;
-            arena.intern_observed(
-                ScalarNode::BinaryOp {
-                    left,
-                    op,
-                    right,
-                    decimal_overflow_policy,
-                },
-                value_type,
-                control,
-            )?
-        }
-        ScalarNode::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } if matches!(
-            op,
-            BinOp::Eq
-                | BinOp::EqForNull
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-        ) =>
-        {
-            let left_outer_only = scalar_utils::scalar_refs_only(arena, left, outer_ids);
-            let right_outer_only = scalar_utils::scalar_refs_only(arena, right, outer_ids);
-            let left_has_outer = scalar_utils::scalar_refs_any(arena, left, outer_ids);
-            let right_has_outer = scalar_utils::scalar_refs_any(arena, right, outer_ids);
-            match (
-                left_outer_only && !right_has_outer,
-                right_outer_only && !left_has_outer,
-            ) {
-                (true, false) => predicate,
-                (false, true) => {
-                    let inner_type = arena.data_type(left).clone();
-                    let mut outer_expr = right;
-                    if arena.data_type(right) != &inner_type {
-                        outer_expr = arena.intern_observed(
-                            ScalarNode::Cast {
-                                cast_mode: None,
-                                child: right,
-                                target: inner_type.clone(),
-                                decimal_overflow_policy:
-                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                            },
-                            novarocks_type_contract::FunctionValueType::new(
-                                inner_type,
-                                arena.nullable(right),
-                            ),
-                            control,
-                        )?;
-                    }
-                    arena.intern_observed(
-                        ScalarNode::BinaryOp {
-                            left: outer_expr,
-                            op: reverse_comparison_op(op),
-                            right: left,
-                            decimal_overflow_policy,
-                        },
-                        value_type,
-                        control,
-                    )?
-                }
-                _ => predicate,
-            }
-        }
-        _ => predicate,
-    })
-}
-
-fn reverse_comparison_op(op: BinOp) -> BinOp {
-    match op {
-        BinOp::Lt => BinOp::Gt,
-        BinOp::Le => BinOp::Ge,
-        BinOp::Gt => BinOp::Lt,
-        BinOp::Ge => BinOp::Le,
-        _ => op,
-    }
 }
 
 fn expose_predicate_inner_columns_opt(
@@ -360,8 +237,7 @@ mod legacy {
                     return None;
                 }
                 let input = children.remove(0);
-                let predicate =
-                    normalize_correlated_on_predicate(f.predicate, outer_correlation_column_ids);
+                let predicate = f.predicate;
                 let items = expose_predicate_inner_columns(
                     p.items,
                     &predicate,
@@ -385,8 +261,7 @@ mod legacy {
                     return None;
                 }
                 let input = children.remove(0);
-                let predicate =
-                    normalize_correlated_on_predicate(f.predicate, outer_correlation_column_ids);
+                let predicate = f.predicate;
                 if !predicate_inner_refs_available(
                     &predicate,
                     &input,
@@ -401,140 +276,6 @@ mod legacy {
             }
             _ => None,
         }
-    }
-
-    fn normalize_correlated_on_predicate(
-        predicate: TypedExpr,
-        outer_correlation_column_ids: &[ColumnId],
-    ) -> TypedExpr {
-        let outer_ids: HashSet<ColumnId> = outer_correlation_column_ids.iter().copied().collect();
-        normalize_correlated_on_predicate_inner(predicate, &outer_ids)
-    }
-
-    fn normalize_correlated_on_predicate_inner(
-        predicate: TypedExpr,
-        outer_ids: &HashSet<ColumnId>,
-    ) -> TypedExpr {
-        let TypedExpr { kind, value_type } = predicate;
-        match kind {
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } if matches!(op, BinOp::And | BinOp::Or) => TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: novarocks_parser::ast::AstBox::new(
-                        normalize_correlated_on_predicate_inner(left.into_inner(), outer_ids),
-                    ),
-                    op,
-                    right: novarocks_parser::ast::AstBox::new(
-                        normalize_correlated_on_predicate_inner(right.into_inner(), outer_ids),
-                    ),
-                    decimal_overflow_policy,
-                },
-                value_type,
-            },
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } if matches!(
-                op,
-                BinOp::Eq
-                    | BinOp::EqForNull
-                    | BinOp::Ne
-                    | BinOp::Lt
-                    | BinOp::Le
-                    | BinOp::Gt
-                    | BinOp::Ge
-            ) =>
-            {
-                let left_outer_only = expr_refs_outer_only(&left, outer_ids);
-                let right_outer_only = expr_refs_outer_only(&right, outer_ids);
-                let left_has_outer = expr_refs_any_outer(&left, outer_ids);
-                let right_has_outer = expr_refs_any_outer(&right, outer_ids);
-                match (
-                    left_outer_only && !right_has_outer,
-                    right_outer_only && !left_has_outer,
-                ) {
-                    (true, false) => TypedExpr {
-                        kind: ExprKind::BinaryOp {
-                            left,
-                            op,
-                            right,
-                            decimal_overflow_policy,
-                        },
-                        value_type,
-                    },
-                    (false, true) => {
-                        let inner_type = left.value_type.data_type().clone();
-                        let inner_expr = left.into_inner();
-                        let mut outer_expr = right.into_inner();
-                        if *outer_expr.value_type.data_type() != inner_type {
-                            outer_expr = TypedExpr {
-                                value_type: novarocks_type_contract::FunctionValueType::new(
-                                    inner_type.clone(),
-                                    outer_expr.value_type.nullable(),
-                                ),
-
-                                kind: ExprKind::Cast {
-                                    cast_mode: None,
-                                    expr: novarocks_parser::ast::AstBox::new(outer_expr),
-                                    target: inner_type,
-                                    decimal_overflow_policy:
-                                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                                },
-                            };
-                        }
-                        TypedExpr {
-                            kind: ExprKind::BinaryOp {
-                                left: novarocks_parser::ast::AstBox::new(outer_expr),
-                                op: reverse_comparison_op(op),
-                                right: novarocks_parser::ast::AstBox::new(inner_expr),
-                                decimal_overflow_policy,
-                            },
-                            value_type,
-                        }
-                    }
-                    _ => TypedExpr {
-                        kind: ExprKind::BinaryOp {
-                            left,
-                            op,
-                            right,
-                            decimal_overflow_policy,
-                        },
-                        value_type,
-                    },
-                }
-            }
-            kind => TypedExpr { kind, value_type },
-        }
-    }
-
-    fn reverse_comparison_op(op: BinOp) -> BinOp {
-        match op {
-            BinOp::Lt => BinOp::Gt,
-            BinOp::Le => BinOp::Ge,
-            BinOp::Gt => BinOp::Lt,
-            BinOp::Ge => BinOp::Le,
-            _ => op,
-        }
-    }
-
-    fn expr_refs_any_outer(expr: &TypedExpr, outer_ids: &HashSet<ColumnId>) -> bool {
-        collect_column_id_refs(expr)
-            .into_iter()
-            .any(|column_id| outer_ids.contains(&column_id))
-    }
-
-    fn expr_refs_outer_only(expr: &TypedExpr, outer_ids: &HashSet<ColumnId>) -> bool {
-        let refs = collect_column_id_refs(expr);
-        !refs.is_empty()
-            && refs
-                .into_iter()
-                .all(|column_id| outer_ids.contains(&column_id))
     }
 
     fn expose_predicate_inner_columns(
@@ -618,15 +359,12 @@ mod legacy {
     /// Build a bare `Eq` Boolean predicate `left = right` (the IN join key).
     #[allow(dead_code)]
     pub(super) fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 }
 
@@ -707,39 +445,30 @@ mod tests {
     }
 
     fn predicate() -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(INNER_K, "k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            crate::common::BinOp::Eq,
+            col_ref(INNER_K, "k"),
+            col_ref(OUTER_K, "k"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn typed_inner_left_predicate(inner_type: DataType, outer_type: DataType) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(typed_col_ref(INNER_K, "k", inner_type)),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(typed_col_ref(OUTER_K, "k", outer_type)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            crate::common::BinOp::Eq,
+            typed_col_ref(INNER_K, "k", inner_type),
+            typed_col_ref(OUTER_K, "k", outer_type),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn missing_inner_predicate() -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(MISSING_INNER, "missing_k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            crate::common::BinOp::Eq,
+            col_ref(MISSING_INNER, "missing_k"),
+            col_ref(OUTER_K, "k"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn project(input: LogicalPlanNode) -> LogicalPlanNode {
@@ -852,33 +581,27 @@ mod tests {
     }
 
     #[test]
-    fn lift_normalizes_correlation_predicate_and_casts_outer_key() {
-        let inner_type = DataType::Utf8;
-        let outer_type = DataType::Int64;
+    fn lift_preserves_selected_correlation_order_and_cast() {
         let lifted = lift_correlated_inner(
             filter_with_predicate(
                 scan(),
-                typed_inner_left_predicate(inner_type.clone(), outer_type),
+                typed_inner_left_predicate(DataType::Int32, DataType::Int64),
             ),
             &[OUTER_K],
         )
         .expect("inner must lift");
-        let predicate = lifted
-            .on_predicate
-            .expect("lifted predicate must be present");
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &predicate.kind
+        let predicate = lifted.on_predicate.expect("lifted predicate");
+        let Some((crate::common::BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(&predicate)
         else {
-            panic!("expected binary predicate, got: {predicate:?}");
+            panic!("expected selected equality, got: {predicate:?}");
         };
-        assert_eq!(*op, BinOp::Eq);
         let ExprKind::Cast { expr, target, .. } = &left.kind else {
-            panic!("expected outer key cast, got: {left:?}");
+            panic!("expected original inner key cast, got: {left:?}");
         };
-        assert_eq!(target, &inner_type);
-        assert_column_ref(expr, OUTER_K);
-        assert_column_ref(right, INNER_K);
+        assert_eq!(target, &DataType::Int64);
+        assert_column_ref(expr, INNER_K);
+        assert_column_ref(right, OUTER_K);
     }
 
     #[test]

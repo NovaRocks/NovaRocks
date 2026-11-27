@@ -29,8 +29,7 @@ use novarocks_connector_contract::{
 };
 use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
-    SemanticParameters,
+    EvaluationDemand, EvaluationRegionId, ExpressionEffectContext, SemanticParameters,
 };
 use std::sync::{Arc, Mutex};
 
@@ -165,28 +164,18 @@ fn predicate(
     builder: &mut FragmentBuilder,
     node: NodeId,
     value: ValueId,
-    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+    _fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> ExprId {
     let left = builder
         .define(node, ty(DataType::Int64), ExprKind::input(value))
-        .unwrap();
-    let right = builder
-        .define(
-            node,
-            (ty(DataType::Int64)).clone(),
-            fixture_constants.i64(0, &(ty(DataType::Int64))),
-        )
         .unwrap();
     builder
         .define(
             node,
             ty(DataType::Boolean),
-            ExprKind::Binary {
-                allow_throw_exception: None,
-                left,
-                op: BinaryOperator::Gt,
-                right,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            ExprKind::IsNull {
+                expr: left,
+                negated: true,
             },
         )
         .unwrap()
@@ -509,10 +498,7 @@ fn stronger_arbitrary_q_can_be_structurally_sound_without_implication_or_pruning
         .unwrap();
     assert!(matches!(
         expression.kind,
-        ExprKind::Binary {
-            op: BinaryOperator::Gt,
-            ..
-        }
+        ExprKind::IsNull { negated: true, .. }
     ));
     let domain = &checked.domain().domains().unwrap()[&ScanColumnId::new(0)];
     assert_eq!(
@@ -525,7 +511,7 @@ fn stronger_arbitrary_q_can_be_structurally_sound_without_implication_or_pruning
             .contains_value(&ConnectorValue::BigInt(2))
             .unwrap()
     );
-    // v=2 satisfies this fixture's original v>0 while q(v)=v=1 is false.
+    // v=2 satisfies this fixture's original IS NOT NULL while q(v)=v=1 is false.
     // Structural success therefore establishes no p=>q or execute privilege.
     assert_eq!(checked.sources().len(), 1);
 }

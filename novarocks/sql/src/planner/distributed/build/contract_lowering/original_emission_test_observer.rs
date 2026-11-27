@@ -275,7 +275,6 @@ pub(in crate::planner::distributed::build) fn lower_read_with_original_emission_
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &'control dyn PureCompileControl,
     observer: &'control mut dyn OriginalEmissionObserver,
@@ -286,7 +285,6 @@ pub(in crate::planner::distributed::build) fn lower_read_with_original_emission_
         reads,
         functions,
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        root_allow_throw_exception,
         constant_policy,
         control,
     )?;
@@ -303,7 +301,6 @@ pub(in crate::planner::distributed::build) fn lower_write_with_original_emission
     dop_domain: PipelineDopDomain,
     input: FinalWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantValidation,
     control: &'control dyn PureCompileControl,
     observer: &'control mut dyn OriginalEmissionObserver,
@@ -321,7 +318,6 @@ pub(in crate::planner::distributed::build) fn lower_write_with_original_emission
         reads,
         functions,
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        root_allow_throw_exception,
         constant_policy,
         control,
     )?;

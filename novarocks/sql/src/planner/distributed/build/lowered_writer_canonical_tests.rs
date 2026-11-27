@@ -137,7 +137,6 @@ fn authored(
         },
         functions,
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         crate::constant::test_constant_policy(),
         control,
     )?
@@ -601,7 +600,6 @@ fn assert_licensed_nested_writer_projection(mode: LicensedWriterProjectionFixtur
         },
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         crate::constant::test_constant_policy(),
         &control,
     )

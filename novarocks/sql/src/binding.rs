@@ -241,7 +241,7 @@ impl SqlFunctionBinding {
         Ok(self)
     }
 
-    /// IDs 0–3 belong to AllowThrowException and GROUP_CONCAT. A statement
+    /// IDs 0–3 were reserved for retired parameter sources. A statement
     /// body has one original instant and one effective time zone; required
     /// property constants use their own environment and parameter table.
     pub(crate) fn statement_time_parameters(

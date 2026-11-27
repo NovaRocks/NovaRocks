@@ -438,9 +438,9 @@ pub(crate) async fn compile_routed_mutation_write(
     let access = sink
         .try_into_access()
         .map_err(|(error, _)| error.to_string())?;
-    let options = Some(options.unwrap_or_else(|| {
-        crate::query_execution::contract::synthetic_statement_query_options(execution)
-    }));
+    let options = Some(
+        options.unwrap_or_else(|| crate::query_execution::contract::synthetic_query_options()),
+    );
     finish_change_stream_write(
         state,
         completion,

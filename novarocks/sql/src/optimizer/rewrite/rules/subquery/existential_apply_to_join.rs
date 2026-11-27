@@ -245,15 +245,12 @@ mod tests {
     }
 
     fn correlation_predicate() -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(INNER_K, "k")),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref(OUTER_K, "k")),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_ref(INNER_K, "k"),
+            col_ref(OUTER_K, "k"),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn correlated_inner() -> LogicalPlanNode {
@@ -383,13 +380,11 @@ mod tests {
     }
 
     fn assert_correlation_condition(condition: &TypedExpr) {
-        let ExprKind::BinaryOp {
-            left, op, right, ..
-        } = &condition.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(&condition)
         else {
             panic!("expected binary condition, got: {condition:?}");
         };
-        assert_eq!(*op, BinOp::Eq);
         // The arena normalizes commutative Eq by ScalarId order, so the
         // left/right assignment is an implementation detail rather than a
         // semantic guarantee. Assert that the two expected column ids appear

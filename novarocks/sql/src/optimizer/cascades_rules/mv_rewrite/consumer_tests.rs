@@ -252,18 +252,12 @@ fn predicate(arena: &mut ScalarArena, number: i64, ordinal: u32, unused: i64) ->
         vec![unused, number]
     };
     let value = insert(arena, integer(values, ordinal, HashMap::new()));
-    arena
-        .intern_observed(
-            ScalarNode::BinaryOp {
-                left: column,
-                op: BinOp::Ne,
-                right: value,
-                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            },
-            FunctionValueType::new(DataType::Boolean, true),
-            crate::optimizer::test_optimizer_control(),
-        )
-        .unwrap()
+    arena.test_intern_operator(
+        BinOp::Ne,
+        column,
+        value,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 struct ResidualFixture {
     query: ScalarArena,

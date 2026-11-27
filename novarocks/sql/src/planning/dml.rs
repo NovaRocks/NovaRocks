@@ -687,7 +687,6 @@ pub fn build_final_frozen_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
@@ -754,7 +753,6 @@ pub fn build_final_frozen_connector_write_plan(
         final_write,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -769,7 +767,6 @@ pub fn build_final_frozen_connector_write_plan(
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
     constant_policy: novarocks_functions::ConstantValidation,
-    root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -835,7 +832,6 @@ pub fn begin_final_connector_write_plan(
     Ok((
         DmlWriteCompletion {
             constant_policy,
-            root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
             sealed_functions: compiled.sealed_functions,
             query_statistics: compiled.statistics.snapshot,
@@ -890,7 +886,6 @@ impl DmlWriteCompletion {
             },
             self.functions,
             self.sealed_functions,
-            self.root_allow_throw_exception,
             self.constant_policy,
             control,
         )
@@ -946,7 +941,6 @@ pub fn compile_final_connector_write_plan(
         final_write,
         compiled.function_catalog,
         compiled.sealed_functions,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -966,7 +960,6 @@ fn complete_connector_write_plan(
     final_write: DmlFinalWritePlanContext,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
@@ -989,7 +982,6 @@ fn complete_connector_write_plan(
         },
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -1006,7 +998,6 @@ fn complete_connector_write_plan(
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
     constant_policy: novarocks_functions::ConstantValidation,
-    root_allow_throw_exception: bool,
     semantic_settings: crate::sql_mode::SqlSemanticSettings,
     private_output_domain: bool,
     output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
@@ -1072,12 +1063,10 @@ impl DmlCtasSourcePlan {
             (&self.output_domains, &self.output_names),
             self.private_output_domain
         );
-        let root_allow = [u8::from(self.root_allow_throw_exception)];
         let mut digest = Sha256::new();
         for part in [
             b"novarocks.ctas-optimized-capture.v2".as_slice(),
             material.as_bytes(),
-            root_allow.as_slice(),
         ] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part);
@@ -1110,7 +1099,6 @@ pub fn compile_ctas_source(
     let private_output_domain = compiled.root_semantics.has_private_persistence_domain();
     Ok(DmlCtasSourcePlan {
         constant_policy,
-        root_allow_throw_exception: compiled.root_allow_throw_exception,
         semantic_settings,
         private_output_domain,
         output_domains,
@@ -1171,7 +1159,6 @@ pub fn begin_final_ctas_connector_write_plan(
     Ok((
         DmlWriteCompletion {
             constant_policy: source.constant_policy,
-            root_allow_throw_exception: source.root_allow_throw_exception,
             functions: source.function_catalog.clone(),
             sealed_functions: source.sealed_functions.clone(),
             query_statistics: source.query_statistics.clone(),
@@ -1375,7 +1362,6 @@ pub struct DmlFinalChangeStreamPlan {
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
     constant_policy: novarocks_functions::ConstantValidation,
-    root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1404,7 +1390,6 @@ impl DmlChangeStreamCompletion {
             },
             self.functions,
             self.sealed_functions,
-            self.root_allow_throw_exception,
             self.constant_policy,
             control,
         )
@@ -1437,7 +1422,6 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
@@ -1501,7 +1485,6 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     Ok((
         DmlChangeStreamCompletion {
             constant_policy,
-            root_allow_throw_exception,
             functions,
             sealed_functions,
             query_statistics,
@@ -1586,6 +1569,7 @@ pub fn begin_final_dml_change_stream(
                 not_matched_insert,
                 &control,
                 file_metadata,
+                compiled.function_catalog.as_ref(),
             )?;
             if let Some(assertion) = &mut keyed_assert {
                 assertion.applicability_output_ordinal = Some(applicability_ordinal);
@@ -1611,7 +1595,6 @@ pub fn begin_final_dml_change_stream(
         keyed_assert,
         request.shape,
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -1659,6 +1642,7 @@ pub fn compile_final_dml_change_stream(
                 not_matched_insert,
                 &control,
                 file_metadata,
+                compiled.function_catalog.as_ref(),
             )?;
             if let Some(assertion) = &mut keyed_assert {
                 assertion.applicability_output_ordinal = Some(applicability_ordinal);
@@ -1679,7 +1663,6 @@ pub fn compile_final_dml_change_stream(
             final_write: request.final_write,
         },
         decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
         constant_policy,
         &control,
     )
@@ -1698,7 +1681,6 @@ pub(crate) fn seal_final_change_stream_producer(
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
@@ -1733,7 +1715,6 @@ pub(crate) fn seal_final_change_stream_producer(
         sealed_functions,
         context,
         decimal_overflow_policy,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -1753,7 +1734,6 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
@@ -1817,7 +1797,6 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         },
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -2291,6 +2270,7 @@ fn build_merge_change_event_expand(
     not_matched_insert: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
     file_metadata: Option<[usize; 2]>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<(crate::optimizer::OptimizedOperatorNode, usize), crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
@@ -2400,6 +2380,7 @@ fn build_merge_change_event_expand(
                 &child_outputs,
                 1,
                 control,
+                functions,
             )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: reuse_assignments,
@@ -2412,6 +2393,7 @@ fn build_merge_change_event_expand(
                 &child_outputs,
                 2,
                 control,
+                functions,
             )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
             assignments: delete_assignments,
@@ -2424,6 +2406,7 @@ fn build_merge_change_event_expand(
                 &child_outputs,
                 3,
                 control,
+                functions,
             )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             assignments: fresh_assignments,
@@ -2687,6 +2670,7 @@ fn merge_action_predicate(
     columns: &[crate::analysis::OutputColumn],
     action: i32,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action", control)?;
     let literal = arena.intern_observed(
@@ -2696,14 +2680,12 @@ fn merge_action_predicate(
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
         control,
     )?;
-    arena.intern_observed(
-        crate::optimizer::scalar::ScalarNode::BinaryOp {
-            op: crate::common::BinOp::Eq,
-            left: action_expr,
-            right: literal,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Boolean, false),
+    crate::optimizer::scalar::intern_scalar_operator(
+        functions,
+        arena,
+        novarocks_type_contract::OperatorFunction::Equal,
+        [action_expr, literal],
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         control,
     )
 }
@@ -2843,7 +2825,6 @@ pub fn build_final_statistics_connector_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_context: DmlFinalPlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
@@ -2886,7 +2867,6 @@ pub fn build_final_statistics_connector_plan(
         reads,
         functions,
         sealed_functions,
-        root_allow_throw_exception,
         constant_policy,
         control,
     )
@@ -3484,6 +3464,7 @@ mod tests {
             true,
             &control,
             file_metadata,
+            crate::functions::builtin_sql_function_catalog(),
         )
         .unwrap();
         for expanded in [update, merge] {
@@ -3600,6 +3581,7 @@ mod tests {
                     false,
                     &crate::compiler::SqlCompileControl::unbounded(),
                     None,
+                    crate::functions::builtin_sql_function_catalog(),
                 )
                 .unwrap()
                 .0
@@ -3696,6 +3678,7 @@ mod tests {
             true,
             &crate::compiler::SqlCompileControl::unbounded(),
             None,
+            crate::functions::builtin_sql_function_catalog(),
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
@@ -3816,6 +3799,7 @@ mod tests {
                 true,
                 &control,
                 None,
+                crate::functions::builtin_sql_function_catalog(),
             )
             .unwrap();
             let Operator::PhysicalProject(project) = &producer.children[0].op else {
@@ -3847,22 +3831,21 @@ mod tests {
                 .events
                 .iter()
                 .map(|event| {
-                    let ScalarNode::BinaryOp {
-                        op: crate::common::BinOp::Eq,
-                        left,
-                        right,
-                        ..
-                    } = arena.node(event.predicate.unwrap())
+                    let Some((crate::common::BinOp::Eq, [left, right])) =
+                        crate::common::binary_operator::scalar_comparison(
+                            arena,
+                            event.predicate.unwrap(),
+                        )
                     else {
                         panic!("each event consumes the original selected action")
                     };
                     assert!(matches!(
-                        arena.node(*left),
+                        arena.node(left),
                         ScalarNode::ColumnRef(crate::column_id::ColumnId(4))
                     ));
                     let ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
                         crate::analysis::LiteralValue::Int(action),
-                    )) = arena.node(*right)
+                    )) = arena.node(right)
                     else {
                         panic!("each event has its exact selected action")
                     };
@@ -3948,6 +3931,7 @@ mod tests {
             false,
             &crate::compiler::SqlCompileControl::unbounded(),
             None,
+            crate::functions::builtin_sql_function_catalog(),
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&expanded);
@@ -4286,7 +4270,6 @@ mod tests {
                     .unwrap(),
             ),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            false,
             crate::constant::test_constant_policy(),
             &control,
         )
@@ -4476,7 +4459,6 @@ mod tests {
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
@@ -5297,7 +5279,7 @@ mod tests {
     }
 
     #[test]
-    fn ctas_keeps_actual_analyzed_root_allow_across_move_handoffs() {
+    fn ctas_keeps_constant_policy_across_move_handoffs() {
         use crate::compiler::{
             SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
             SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
@@ -5312,35 +5294,24 @@ mod tests {
                 ..crate::constant::test_constant_fixture()
             },
         );
-        for (session_mode, sql, expected) in [
-            ("32", "SELECT 1 AS x", false),
-            ("ALLOW_THROW_EXCEPTION", "SELECT 1 AS x", true),
-            ("ERROR_IF_OVERFLOW", "SELECT 1 AS x", false),
+        for (session_mode, sql) in [
+            ("32", "SELECT 1 AS x"),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1 AS x"),
+            ("ERROR_IF_OVERFLOW", "SELECT 1 AS x"),
             (
                 "32",
                 "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1 AS x",
-                true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
                 "WITH SESSION sql_mode = 32 SELECT 1 AS x",
-                false,
             ),
-            ("32", "SELECT x FROM (SELECT 1 AS x) s", false),
-            (
-                "ALLOW_THROW_EXCEPTION",
-                "SELECT x FROM (SELECT 1 AS x) s",
-                true,
-            ),
-            (
-                "ALLOW_THROW_EXCEPTION",
-                "SELECT 1 AS x UNION ALL SELECT 2",
-                true,
-            ),
+            ("32", "SELECT x FROM (SELECT 1 AS x) s"),
+            ("ALLOW_THROW_EXCEPTION", "SELECT x FROM (SELECT 1 AS x) s"),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1 AS x UNION ALL SELECT 2"),
             (
                 "ALLOW_THROW_EXCEPTION",
                 "WITH s AS (SELECT 1 AS x) SELECT x FROM s",
-                true,
             ),
         ] {
             let request = |intent| {
@@ -5365,14 +5336,11 @@ mod tests {
                 .unwrap()
                 .into_pending()
                 .unwrap();
-                assert_eq!(analyzed.root_allow_throw_exception(), expected);
                 let request =
                     SqlOptimizeRequest::new(analyzed, &statistics, SqlCompileControl::unbounded());
-                assert_eq!(request.root_allow_throw_exception(), expected);
                 request
             };
             let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
-            assert_eq!(source.root_allow_throw_exception, expected);
             assert_eq!(source.constant_policy, constant_policy);
             assert_eq!(source.output_columns().len(), 1);
         }
@@ -5432,7 +5400,7 @@ mod tests {
     }
 
     #[test]
-    fn ctas_capture_fingerprint_binds_root_allow_for_identical_actual_optimized_sources() {
+    fn ctas_capture_fingerprint_ignores_retired_legacy_mode() {
         use crate::compiler::{
             SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
             SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
@@ -5441,7 +5409,7 @@ mod tests {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let statistics = DmlStatisticsSnapshot::empty();
-        let sources = ["32", "ALLOW_THROW_EXCEPTION"].map(|session_mode| {
+        let sources = ["32", "32,ALLOW_THROW_EXCEPTION"].map(|session_mode| {
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
                 SqlStatementInput::parsed_query(crate::compiler::test_query("SELECT 1 AS x")),
                 SqlCompileIntent::Query,
@@ -5470,15 +5438,11 @@ mod tests {
             ))
             .unwrap()
         });
-        assert!(!sources[0].root_allow_throw_exception);
-        assert!(sources[1].root_allow_throw_exception);
-        // The previous capture material was identical for these two admitted
-        // statements, even though their frozen terminal exception modes differ.
         assert_eq!(
             format!("{:#?}", sources[0].optimized),
             format!("{:#?}", sources[1].optimized)
         );
-        assert_ne!(
+        assert_eq!(
             sources[0].capture_fingerprint(),
             sources[1].capture_fingerprint()
         );

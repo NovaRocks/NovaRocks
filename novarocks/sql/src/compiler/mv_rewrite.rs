@@ -4637,7 +4637,6 @@ mod tests {
                     analyzed.decimal_overflow_policy,
                     &control,
                 );
-                context.set_root_allow_throw_exception(analyzed.root_allow_throw_exception);
                 context.set_function_catalog(Arc::clone(&analyzed.function_catalog));
                 context.set_sealed_functions(Arc::clone(&analyzed.sealed_functions));
                 let receipts = Arc::new(SignedCastReceipts::default());

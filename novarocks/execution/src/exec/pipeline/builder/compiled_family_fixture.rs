@@ -477,13 +477,12 @@ fn options(dop: usize) -> LocalCompileOptions {
     }
 }
 
-/// Compile with the real local compiler. The catalog is the sealed RAND
-/// subset because an empty catalog is refused; these fixtures bind no call.
+/// Compile with the real local compiler and the installed scalar catalogue.
 pub(crate) fn try_compile(
     package: Arc<FragmentPackage>,
     dop: usize,
 ) -> Result<Arc<LocalProgram>, String> {
-    let functions = novarocks_functions::testkit::rng_subset();
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

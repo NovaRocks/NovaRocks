@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 use novarocks_local_program::{
     JoinDistributionMode, JoinType, LocalProgram, NestedLoopJoinType, ProgramNodeKind,
 };
@@ -41,9 +41,8 @@ use novarocks_physical_plan::{
     ResultPort, RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters, arithmetic_result_value_type_with_op,
+    ArithmeticOperator, EvaluationDemand, FunctionValueType, SemanticParameters,
+    arithmetic_result_value_type_with_op,
 };
 use novarocks_types::UniqueId;
 
@@ -384,21 +383,11 @@ fn add_join(
                 .add(None, int64(true), ExprKind::input(r[1]))
                 .unwrap()
         };
-        builder
-            .unit(join)
-            .unwrap()
-            .add(
-                None,
-                FunctionValueType::new(DataType::Boolean, true),
-                ExprKind::Binary {
-                    left: x,
-                    op: BinaryOperator::Lt,
-                    right: y,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap()
+        builder.operator(
+            join,
+            novarocks_type_contract::OperatorFunction::LessThan,
+            [x, y],
+        )
     });
     let nested_predicate = if matches!(spec.family, Family::NestLoop)
         && spec.kind == JoinKind::NullAwareLeftAnti
@@ -713,7 +702,7 @@ fn single_plan_with_predicate(
         Placement::Single,
         checked_right,
     );
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_definition(
             join,
@@ -727,13 +716,7 @@ fn single_plan_with_predicate(
         &fixture_sources,
     );
     if checked_right {
-        plan = plan.with_semantic_parameters(
-            SemanticParameters::try_new([(
-                ALLOW.id,
-                SemanticParameterValue::AllowThrowException(true),
-            )])
-            .unwrap(),
-        );
+        plan = plan.with_semantic_parameters(SemanticParameters::default());
     }
     plan.add_fragment(fragment).unwrap();
     let mut port = result_port(SINGLE, join, &output);
@@ -766,7 +749,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             &[int64(true), int64(true)],
             &literal_rows(rows),
         );
-        super::family_fixture::seal_no_call_units(&mut builder);
+        builder.seal_catalogue_units();
         let fragment = builder
             .finish_definition(
                 node,
@@ -824,7 +807,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         placement,
         false,
     );
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let join_fragment = builder
         .finish_definition(
             join,
@@ -848,7 +831,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         |_| Distribution::Singleton,
         RowMultiplicity::SingleCopy,
     );
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let result_fragment = builder
         .finish_definition(
             receiver,
@@ -1321,11 +1304,6 @@ fn nested_loop_joins_with_a_predicate_match_the_oracle() {
     ));
 }
 
-const ALLOW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(3),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Overflow {
     ProbeKey,
@@ -1353,21 +1331,11 @@ fn overflowing(
         arithmetic_result_value_type_with_op(&int64(true), &int64(false), ArithmeticOperator::Add)
             .unwrap();
     assert_eq!(ty, int64(true));
-    builder
-        .unit(owner)
-        .unwrap()
-        .add(
-            None,
-            ty,
-            ExprKind::Binary {
-                op: BinaryOperator::Add,
-                left: read,
-                right: max,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                allow_throw_exception: Some(ALLOW),
-            },
-        )
-        .unwrap()
+    builder.operator(
+        owner,
+        novarocks_type_contract::OperatorFunction::Add,
+        [read, max],
+    )
 }
 
 /// An inner equi-join of the fixture rows whose `at` expression overflows.
@@ -1430,21 +1398,11 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
     let residual = (at == Overflow::Residual).then(|| {
         let x = overflowing(&mut builder, join, l[1]);
         let y = read(&mut builder, r[1]);
-        builder
-            .unit(join)
-            .unwrap()
-            .add(
-                None,
-                FunctionValueType::new(DataType::Boolean, true),
-                ExprKind::Binary {
-                    left: x,
-                    op: BinaryOperator::Lt,
-                    right: y,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap()
+        builder.operator(
+            join,
+            novarocks_type_contract::OperatorFunction::LessThan,
+            [x, y],
+        )
     });
     let residual = residual.map(|definition| {
         builder
@@ -1475,7 +1433,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             },
         )
         .unwrap();
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_definition(
             join,
@@ -1488,13 +1446,7 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
         version(),
         &fixture_sources,
     )
-    .with_semantic_parameters(
-        SemanticParameters::try_new([(
-            ALLOW.id,
-            SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap(),
-    );
+    .with_semantic_parameters(SemanticParameters::default());
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result_port(SINGLE, join, &output))
         .unwrap();
@@ -3273,23 +3225,11 @@ fn authored_naa_plan(
                 .unwrap()
                 .add(None, int64(true), ExprKind::input(l[1]))
                 .unwrap();
-            Some(
-                builder
-                    .unit(join)
-                    .unwrap()
-                    .add(
-                        None,
-                        FunctionValueType::new(DataType::Boolean, true),
-                        ExprKind::Binary {
-                            left: build,
-                            op: BinaryOperator::Gt,
-                            right: probe,
-                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                            allow_throw_exception: None,
-                        },
-                    )
-                    .unwrap(),
-            )
+            Some(builder.operator(
+                join,
+                novarocks_type_contract::OperatorFunction::GreaterThan,
+                [build, probe],
+            ))
         }
     };
     let eligibility = eligibility.map(|definition| {
@@ -3321,7 +3261,7 @@ fn authored_naa_plan(
             },
         )
         .unwrap();
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_definition(
             join,
@@ -3335,13 +3275,7 @@ fn authored_naa_plan(
         &fixture_sources,
     );
     if late_overflow {
-        plan = plan.with_semantic_parameters(
-            SemanticParameters::try_new([(
-                ALLOW.id,
-                SemanticParameterValue::AllowThrowException(true),
-            )])
-            .unwrap(),
-        );
+        plan = plan.with_semantic_parameters(SemanticParameters::default());
     }
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result_port(SINGLE, join, &l)).unwrap();
@@ -3775,7 +3709,7 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
                 },
             )
             .unwrap();
-        super::family_fixture::seal_no_call_units(&mut builder);
+        builder.seal_catalogue_units();
         let fragment = builder
             .finish_definition(
                 join,

@@ -20,13 +20,12 @@
 
 use super::{ExpressionCodecError, PreparedExpressionIds};
 use crate::allocation_exit_v2::reserve_exit;
-use crate::physical_semantics_v2::{encode_decimal_policy, encode_reference};
-use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, ValueAddress};
+use novarocks_expression_contract::{ExprKind, ExprNode, ValueAddress};
 use novarocks_physical_plan::{
     ExprId, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 use novarocks_proto_models::{physical_control_v2, physical_package_v2 as wire};
-use novarocks_type_contract::{CompileCheckpoints, SemanticParameterKey, SemanticParameterRef};
+use novarocks_type_contract::CompileCheckpoints;
 
 pub(super) fn encode_kind(
     node: &ExprNode,
@@ -53,22 +52,7 @@ pub(super) fn encode_kind(
             pool_id: Some(reference.pool.get()),
             row_ordinal: reference.ordinal,
         }),
-        ExprKind::Binary {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-            allow_throw_exception,
-        } => Kind::Binary(wire::BinaryExpression {
-            left_expr_id: Some(left.get()),
-            op: binary(*op),
-            right_expr_id: Some(right.get()),
-            decimal_overflow_policy: encode_decimal_policy(*decimal_overflow_policy),
-            allow_throw_exception: allow_throw_exception
-                .as_ref()
-                .map(|reference| allow_throw(reference, work))
-                .transpose()?,
-        }),
+
         ExprKind::Conjunction { args } => Kind::Conjunction(wire::ExpressionIds {
             expr_ids: expression_ids(args, work)?,
         }),
@@ -138,21 +122,6 @@ fn required_binding(id: Option<u32>) -> Result<u32, ExpressionCodecError> {
     ))
 }
 
-fn allow_throw(
-    reference: &SemanticParameterRef,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<novarocks_proto_models::physical_semantics_v2::SemanticParameterRef, ExpressionCodecError>
-{
-    let valid_key = reference.expected_key == SemanticParameterKey::AllowThrowException;
-    work.step()?;
-    if !valid_key {
-        return Err(ExpressionCodecError::InvalidShape(
-            "intrinsic parameter reference has the wrong expected key",
-        ));
-    }
-    Ok(encode_reference(reference, work)?)
-}
-
 fn expression_ids(
     ids: &[ExprId],
     work: &mut CompileCheckpoints<'_>,
@@ -176,23 +145,6 @@ fn project<T, U>(
         work.step()?;
     }
     Ok(output)
-}
-
-fn binary(op: BinaryOperator) -> i32 {
-    (match op {
-        BinaryOperator::Add => wire::BinaryOperator::Add,
-        BinaryOperator::Subtract => wire::BinaryOperator::Subtract,
-        BinaryOperator::Multiply => wire::BinaryOperator::Multiply,
-        BinaryOperator::Divide => wire::BinaryOperator::Divide,
-        BinaryOperator::Modulo => wire::BinaryOperator::Modulo,
-        BinaryOperator::Eq => wire::BinaryOperator::Eq,
-        BinaryOperator::EqForNull => wire::BinaryOperator::EqForNull,
-        BinaryOperator::NotEq => wire::BinaryOperator::NotEq,
-        BinaryOperator::Lt => wire::BinaryOperator::Lt,
-        BinaryOperator::LtEq => wire::BinaryOperator::LtEq,
-        BinaryOperator::Gt => wire::BinaryOperator::Gt,
-        BinaryOperator::GtEq => wire::BinaryOperator::GtEq,
-    }) as i32
 }
 
 pub(crate) fn window_frame(

@@ -234,6 +234,50 @@ pub fn add_catalogue_predicate(
     operator: novarocks_type_contract::OperatorFunction,
     sources: Vec<ExprId>,
 ) -> Result<ExprId, novarocks_functions::FunctionBindingError> {
+    let (binding, arguments) = resolve_catalogue_operator(draft, pools, operator, &sources)?;
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        panic!("operator selects a scalar");
+    };
+    let function = legacy_scalar_function(&binding, result);
+    let definition = draft
+        .add(
+            None,
+            result.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: sources.into_boxed_slice(),
+            },
+        )
+        .unwrap();
+    draft
+        .request(definition, physical_call_request(&arguments, None, pools))
+        .unwrap();
+    Ok(definition)
+}
+
+pub fn add_catalogue_infix_with_policy(
+    draft: &mut BoundExprSetBuilder,
+    pools: &ConstantPools,
+    authors: &mut BTreeMap<ExprId, ClaimAuthor>,
+    operator: OperatorFunction,
+    sources: [ExprId; 2],
+    decimal_policy: DecimalOverflowPolicy,
+) -> Result<ExprId, novarocks_functions::FunctionBindingError> {
+    assert!(operator.is_infix());
+    let (binding, arguments) = resolve_catalogue_operator(draft, pools, operator, &sources)?;
+    let author = catalogue_operator_author(binding, arguments, decimal_policy);
+    Ok(add_call(draft, authors, author, sources.to_vec()))
+}
+
+fn resolve_catalogue_operator(
+    draft: &BoundExprSetBuilder,
+    pools: &ConstantPools,
+    operator: OperatorFunction,
+    sources: &[ExprId],
+) -> Result<
+    (ResolvedFunctionBinding, Vec<FunctionArgument>),
+    novarocks_functions::FunctionBindingError,
+> {
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let control = &crate::testkit::HarnessControl;
     let mut work = CompileCheckpoints::try_new(
@@ -242,7 +286,7 @@ pub fn add_catalogue_predicate(
     )?;
     let mut arguments = Vec::new();
     let mut children = Vec::new();
-    for &source in &sources {
+    for &source in sources {
         let source = draft
             .definition(source)
             .expect("predicate source is present");
@@ -280,29 +324,32 @@ pub fn add_catalogue_predicate(
         },
         control,
     )?;
+    Ok((binding, arguments))
+}
+
+fn catalogue_operator_author(
+    binding: ResolvedFunctionBinding,
+    arguments: Vec<FunctionArgument>,
+    decimal_policy: DecimalOverflowPolicy,
+) -> ClaimAuthor {
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
-        panic!("predicate selects a scalar")
+        panic!("operator selects a scalar")
     };
     let function = BoundFunction::from_exact_signature(
         binding.function_id,
-        binding.selected.overload,
+        binding.selected.overload.clone(),
         binding.kind,
-        binding.selected.argument_types,
+        binding.selected.argument_types.clone(),
         result.clone(),
     );
-    let definition = draft
-        .add(
-            None,
-            result.clone(),
-            ExprKind::FunctionCall {
-                function,
-                args: sources.into_boxed_slice(),
-            },
-        )
-        .unwrap();
-    let request = physical_call_request(&arguments, None, pools);
-    draft.request(definition, request).unwrap();
-    Ok(definition)
+    ClaimAuthor {
+        function,
+        selected: Arc::new(binding.selected),
+        arguments,
+        decimal_policy,
+        expected_result_type: None,
+        shape: ControlShape::OrderedNull,
+    }
 }
 
 /// Freeze the original requests using the explicit constant table of the caller.
@@ -392,6 +439,31 @@ pub fn declare_call_controls(
     }
 }
 
+pub fn seal_catalogue_fixture(
+    mut draft: BoundExprSetBuilder,
+    ports: Vec<novarocks_expression_contract::ExprPort>,
+    constants: &ConstantPools,
+    parameters: &SemanticParameters,
+    control: &dyn PureCompileControl,
+) -> BoundExprSet {
+    let catalogue = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let mut work =
+        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)
+            .unwrap();
+    declare_call_controls(&mut draft, &catalogue, constants, parameters, &mut work);
+    let sealed = draft.seal(ports, &mut work).unwrap();
+    let unit = finish_unit(
+        &catalogue,
+        sealed,
+        &BTreeMap::new(),
+        constants,
+        parameters,
+        &mut work,
+    );
+    work.finish().unwrap();
+    unit
+}
+
 /// Complete the actual uses of a unit from its sealed control graph.
 pub fn finish_unit(
     functions: &PureEngineFunctionCatalog,
@@ -419,15 +491,7 @@ pub fn try_finish_unit(
         .collect::<BTreeMap<_, _>>();
     for definition in sealed.definitions() {
         if let ExprKind::FunctionCall { function, .. } = &definition.kind
-            && matches!(
-                OperatorFunction::from_function_id(&function.function_id),
-                Some(
-                    OperatorFunction::BooleanNot
-                        | OperatorFunction::InList
-                        | OperatorFunction::Like
-                        | OperatorFunction::LessThanOrEqual
-                )
-            )
+            && OperatorFunction::from_function_id(&function.function_id).is_some()
         {
             decimal_overflow
                 .entry(definition.id)

@@ -469,7 +469,7 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::Constant(_) => Ok(()),
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,

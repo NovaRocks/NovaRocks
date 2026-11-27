@@ -19,85 +19,9 @@
 use super::support::*;
 use arrow_schema::{DataType, Field};
 use novarocks_expression_contract::*;
-use novarocks_type_contract::{
-    DecimalOverflowPolicy as Policy, EvaluationDemand, FunctionArgumentType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef,
-};
+use novarocks_type_contract::{EvaluationDemand, FunctionArgumentType};
 use std::sync::Arc;
 
-#[test]
-fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
-    for (op, result_type, policy, accepted) in [
-        (
-            BinaryOperator::Eq,
-            DataType::Boolean,
-            Policy::OutputNull,
-            true,
-        ),
-        (
-            BinaryOperator::Eq,
-            DataType::Boolean,
-            Policy::ReportError,
-            false,
-        ),
-        (
-            BinaryOperator::Add,
-            DataType::Int64,
-            Policy::OutputNull,
-            true,
-        ),
-        (
-            BinaryOperator::Add,
-            DataType::Int64,
-            Policy::ReportError,
-            true,
-        ),
-    ] {
-        let mut builder = BoundExprSetBuilder::new(limits());
-        let (pools, reference) = i64_source(1);
-        let operand = builder
-            .add(None, integer(false), ExprKind::Constant(reference))
-            .unwrap();
-        let expression = builder
-            .add(
-                None,
-                ValueType::new(result_type, false),
-                ExprKind::Binary {
-                    allow_throw_exception: matches!(
-                        op,
-                        BinaryOperator::Add
-                            | BinaryOperator::Subtract
-                            | BinaryOperator::Multiply
-                            | BinaryOperator::Divide
-                            | BinaryOperator::Modulo
-                    )
-                    .then_some(SemanticParameterRef {
-                        id: SemanticParameterId::new(0),
-                        expected_key: SemanticParameterKey::AllowThrowException,
-                    }),
-                    left: operand,
-                    op,
-                    right: operand,
-                    decimal_overflow_policy: policy,
-                },
-            )
-            .unwrap();
-        builder
-            .root(expression, EvaluationDemand::Value, RootScope::AllPorts)
-            .unwrap();
-        let result = no_calls(builder, vec![], &Control::good());
-        if accepted {
-            result.unwrap();
-        } else {
-            assert!(
-                result.unwrap_err().to_string().contains(
-                    "non-arithmetic binary expression requires OutputNull decimal policy"
-                )
-            );
-        }
-        drop(pools);
-    }
-}
 #[test]
 fn physical_nested_decimal_cast_preserves_its_frozen_mode() {
     let source = DataType::List(Arc::new(Field::new(

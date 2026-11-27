@@ -21,8 +21,8 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
+use crate::common::LiteralValue;
 use crate::common::negation::{render_negation, scalar_operand};
-use crate::common::{BinOp, LiteralValue};
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
 pub(crate) fn column_id(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
@@ -57,7 +57,7 @@ fn collect_column_ids_strict_inner(
         | ScalarNode::LocalValue(_)
         | ScalarNode::Literal(_)
         | ScalarNode::Constant(_) => {}
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -137,8 +137,8 @@ fn collect_column_ids_strict_inner(
 pub(crate) fn split_conjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
     match arena.node(expr) {
         ScalarNode::Nested(inner) => split_conjuncts(arena, *inner, out),
-        ScalarNode::BinaryOp {
-            op: BinOp::And,
+        ScalarNode::BooleanConnective {
+            op: crate::common::BooleanOp::And,
             left,
             right,
             ..
@@ -155,14 +155,14 @@ pub(crate) fn combine_conjuncts(
     mut exprs: Vec<ScalarId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
-    combine_binary_bool(arena, &mut exprs, BinOp::And, control)
+    combine_binary_bool(arena, &mut exprs, crate::common::BooleanOp::And, control)
 }
 
 pub(crate) fn split_disjuncts(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
     match arena.node(expr) {
         ScalarNode::Nested(inner) => split_disjuncts(arena, *inner, out),
-        ScalarNode::BinaryOp {
-            op: BinOp::Or,
+        ScalarNode::BooleanConnective {
+            op: crate::common::BooleanOp::Or,
             left,
             right,
             ..
@@ -179,13 +179,13 @@ pub(crate) fn combine_disjuncts(
     mut exprs: Vec<ScalarId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
-    combine_binary_bool(arena, &mut exprs, BinOp::Or, control)
+    combine_binary_bool(arena, &mut exprs, crate::common::BooleanOp::Or, control)
 }
 
 fn combine_binary_bool(
     arena: &mut ScalarArena,
     exprs: &mut Vec<ScalarId>,
-    op: BinOp,
+    op: crate::common::BooleanOp,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -195,11 +195,10 @@ fn combine_binary_bool(
     while let Some(next) = exprs.pop() {
         let nullable = arena.nullable(next) || arena.nullable(result);
         result = arena.intern_observed(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 op,
                 left: next,
                 right: result,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
             control,
@@ -364,7 +363,7 @@ pub(crate) fn literal_count_value(
 pub(crate) fn contains_aggregate(arena: &ScalarArena, expr: ScalarId) -> bool {
     match arena.node(expr) {
         ScalarNode::AggregateCall { .. } => true,
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -545,13 +544,13 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
                 format!("{child} IS NULL")
             }
         }
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left, op, right, ..
         } => {
             format!(
                 "{} {} {}",
                 scalar_display_name_with_parens(arena, *left),
-                bin_op_display(*op),
+                op.sql(),
                 scalar_display_name_with_parens(arena, *right)
             )
         }
@@ -647,25 +646,6 @@ fn scalar_display_name_with_parens(arena: &ScalarArena, expr: ScalarId) -> Strin
         | ScalarNode::FunctionCall { .. }
         | ScalarNode::AggregateCall { .. } => scalar_display_name(arena, expr),
         _ => format!("({})", scalar_display_name(arena, expr)),
-    }
-}
-
-fn bin_op_display(op: BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Mod => "%",
-        BinOp::Eq => "=",
-        BinOp::Ne => "!=",
-        BinOp::Lt => "<",
-        BinOp::Le => "<=",
-        BinOp::Gt => ">",
-        BinOp::Ge => ">=",
-        BinOp::EqForNull => "<=>",
-        BinOp::And | BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => "AND",
-        BinOp::Or => "OR",
     }
 }
 
@@ -795,7 +775,7 @@ fn contains_function_matching(
                     .iter()
                     .any(|item| contains_function_matching(arena, item.expr, matches))
         }
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -833,7 +813,7 @@ fn contains_function_matching(
 
 // Source-backed own Cast effects; unsupported frozen shapes and allocation
 // failures are not row effects. Recursive casts use the shared scalar caster,
-// while root Cast adds Date calendar conversion and the legacy SQL mode check.
+// while root Cast adds Date calendar conversion.
 fn cast_has_intrinsic_row_error(source: &DataType, target: &DataType, root: bool) -> bool {
     use arrow::datatypes::TimeUnit;
     if source == target || source == &DataType::Null || target == &DataType::Null {
@@ -845,11 +825,9 @@ fn cast_has_intrinsic_row_error(source: &DataType, target: &DataType, root: bool
     {
         return true;
     }
-    // ALLOW_THROW_EXCEPTION also governs Decimal-to-Decimal overflow. A
-    // same-scale non-narrowing precision cast is total on the declared source
-    // domain (including a carrier change). Other rescaling/narrowing profiles
-    // remain a conservative effect upper bound, not a claim that every such
-    // profile overflows. The statement flag is not a per-node frozen fact.
+    // A same-scale non-narrowing precision cast is total on the declared
+    // source domain, including a carrier change. Other rescaling and
+    // narrowing profiles may report a row error.
     let decimal_parts = |dtype: &DataType| match dtype {
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Some((*p, *s)),
         _ => None,
@@ -858,8 +836,7 @@ fn cast_has_intrinsic_row_error(source: &DataType, target: &DataType, root: bool
     {
         return ss != ts || tp < sp;
     }
-    // ALLOW_THROW_EXCEPTION is an existing statement setting rather than a
-    // per-node Decimal policy. Conservatively preserve its lawful error route.
+    // Floating-to-integral conversion can report out-of-range rows.
     if root
         && matches!(source, DataType::Float32 | DataType::Float64)
         && matches!(
@@ -1140,15 +1117,9 @@ fn prove_signed_integer_operator_total(
 /// This effect is independent from function volatility.
 pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
     use novarocks_functions::PreparedCompositeComparisonRecipe;
-    use novarocks_type_contract::DecimalOverflowPolicy;
+
     let comparison_can_fail = |value| {
         PreparedCompositeComparisonRecipe::equal_may_raise_row_error(arena.value_type(value))
-    };
-    let decimal = |data_type: &DataType| {
-        matches!(
-            data_type,
-            DataType::Decimal128(..) | DataType::Decimal256(..)
-        )
     };
     let own_error = match arena.node(expr) {
         ScalarNode::FunctionCall { binding, args, .. } => {
@@ -1161,19 +1132,6 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 && scalar_call_can_fail(binding)
                 && (scalar_invocation_can_fail(binding)
                     || prove_signed_integer_operator_total(arena, expr, binding, args).is_none())
-        }
-        ScalarNode::BinaryOp {
-            op,
-            decimal_overflow_policy,
-            ..
-        } => {
-            // Legacy ALLOW_THROW_EXCEPTION can also raise for Decimal multiply.
-            // It is not a per-node frozen fact, so OutputNull cannot prove this
-            // operation error-free. This is MayRaise, not an unconditional error.
-            decimal(arena.data_type(expr))
-                && (*op == BinOp::Mul
-                    || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                        && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Div | BinOp::Mod)))
         }
         ScalarNode::Cast {
             child,
@@ -1217,7 +1175,7 @@ pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
                 || partition_by.iter().any(|expr| can_fail(arena, *expr))
                 || order_by.iter().any(|item| can_fail(arena, item.expr))
         }
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -1357,11 +1315,10 @@ mod tests {
         let a = col(&mut arena, 1, true);
         let b = col(&mut arena, 2, false);
         let and = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::And,
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
                 left: a,
                 right: b,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
@@ -1379,7 +1336,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             arena.node(rebuilt),
-            ScalarNode::BinaryOp { op: BinOp::And, .. }
+            ScalarNode::BooleanConnective {
+                op: crate::common::BooleanOp::And,
+                ..
+            }
         ));
         assert_eq!(arena.data_type(rebuilt), &DataType::Boolean);
         assert!(arena.nullable(rebuilt));
@@ -1417,15 +1377,7 @@ mod tests {
         assert!(!can_fail(&arena, nullable));
         assert!(can_fail(&arena, throwing));
         assert!(!contains_non_deterministic_function(&arena, throwing));
-        let predicate = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: throwing,
-                right: nullable,
-                decimal_overflow_policy: OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-        );
+        let predicate = arena.test_intern_operator(BinOp::Eq, throwing, nullable, OutputNull);
         assert!(can_fail(&arena, predicate));
         assert!(!contains_non_deterministic_function(&arena, predicate));
     }
@@ -2065,22 +2017,20 @@ mod intrinsic_cast_effect_tests {
                 ScalarNode::ColumnRef(ColumnId(52)),
                 novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
             );
-            for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
+            for op in [
+                crate::common::BinOp::Add,
+                crate::common::BinOp::Sub,
+                crate::common::BinOp::Mul,
+                crate::common::BinOp::Div,
+                crate::common::BinOp::Mod,
+            ] {
                 for policy in [OutputNull, ReportError] {
-                    let expr = arena.intern(
-                        ScalarNode::BinaryOp {
-                            op,
-                            left,
-                            right,
-                            decimal_overflow_policy: policy,
-                        },
-                        novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
-                    );
+                    let expr = arena.test_intern_operator(op, left, right, policy);
                     let is_decimal =
                         matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
                     assert_eq!(
                         can_fail(&arena, expr),
-                        is_decimal && (op == BinOp::Mul || policy == ReportError),
+                        is_decimal && (op == crate::common::BinOp::Mul || policy == ReportError),
                         "{dtype:?}/{op:?}/{policy:?}"
                     );
                     assert!(!contains_non_deterministic_function(&arena, expr));

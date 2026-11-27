@@ -28,9 +28,7 @@ use arrow::{
 };
 use novarocks_expression_contract::ValueId;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
+    CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, FunctionValueType, SemanticParameters,
 };
 use std::cell::RefCell;
 
@@ -104,15 +102,7 @@ fn program(text: &str, columns: &[(&str, ArrayRef, bool)]) -> (Arc<CompiledExprS
     )
     .unwrap();
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
-    let allow_throw_exception = SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    };
-    let parameters = SemanticParameters::try_new([(
-        allow_throw_exception.id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap();
+    let parameters = SemanticParameters::default();
     let typed = type_expression_text(
         text,
         &typed_columns,
@@ -121,7 +111,6 @@ fn program(text: &str, columns: &[(&str, ArrayRef, bool)]) -> (Arc<CompiledExprS
             constant_policy: constant_policy(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             parameters: &parameters,
-            allow_throw_exception,
         },
         &HarnessControl,
     )
@@ -155,7 +144,7 @@ fn lists(values: impl IntoIterator<Item = Option<Vec<Option<i32>>>>) -> ArrayRef
 }
 
 #[test]
-fn scalar_call_protocol_borrows_wide_guarded_captures_in_the_original_body_batch() {
+fn fallible_body_borrows_wide_guarded_captures_at_each_required_element() {
     let alternating = |a, b| {
         (0..20000)
             .map(|i| Some(if i % 2 == 0 { a } else { b }))
@@ -215,21 +204,19 @@ fn scalar_call_protocol_borrows_wide_guarded_captures_in_the_original_body_batch
         assert_eq!(actual.value(row).to_data(), original.value(row).to_data());
     }
     let mut body_rows = 0;
-    let mut leaf_rows = 0;
     let mut batches = 0;
-    let mut groups = 0;
+    let mut leaf_rows = 0;
     let mut capture_copy = 0;
     for event in events {
         match event {
             Event::Body { parents } => {
                 body_rows += parents.len();
                 batches += 1;
-                assert_eq!((parents.first(), parents.last()), (Some(&0), Some(&1)));
+                assert_eq!(parents, [0, 1]);
             }
             Event::ScalarLeaf { rows, broadcast } => {
                 assert_eq!(broadcast, [0]);
                 leaf_rows += rows;
-                groups += 1;
             }
             Event::Gather {
                 is_collection: true,
@@ -239,8 +226,8 @@ fn scalar_call_protocol_borrows_wide_guarded_captures_in_the_original_body_batch
         }
     }
     assert_eq!(body_rows, 40000);
-    assert_eq!(leaf_rows, body_rows);
-    assert!(groups > batches);
+    assert_eq!(batches, 20000);
+    assert!(leaf_rows > 0 && leaf_rows <= body_rows);
     assert!(
         capture_copy <= (4 * 20000 * size_of::<i32>()),
         "capture copy was {capture_copy}"
@@ -306,13 +293,13 @@ fn scalar_call_protocol_borrows_repeated_variable_width_capture() {
     assert!(!values.is_null(0));
     assert_eq!(values.value_length(0), 0);
 
-    let mut leaf_rows = 0;
+    let mut body_rows = 0;
     let mut capture_copy = 0;
     for event in events {
         match event {
-            Event::ScalarLeaf { rows, broadcast } => {
-                assert_eq!(broadcast, [0], "only the repeated source is broadcast");
-                leaf_rows += rows;
+            Event::Body { parents } => {
+                assert_eq!(parents, [0]);
+                body_rows += parents.len();
             }
             Event::Gather {
                 is_collection: true,
@@ -321,7 +308,7 @@ fn scalar_call_protocol_borrows_repeated_variable_width_capture() {
             _ => {}
         }
     }
-    assert_eq!(leaf_rows, needles);
+    assert_eq!(body_rows, needles);
     assert!(
         capture_copy <= payload.len(),
         "capture copy was {capture_copy} bytes"
@@ -346,7 +333,7 @@ fn array_invocation_frames_reuse_actual_ancestor_rows_across_intermediate_calls(
         ),
     ];
     let (compiled, batch) = program(
-        "transform(a, x -> transform(a, y -> transform(a, z -> z + (x + bias) + bias * 7)))",
+        "transform(a, x -> transform(a, y -> transform(a, z -> bitwise_xor(bitwise_xor(z, bitwise_and(x, bias)), bitwise_and(bias, BIGINT '7')))))",
         &inputs,
     );
     let allocator = Arc::new(CountingAllocator::new(usize::MAX));
@@ -397,7 +384,10 @@ fn array_invocation_frames_reuse_actual_ancestor_rows_across_intermediate_calls(
         }
     }
     assert!(top.values().any(|rows| rows == &[0]));
-    assert!(ancestor.values().any(|rows| rows == &[0, 1, 2]));
+    assert!(
+        ancestor.values().any(|rows| rows == &[0, 1, 2]),
+        "actual ancestor source positions: {ancestor:?}"
+    );
     for rows in top.values().chain(ancestor.values()) {
         let unique = rows.iter().collect::<BTreeSet<_>>();
         assert_eq!(
@@ -412,9 +402,9 @@ fn array_invocation_frames_reuse_actual_ancestor_rows_across_intermediate_calls(
 }
 
 #[test]
-fn scalar_call_protocol_keeps_the_outer_refusal_in_an_issued_match_tail() {
-    struct RefuseTail(bool);
-    impl ScalarCallHost for RefuseTail {
+fn scalar_call_protocol_keeps_required_match_refusal_after_an_independent_parent_stops() {
+    struct RefuseRequiredBody(bool);
+    impl ScalarCallHost for RefuseRequiredBody {
         type Refusal = &'static str;
 
         fn begin_call(&mut self) {}
@@ -425,18 +415,17 @@ fn scalar_call_protocol_keeps_the_outer_refusal_in_an_issued_match_tail() {
             _: ScalarCallRequestFacts,
             run: &mut dyn FnMut() -> Result<(), ScalarCallFailure<Self::Refusal>>,
         ) -> Result<(), ScalarCallFailure<Self::Refusal>> {
-            let in_two_element_batch = EVENTS.with_borrow(|slot| {
-                slot.as_ref()
-                    .and_then(|events| {
-                        events.iter().rev().find_map(|event| match event {
-                            Event::Body { parents } => Some(parents.len() == 2),
-                            _ => None,
-                        })
-                    })
-                    .unwrap_or(false)
+            let after_first_batch = EVENTS.with_borrow(|slot| {
+                slot.as_ref().is_some_and(|events| {
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::Body { .. }))
+                        .count()
+                        == 2
+                })
             });
-            if self.0 && phase == ScalarCallPhase::Body && in_two_element_batch {
-                return Err(ScalarCallFailure::Host("tail allocation refused"));
+            if self.0 && phase == ScalarCallPhase::Body && after_first_batch {
+                return Err(ScalarCallFailure::Host("required body allocation refused"));
             }
             run()
         }
@@ -449,7 +438,14 @@ fn scalar_call_protocol_keeps_the_outer_refusal_in_an_issued_match_tail() {
         }
     }
 
-    let inputs = [("a", lists([Some(vec![Some(2), Some(1), Some(0)])]), false)];
+    let inputs = [(
+        "a",
+        lists([
+            Some(vec![Some(2), Some(1), Some(0)]),
+            Some(vec![Some(1), Some(0), Some(0)]),
+        ]),
+        false,
+    )];
     let (compiled, batch) = program(
         "TRY(any_match(a, x -> bitwise_and(CAST(x AS BIGINT), BIGINT '1') > BIGINT '0'))",
         &inputs,
@@ -463,7 +459,7 @@ fn scalar_call_protocol_keeps_the_outer_refusal_in_an_issued_match_tail() {
             Some(allocator.clone()),
         )
         .unwrap();
-        let selection = Selection::all(1);
+        let selection = Selection::all(2);
         let (result, events) = observe(|| {
             evaluator.evaluate(
                 EvaluationInput::Batch {
@@ -473,29 +469,29 @@ fn scalar_call_protocol_keeps_the_outer_refusal_in_an_issued_match_tail() {
                 ScalarInvocationScope::new(selection, selection),
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 &HarnessControl,
-                &mut RefuseTail(refuse),
+                &mut RefuseRequiredBody(refuse),
             )
         });
         match (refuse, result) {
-            (true, Err(ExprEvaluationFailure::Host("tail allocation refused"))) => {}
+            (true, Err(ExprEvaluationFailure::Host("required body allocation refused"))) => {}
             (false, Ok(result)) => {
                 let array = result
                     .values()
                     .as_any()
                     .downcast_ref::<arrow::array::BooleanArray>()
                     .unwrap();
-                assert!(array.value(0));
+                assert_eq!(array.iter().collect::<Vec<_>>(), [Some(true), Some(true)]);
             }
-            (_, other) => panic!("incorrect tail refusal or MATCH result: {other:?}"),
+            (_, other) => panic!("incorrect required body refusal or MATCH result: {other:?}"),
         }
-        let sizes = events
+        let parent_batches = events
             .into_iter()
             .filter_map(|event| match event {
-                Event::Body { parents } => Some(parents.len()),
+                Event::Body { parents } => Some(parents),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(sizes, [1, 2]);
+        assert_eq!(parent_batches, [vec![0, 1], vec![0]]);
         drop(evaluator);
         assert_eq!(allocator.outstanding(), 0);
     }

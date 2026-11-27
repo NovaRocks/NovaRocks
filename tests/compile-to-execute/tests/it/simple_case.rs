@@ -49,6 +49,18 @@ fn evaluate_case(
     ieee_float_equality: bool,
     arms: u32,
 ) -> Vec<Option<i64>> {
+    let (values, errors) = evaluate_case_with_errors(sql, input, rows, ieee_float_equality, arms);
+    assert!(errors.is_empty(), "{errors:?}");
+    values
+}
+
+fn evaluate_case_with_errors(
+    sql: &str,
+    input: ArrayRef,
+    rows: &[usize],
+    ieee_float_equality: bool,
+    arms: u32,
+) -> (Vec<Option<i64>>, Vec<novarocks_functions::RowDataError>) {
     let source =
         sql_source_with_single_field(sql, Field::new("k", input.data_type().clone(), true));
     let programs =
@@ -101,14 +113,14 @@ fn evaluate_case(
         )
         .unwrap();
     assert_eq!(output.selection(), selection);
-    assert!(output.errors().is_empty(), "{:?}", output.errors());
-    output
+    let values = output
         .values()
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap()
         .iter()
-        .collect()
+        .collect();
+    (values, output.errors().to_vec())
 }
 
 #[test]
@@ -180,5 +192,32 @@ fn simple_case_uses_standard_float_equality_with_a_max_precision_decimal_label()
             2,
         ),
         [Some(1), Some(1), Some(9)],
+    );
+}
+
+#[test]
+fn simple_case_keeps_the_first_label_error_and_demands_only_remaining_rows() {
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), Some(1), Some(2), None]));
+    let (values, errors) = evaluate_case_with_errors(
+        "SELECT CASE k WHEN BIGINT '0' THEN BIGINT '17' \
+         WHEN BIGINT '10' / (COALESCE(k, BIGINT '1') - BIGINT '1') THEN BIGINT '18' \
+         WHEN CAST(k + BIGINT '255' AS TINYINT) THEN BIGINT '19' \
+         ELSE BIGINT '20' END FROM fixture",
+        input,
+        &[0, 1, 2, 3],
+        false,
+        3,
+    );
+    assert_eq!(values, [Some(17), None, None, None]);
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| (error.selected_ordinal(), error.message()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "Division by zero"),
+            (2, "Cast value is outside the target numeric range"),
+            (3, "Division by zero"),
+        ],
     );
 }

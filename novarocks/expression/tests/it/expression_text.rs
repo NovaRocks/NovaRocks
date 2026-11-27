@@ -40,8 +40,7 @@ use novarocks_expression_contract::{ExprKind, ValueId};
 use novarocks_functions::{DataFailureReason, largeint};
 use novarocks_type_contract::{
     AssignmentCommonTypeError, DecimalOverflowPolicy, FunctionValueType, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
-    TemporalPrecision, TemporalType, ValueLogicalType,
+    SemanticParameterValue, SemanticParameters, TemporalPrecision, TemporalType, ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -50,21 +49,12 @@ const CONSTANT_SHAPE: EvaluationShape = EvaluationShape {
     input_columns: 0,
     input_rows: 1,
 };
-const ALLOW_THROW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(0),
-    expected_key: SemanticParameterKey::AllowThrowException,
-};
-
 fn fixture() -> Arc<novarocks_functions::PureEngineFunctionCatalog> {
     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue()
 }
 
 fn parameters() -> SemanticParameters {
-    SemanticParameters::try_new([(
-        ALLOW_THROW.id,
-        SemanticParameterValue::AllowThrowException(true),
-    )])
-    .unwrap()
+    SemanticParameters::default()
 }
 
 fn context<'a>(
@@ -76,7 +66,6 @@ fn context<'a>(
         constant_policy: constant_policy(),
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters,
-        allow_throw_exception: ALLOW_THROW,
     }
 }
 
@@ -503,7 +492,7 @@ fn literal_types_and_cast_parameters_follow_the_checked_unit() {
             ..
         }
     )));
-    assert!(typed.environment().parameters.require(ALLOW_THROW).is_err());
+    assert!(typed.environment().parameters.entries().is_empty());
     assert_eq!(
         constant(source, &context).batch.values.to_data(),
         Int64Array::from(vec![2_147_483_648]).to_data(),

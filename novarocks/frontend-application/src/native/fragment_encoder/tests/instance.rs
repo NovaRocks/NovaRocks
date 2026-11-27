@@ -31,7 +31,6 @@ fn query_options_encoder_maps_every_query_wide_option() {
         exec_mem_limit: Some(1 << 20),
         runtime_filter_scan_wait_time_ms: Some(250),
         runtime_filter_wait_timeout_ms: Some(5_000),
-        allow_throw_exception: true,
 
         enable_join_runtime_bitset_filter: Some(false),
         global_runtime_filter_build_max_size: Some(1 << 19),

@@ -147,20 +147,13 @@ fn declared_aggregate_effects(proof_scope: CallProofScope) -> CallEffects {
 }
 
 /// One call argument: an input column, a checked BIGINT constant, or an
-/// input column times `i64::MAX` under ALLOW_THROW, whose overflow is a row
+/// input column times `i64::MAX`, whose overflow is a row
 /// data error of the argument root.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Arg {
     Column(usize),
     Constant(i64),
     Overflowing(usize),
-}
-
-fn allow_throw() -> novarocks_type_contract::SemanticParameterRef {
-    novarocks_type_contract::SemanticParameterRef {
-        id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
-        expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -574,23 +567,11 @@ pub(super) fn package_typed(
                         int64(false),
                         crate::exec::operators::family_fixture::constant_sources::i64(i64::MAX),
                     );
-                    arguments.push(
-                        builder
-                            .unit(WINDOW)
-                            .unwrap()
-                            .add(
-                                None,
-                                int64(true),
-                                ExprKind::Binary {
-                                    op: novarocks_expression_contract::BinaryOperator::Multiply,
-                                    left: value,
-                                    right: max,
-                                    decimal_overflow_policy: POLICY,
-                                    allow_throw_exception: Some(allow_throw()),
-                                },
-                            )
-                            .unwrap(),
-                    );
+                    arguments.push(builder.operator(
+                        WINDOW,
+                        novarocks_type_contract::OperatorFunction::Multiply,
+                        [value, max],
+                    ));
                     request.push(FunctionArgument::Value {
                         value_type: int64(true),
                         constant: None,
@@ -767,7 +748,7 @@ pub(super) fn package_typed(
             }),
         )
         .unwrap();
-    super::family_fixture::seal_no_call_units(&mut builder);
+    builder.seal_catalogue_units();
     let fragment = builder
         .finish_structure(
             WINDOW,
@@ -793,11 +774,7 @@ pub(super) fn package_typed(
         .flat_map(|call| call.args.iter())
         .any(|arg| matches!(arg, Arg::Overflowing(_)));
     let parameters = if overflowing {
-        SemanticParameters::try_new([(
-            allow_throw().id,
-            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
-        )])
-        .unwrap()
+        SemanticParameters::default()
     } else {
         SemanticParameters::try_new([]).unwrap()
     };
@@ -918,7 +895,7 @@ pub(super) fn package_typed(
             continue;
         }
         // The actual unit compiler authors primitive own-effects and child
-        // composition, including ALLOW_THROW overflow. Only empty argument
+        // composition, including the arithmetic overflow. Only empty argument
         // lists start and finish at the neutral pure-value join identity.
         let mut children = ExpressionEffects::PURE_VALUE;
         for root in source

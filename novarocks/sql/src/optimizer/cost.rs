@@ -801,7 +801,7 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
             0.2 + scalar_complexity(Some(arena), *child)
         }
         ScalarNode::IsNull { child, .. } => 0.5 + scalar_complexity(Some(arena), *child),
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,

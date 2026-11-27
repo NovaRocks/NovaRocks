@@ -345,6 +345,47 @@ impl FragmentBuilder {
             .add(None, ty, kind)
             .unwrap()
     }
+    pub(crate) fn operator(
+        &mut self,
+        node: p::NodeId,
+        operator: novarocks_type_contract::OperatorFunction,
+        arguments: [p::ExprId; 2],
+    ) -> p::ExprId {
+        let mut pools = self.sources.0.lock().unwrap();
+        novarocks_expression::testkit::add_catalogue_predicate(
+            self.physical.unit(node).unwrap(),
+            &mut pools,
+            operator,
+            arguments.to_vec(),
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn seal_catalogue_units(&mut self) {
+        let nodes = self
+            .physical
+            .construction_nodes()
+            .filter_map(|(&id, node)| {
+                let mut roots = Vec::new();
+                node.kind.root_references(&mut roots);
+                (node.expressions.is_none() && !roots.is_empty()).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        let pools = self.sources.snapshot();
+        for node in nodes {
+            let ports = self.physical.node_ports(node).unwrap();
+            let draft = self.physical.take_unit_builder(node).unwrap();
+            let unit = novarocks_expression::testkit::seal_catalogue_fixture(
+                draft,
+                ports,
+                &pools,
+                &novarocks_type_contract::SemanticParameters::default(),
+                &FixtureControl,
+            );
+            self.physical.install_unit(node, Arc::new(unit)).unwrap();
+        }
+    }
+
     pub(crate) fn finish_structure(
         self,
         root: p::NodeId,

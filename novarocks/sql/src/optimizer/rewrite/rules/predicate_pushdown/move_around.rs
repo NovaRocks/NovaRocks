@@ -99,6 +99,7 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
         collect_child_predicate_groups(&right, &mut child_groups, &arena);
 
         let derived = derive_inner_join_predicates(
+            ctx.function_catalog(),
             &mut arena,
             &left_ids,
             &right_ids,
@@ -298,7 +299,7 @@ fn collect_top_level_conjunct_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::optimizer::opt_expr::OptExpr;
@@ -331,34 +332,27 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
 
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
+        crate::common::binary_operator::test_predicate(
+            novarocks_type_contract::OperatorFunction::Equal,
+            vec![left, right],
+        )
     }
 
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -444,6 +438,7 @@ mod tests {
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
     }
@@ -520,8 +515,7 @@ mod tests {
             bound,
             DecimalOverflowPolicy::OutputNull,
         );
-        let predicate =
-            crate::common::binary_operator::typed_call(operator, binding, vec![column, literal]);
+        let predicate = crate::common::binary_operator::typed_call(binding, vec![column, literal]);
         let left = make_filter(&mut arena, predicate, make_scan("l", &[("a", 1)]));
         let join = make_inner_join(
             &mut arena,
@@ -539,8 +533,11 @@ mod tests {
             panic!("the right child must have the propagated filter");
         };
         assert!(matches!(
-            ctx.scalar_arena().borrow().node(derived.predicate),
-            crate::optimizer::scalar::ScalarNode::BinaryOp { op: BinOp::Eq, .. }
+            crate::common::binary_operator::scalar_operands(
+                &ctx.scalar_arena().borrow(),
+                derived.predicate,
+            ),
+            Some((novarocks_type_contract::OperatorFunction::Equal, _)),
         ));
         assert!(matches!(
             JoinPredicateMoveAround.apply(propagated, &mut ctx).unwrap(),

@@ -52,13 +52,7 @@ use novarocks_sql::{
 use novarocks_sql_testkit::sql_fixture_constant_policy;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters,
-};
-
-const ALLOW_THROW: SemanticParameterRef = SemanticParameterRef {
-    id: SemanticParameterId::new(17),
-    expected_key: SemanticParameterKey::AllowThrowException,
+    SemanticParameterId, SemanticParameterRef, SemanticParameterValue, SemanticParameters,
 };
 
 struct Fixture {
@@ -71,11 +65,7 @@ impl Fixture {
     fn new() -> Self {
         Self {
             functions: shared_installed_builtin_owner_catalogue(),
-            parameters: SemanticParameters::try_new([(
-                ALLOW_THROW.id,
-                SemanticParameterValue::AllowThrowException(true),
-            )])
-            .unwrap(),
+            parameters: SemanticParameters::default(),
             sql_semantics: SqlSemanticSettings::default()
                 .with_sql_mode(SqlMode::from_assignment("ALLOW_THROW_EXCEPTION")),
         }
@@ -117,7 +107,6 @@ impl Fixture {
                 constant_policy: sql_fixture_constant_policy(),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                 parameters: &self.parameters,
-                allow_throw_exception: ALLOW_THROW,
             },
             &HarnessControl,
         )
@@ -270,12 +259,6 @@ fn resolved_definition(
     let mut kind = kind.clone();
     let mut values = Vec::new();
     match &mut kind {
-        ExprKind::Binary {
-            allow_throw_exception: Some(allow_throw_exception),
-            ..
-        } => {
-            resolve_parameter(allow_throw_exception, parameters, &mut values)?;
-        }
         ExprKind::FunctionCall {
             function:
                 BoundFunction {

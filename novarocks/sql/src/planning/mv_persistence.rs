@@ -1276,7 +1276,7 @@ fn walk_expression<'a, E>(
         return Ok(());
     }
     match &expression.kind {
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,

@@ -6017,7 +6017,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             "Iceberg IMV refresh contract does not support aggregate or window expressions outside direct aggregate outputs"
                 .to_string(),
         ),
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let { initializer: left, body: right, .. } => {
             validate_non_contract_aggregate_projection_expr(left)?;
             validate_non_contract_aggregate_projection_expr(right)
@@ -6157,7 +6157,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             "Iceberg IMV refresh contract does not support subquery expressions in projection/filter shapes"
                 .to_string(),
         ),
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let { initializer: left, body: right, .. } => {
             validate_projection_filter_expr(left)?;
             validate_projection_filter_expr(right)
@@ -6246,9 +6246,9 @@ fn count_equality_join_keys(
         return Ok(1);
     }
     match &expr.kind {
-        ExprKind::BinaryOp {
+        ExprKind::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => Ok(

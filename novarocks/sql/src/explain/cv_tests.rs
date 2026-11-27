@@ -153,22 +153,19 @@ fn explain_selected_constants_preserve_scalar_text_and_column_first_equality() {
     assert_eq!(value.ordinal(), 1);
     let expr = constant(value);
     assert_eq!(format_expr(&expr, &Control::new(None)).unwrap(), "17");
-    let equality = TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: novarocks_parser::ast::AstBox::new(expr),
-            op: BinOp::Eq,
-            right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: crate::column_id::ColumnId::new_for_test(4),
-                    qualifier: Some("t".into()),
-                    column: "k".into(),
-                },
-                value_type: FunctionValueType::new(DataType::Int64, false),
-            }),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    let equality = crate::common::binary_operator::test_operator(
+        BinOp::Eq,
+        expr,
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: crate::column_id::ColumnId::new_for_test(4),
+                qualifier: Some("t".into()),
+                column: "k".into(),
+            },
+            value_type: FunctionValueType::new(DataType::Int64, false),
         },
-        value_type: FunctionValueType::new(DataType::Boolean, false),
-    };
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    );
     assert_eq!(
         format_expr(&equality, &Control::new(None)).unwrap(),
         "t.k = 17"

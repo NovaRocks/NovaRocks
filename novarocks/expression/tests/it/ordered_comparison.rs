@@ -23,7 +23,7 @@ use arrow::{
     datatypes::DataType,
 };
 use novarocks_expression::{
-    ComparisonSite, EvaluationInput, ExprEvaluationFailure,
+    EvaluationInput, ExprEvaluationFailure,
     testkit::{
         PassThroughCallHost,
         guarded_fixtures::{
@@ -34,18 +34,18 @@ use novarocks_expression::{
         },
     },
 };
-use novarocks_expression_contract::BinaryOperator;
 use novarocks_functions::{
     ComparisonOperator, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
+use novarocks_type_contract::OperatorFunction;
 use novarocks_type_contract::{EvaluationDemand, FunctionValueType};
 use std::sync::Arc;
-fn operators() -> [(BinaryOperator, ComparisonOperator); 4] {
+fn operators() -> [(OperatorFunction, ComparisonOperator); 4] {
     [
-        (BinaryOperator::Lt, ComparisonOperator::Lt),
-        (BinaryOperator::LtEq, ComparisonOperator::Le),
-        (BinaryOperator::Gt, ComparisonOperator::Gt),
-        (BinaryOperator::GtEq, ComparisonOperator::Ge),
+        (OperatorFunction::LessThan, ComparisonOperator::Lt),
+        (OperatorFunction::LessThanOrEqual, ComparisonOperator::Le),
+        (OperatorFunction::GreaterThan, ComparisonOperator::Gt),
+        (OperatorFunction::GreaterThanOrEqual, ComparisonOperator::Ge),
     ]
 }
 // Relation -1/0/1 is supplied by the independent hand-written oracle below.
@@ -75,15 +75,36 @@ fn result(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
 fn assert_recipe(program: &Fixture, truth: bool, op: ComparisonOperator, ty: DataType) {
     let unit = &program.unit;
     let occurrence = unit.root(program.root).unwrap().use_id;
-    let recipe = unit
-        .recipes()
-        .comparison(ComparisonSite::Binary(occurrence))
-        .unwrap();
-    assert_eq!(recipe.operator(), op);
-    assert_eq!(recipe.left_type().data_type().clone(), ty);
-    assert_eq!(recipe.right_type().data_type().clone(), ty);
     let flow = unit.control_flow();
     let invocation = &flow.uses()[&occurrence];
+    assert!(matches!(
+        unit.definitions()
+            .node(invocation.definition)
+            .unwrap()
+            .kind(),
+        novarocks_expression::StaticExprKind::BoundCall { .. }
+    ));
+    assert_eq!(
+        invocation.control,
+        novarocks_type_contract::ControlShape::OrderedNull
+    );
+    assert_eq!(invocation.arguments.len(), 2);
+    for child in &invocation.arguments {
+        assert_eq!(
+            unit.definitions()
+                .node(flow.uses()[child].definition)
+                .unwrap()
+                .data_type(),
+            &ty
+        );
+    }
+    assert!(matches!(
+        op,
+        ComparisonOperator::Lt
+            | ComparisonOperator::Le
+            | ComparisonOperator::Gt
+            | ComparisonOperator::Ge
+    ));
     assert_eq!(
         invocation.context.demand,
         if truth {
@@ -185,7 +206,7 @@ fn ordered_four_operators_preserve_i64_precision_extremes_sparse_nulls_and_actua
 }
 
 #[test]
-fn ordered_float_total_order_distinguishes_signed_zero_nan_payload_sign_and_infinity() {
+fn ordered_float_uses_ieee_signed_zero_nan_and_infinity() {
     let positive_nan = f64::from_bits(0x7ff8_0000_0000_0001);
     let next_nan = f64::from_bits(0x7ff8_0000_0000_0002);
     let negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
@@ -227,21 +248,20 @@ fn ordered_float_total_order_distinguishes_signed_zero_nan_payload_sign_and_infi
                 &mut PassThroughCallHost,
             )
             .unwrap();
+        let equals = matches!(frozen, ComparisonOperator::Le | ComparisonOperator::Ge);
+        let ascending = matches!(frozen, ComparisonOperator::Lt | ComparisonOperator::Le);
         assert_eq!(
             result(&output),
-            expected(
-                frozen,
-                &[
-                    Some(-1),
-                    Some(1),
-                    Some(0),
-                    Some(-1),
-                    Some(-1),
-                    Some(-1),
-                    Some(-1),
-                    None
-                ]
-            )
+            vec![
+                Some(equals),
+                Some(equals),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(ascending),
+                Some(false),
+                None,
+            ]
         );
         assert!(output.errors().is_empty());
     }
@@ -366,9 +386,9 @@ fn ordered_filter_truth_only_root_keeps_value_demand_children_and_successful_nul
 }
 
 #[test]
-fn ordered_both_round_children_preserve_each_compact_error_cursor_and_eager_right_on_null() {
+fn ordered_round_children_keep_first_error_and_skip_right_after_null() {
     let program = ordered_program(
-        BinaryOperator::Lt,
+        OperatorFunction::LessThan,
         DataType::Decimal128(38, 0),
         Source::Rounded,
         false,
@@ -409,7 +429,7 @@ fn ordered_both_round_children_preserve_each_compact_error_cursor_and_eager_righ
             .iter()
             .map(|e| e.selected_ordinal())
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 4]
+        vec![0, 1, 2]
     );
     assert_eq!(output.selection().row(4), Some(9));
     assert!(
@@ -423,7 +443,7 @@ fn ordered_both_round_children_preserve_each_compact_error_cursor_and_eager_righ
 #[test]
 fn every_actual_ordered_comparison_callback_keeps_seven_primary_failures_and_refuses_replay() {
     let program = ordered_program(
-        BinaryOperator::LtEq,
+        OperatorFunction::LessThanOrEqual,
         DataType::Decimal128(38, 0),
         Source::Rounded,
         false,
@@ -514,15 +534,7 @@ fn ordered_largeint_is_signed_i128_while_same_fixed16_physical_and_uuid_keep_byt
     for domain in domains {
         for (physical, frozen) in operators() {
             let program = ordered_value_program(physical, domain.clone(), Source::Columns, false);
-            let recipe = program
-                .unit
-                .recipes()
-                .comparison(ComparisonSite::Binary(
-                    program.unit.root(program.root).unwrap().use_id,
-                ))
-                .unwrap();
-            assert_eq!(recipe.left_type(), &domain);
-            assert_eq!(recipe.right_type(), &domain);
+            assert_recipe(&program, false, frozen, domain.data_type().clone());
             let input = ordered_batch(
                 &program,
                 fixed16(&[

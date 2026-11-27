@@ -79,17 +79,15 @@ fn wrap(slot: usize, child: TypedExpr) -> TypedExpr {
     let boxed = AstBox::new;
     let policy = DecimalOverflowPolicy::ReportError;
     let kind = match slot {
-        0 => ExprKind::BinaryOp {
+        0 => ExprKind::BooleanConnective {
             left: boxed(child),
             right: boxed(marker()),
-            op: BinOp::Add,
-            decimal_overflow_policy: policy,
+            op: crate::common::BooleanOp::And,
         },
-        1 => ExprKind::BinaryOp {
+        1 => ExprKind::BooleanConnective {
             left: boxed(marker()),
             right: boxed(child),
-            op: BinOp::Add,
-            decimal_overflow_policy: policy,
+            op: crate::common::BooleanOp::And,
         },
         2 => ExprKind::Let {
             binding: LocalBindingId(11),
@@ -225,11 +223,10 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
     assert_eq!(node.value_type, value_type());
     match (&node.kind, slot) {
         (
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left,
                 right,
-                op: BinOp::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                op: crate::common::BooleanOp::And,
             },
             0,
         ) => {
@@ -237,11 +234,10 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
             left
         }
         (
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left,
                 right,
-                op: BinOp::Add,
-                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                op: crate::common::BooleanOp::And,
             },
             1,
         ) => {
@@ -422,8 +418,8 @@ fn child(slot: usize, node: &TypedExpr) -> &TypedExpr {
 }
 fn take_child(slot: usize, node: TypedExpr) -> TypedExpr {
     match (node.kind, slot) {
-        (ExprKind::BinaryOp { left, .. }, 0) => left.into_inner(),
-        (ExprKind::BinaryOp { right, .. }, 1) => right.into_inner(),
+        (ExprKind::BooleanConnective { left, .. }, 0) => left.into_inner(),
+        (ExprKind::BooleanConnective { right, .. }, 1) => right.into_inner(),
         (ExprKind::Let { initializer, .. }, 2) => initializer.into_inner(),
         (ExprKind::Let { body, .. }, 6) => body.into_inner(),
         (ExprKind::Cast { expr, .. }, 4) | (ExprKind::IsNull { expr, .. }, 5) => expr.into_inner(),

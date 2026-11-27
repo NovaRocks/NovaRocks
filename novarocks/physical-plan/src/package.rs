@@ -311,15 +311,14 @@ impl FragmentPackage {
             }
         };
         let semantic_items = match &observation {
-            PackageValidation::Plain(_) => call_items
-                .saturating_add(pruning_items)
-                .saturating_add(counts.intrinsic),
-            PackageValidation::Caller { .. } => call_items
-                .checked_add(pruning_items)
-                .and_then(|n| n.checked_add(counts.intrinsic))
-                .ok_or(FragmentPackageError::Control(
-                    CompileControlError::ResourceExhausted,
-                ))?,
+            PackageValidation::Plain(_) => call_items.saturating_add(pruning_items),
+            PackageValidation::Caller { .. } => {
+                call_items
+                    .checked_add(pruning_items)
+                    .ok_or(FragmentPackageError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))?
+            }
         };
         match &mut observation {
             PackageValidation::Plain(control) => {
@@ -733,7 +732,6 @@ fn parameter_projection_resources(
 struct ParameterReferenceCounts {
     total: usize,
     relation: usize,
-    intrinsic: usize,
 }
 
 // Both the allocation-free counting pass and the admitted collection pass
@@ -804,38 +802,6 @@ fn visit_fragment_parameter_references_core(
                 for claim in unit.claims().values() {
                     environment(&claim.effects.environment, false, work)?;
                 }
-            }
-        }
-    }
-    for node in fragment.nodes().values() {
-        let unit = node.expressions.as_ref();
-        work.step()
-            .map_err(SemanticParameterProjectionError::Control)?;
-        if let Some(unit) = unit {
-            for definition in unit.definitions() {
-                for reference in definition.kind.intrinsic_parameter_references() {
-                    visit(*reference);
-                    counts.total = if checked {
-                        counts.total.checked_add(1).ok_or(
-                            SemanticParameterProjectionError::Control(
-                                CompileControlError::ResourceExhausted,
-                            ),
-                        )?
-                    } else {
-                        counts.total.saturating_add(1)
-                    };
-                    counts.intrinsic = if checked {
-                        counts.intrinsic.checked_add(1).ok_or(
-                            SemanticParameterProjectionError::Control(
-                                CompileControlError::ResourceExhausted,
-                            ),
-                        )?
-                    } else {
-                        counts.intrinsic.saturating_add(1)
-                    };
-                }
-                work.step()
-                    .map_err(SemanticParameterProjectionError::Control)?;
             }
         }
     }
@@ -1170,7 +1136,6 @@ fn parameter_preallocation_items(fragment: &Fragment, counts: ParameterReference
         .entries()
         .len()
         .saturating_add(counts.relation)
-        .saturating_add(counts.intrinsic)
 }
 
 #[cfg(test)]
@@ -1356,7 +1321,6 @@ mod parameter_preallocation_review_tests {
         assert_eq!(extracted[&fragment.id()].fragment(), package.fragment());
         let counts = visit_fragment_parameter_references(&fragment, &Control, |_| {}).unwrap();
         assert_eq!(counts.total, 1);
-        assert_eq!(counts.intrinsic, 0);
         assert!(fragment.calls().entries().is_empty());
         assert_eq!(
             fragment

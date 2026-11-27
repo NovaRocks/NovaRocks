@@ -278,12 +278,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
     let node = arena.node(expr).clone();
     match node {
         ScalarNode::Let { .. } => Ok(None),
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => {
+        ScalarNode::BooleanConnective { op, left, right } => {
             let new_left = rewrite_variant_request_scalar(arena, left, bindings, factory, control)?;
             let new_right =
                 rewrite_variant_request_scalar(arena, right, bindings, factory, control)?;
@@ -291,11 +286,10 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             changed
                 .then(|| {
                     arena.intern_observed(
-                        ScalarNode::BinaryOp {
+                        ScalarNode::BooleanConnective {
                             op,
                             left: new_left.unwrap_or(left),
                             right: new_right.unwrap_or(right),
-                            decimal_overflow_policy,
                         },
                         value_type,
                         control,
@@ -857,7 +851,7 @@ fn expr_contains_variant_request_scalar(
     // Preserve the original child order and first-true short circuit. Each
     // selected Constant reader keeps the same originating request control.
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,
@@ -1061,7 +1055,7 @@ fn contains_variant_get_candidate_scalar(arena: &ScalarArena, expr: ScalarId) ->
     }
 
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, right, .. }
+        ScalarNode::BooleanConnective { left, right, .. }
         | ScalarNode::Let {
             initializer: left,
             body: right,

@@ -155,7 +155,12 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
     let mut encoded = encode_fragment_semantics(&package, &Control::default()).unwrap();
     encoded.parameters.entries.push(wire::SemanticParameter {
         id: u32::MAX,
-        value: Some(wire::semantic_parameter::Value::AllowThrowException(false)),
+        value: Some(wire::semantic_parameter::Value::StatementStartUtc(
+            wire::StatementStartUtc {
+                seconds: Some(0),
+                nanos: Some(0),
+            },
+        )),
     });
     let (parameters, calls, pruning) =
         decode_fragment_semantics(package.fragment(), &encoded, &Control::default())
@@ -171,7 +176,9 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
         .unwrap();
     assert_eq!(
         parameters.get(SemanticParameterId::new(u32::MAX)),
-        Some(&SemanticParameterValue::AllowThrowException(false))
+        Some(&SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap()
+        ))
     );
     assert!(matches!(
         FragmentPackage::try_new(

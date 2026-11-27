@@ -1466,14 +1466,11 @@ mod tests {
             ),
             novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         );
-        let predicate = arena.intern(
-            crate::optimizer::scalar::ScalarNode::BinaryOp {
-                op: crate::common::BinOp::Gt,
-                left: sign,
-                right: zero,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        let predicate = arena.test_intern_operator(
+            crate::common::BinOp::Gt,
+            sign,
+            zero,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         let Operator::PhysicalScan(scan) = &mut source.op else {
             unreachable!()

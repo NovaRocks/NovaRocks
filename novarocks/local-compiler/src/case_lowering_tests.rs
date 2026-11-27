@@ -1049,21 +1049,17 @@ fn searched_and_simple_case_keep_ordered_children_flags_root_types_and_demands()
                     }
                     let position = ordinal - usize::from(simple);
                     let (demand, guard) = if position == 4 {
-                        (parent_demand, GuardKind::CaseElse)
+                        (EvaluationDemand::Value, GuardKind::CaseElse)
                     } else if position.is_multiple_of(2) {
                         (
-                            if simple {
-                                EvaluationDemand::Value
-                            } else {
-                                EvaluationDemand::TruthOnly
-                            },
+                            EvaluationDemand::Value,
                             GuardKind::CaseWhen {
                                 arm: (position / 2) as u32,
                             },
                         )
                     } else {
                         (
-                            parent_demand,
+                            EvaluationDemand::Value,
                             GuardKind::CaseThen {
                                 arm: (position / 2) as u32,
                             },

@@ -247,9 +247,13 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
         )),
     );
     let mut wrong = input.clone();
-    wrong.parameters =
-        SemanticParameters::try_new([(r.id, SemanticParameterValue::AllowThrowException(false))])
-            .unwrap();
+    wrong.parameters = SemanticParameters::try_new([(
+        r.id,
+        SemanticParameterValue::StatementStartUtc(
+            novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+        ),
+    )])
+    .unwrap();
     every_prefix(
         &wrong,
         Err(FragmentPackageError::Parameter(
@@ -273,19 +277,6 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
     ])
     .unwrap();
     every_prefix(&unused, Err(FragmentPackageError::UnusedParameters));
-    let intrinsic = intrinsic_package_fixture(&mut fixture_constants);
-    every_prefix(&intrinsic, Ok(()));
-    let p = construct(&intrinsic, &BorrowedControl::new(None)).unwrap();
-    assert_eq!(
-        p.parameters().require(intrinsic_reference(0)).unwrap(),
-        &SemanticParameterValue::AllowThrowException(false)
-    );
-    assert_eq!(
-        p.parameters()
-            .require(intrinsic_reference(u32::MAX))
-            .unwrap(),
-        &SemanticParameterValue::AllowThrowException(true)
-    );
 }
 
 #[test]

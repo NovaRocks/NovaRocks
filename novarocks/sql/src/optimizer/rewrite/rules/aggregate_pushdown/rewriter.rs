@@ -551,15 +551,12 @@ mod tests {
     }
 
     fn eq_typed(a: &str, b: &str) -> crate::analysis::TypedExpr {
-        crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref_typed(a, DataType::Int64)),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(col_ref_typed(b, DataType::Int64)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            col_ref_typed(a, DataType::Int64),
+            col_ref_typed(b, DataType::Int64),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn join_opt(
@@ -1157,25 +1154,12 @@ mod tests {
                 value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
             };
 
-        let join_cond = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "t1",
-                    "c_bigint",
-                    c_bigint,
-                    DataType::Int64,
-                )),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "t2",
-                    "c_int",
-                    c_int,
-                    DataType::Int32,
-                )),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let join_cond = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
+            qualified_col("t2", "c_int", c_int, DataType::Int32),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
         let sum_arg = intern_typed(
@@ -1334,25 +1318,12 @@ mod tests {
             Some("d"),
             &[("d_date_sk", date_sk, DataType::Int64)],
         );
-        let join_cond = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "cs",
-                    "cs_sold_date_sk",
-                    sold_date,
-                    DataType::Int64,
-                )),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "d",
-                    "d_date_sk",
-                    date_sk,
-                    DataType::Int64,
-                )),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let join_cond = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            qualified_col("cs", "cs_sold_date_sk", sold_date, DataType::Int64),
+            qualified_col("d", "d_date_sk", date_sk, DataType::Int64),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
         let sum_arg = intern_typed(
@@ -1498,25 +1469,12 @@ mod tests {
             ],
         );
         let right = scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
-        let join_cond = crate::analysis::TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "t1",
-                    "c_bigint",
-                    c_bigint,
-                    DataType::Int64,
-                )),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(qualified_col(
-                    "t2",
-                    "c_int",
-                    c_int,
-                    DataType::Int32,
-                )),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let join_cond = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            qualified_col("t1", "c_bigint", c_bigint, DataType::Int64),
+            qualified_col("t2", "c_int", c_int, DataType::Int32),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
 
         let count_arg = intern_typed(

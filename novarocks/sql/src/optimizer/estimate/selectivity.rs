@@ -63,10 +63,10 @@ pub(crate) fn estimate_selectivity(
         };
     }
     match arena.node(expr) {
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left, op, right, ..
         } => match op {
-            BinOp::And => {
+            crate::common::BooleanOp::And => {
                 let mut conjuncts = Vec::new();
                 flatten_and(arena, expr, &mut conjuncts);
                 let sels: Vec<f64> = conjuncts
@@ -75,16 +75,16 @@ pub(crate) fn estimate_selectivity(
                     .collect();
                 damped_conjunction(&sels)
             }
-            BinOp::ExpandedConjunction | BinOp::ExpandedNegatedConjunction => {
+            crate::common::BooleanOp::ExpandedConjunction
+            | crate::common::BooleanOp::ExpandedNegatedConjunction => {
                 estimate_selectivity(arena, *left, column_stats)
                     * estimate_selectivity(arena, *right, column_stats)
             }
-            BinOp::Or => {
+            crate::common::BooleanOp::Or => {
                 let l = estimate_selectivity(arena, *left, column_stats);
                 let r = estimate_selectivity(arena, *right, column_stats);
                 l + r - l * r
             }
-            _ => PREDICATE_UNKNOWN_FILTER,
         },
         ScalarNode::IsNull { negated, child } => {
             let col_id = extract_column_id(arena, *child);
@@ -134,8 +134,8 @@ pub(crate) fn apply_filter(
 
 /// Flatten a left/right-nested AND tree into its leaf conjuncts.
 fn flatten_and(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
-    if let ScalarNode::BinaryOp {
-        op: BinOp::And,
+    if let ScalarNode::BooleanConnective {
+        op: crate::common::BooleanOp::And,
         left,
         right,
         ..
@@ -316,24 +316,20 @@ mod tests {
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }

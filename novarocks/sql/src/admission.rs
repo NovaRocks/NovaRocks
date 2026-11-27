@@ -17,17 +17,6 @@
 
 //! SQL admission helpers over native typed parser nodes.
 
-pub fn query_allows_throw_exception_hint(
-    query: &novarocks_parser::ast::Query,
-) -> Result<bool, crate::analyze_error::AnalyzeError> {
-    Ok(crate::sql_mode::query_sql_semantics(
-        &crate::sql_mode::SqlSemanticSettings::default(),
-        query,
-    )?
-    .sql_mode()
-    .allow_throw_exception())
-}
-
 /// Returns a positive literal memory override from the root query's facts.
 pub fn query_mem_limit_hint(query: &novarocks_parser::ast::Query) -> Option<i64> {
     use novarocks_parser::ast::{Expr, LiteralKind};
@@ -54,16 +43,7 @@ pub fn query_mem_limit_hint(query: &novarocks_parser::ast::Query) -> Option<i64>
 
 #[cfg(test)]
 mod tests {
-    use super::{query_allows_throw_exception_hint, query_mem_limit_hint};
-
-    #[test]
-    fn allow_throw_exception_uses_root_session_properties() {
-        let query = &mut novarocks_parser::parser::parse_query(
-            "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1",
-        )
-        .expect("typed session fixture parses");
-        assert!(query_allows_throw_exception_hint(query).unwrap());
-    }
+    use super::query_mem_limit_hint;
 
     #[test]
     fn query_memory_limit_uses_root_session_properties() {

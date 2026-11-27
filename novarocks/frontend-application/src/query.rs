@@ -1476,15 +1476,6 @@ impl FrontendQuerySession {
     }
 }
 
-fn with_query_sql_semantics(
-    query_options: QueryOptions,
-    sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-) -> QueryOptions {
-    let mut raw = *query_options.as_proto();
-    raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
-    QueryOptions::from_proto(raw)
-}
-
 #[async_trait]
 impl QuerySession for FrontendQuerySession {
     async fn execute_statement(
@@ -2766,30 +2757,6 @@ mod tests {
             1_000
         );
         assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
-    }
-
-    #[test]
-    fn execution_throw_policy_uses_the_same_effective_mode_as_sql_analysis() {
-        let session = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
-            novarocks_sql::sql_mode::SqlMode::from_assignment(
-                "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION",
-            ),
-        );
-        let query =
-            novarocks_parser::parser::parse_query("WITH SESSION sql_mode = '32' SELECT 1").unwrap();
-        let mut execution = SessionExecutionSettings::default();
-        execution.set_query_mem_limit_bytes(9).unwrap();
-        let options = with_query_sql_semantics(
-            query_options_from_session_settings(&execution),
-            &novarocks_sql::sql_mode::query_sql_semantics(&session, &query).unwrap(),
-        );
-        assert!(!options.as_proto().allow_throw_exception);
-        assert_eq!(options.as_proto().query_mem_limit, 9);
-        let restored =
-            with_query_sql_semantics(query_options_from_session_settings(&execution), &session);
-        assert!(restored.as_proto().allow_throw_exception);
-        assert_eq!(restored.as_proto().query_mem_limit, 9);
-        assert!(session.sql_mode().error_if_overflow());
     }
 }
 

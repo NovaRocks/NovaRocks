@@ -829,19 +829,12 @@ mod tests {
             LogicalPlanKind::Join(LogicalJoinNode {
                 naa_author: None,
                 join_type: JoinKind::Inner,
-                condition: Some(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col_expr(20, "k")),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(col_expr(30, "k")),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }),
+                condition: Some(crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    col_expr(20, "k"),
+                    col_expr(30, "k"),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )),
             }),
             vec![scan("j1", 20), scan("j2", 30)],
             None,
@@ -851,25 +844,18 @@ mod tests {
     fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col_expr(column_id, column)),
-                        op: BinOp::Ge,
-                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int32,
-                                false,
-                            ),
-                        }),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                predicate: crate::common::binary_operator::test_operator(
+                    BinOp::Ge,
+                    col_expr(column_id, column),
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            false,
+                        ),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             vec![input],
             None,

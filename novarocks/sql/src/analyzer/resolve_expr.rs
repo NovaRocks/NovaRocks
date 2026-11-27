@@ -27,10 +27,7 @@ use novarocks_parser::printer::print_object_name;
 
 use crate::analysis::*;
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
-use novarocks_functions::PreparedCompositeComparisonRecipe;
-use novarocks_type_contract::{
-    ArithmeticOperator, KeyRelation, arithmetic_result_value_type_with_op,
-};
+use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name};
@@ -1110,35 +1107,69 @@ impl<'a> super::AnalyzerContext<'a> {
             self.check_control()?;
             coerced_list.push(self.coerce_common_value(item, &common_type, span)?);
         }
-        let operator = novarocks_type_contract::OperatorFunction::InList;
         let mut operands = Vec::with_capacity(coerced_list.len() + 1);
         operands.push(expr_typed);
         operands.extend(coerced_list);
         let call = self.type_scalar_call(NodeShape::InList, operands, span)?;
-        let positive =
-            crate::common::binary_operator::typed_call(operator, call.binding, call.args);
+        let positive = crate::common::binary_operator::typed_call(call.binding, call.args);
         if negated {
             self.analyze_boolean_not(positive, span)
         } else {
             Ok(positive)
         }
     }
-    fn prepare_composite_equality(
+    fn bind_simple_case_match(
         &self,
-        left: &novarocks_type_contract::FunctionValueType,
-        right: &novarocks_type_contract::FunctionValueType,
+        operand: &TypedExpr,
+        label: &TypedExpr,
         span: Span,
-    ) -> Result<PreparedCompositeComparisonRecipe, AnalyzeError> {
-        PreparedCompositeComparisonRecipe::try_new(KeyRelation::Equal, left, right, self.control)
-            .map_err(|error| match error.control_error() {
-                Some(cause) => AnalyzeError::control(cause),
-                None => match error {
-                    novarocks_functions::ComparisonPrepareError::Unsupported => {
-                        AnalyzeError::unsupported_expression(error.to_string(), span)
-                    }
-                    _ => AnalyzeError::type_mismatch(error.to_string(), span),
+    ) -> Result<(), AnalyzeError> {
+        use novarocks_functions::{
+            FunctionArgument, FunctionArgumentType, FunctionBindingRequest, FunctionResultType,
+        };
+        use novarocks_type_contract::OperatorFunction;
+
+        // The CASE controller materializes its subject and the label before
+        // matching. The selected comparison sees those original typed values.
+        let arguments = [operand, label].map(|expression| FunctionArgument::Value {
+            value_type: expression.value_type.clone(),
+            constant: None,
+        });
+        let binding = self
+            .function_catalog
+            .resolve_scalar_operator_binding(
+                OperatorFunction::Equal,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
                 },
-            })
+                self.control,
+            )
+            .map_err(|error| super::expression_typing::analyze_typing_error(error.into(), span))?;
+        let [
+            FunctionArgumentType::Value(left),
+            FunctionArgumentType::Value(right),
+        ] = &binding.selected.argument_types[..]
+        else {
+            return Err(AnalyzeError::internal(
+                "simple CASE equality changed its value arity",
+            ));
+        };
+        if binding.function_id != OperatorFunction::Equal.function_id()
+            || Some(binding.selected.overload.as_str())
+                != OperatorFunction::Equal.comparison_overload_text()
+            || left != &operand.value_type
+            || right != &label.value_type
+            || !matches!(&binding.selected.result_type, FunctionResultType::Scalar(result)
+                if result.data_type() == &DataType::Boolean)
+        {
+            return Err(AnalyzeError::type_mismatch(
+                "simple CASE comparison differs from its original typed operands",
+                span,
+            ));
+        }
+        Ok(())
     }
 
     fn analyze_between_predicate(
@@ -1212,15 +1243,14 @@ impl<'a> super::AnalyzerContext<'a> {
             left.value_type.nullable() || right.value_type.nullable(),
         );
         let conjunction = TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(left),
                 right: novarocks_parser::ast::AstBox::new(right),
                 op: if predicate.negated {
-                    BinOp::ExpandedNegatedConjunction
+                    crate::common::BooleanOp::ExpandedNegatedConjunction
                 } else {
-                    BinOp::ExpandedConjunction
+                    crate::common::BooleanOp::ExpandedConjunction
                 },
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: value_type.clone(),
         };
@@ -1303,8 +1333,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         let operator = novarocks_type_contract::OperatorFunction::Like;
         let call = self.type_scalar_call(NodeShape::Operator(operator), args, predicate.span)?;
-        let positive =
-            crate::common::binary_operator::typed_call(operator, call.binding, call.args);
+        let positive = crate::common::binary_operator::typed_call(call.binding, call.args);
         if predicate.negated {
             self.analyze_boolean_not(positive, predicate.span)
         } else {
@@ -1320,7 +1349,6 @@ impl<'a> super::AnalyzerContext<'a> {
         let operator = novarocks_type_contract::OperatorFunction::BooleanNot;
         let call = self.type_scalar_call(NodeShape::Operator(operator), vec![operand], span)?;
         Ok(crate::common::binary_operator::typed_call(
-            operator,
             call.binding,
             call.args,
         ))
@@ -1412,180 +1440,124 @@ impl<'a> super::AnalyzerContext<'a> {
         right: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        use novarocks_type_contract::OperatorFunction;
+        let bind = |left_operand, right_operand| {
+            let call = self.type_scalar_call_at_arguments(
+                NodeShape::Operator(operator),
+                vec![left_operand, right_operand],
+                &[left, right],
+                left.span(),
+            )?;
+            Ok(crate::common::binary_operator::typed_call(
+                call.binding,
+                call.args,
+            ))
+        };
         let op = crate::common::binary_operator::comparison_op(operator);
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
-        let legacy_wide = crate::common::binary_operator::requires_legacy_wide(
-            left_typed.value_type.value_type(),
-        ) || crate::common::binary_operator::requires_legacy_wide(
-            right_typed.value_type.value_type(),
-        );
-        let (left_typed, right_typed) = {
-            // BITMAP / HLL columns have no scalar identity and cannot be
-            // compared with `=`, `<`, etc. Reject before the operand type
-            // is dropped to `Boolean` so the user sees a clear error.
-            let op_sym = match op {
-                BinOp::Eq => "=",
-                BinOp::Ne => "!=",
-                BinOp::Lt => "<",
-                BinOp::Le => "<=",
-                BinOp::Gt => ">",
-                BinOp::Ge => ">=",
-                BinOp::EqForNull => "<=>",
-                _ => unreachable!(),
-            };
-            check_json_comparison_domains(
-                &left_typed.value_type,
-                &right_typed.value_type,
-                op_sym,
+        // BITMAP / HLL columns have no scalar identity and cannot be
+        // compared with `=`, `<`, etc. Reject before the operand type
+        // is dropped to `Boolean` so the user sees a clear error.
+        let op_sym = match op {
+            BinOp::Eq => "=",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::EqForNull => "<=>",
+            _ => unreachable!(),
+        };
+        check_json_comparison_domains(
+            &left_typed.value_type,
+            &right_typed.value_type,
+            op_sym,
+            left.span(),
+        )?;
+        if let Some(logical) = scope
+            .logical_type_of_expr(&left_typed)
+            .filter(is_bitmap_or_hll_type)
+        {
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                ),
                 left.span(),
-            )?;
-            if let Some(logical) = scope
-                .logical_type_of_expr(&left_typed)
-                .filter(is_bitmap_or_hll_type)
-            {
-                return Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
-                    ),
-                    left.span(),
-                ));
-            }
-            if let Some(logical) = scope
-                .logical_type_of_expr(&right_typed)
-                .filter(is_bitmap_or_hll_type)
-            {
-                return Err(AnalyzeError::invalid_argument(
-                    format!(
-                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
-                    ),
-                    right.span(),
-                ));
-            }
-            // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
-            // ARRAY / MAP / STRUCT values in standalone SQL. Keep equality
-            // and null-safe equality on ARRAY available, but reject
-            // ordering predicates at analysis time so join predicates fail
-            // before reaching execution.
-            let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-            let has_temporal = left_typed.value_type.value_type().temporal().is_some()
-                || right_typed.value_type.value_type().temporal().is_some();
-            if is_ordering_op && !has_temporal {
-                let unsupported_complex_kind = |dt: &DataType| match dt {
-                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-                        Some("ARRAY")
-                    }
-                    DataType::Map(_, _) => Some("MAP"),
-                    DataType::Struct(_) => Some("STRUCT"),
-                    _ => None,
-                };
-                if let Some(kind) = unsupported_complex_kind(left_typed.value_type.data_type())
-                    .or_else(|| unsupported_complex_kind(right_typed.value_type.data_type()))
-                {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
-                        ),
-                        left.span(),
-                    ));
+            ));
+        }
+        if let Some(logical) = scope
+            .logical_type_of_expr(&right_typed)
+            .filter(is_bitmap_or_hll_type)
+        {
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                ),
+                right.span(),
+            ));
+        }
+        // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
+        // ARRAY / MAP / STRUCT values in standalone SQL. Keep equality
+        // and null-safe equality on ARRAY available, but reject
+        // ordering predicates at analysis time so join predicates fail
+        // before reaching execution.
+        let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        let has_temporal = left_typed.value_type.value_type().temporal().is_some()
+            || right_typed.value_type.value_type().temporal().is_some();
+        if is_ordering_op && !has_temporal {
+            let unsupported_complex_kind = |dt: &DataType| match dt {
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                    Some("ARRAY")
                 }
-            }
-            // Reject comparisons between complex types whose element /
-            // entry / field layouts are fundamentally incompatible.
-            // Cases like `array<int> = [map{...}, null]` would otherwise
-            // fall through to a runtime CAST that produces a confusing
-            // error; surface a clear analyzer-level message instead.
-            if !has_temporal
-                && let Some(reason) = incompatible_complex_compare(
-                    left_typed.value_type.data_type(),
-                    right_typed.value_type.data_type(),
-                )
+                DataType::Map(_, _) => Some("MAP"),
+                DataType::Struct(_) => Some("STRUCT"),
+                _ => None,
+            };
+            if let Some(kind) = unsupported_complex_kind(left_typed.value_type.data_type())
+                .or_else(|| unsupported_complex_kind(right_typed.value_type.data_type()))
             {
-                return Err(AnalyzeError::type_mismatch(
+                return Err(AnalyzeError::invalid_argument(
                     format!(
-                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                        "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
                     ),
                     left.span(),
                 ));
             }
-            let ordinary_composite_equality =
-                matches!(
-                    operator,
-                    OperatorFunction::Equal
-                        | OperatorFunction::NotEqual
-                        | OperatorFunction::Identical
-                        | OperatorFunction::Distinct
-                ) && [&left_typed, &right_typed].into_iter().any(|operand| {
-                    novarocks_functions::PreparedCompositeComparisonRecipe::is_composite(
-                        &operand.value_type,
-                    )
-                });
-            if ordinary_composite_equality && !legacy_wide {
-                return self.analyze_binary_operator(
-                    operator,
-                    left_typed,
-                    right_typed,
-                    left.span(),
-                );
-            }
-
-            let integer_array_equality =
-                matches!(
-                    operator,
-                    OperatorFunction::Equal | OperatorFunction::NotEqual
-                ) && [&left_typed, &right_typed].into_iter().all(|operand| {
-                    novarocks_functions::PreparedComparisonRecipe::supports_array_equality_operand(
-                        &operand.value_type,
-                    )
-                });
-            if !legacy_wide
-                && (integer_array_equality
-                    || !crate::common::binary_operator::uses_structural_comparison(
-                        left_typed.value_type.value_type(),
-                    ) && !crate::common::binary_operator::uses_structural_comparison(
-                        right_typed.value_type.value_type(),
-                    ))
-            {
-                return self.analyze_binary_operator(
-                    operator,
-                    left_typed,
-                    right_typed,
-                    left.span(),
-                );
-            }
+        }
+        // Reject comparisons between complex types whose element /
+        // entry / field layouts are fundamentally incompatible.
+        // Cases like `array<int> = [map{...}, null]` would otherwise
+        // fall through to a runtime CAST that produces a confusing
+        // error; surface a clear analyzer-level message instead.
+        if !has_temporal
+            && let Some(reason) = incompatible_complex_compare(
+                left_typed.value_type.data_type(),
+                right_typed.value_type.data_type(),
+            )
+        {
+            return Err(AnalyzeError::type_mismatch(
+                format!(
+                    "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                ),
+                left.span(),
+            ));
+        }
+        use crate::common::binary_operator::contains_internal_wide_type;
+        if [&left_typed, &right_typed]
+            .into_iter()
+            .any(|operand| contains_internal_wide_type(operand.value_type.value_type()))
+        {
             let common = self.require_common_trino_type(
                 &left_typed.value_type,
                 &right_typed.value_type,
                 left.span(),
             )?;
-            (
+            return bind(
                 self.coerce_common_value(left_typed, &common, left.span())?,
                 self.coerce_common_value(right_typed, &common, right.span())?,
-            )
-        };
-        let nullable = op != BinOp::EqForNull
-            && (left_typed.value_type.nullable()
-                || right_typed.value_type.nullable()
-                || compares_element_wise_with_nulls(left_typed.value_type.data_type())
-                || compares_element_wise_with_nulls(right_typed.value_type.data_type()));
-        let equality = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left_typed),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right_typed),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                nullable,
-            ),
-        };
-        if operator == OperatorFunction::Distinct {
-            self.analyze_boolean_not(equality, left.span())
-        } else {
-            Ok(equality)
+            );
         }
+        bind(left_typed, right_typed)
     }
 
     pub(super) fn analyze_binary_operator(
@@ -1597,7 +1569,6 @@ impl<'a> super::AnalyzerContext<'a> {
     ) -> Result<TypedExpr, AnalyzeError> {
         let call = self.type_scalar_call(NodeShape::Operator(operator), vec![left, right], span)?;
         Ok(crate::common::binary_operator::typed_call(
-            operator,
             call.binding,
             call.args,
         ))
@@ -1621,8 +1592,8 @@ impl<'a> super::AnalyzerContext<'a> {
             analyzed.push(self.analyze_expr(term, scope)?);
         }
         let (bin_op, shape) = match logical.operator {
-            ast::LogicalOperator::And => (BinOp::And, NodeShape::And),
-            ast::LogicalOperator::Or => (BinOp::Or, NodeShape::Or),
+            ast::LogicalOperator::And => (crate::common::BooleanOp::And, NodeShape::And),
+            ast::LogicalOperator::Or => (crate::common::BooleanOp::Or, NodeShape::Or),
         };
         let (result_type, mut analyzed) = self.type_value_node(shape, analyzed, logical.span)?;
         while analyzed.len() > 1 {
@@ -1632,12 +1603,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(right) = operands.next() {
                     let nullable = left.value_type.nullable() || right.value_type.nullable();
                     next_level.push(TypedExpr {
-                        kind: ExprKind::BinaryOp {
+                        kind: ExprKind::BooleanConnective {
                             left: novarocks_parser::ast::AstBox::new(left),
                             op: bin_op,
                             right: novarocks_parser::ast::AstBox::new(right),
-                            decimal_overflow_policy:
-                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                         value_type: novarocks_type_contract::FunctionValueType::new(
                             DataType::Boolean,
@@ -1724,129 +1693,25 @@ impl<'a> super::AnalyzerContext<'a> {
                 binary.span,
             );
         }
-        let legacy = |value: &TypedExpr| {
-            crate::common::binary_operator::requires_legacy_wide(value.value_type.value_type())
-                || matches!(
-                    value.value_type.data_type(),
-                    DataType::Date32
-                        | DataType::Date64
-                        | DataType::Timestamp(..)
-                        | DataType::Time32(_)
-                        | DataType::Time64(_)
-                        | DataType::Duration(_)
-                        | DataType::Interval(_)
-                )
-        };
-        if !legacy(&left_typed) && !legacy(&right_typed) {
-            return self.analyze_binary_operator(
-                novarocks_expression::typing::syntax_arithmetic(*op),
-                left_typed,
-                right_typed,
+        let has_internal_largeint = [&left_typed, &right_typed].into_iter().any(|operand| {
+            operand.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
+        });
+        let (left, right) = if has_internal_largeint {
+            self.cast_operands_to_numbers(
+                cast_boolean_operand_to_number(left_typed),
+                cast_boolean_operand_to_number(right_typed),
+                arithmetic_operator_of(op),
                 binary.left_operand_span,
-            );
-        }
-
-        // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
-        // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
-        // elements that matched. Spelling that as a cast to the width a
-        // boolean is stored at keeps the frozen numeric rules below the only
-        // place that decides a result type, instead of teaching each of them
-        // a second operand kind.
-        let (left_typed, right_typed) = self.cast_operands_to_numbers(
-            cast_boolean_operand_to_number(left_typed),
-            cast_boolean_operand_to_number(right_typed),
-            arithmetic_operator_of(op),
+            )?
+        } else {
+            (left_typed, right_typed)
+        };
+        self.analyze_binary_operator(
+            novarocks_expression::typing::syntax_arithmetic(*op),
+            left,
+            right,
             binary.left_operand_span,
-        )?;
-
-        let arithmetic_type = |operator| {
-            arithmetic_result_value_type_with_op(
-                &left_typed.value_type,
-                &right_typed.value_type,
-                operator,
-            )
-            .ok_or_else(|| {
-                AnalyzeError::type_mismatch(
-                    format!(
-                        "arithmetic operator `{operator:?}` has no frozen result rule for {:?} and {:?}",
-                        left_typed.value_type.data_type(), right_typed.value_type.data_type()
-                    ),
-                    binary.left_operand_span,
-                )
-            })
-        };
-        let (bin_op, result_type) = match op {
-            // Arithmetic operators -> inferred type
-            ast::BinaryOperator::Add => {
-                let dt = arithmetic_type(ArithmeticOperator::Add)?;
-                (BinOp::Add, dt)
-            }
-            ast::BinaryOperator::Subtract => {
-                let dt = arithmetic_type(ArithmeticOperator::Subtract)?;
-                (BinOp::Sub, dt)
-            }
-            ast::BinaryOperator::Multiply => {
-                let dt = arithmetic_type(ArithmeticOperator::Multiply)?;
-                (BinOp::Mul, dt)
-            }
-            ast::BinaryOperator::Divide => {
-                let dt = arithmetic_type(ArithmeticOperator::Divide)?;
-                (BinOp::Div, dt)
-            }
-            ast::BinaryOperator::Modulo => {
-                let dt = arithmetic_type(ArithmeticOperator::Modulo)?;
-                (BinOp::Mod, dt)
-            }
-        };
-
-        if let DataType::Decimal128(precision, scale) = &result_type.data_type()
-            && *scale > *precision as i8
-        {
-            return Err(AnalyzeError::invalid_literal(
-                format!("scale {scale} is greater than max {precision}"),
-                binary.left_operand_span,
-            ));
-        }
-
-        // Arithmetic answers with NULL where it cannot answer with a number:
-        // a product or sum that overflows its declared decimal, a division or
-        // modulo by zero. Comparison and the boolean connectives have no such
-        // gap -- they are defined for every pair of values they accept -- so
-        // only they carry their operands' nullability through.
-        //
-        // Null-safe equality is the exception among comparisons: answering
-        // about null is what it is for. `NULL <=> NULL` is true and
-        // `1 <=> NULL` is false, so it is total whatever its operands admit.
-        let nullable = match bin_op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
-            BinOp::EqForNull => false,
-            // An ordering comparison of two complex values compares their
-            // elements, and a NULL element answers NULL. `<=>` is exempt: it
-            // is defined to answer a boolean for every pair of values.
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                left_typed.value_type.nullable()
-                    || right_typed.value_type.nullable()
-                    || compares_element_wise_with_nulls(left_typed.value_type.data_type())
-                    || compares_element_wise_with_nulls(right_typed.value_type.data_type())
-            }
-            _ => left_typed.value_type.nullable() || right_typed.value_type.nullable(),
-        };
-        Ok(TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left_typed),
-                op: bin_op,
-                right: novarocks_parser::ast::AstBox::new(right_typed),
-                decimal_overflow_policy: if matches!(
-                    bin_op,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-                ) {
-                    self.sql_semantics.sql_mode().decimal_overflow_policy()
-                } else {
-                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull
-                },
-            },
-            value_type: super::helpers::with_nullability(result_type, nullable),
-        })
+        )
     }
 
     fn analyze_temporal_operator(
@@ -2004,18 +1869,14 @@ impl<'a> super::AnalyzerContext<'a> {
 
         let mut ieee_float_equality = false;
         if let Some(value) = operand_typed.take() {
-            use crate::common::binary_operator::requires_legacy_wide;
-
-            let mut legacy_wide = requires_legacy_wide(value.value_type.value_type());
             let mut common = value.value_type.clone();
             for (label, _) in &when_then {
                 self.check_control()?;
-                legacy_wide |= requires_legacy_wide(label.value_type.value_type());
                 check_json_comparison_domains(&common, &label.value_type, "=", span)?;
                 common = self.require_common_trino_type(&common, &label.value_type, span)?;
             }
-            ieee_float_equality = !legacy_wide
-                && common.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            ieee_float_equality = common.logical_type()
+                == novarocks_type_contract::ValueLogicalType::Physical
                 && matches!(common.data_type(), DataType::Float32 | DataType::Float64);
 
             let cast = |input: TypedExpr| {
@@ -2032,9 +1893,7 @@ impl<'a> super::AnalyzerContext<'a> {
             for (label, result) in when_then {
                 self.check_control()?;
                 let label = cast(label)?;
-                if PreparedCompositeComparisonRecipe::is_composite(&value.value_type) {
-                    self.prepare_composite_equality(&value.value_type, &label.value_type, span)?;
-                }
+                self.bind_simple_case_match(&value, &label, span)?;
                 coerced_when_then.push((label, result));
             }
             operand_typed = Some(value);
@@ -3590,26 +3449,6 @@ impl super::AnalyzerContext<'_> {
     }
 }
 
-/// True when a value of this type can hold a NULL inside it.
-///
-/// Comparing two complex values compares their elements, so a NULL element
-/// makes the whole comparison NULL even though neither operand is NULL --
-/// `[1, NULL] = [1, 2]` answers NULL. The type is what says a NULL element is
-/// possible, so it is what the comparison's nullability has to read.
-fn compares_element_wise_with_nulls(data_type: &DataType) -> bool {
-    let field_admits_null = |field: &arrow::datatypes::FieldRef| {
-        field.is_nullable() || compares_element_wise_with_nulls(field.data_type())
-    };
-    match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => field_admits_null(field),
-        DataType::Struct(fields) => fields.iter().any(field_admits_null),
-        _ => false,
-    }
-}
-
 // Literal classification chooses a type; actual parsing remains an ordinary CAST.
 pub(super) fn cast_null_preserving_target_type(
     expr: TypedExpr,
@@ -3638,6 +3477,7 @@ pub(super) fn cast_null_preserving_target_type(
 pub(super) struct BoundScalarCall {
     pub(super) args: Vec<TypedExpr>,
     pub(super) binding: crate::binding::SqlFunctionBinding,
+    pub(super) operand_order: novarocks_expression::typing::CallOperandOrder,
 }
 
 impl BoundScalarCall {
@@ -4320,6 +4160,7 @@ fn bind_legacy_scalar_call(
             Ok(BoundScalarCall {
                 args,
                 binding: finalizer.finish(exact, name, span)?,
+                operand_order: Default::default(),
             })
         }
         Err(error)
@@ -4796,8 +4637,12 @@ mod tests {
 
     #[test]
     fn logical_terms_balance_only_typed_ir_and_keep_source_order_and_nullable_bounds() {
-        fn leaves<'a>(expression: &'a TypedExpr, op: BinOp, out: &mut Vec<&'a TypedExpr>) -> usize {
-            if let ExprKind::BinaryOp {
+        fn leaves<'a>(
+            expression: &'a TypedExpr,
+            op: crate::common::BooleanOp,
+            out: &mut Vec<&'a TypedExpr>,
+        ) -> usize {
+            if let ExprKind::BooleanConnective {
                 left,
                 right,
                 op: actual,
@@ -4810,7 +4655,10 @@ mod tests {
             out.push(expression);
             0
         }
-        for (keyword, op) in [("AND", BinOp::And), ("OR", BinOp::Or)] {
+        for (keyword, op) in [
+            ("AND", crate::common::BooleanOp::And),
+            ("OR", crate::common::BooleanOp::Or),
+        ] {
             let sql = format!(
                 "SELECT 1 = 10 {keyword} 2 = 20 {keyword} 3 = 30 {keyword} 4 = 40 {keyword} 5 = 50"
             );
@@ -4884,7 +4732,7 @@ mod tests {
             .collect();
         let mixed = ctx.analyze_expr(expression, &scope).unwrap();
         let mut terms = Vec::new();
-        leaves(&mixed, BinOp::And, &mut terms);
+        leaves(&mixed, crate::common::BooleanOp::And, &mut terms);
         assert_eq!(terms.len(), expected.len());
         for (actual, expected) in terms.iter().zip(&expected) {
             assert_eq!(actual.value_type, expected.value_type);
@@ -4903,19 +4751,14 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true)
         );
         assert_eq!(inner.value_type, terms[1].value_type);
-        let ExprKind::BinaryOp {
+        let ExprKind::BooleanConnective {
             left,
             right,
-            op: BinOp::Or,
-            decimal_overflow_policy,
+            op: crate::common::BooleanOp::Or,
         } = &inner.kind
         else {
             panic!("the nested disjunction remains one source term")
         };
-        assert_eq!(
-            *decimal_overflow_policy,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
-        );
         assert!(matches!(
             left.kind,
             ExprKind::Literal(LiteralValue::Bool(false))
@@ -5168,10 +5011,10 @@ mod tests {
                 "{profile}: {sql}"
             );
             let boolean = &select.projection[0].expr;
-            let ExprKind::BinaryOp {
+            let ExprKind::BooleanConnective {
                 left,
                 right,
-                op: BinOp::Or,
+                op: crate::common::BooleanOp::Or,
                 ..
             } = &boolean.kind
             else {
@@ -5374,10 +5217,10 @@ mod tests {
             FunctionValueType::new(DataType::Boolean, false)
         );
         let boolean = &actual;
-        let ExprKind::BinaryOp {
+        let ExprKind::BooleanConnective {
             left,
             right,
-            op: BinOp::Or,
+            op: crate::common::BooleanOp::Or,
             ..
         } = &boolean.kind
         else {
@@ -6727,7 +6570,7 @@ mod tests {
 
     #[test]
     fn arithmetic_preserves_authored_largeint_and_nullable_null_lifts() {
-        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        use novarocks_type_contract::{FunctionValueType, OperatorFunction, ValueLogicalType};
         let catalog = UnaryInputCatalog {
             key_type: DataType::FixedSizeBinary(16),
             nullable: false,
@@ -6752,8 +6595,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(expression.value_type, expected, "{sql}");
-            let ExprKind::BinaryOp { left, right, .. } = expression.kind else {
-                panic!("expected exact arithmetic");
+            let Some((OperatorFunction::Add, [left, right])) =
+                crate::common::binary_operator::typed_operands(&expression)
+            else {
+                panic!("expected exact selected arithmetic");
             };
             let operand = if matches!(left.kind, ExprKind::ColumnRef { .. }) {
                 left
@@ -6791,14 +6636,10 @@ mod tests {
         scope.add_column(None, "k", required_largeint.clone());
         let typed = context.analyze_expr(&column.expression, &scope).unwrap();
         assert_eq!(typed.value_type, expected);
-        let ExprKind::BinaryOp {
-            left,
-            op: BinOp::Add,
-            right,
-            ..
-        } = typed.kind
+        let Some((OperatorFunction::Add, [left, right])) =
+            crate::common::binary_operator::typed_operands(&typed)
         else {
-            panic!("expected exact signed addition");
+            panic!("expected exact selected addition");
         };
         assert!(matches!(left.kind, ExprKind::ColumnRef { .. }));
         assert_eq!(left.value_type, required_largeint);
@@ -6819,12 +6660,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(expression.value_type, expected);
-        let ExprKind::BinaryOp { left, right, .. } = expression.kind else {
-            panic!("expected exact arithmetic");
+        let Some((OperatorFunction::Add, [left, right])) =
+            crate::common::binary_operator::typed_operands(&expression)
+        else {
+            panic!("expected exact selected arithmetic");
         };
         assert!(matches!(right.kind, ExprKind::ColumnRef { .. }));
-        let left = left.into_inner();
-        let ExprKind::FunctionCall { binding, args, .. } = left.kind else {
+        let ExprKind::FunctionCall { binding, args, .. } = &left.kind else {
             panic!("nonliteral NULL must invoke its exact lift owner");
         };
         assert_eq!(
@@ -6863,9 +6705,9 @@ mod tests {
             } => (Some(initializer.as_ref()), body.as_ref()),
             _ => (None, expression),
         };
-        if let ExprKind::BinaryOp {
+        if let ExprKind::BooleanConnective {
             left,
-            op: BinOp::ExpandedConjunction,
+            op: crate::common::BooleanOp::ExpandedConjunction,
             right,
             ..
         } = &body.kind
@@ -9389,7 +9231,7 @@ mod tests {
                 let sql = format!("select {left} {op} {right} from unary_input");
                 let expr = analyze(&sql).unwrap();
                 assert_eq!(expr.value_type.data_type(), &DataType::Decimal256(55, 15));
-                let ExprKind::BinaryOp { left, right, .. } = expr.kind else {
+                let ExprKind::BooleanConnective { left, right, .. } = expr.kind else {
                     panic!("expected frozen arithmetic");
                 };
                 let (source, decimal) = if reverse {

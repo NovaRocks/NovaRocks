@@ -63,7 +63,7 @@ pub(super) fn orient_eq_opt(
 mod legacy {
     use std::collections::HashSet;
 
-    use crate::analysis::{BinOp, ExprKind, TypedExpr};
+    use crate::analysis::{BinOp, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
 
@@ -88,9 +88,12 @@ mod legacy {
     /// True iff every conjunct is a binary `=` comparison (the only correlation
     /// shape decorrelation supports; mirrors StarRocks checkAllIsBinaryEQ).
     pub(crate) fn all_binary_eq(conjuncts: &[TypedExpr]) -> bool {
-        conjuncts
-            .iter()
-            .all(|c| matches!(&c.kind, ExprKind::BinaryOp { op: BinOp::Eq, .. }))
+        conjuncts.iter().all(|c| {
+            matches!(
+                crate::common::binary_operator::typed_comparison(c),
+                Some((BinOp::Eq, _))
+            )
+        })
     }
 
     /// For a correlated EQ conjunct `a == b`, return (outer_side, inner_side) by
@@ -100,12 +103,8 @@ mod legacy {
         conjunct: &'a TypedExpr,
         corr_ids: &HashSet<ColumnId>,
     ) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
-        let ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } = &conjunct.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(conjunct)
         else {
             return None;
         };
@@ -142,16 +141,17 @@ mod tests {
         }
     }
 
-    fn binary_op(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+    fn binary_op(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     #[test]
@@ -173,7 +173,11 @@ mod tests {
         // inner.v > 5  (residual)
         let gt_pred = binary_op(col_ref(inner_v), BinOp::Gt, lit_5);
         // combined: (inner.k == OUTER) AND (inner.v > 5)
-        let predicate = binary_op(eq_pred.clone(), BinOp::And, gt_pred.clone());
+        let predicate = binary_op(
+            eq_pred.clone(),
+            crate::common::BooleanOp::And,
+            gt_pred.clone(),
+        );
 
         let corr_ids: HashSet<ColumnId> = [outer].into();
         let (correlated, residual) = partition_conjuncts(predicate, &corr_ids);

@@ -31,13 +31,12 @@ message SemanticParameter {
   reserved 2;
   reserved "statement_start_utc_micros";
   uint32 id = 1;
-  reserved 5, 6, 7;
-  reserved "decimal_overflow_to_double", "group_concat_legacy", "group_concat_max_len";
+  reserved 4, 5, 6, 7;
+  reserved "allow_throw_exception", "decimal_overflow_to_double", "group_concat_legacy", "group_concat_max_len";
   // The value variant determines the one stable key. No separate key or type
   // may override it; runtime settings and process defaults do not fill gaps.
   oneof value {
     string time_zone = 3;
-    bool allow_throw_exception = 4;
     StatementStartUtc statement_start_utc = 8;
   }
 }
@@ -49,9 +48,9 @@ enum SemanticParameterKey {
   SEMANTIC_PARAMETER_KEY_UNSPECIFIED = 0;
   SEMANTIC_PARAMETER_KEY_STATEMENT_START_UTC = 1;
   SEMANTIC_PARAMETER_KEY_TIME_ZONE = 2;
-  SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION = 3;
-  reserved 4, 5, 6;
-  reserved "SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE",
+  reserved 3, 4, 5, 6;
+  reserved "SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION",
+           "SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE",
            "SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY",
            "SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN";
 }
@@ -94,8 +93,7 @@ message FrozenCall {
   reserved "context", "temporal_source", "regexp_count_pattern_source", "to_base64_byte_source", "materialized_writer_input";
   RelationEffectContext relation_context = 9;
   CallEffects effects = 3;
-  // Required for every real call. It belongs to the original SQL scope, not
-  // to CallEffects or ALLOW_THROW_EXCEPTION. Typed
+  // Required for every real call and owned by the original SQL scope. Typed
   // decode rejects absence, UNSPECIFIED and unknown values without a default.
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
 
@@ -105,8 +103,7 @@ message FrozenCall {
   RelationEffectContext materialized_input = 10;
 }
 
-// One shared semantic policy for actual function calls and Binary/Cast nodes.
-// The numeric wire values remain identical across both use sites.
+// Frozen overflow policy of an actual selected function call.
 enum DecimalOverflowPolicy {
   DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
   DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;

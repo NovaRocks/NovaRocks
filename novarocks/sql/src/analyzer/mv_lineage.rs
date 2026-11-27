@@ -404,9 +404,9 @@ impl<'a> QualifiedLineageCollector<'a> {
             return Ok(());
         }
         match &expr.kind {
-            ExprKind::BinaryOp {
+            ExprKind::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right,
                 ..
             } => {
@@ -533,7 +533,7 @@ fn unwrap_nested_expr(mut expr: &TypedExpr) -> &TypedExpr {
 
 fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
     match &expr.kind {
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,
@@ -626,7 +626,7 @@ fn collect_column_refs(
             kind.saw_cast();
             collect_column_refs(expr, out, kind);
         }
-        ExprKind::BinaryOp { left, right, .. }
+        ExprKind::BooleanConnective { left, right, .. }
         | ExprKind::Let {
             initializer: left,
             body: right,

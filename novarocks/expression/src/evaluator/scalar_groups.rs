@@ -90,7 +90,7 @@ impl Groups {
         for (ordinal, child) in children.iter().enumerate() {
             if kernel.supports_scalar_broadcast(ordinal)
                 && let Value::Mapped(value) = child.uncontinued()
-                && repeats_wide_source(value, active, &parent_at, allocator, work)?
+                && benefits_from_borrowing(value, active, &parent_at, allocator, work)?
             {
                 arguments.push(ordinal);
             }
@@ -155,10 +155,8 @@ impl Groups {
             group_of.push(group_index);
             work.step()?;
         }
-        if groups.len() == active.len() {
-            return Ok(None);
-        }
-
+        // Single-row groups can borrow distinct wide sources. Their original
+        // mapped selection would otherwise gather across those sources.
         let offsets_len = groups
             .len()
             .checked_add(1)
@@ -318,7 +316,7 @@ impl Operand<'_> {
     }
 }
 
-fn repeats_wide_source(
+fn benefits_from_borrowing(
     value: &mapped::MappedValues,
     active: &[usize],
     parent_at: &dyn Fn(usize) -> Result<usize, KernelFailure>,
@@ -327,18 +325,32 @@ fn repeats_wide_source(
 ) -> Result<bool, KernelFailure> {
     let mut seen = mapped::ScopedMap::<(usize, usize, usize), ()>::new();
     let grouping_bytes = size_of::<Group>() + size_of::<(usize, usize)>();
-    for &ordinal in active {
-        if let Some((slot, row)) = value.address(ordinal)
-            && selected_payload(&value.sources()[slot], row)
-                .is_none_or(|bytes| bytes > grouping_bytes)
-        {
-            let address = (parent_at(ordinal)?, slot, row);
-            if seen.get(&address).is_some() {
-                return Ok(true);
-            }
-            seen.insert(address, (), allocator, work)?;
-        }
+    let first = value.address(active[0]);
+    let mut contiguous = first.is_some();
+    let mut wide = false;
+    for (position, &ordinal) in active.iter().enumerate() {
         work.step()?;
+        let address = value.address(ordinal);
+        contiguous &= first
+            .and_then(|(slot, row)| row.checked_add(position).map(|next| (slot, next)))
+            == address;
+        if let Some((slot, row)) = address {
+            match selected_payload(&value.sources()[slot], row) {
+                Some(bytes) => wide |= bytes > grouping_bytes,
+                None => {
+                    let address = (parent_at(ordinal)?, slot, row);
+                    if seen.get(&address).is_some() {
+                        return Ok(true);
+                    }
+                    seen.insert(address, (), allocator, work)?;
+                }
+            }
+        }
+        if wide && !contiguous {
+            // Even a batch containing one element from each parent can
+            // otherwise copy every wide source during argument assembly.
+            return Ok(true);
+        }
     }
     Ok(false)
 }

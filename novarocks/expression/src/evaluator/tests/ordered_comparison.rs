@@ -30,8 +30,8 @@ use arrow::{
     array::{BooleanArray, Float64Array},
     datatypes::DataType,
 };
-use novarocks_expression_contract::BinaryOperator;
 use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope, Selection};
+use novarocks_type_contract::OperatorFunction;
 use std::sync::Arc;
 fn result(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>> {
     output
@@ -44,8 +44,13 @@ fn result(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>>
 }
 
 #[test]
-fn ordered_eager_right_rand_visits_left_null_and_both_instances_keep_independent_batches() {
-    let program = ordered_program(BinaryOperator::Lt, DataType::Float64, Source::Random, false);
+fn ordered_right_rand_skips_left_null_and_both_instances_keep_independent_batches() {
+    let program = ordered_program(
+        OperatorFunction::LessThan,
+        DataType::Float64,
+        Source::Random,
+        false,
+    );
     let input = ordered_batch(
         &program,
         Arc::new(Float64Array::from(vec![None; 6])),
@@ -76,10 +81,10 @@ fn ordered_eager_right_rand_visits_left_null_and_both_instances_keep_independent
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(rows, vec![vec![4], vec![1, 4]]);
+    assert_eq!(rows, vec![vec![4], vec![4], vec![4]]);
     assert_eq!(result(&output), vec![None, Some(false)]);
     assert!(output.errors().is_empty());
-    assert_eq!(evaluator.instances.len(), 2);
+    assert_eq!(evaluator.instances.len(), 3);
     let next = ordered_batch(
         &program,
         Arc::new(Float64Array::from(vec![None])),

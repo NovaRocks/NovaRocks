@@ -410,15 +410,12 @@ mod tests {
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn make_t2_scan() -> LogicalPlanNode {
@@ -601,12 +598,8 @@ mod tests {
         // correlation_conjuncts must be the OUTER == t2.k EQ.
         assert_eq!(new_apply.correlation_conjuncts.len(), 1);
         let conj = &new_apply.correlation_conjuncts[0];
-        let ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-            ..
-        } = &conj.kind
+        let Some((BinOp::Eq, [left, right])) =
+            crate::common::binary_operator::typed_comparison(&conj)
         else {
             panic!("correlation conjunct must be a BinaryOp(Eq), got: {conj:?}");
         };
@@ -666,27 +659,20 @@ mod tests {
             col_ref(T2_K, "k", DataType::Int64),
             col_ref(OUTER_K, "k", DataType::Int64),
         );
-        let residual_pred = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref(T2_V2, "v2", DataType::Int64)),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(5)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let residual_pred = crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            col_ref(T2_V2, "v2", DataType::Int64),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(5)),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let combined_pred = TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(corr_pred),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(residual_pred),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
@@ -937,11 +923,10 @@ mod tests {
             col_ref(OUTER2, "b", DataType::Int64),
         );
         let combined = TypedExpr {
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(corr_pred_a),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(corr_pred_b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
@@ -1170,7 +1155,7 @@ mod tests {
         let inner_ids: HashSet<ColumnId> = [T2_A, T2_B].into();
         for conj in &new_apply.correlation_conjuncts {
             let all_refs: HashSet<ColumnId> = {
-                let ExprKind::BinaryOp { left, right, .. } = &conj.kind else {
+                let ExprKind::BooleanConnective { left, right, .. } = &conj.kind else {
                     panic!("conjunct must be BinaryOp");
                 };
                 collect_column_id_refs(left)

@@ -31,7 +31,6 @@ pub struct QueryOptions {
     pub enable_parquet_reader_page_index: bool,
     pub runtime_filter_scan_wait_time_ms: Option<i64>,
     pub runtime_filter_wait_timeout_ms: Option<i32>,
-    pub allow_throw_exception: bool,
 
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
@@ -56,7 +55,6 @@ pub struct QueryOptionsParts {
     pub enable_parquet_reader_page_index: bool,
     pub runtime_filter_scan_wait_time_ms: Option<i64>,
     pub runtime_filter_wait_timeout_ms: Option<i32>,
-    pub allow_throw_exception: bool,
 
     pub enable_join_runtime_bitset_filter: Option<bool>,
     pub global_runtime_filter_build_max_size: Option<i64>,
@@ -64,11 +62,6 @@ pub struct QueryOptionsParts {
 }
 
 impl QueryOptions {
-    /// Records an SQL-owner decision already parsed at the ingress boundary.
-    pub fn set_allow_throw_exception(&mut self, enabled: bool) {
-        self.allow_throw_exception = enabled;
-    }
-
     pub fn from_parts(parts: QueryOptionsParts) -> Self {
         Self {
             query_timeout: parts.query_timeout,
@@ -83,7 +76,6 @@ impl QueryOptions {
             enable_parquet_reader_page_index: parts.enable_parquet_reader_page_index,
             runtime_filter_scan_wait_time_ms: parts.runtime_filter_scan_wait_time_ms,
             runtime_filter_wait_timeout_ms: parts.runtime_filter_wait_timeout_ms,
-            allow_throw_exception: parts.allow_throw_exception,
 
             enable_join_runtime_bitset_filter: parts.enable_join_runtime_bitset_filter,
             global_runtime_filter_build_max_size: parts.global_runtime_filter_build_max_size,
@@ -113,10 +105,6 @@ impl QueryOptions {
 
     pub const fn enable_file_pagecache(&self) -> bool {
         self.enable_file_pagecache
-    }
-
-    pub const fn allow_throw_exception(&self) -> bool {
-        self.allow_throw_exception
     }
 
     pub const fn runtime_filter_scan_wait_time_ms(&self) -> Option<i64> {

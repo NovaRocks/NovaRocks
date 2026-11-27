@@ -187,7 +187,7 @@ impl Owner {
             value_stability: declaration.value_stability,
             own_row_error: declaration.own_row_error,
             failure_behavior: declaration.failure_behavior,
-            null_behavior: declaration.null_behavior,
+            null_behavior: declaration.null_behavior.clone(),
             argument_control: declaration.argument_control,
             instance_state: declaration.instance_state,
             observable_effects: declaration.observable_effects,
@@ -332,7 +332,8 @@ impl<'owner> Call<'owner> {
                     value_type: value_type.clone(),
                     constant: None,
                 },
-                FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
+                FunctionArgumentType::CandidateGroup { .. }
+                | FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
             })
             .collect();
         let types: Vec<_> = selected
@@ -340,7 +341,8 @@ impl<'owner> Call<'owner> {
             .iter()
             .map(|ty| match ty {
                 FunctionArgumentType::Value(ty) => ty.clone(),
-                FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
+                FunctionArgumentType::CandidateGroup { .. }
+                | FunctionArgumentType::Lambda { .. } => unreachable!("typed fixture uses values"),
             })
             .collect();
         let argument_unit = crate::test_support::argument_unit(&types);
@@ -995,7 +997,8 @@ fn resolved_signature(owner: &Owner) -> ResolvedAggregateSignature {
             .iter()
             .map(|arg| match arg {
                 FunctionArgumentType::Value(ty) => ty.data_type().clone(),
-                FunctionArgumentType::Lambda { .. } => unreachable!(),
+                FunctionArgumentType::CandidateGroup { .. }
+                | FunctionArgumentType::Lambda { .. } => unreachable!(),
             })
             .collect(),
         intermediate_type: DataType::Int64,

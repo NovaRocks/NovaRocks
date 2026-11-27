@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, JoinKind, OutputColumn};
+use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::optimizer::operator::*;
 use crate::optimizer::rule::{NewExpr, Rule, RuleType};
@@ -62,7 +62,6 @@ struct ScalarHashJoinEqCondition {
     null_safe: bool,
     match_relation: novarocks_type_contract::JoinKeyMatch,
     origin: ScalarId,
-    bound_comparison: bool,
 }
 
 /// Orient an eq pair so that the first element references the left child's
@@ -135,62 +134,36 @@ fn coerce_hash_join_eq_condition(
 ) -> Option<ScalarHashJoinEqCondition> {
     let left = arena.value_type(eq.left);
     let right = arena.value_type(eq.right);
-    if eq.bound_comparison {
-        return (left.value_type().kind() == right.value_type().kind()
-            && left.data_type() == right.data_type()
-            && eq
-                .match_relation
-                .supports(left.data_type(), left.logical_type(), eq.null_safe)
-            && hash_join_key_type_is_supported(left.data_type()))
-        .then_some(eq);
-    }
-    // The original membership and wider-number author can leave a compatible
-    // common carrier for physical comparison lowering. Preserve that route.
-    let carrier = novarocks_types::wider_type(left.data_type(), right.data_type());
-    hash_join_key_type_is_supported(&carrier).then_some(eq)
+    (left.value_type().kind() == right.value_type().kind()
+        && left.data_type() == right.data_type()
+        && eq
+            .match_relation
+            .supports(left.data_type(), left.logical_type(), eq.null_safe)
+        && hash_join_key_type_is_supported(left.data_type()))
+    .then_some(eq)
 }
 
 fn comparison_key(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarHashJoinEqCondition> {
     use novarocks_type_contract::{JoinKeyMatch, OperatorFunction};
 
-    let (left, right, null_safe, bound_comparison) = if let Some((operator, [left, right])) =
-        crate::common::binary_operator::scalar_operands(arena, expr)
-    {
-        let null_safe = match operator {
-            OperatorFunction::Equal => false,
-            OperatorFunction::Identical => true,
-            _ => return None,
-        };
-        (left, right, null_safe, true)
-    } else {
-        let ScalarNode::BinaryOp {
-            left, op, right, ..
-        } = arena.node(expr)
-        else {
-            return None;
-        };
-        let null_safe = match op {
-            BinOp::Eq => false,
-            BinOp::EqForNull => true,
-            _ => return None,
-        };
-        (*left, *right, null_safe, false)
+    let (operator, [left, right]) = crate::common::binary_operator::scalar_operands(arena, expr)?;
+    let null_safe = match operator {
+        OperatorFunction::Equal => false,
+        OperatorFunction::Identical => true,
+        _ => return None,
     };
-    let match_relation = if bound_comparison
-        && !null_safe
-        && matches!(arena.data_type(left), DataType::Float32 | DataType::Float64)
-    {
-        JoinKeyMatch::IeeeFloat
-    } else {
-        JoinKeyMatch::Grouping
-    };
+    let match_relation =
+        if !null_safe && matches!(arena.data_type(left), DataType::Float32 | DataType::Float64) {
+            JoinKeyMatch::IeeeFloat
+        } else {
+            JoinKeyMatch::Grouping
+        };
     Some(ScalarHashJoinEqCondition {
         left,
         right,
         null_safe,
         match_relation,
         origin: expr,
-        bound_comparison,
     })
 }
 
@@ -202,11 +175,10 @@ fn append_residual_condition(
 ) -> Result<(), crate::compiler::SqlCompileError> {
     *other = Some(match other.take() {
         Some(existing) => arena.intern_observed(
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left: existing,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: residual,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
             control,
@@ -280,9 +252,9 @@ fn collect_conjuncts(
         ScalarNode::Nested(inner) => {
             collect_conjuncts(arena, *inner, eq_pairs, others);
         }
-        ScalarNode::BinaryOp {
+        ScalarNode::BooleanConnective {
             left,
-            op: BinOp::And,
+            op: crate::common::BooleanOp::And,
             right,
             ..
         } => {
@@ -306,7 +278,6 @@ fn collect_conjuncts(
 fn eq_pair_matches(a: &ScalarHashJoinEqCondition, b: &ScalarHashJoinEqCondition) -> bool {
     a.null_safe == b.null_safe
         && a.match_relation == b.match_relation
-        && a.bound_comparison == b.bound_comparison
         && ((a.left == b.left && a.right == b.right) || (a.left == b.right && a.right == b.left))
 }
 
@@ -545,9 +516,9 @@ fn null_aware_hash_condition(
         }
         match arena.node(prefix) {
             ScalarNode::Nested(inner) => prefix = *inner,
-            ScalarNode::BinaryOp {
+            ScalarNode::BooleanConnective {
                 left,
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 ..
             } => prefix = *left,
             _ => return Ok(None),
@@ -1824,18 +1795,12 @@ mod eq_pair_tests {
         left: TypedExpr,
         right: TypedExpr,
     ) -> ScalarHashJoinEqCondition {
-        let expression = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                DataType::Boolean,
-                left.value_type.nullable() || right.value_type.nullable(),
-            ),
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
+        let expression = crate::common::binary_operator::test_operator(
+            crate::common::BinOp::Eq,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let origin = intern_typed(
             arena,
             &expression,
@@ -1991,16 +1956,17 @@ mod join_demotion_tests {
     }
 
     /// Build `left op right` as a TypedExpr.
-    fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(left),
-                op,
-                right: novarocks_parser::ast::AstBox::new(right),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        }
+    fn bin(
+        left: TypedExpr,
+        op: impl Into<crate::common::binary_operator::TestOperator>,
+        right: TypedExpr,
+    ) -> TypedExpr {
+        crate::common::binary_operator::test_operator(
+            op,
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn logical_join_expr(
@@ -2055,7 +2021,7 @@ mod join_demotion_tests {
         //   • Second pair (a_id, a_name) — same-side (both left) → must demote.
         let first_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
         let second_eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
-        let condition = bin(first_eq, BinOp::And, second_eq);
+        let condition = bin(first_eq, crate::common::BooleanOp::And, second_eq);
 
         let join_mexpr = logical_join_expr(
             &mut memo,
@@ -2112,36 +2078,30 @@ mod join_demotion_tests {
             .as_ref()
             .expect("demoted same-side pair must appear in other_condition");
         let other = mat(&memo, *other);
-        match &other.kind {
-            ExprKind::BinaryOp {
-                left, op, right, ..
-            } => {
-                assert!(
-                    matches!(op, BinOp::Eq),
-                    "demoted condition should be BinaryOp::Eq, got {:?}",
-                    op
-                );
-                match (&left.kind, &right.kind) {
-                    (
-                        ExprKind::ColumnRef { column_id: l, .. },
-                        ExprKind::ColumnRef { column_id: r, .. },
-                    ) => {
-                        let a_id = test_col_id("a_id");
-                        let a_name = test_col_id("a_name");
-                        assert!(
-                            (*l == a_id && *r == a_name) || (*l == a_name && *r == a_id),
-                            "expected (a_id, a_name) in demoted eq, got ({}, {})",
-                            l,
-                            r
-                        );
-                    }
-                    other => panic!(
-                        "expected two ColumnRef nodes inside demoted eq, got {:?}",
-                        other
-                    ),
+        match crate::common::binary_operator::typed_comparison(&other) {
+            Some((BinOp::Eq, [left, right])) => match (&left.kind, &right.kind) {
+                (
+                    ExprKind::ColumnRef { column_id: l, .. },
+                    ExprKind::ColumnRef { column_id: r, .. },
+                ) => {
+                    let a_id = test_col_id("a_id");
+                    let a_name = test_col_id("a_name");
+                    assert!(
+                        (*l == a_id && *r == a_name) || (*l == a_name && *r == a_id),
+                        "expected (a_id, a_name) in demoted eq, got ({}, {})",
+                        l,
+                        r
+                    );
                 }
-            }
-            other => panic!("expected BinaryOp::Eq in other_condition, got {:?}", other),
+                other => panic!(
+                    "expected two ColumnRef nodes inside demoted eq, got {:?}",
+                    other
+                ),
+            },
+            other => panic!(
+                "expected selected equality in other_condition, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2304,7 +2264,7 @@ mod join_demotion_tests {
             comparison,
             col_typed("b_arr", list_type(DataType::Utf8)),
         );
-        let condition = bin(scalar_eq, BinOp::And, complex_eq);
+        let condition = bin(scalar_eq, crate::common::BooleanOp::And, complex_eq);
         let join_mexpr = logical_join_expr(
             &mut memo,
             JoinKind::Inner,

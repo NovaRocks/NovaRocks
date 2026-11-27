@@ -18,11 +18,11 @@
 use super::*;
 use crate::test_constants as checked;
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BinaryOperator, BoundFunction, ExprKind, ValueType};
+use novarocks_expression_contract::{BoundFunction, ExprKind, ValueType};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, ExpressionDefinitionMembership, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionKind, FunctionOverloadId, FunctionVolatility, control_argument_semantics,
+    ExpressionDefinitionMembership, FunctionArgumentEvaluation, FunctionArgumentType,
+    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind,
+    FunctionOverloadId, FunctionVolatility, control_argument_semantics,
 };
 use std::sync::Mutex;
 
@@ -163,17 +163,30 @@ fn invocation(
             .collect(),
     }
 }
-fn binary_fixture() -> (Definitions, ExpressionControlFlow<ExprId>) {
+pub(super) fn eager_pair(args: [ExprId; 2]) -> ExprKind {
+    let boolean = ValueType::new(DataType::Boolean, false);
+    let function = novarocks_expression_contract::BoundFunction::from_exact_signature(
+        novarocks_type_contract::FunctionId::try_new("fixture/control-eager-pair").unwrap(),
+        novarocks_type_contract::FunctionOverloadId::try_new("fixture/control-eager-pair/v1")
+            .unwrap(),
+        novarocks_type_contract::FunctionKind::Scalar,
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::new([
+            novarocks_type_contract::FunctionArgumentType::Value(boolean.clone()),
+            novarocks_type_contract::FunctionArgumentType::Value(boolean.clone()),
+        ])),
+        boolean,
+    );
+    ExprKind::FunctionCall {
+        function,
+        args: Box::new(args),
+    }
+}
+
+fn eager_pair_fixture() -> (Definitions, ExpressionControlFlow<ExprId>) {
     let mut definitions = Definitions::default();
     let left = definitions.boolean(true);
     let right = definitions.boolean(false);
-    let root = definitions.add(ExprKind::Binary {
-        allow_throw_exception: None,
-        left,
-        op: BinaryOperator::Eq,
-        right,
-        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-    });
+    let root = definitions.add(eager_pair([left, right]));
     let r = region();
     let flow = definitions.flow(
         vec![r],
@@ -357,7 +370,7 @@ fn many_roots_fixture(count: usize) -> (Definitions, ExpressionControlFlow<ExprI
 
 #[test]
 fn typed_control_roundtrip_preserves_presence_and_ordered_children() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let control = Control::default();
     let encoded = encode_expression_control(&flow, &control).unwrap();
     assert_eq!(encoded.regions[0].id, u32::MAX);
@@ -605,7 +618,7 @@ fn every_control_and_guard_variant_roundtrips() {
 
 #[test]
 fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let encoded = encode_expression_control(&flow, &Control::default()).unwrap();
     type MissingFieldMutation = (&'static str, fn(&mut wire::ExpressionControl));
     let mutations: &[MissingFieldMutation] = &[
@@ -652,7 +665,7 @@ fn absent_mandatory_ids_and_oneofs_never_default_to_zero_or_eager() {
 
 #[test]
 fn unspecified_and_unknown_enums_fail_closed() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let encoded = encode_expression_control(&flow, &Control::default()).unwrap();
     for unknown in [0, -1, i32::MAX] {
         let mut forged = encoded.clone();
@@ -694,7 +707,7 @@ fn unspecified_and_unknown_enums_fail_closed() {
 
 #[test]
 fn duplicate_dangling_shared_and_reordered_use_graphs_keep_typed_rejections() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let encoded = encode_expression_control(&flow, &Control::default()).unwrap();
     let mut forged = encoded.clone();
     forged.regions.push(forged.regions[0]);
@@ -776,7 +789,7 @@ fn each_projection_and_validation_phase_observes_midwork_typed_control_failures(
 
 #[test]
 fn count_and_edge_limits_are_checked_before_malformed_dto_projection() {
-    let (definitions, _) = binary_fixture();
+    let (definitions, _) = eager_pair_fixture();
     let too_many = ControlCodecError::Flow(ExpressionControlFlowError::TooManyItems);
     for count in [MAX_CONTROL_USE_REFERENCES, MAX_CONTROL_USE_REFERENCES + 1] {
         let dto = wire::ExpressionControl {
@@ -904,7 +917,7 @@ fn valid_reference_budget_boundary_roundtrips_and_one_more_edge_fails_before_pro
 
 #[test]
 fn region_count_equality_reaches_shape_checks_but_overflow_does_not_project() {
-    let (definitions, _) = binary_fixture();
+    let (definitions, _) = eager_pair_fixture();
     let dto = wire::ExpressionControl {
         regions: vec![wire::EvaluationRegion::default(); MAX_CONTROL_DEFINITIONS],
         ..Default::default()

@@ -112,25 +112,26 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
         let program = nullsafe_program(ty.clone(), NullSafeRight::Column);
         let unit = &program.unit;
         let root_use = unit.root(program.root).unwrap().use_id;
-        let recipe = unit.recipes().null_safe_comparison(root_use).unwrap();
-        assert_eq!(recipe.left_type(), &ty);
-        assert_eq!(recipe.right_type(), &ty);
-        assert!(!recipe.nullable_result());
         let flow = unit.control_flow();
         let invocation = &flow.uses()[&root_use];
-        assert_eq!(invocation.control, ControlShape::Eager);
+        assert_eq!(invocation.control, ControlShape::OrderedNull);
         assert_eq!(invocation.context.demand, EvaluationDemand::Value);
         assert_eq!(invocation.arguments.len(), 2);
-        for child in &invocation.arguments {
-            assert_eq!(flow.uses()[child].context.region, invocation.context.region);
-            assert_eq!(flow.uses()[child].context.demand, EvaluationDemand::Value);
-        }
+        let left_use = &flow.uses()[&invocation.arguments[0]];
+        let right_use = &flow.uses()[&invocation.arguments[1]];
+        assert_eq!(left_use.context.region, invocation.context.region);
+        assert_eq!(
+            flow.regions()[&right_use.context.region].parent,
+            Some(invocation.context.region)
+        );
+        assert_eq!(left_use.context.demand, EvaluationDemand::Value);
+        assert_eq!(right_use.context.demand, EvaluationDemand::Value);
         assert!(matches!(
             unit.definitions()
                 .node(invocation.definition)
                 .unwrap()
                 .kind(),
-            StaticExprKind::PreparedNullSafeComparison { .. }
+            StaticExprKind::BoundCall { .. }
         ));
         let batch = nullsafe_batch(&program, left, right);
         let rows = [1, 2, 3, 4];
@@ -158,6 +159,7 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
             assert!(output.errors().is_empty());
             assert_eq!(output.values().null_count(), 0);
         }
+        let instance_count = evaluator.instances.len();
         let empty = evaluator
             .evaluate(
                 EvaluationInput::Batch {
@@ -174,7 +176,7 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
             )
             .unwrap();
         assert!(empty.values().is_empty());
-        assert_eq!(evaluator.instances.len(), 0);
+        assert_eq!(evaluator.instances.len(), instance_count);
     }
 }
 
@@ -236,7 +238,7 @@ fn null_left_keeps_required_right_random_state_and_round_row_error() {
             vec![Some(false); 2]
         );
     }
-    assert_eq!(evaluator.instances.len(), 1);
+    assert_eq!(evaluator.instances.len(), 2);
     let decimal = nullsafe_program(
         FunctionValueType::new(DataType::Decimal128(38, 0), true),
         NullSafeRight::Round,

@@ -303,7 +303,7 @@ impl MvWritePreparationCustody {
             access,
             session: self.session.clone(),
             carrier: self.kernel.static_plan_carrier().clone(),
-            options: crate::query_execution::contract::synthetic_mv_query_options(&self.execution),
+            options: crate::query_execution::contract::synthetic_query_options(),
             control,
         }));
         self.drive().await?;

@@ -667,8 +667,7 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
 fn ordered_regexp_authorship_guards_each_argument_after_its_predecessor() {
     use novarocks_expression::testkit::expression_text::{TextContext, type_expression_text};
     use novarocks_type_contract::{
-        ArgumentControl, FunctionIntrinsicRowError, GuardKind, RegionGuard, SemanticParameterId,
-        SemanticParameterKey, SemanticParameterRef,
+        ArgumentControl, FunctionIntrinsicRowError, GuardKind, RegionGuard,
     };
 
     let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
@@ -678,10 +677,6 @@ fn ordered_regexp_authorship_guards_each_argument_after_its_predecessor() {
         constant_policy: POLICY,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         parameters: &parameters,
-        allow_throw_exception: SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::AllowThrowException,
-        },
     };
     let typed = type_expression_text(
         "regexp_replace('é', '[é]', 'x')",
@@ -733,7 +728,7 @@ fn ordered_regexp_authorship_guards_each_argument_after_its_predecessor() {
 #[test]
 fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     use arrow::array::{BooleanArray, Decimal128Array, Float64Array};
-    use novarocks_expression_contract::BinaryOperator;
+    use novarocks_type_contract::OperatorFunction;
     use novarocks_type_contract::{
         FunctionIntrinsicRowError, FunctionVolatility, GuardKind, RegionGuard,
     };
@@ -769,16 +764,16 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     let rand = fixture.call("rand", &[], DecimalOverflowPolicy::OutputNull);
     let zero = fixture.constant(Arc::new(Float64Array::from(vec![0.0])), fixture.ty(rand));
     let ty = FunctionValueType::new(DataType::Boolean, fixture.ty(rand).nullable());
-    let else_value = fixture.add(
-        ty.clone(),
-        ExprKind::Binary {
-            left: rand,
-            op: BinaryOperator::Gt,
-            right: zero,
-            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-            allow_throw_exception: None,
-        },
-    );
+    let else_value = novarocks_expression::testkit::add_catalogue_predicate(
+        &mut fixture.draft,
+        &mut fixture.constants,
+        OperatorFunction::LessThan,
+        vec![zero, rand],
+    )
+    .unwrap();
+    fixture
+        .decimal
+        .insert(else_value, DecimalOverflowPolicy::OutputNull);
     let case = fixture.add(
         ty.clone(),
         ExprKind::Case {
@@ -810,10 +805,16 @@ fn case_inside_boolean_guard_keeps_inactive_error_and_random_state_summaries() {
     assert!(summary.has_instance_state);
     assert!(summary.observable_effects.rng_sampling);
     assert!(summary.may_raise_row_error);
-    assert_eq!(authored.claims.len(), 2);
+    assert_eq!(authored.claims.len(), 3);
     let case_id = flow.uses()[&id].arguments[1];
     let case_use = &flow.uses()[&case_id];
     assert_eq!(case_use.definition, case);
+    let comparison = case_use.arguments[2];
+    assert_eq!(flow.uses()[&comparison].definition, else_value);
+    assert_eq!(
+        authored.claims[&comparison].effects.own_row_error,
+        FunctionIntrinsicRowError::NoRowError
+    );
     let round_use = flow.uses()[&case_use.arguments[1]].arguments[0];
     assert_eq!(flow.uses()[&round_use].definition, round);
     assert_eq!(

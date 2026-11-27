@@ -161,9 +161,9 @@ fn exact_like_key(
 
 fn add_conjuncts(expression: &TypedExpr, predicates: &mut Vec<Predicate>) {
     let expression = unnest(expression);
-    if let ExprKind::BinaryOp {
+    if let ExprKind::BooleanConnective {
         left,
-        op: BinOp::And,
+        op: crate::common::BooleanOp::And,
         right,
         ..
     } = &expression.kind

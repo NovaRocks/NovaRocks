@@ -62,10 +62,11 @@ fn effects(scope: v2::proof_scope::Kind) -> v2::CallEffects {
             },
             v2::SemanticParameterRef {
                 id: Some(u32::MAX),
-                expected_key: v2::SemanticParameterKey::AllowThrowException as i32,
+                expected_key: v2::SemanticParameterKey::StatementStartUtc as i32,
             },
         ],
         proof_scope: Some(v2::ProofScope { kind: Some(scope) }),
+        strict_argument_ordinals: Vec::new(),
     }
 }
 
@@ -80,7 +81,10 @@ fn all_parameter_variants_preserve_raw_values_and_oneof_presence() {
             },
         ),
         Value::TimeZone("+08:00".into()),
-        Value::AllowThrowException(false),
+        Value::StatementStartUtc(v2::StatementStartUtc {
+            seconds: Some(0),
+            nanos: Some(0),
+        }),
     ];
     let parameters = v2::SemanticParameters {
         entries: values
@@ -119,7 +123,10 @@ fn all_parameter_variants_preserve_raw_values_and_oneof_presence() {
     }
     let zero = v2::SemanticParameter {
         id: 0,
-        value: Some(Value::AllowThrowException(false)),
+        value: Some(Value::StatementStartUtc(v2::StatementStartUtc {
+            seconds: Some(0),
+            nanos: Some(0),
+        })),
     };
     roundtrip(&zero);
     assert_ne!(
@@ -769,7 +776,6 @@ fn calls_and_binary_share_one_semantic_policy_with_unchanged_numeric_wire_values
             4,
             true,
         ),
-        ("novarocks.physical_package_v2.BinaryExpression", 4, false),
     ] {
         let descriptor = pool.get_message_by_name(message).unwrap();
         let field = descriptor
@@ -788,13 +794,6 @@ fn calls_and_binary_share_one_semantic_policy_with_unchanged_numeric_wire_values
             policy.values().map(|v| v.number()).collect::<Vec<_>>(),
             [0, 1, 2]
         );
-    }
-    for value in [1, 2] {
-        let binary = novarocks_proto_models::physical_package_v2::BinaryExpression::decode(
-            &[0x20, value][..],
-        )
-        .unwrap();
-        assert_eq!(binary.decimal_overflow_policy, i32::from(value));
     }
 }
 

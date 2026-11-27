@@ -319,25 +319,18 @@ mod tests {
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: novarocks_parser::ast::AstBox::new(col_ref(id_b, "b")),
-                        op: BinOp::Eq,
-                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Utf8,
-                                false,
-                            ),
-                        }),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                predicate: crate::common::binary_operator::test_operator(
+                    BinOp::Eq,
+                    col_ref(id_b, "b"),
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                },
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
             }),
             vec![scan],
             None,

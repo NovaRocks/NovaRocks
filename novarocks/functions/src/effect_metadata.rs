@@ -120,7 +120,6 @@ pub(crate) fn digest_effect_declaration(hasher: &mut Sha256, effects: &FunctionE
         hasher.update([match key {
             SemanticParameterKey::StatementStartUtc => 1,
             SemanticParameterKey::TimeZone => 2,
-            SemanticParameterKey::AllowThrowException => 3,
         }]);
     }
 }

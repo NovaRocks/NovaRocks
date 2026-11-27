@@ -493,15 +493,12 @@ mod tests {
             vec![],
             None,
         );
-        let predicate = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(column_expr(1, Some("t"), "k")),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(int_literal(10)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+        let predicate = crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            column_expr(1, Some("t"), "k"),
+            int_literal(10),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![scan],
@@ -577,31 +574,22 @@ mod tests {
 
     #[test]
     fn format_expr_prints_column_before_literal_for_equality() {
-        let expr = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(10)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: ColumnId(42),
-                        qualifier: Some("r".to_string()),
-                        column: "rk".to_string(),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                }),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        let expr = crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(10)),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-        };
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(42),
+                    qualifier: Some("r".to_string()),
+                    column: "rk".to_string(),
+                },
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            },
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
 
         assert_eq!(
             format_expr(&expr, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),

@@ -71,7 +71,7 @@ fn assert_prefixes(
 
 #[test]
 fn decode_malformed_projection_observes_completed_tail_before_returning_format_error() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let original = encode_expression_control(&flow, &Control::default()).unwrap();
     let mut malformed = Vec::new();
     let mut add = |change: fn(&mut wire::ExpressionControl)| {
@@ -124,7 +124,7 @@ fn decode_malformed_projection_observes_completed_tail_before_returning_format_e
 
 #[test]
 fn decode_zero_work_error_still_observes_original_tail_and_keeps_refusal_primary() {
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let mut dto = encode_expression_control(&flow, &Control::default()).unwrap();
     dto.uses.clear();
     dto.regions[0].guard = Some(wire::RegionGuard {
@@ -192,7 +192,7 @@ fn flow_error_projection_preserves_typed_control_causes_and_ordinary_flow_catego
         ControlCodecError::from(ordinary.clone()),
         ControlCodecError::Flow(ordinary)
     );
-    let (definitions, flow) = binary_fixture();
+    let (definitions, flow) = eager_pair_fixture();
     let mut dto = encode_expression_control(&flow, &Control::default()).unwrap();
     dto.uses[0].definition_id = Some(12345);
     let recorder = PrefixControl::default();

@@ -665,9 +665,8 @@ message QueryOptions {
   int64 query_mem_limit = 5;
   optional int64 runtime_filter_scan_wait_time_ms = 7;
   optional int32 runtime_filter_wait_timeout_ms = 8;
-  bool allow_throw_exception = 9;
-  reserved 10, 11, 12;
-  reserved "group_concat_max_len", "enable_spill", "spill_options";
+  reserved 9, 10, 11, 12;
+  reserved "allow_throw_exception", "group_concat_max_len", "enable_spill", "spill_options";
   bool enable_scan_datacache = 13;
   bool enable_populate_datacache = 14;
   bool enable_datacache_async_populate_mode = 15;

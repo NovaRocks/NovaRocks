@@ -373,7 +373,6 @@ fn state_sources_grouped_topn_refuses_transported_state_without_a_rows_fallback(
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        false,
         policy(),
         &control,
     );

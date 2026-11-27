@@ -209,21 +209,11 @@ fn remap_scalar(
         ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {
             Some(expr)
         }
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => {
+        ScalarNode::BooleanConnective { op, left, right } => {
             let left = candidate_or_none!(remap_scalar(arena, left, bindings, control)?);
             let right = candidate_or_none!(remap_scalar(arena, right, bindings, control)?);
             Some(arena.intern_observed(
-                ScalarNode::BinaryOp {
-                    op,
-                    left,
-                    right,
-                    decimal_overflow_policy,
-                },
+                ScalarNode::BooleanConnective { op, left, right },
                 value_type,
                 control,
             )?)
@@ -510,27 +500,22 @@ mod tests {
     }
 
     fn eq(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(a),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            a,
+            b,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(a),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -738,16 +723,12 @@ mod tests {
         let x_id = col_id(2);
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         // Build: Project(Scan) with computed item x = a + 1.
-        let computed_expr = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref("a", a_id)),
-                op: BinOp::Add,
-                right: novarocks_parser::ast::AstBox::new(int_lit(1)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
+        let computed_expr = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col_ref("a", a_id),
+            int_lit(1),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let computed_id = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &computed_expr,
@@ -816,16 +797,12 @@ mod tests {
         let a_id = col_id(1);
         let x_id = col_id(2);
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
-        let computed_expr = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(col_ref("a", a_id)),
-                op: BinOp::Add,
-                right: novarocks_parser::ast::AstBox::new(int_lit(1)),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
+        let computed_expr = crate::common::binary_operator::test_operator(
+            BinOp::Add,
+            col_ref("a", a_id),
+            int_lit(1),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        );
         let passthrough_id = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &col_ref("a", a_id),

@@ -281,12 +281,10 @@ impl FunctionEffectDeclaration {
         // range or a new limit on declarations.
         let mut statement_start_utc = false;
         let mut time_zone = false;
-        let mut allow_throw_exception = false;
         for key in &self.environment_dependencies {
             let seen = match key {
                 SemanticParameterKey::StatementStartUtc => &mut statement_start_utc,
                 SemanticParameterKey::TimeZone => &mut time_zone,
-                SemanticParameterKey::AllowThrowException => &mut allow_throw_exception,
             };
             if std::mem::replace(seen, true) {
                 return Err(EffectContractError::DuplicateEnvironmentKey.into());

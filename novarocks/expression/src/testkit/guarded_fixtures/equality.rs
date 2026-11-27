@@ -18,8 +18,8 @@
 //! Binary and simple CASE fixtures authored as one neutral expression unit.
 
 use super::{
-    Fixture, Shape, catalogue, compile_project_unit, fixture_constant_policy, literal,
-    project_port, random, round_value, unit_draft,
+    Fixture, compile_project_unit, fixture_constant_policy, literal, project_port, random,
+    round_value, unit_draft,
 };
 use crate::{ComparisonSite, testkit::checked_constants};
 use arrow::{
@@ -28,11 +28,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_constant_contract::ConstantPools;
-use novarocks_expression_contract::{
-    BinaryOperator, BoundExprSetBuilder, ExprKind, RootScope, ValueId,
-};
+use novarocks_expression_contract::{BoundExprSetBuilder, ExprKind, RootScope, ValueId};
 use novarocks_type_contract::{
-    DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId, FunctionValueType,
+    EvaluationDemand, ExpressionUseId, FunctionValueType, OperatorFunction,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -48,7 +46,7 @@ pub enum EqualityCase {
 }
 pub fn equality_program(kind: EqualityCase) -> Fixture {
     let mut source_pools = ConstantPools::empty();
-    let functions = catalogue(Shape::Decimal);
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
     let mut builder = unit_draft();
     let floating = FunctionValueType::new(DataType::Float64, true);
     let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
@@ -78,23 +76,18 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
     let expr = if matches!(kind, EqualityCase::Eq | EqualityCase::NotEq) {
         let left = value(&mut builder, 0);
         let right = value(&mut builder, 1);
-        builder
-            .add(
-                None,
-                result_type.clone(),
-                ExprKind::Binary {
-                    op: if matches!(kind, EqualityCase::Eq) {
-                        BinaryOperator::Eq
-                    } else {
-                        BinaryOperator::NotEq
-                    },
-                    left,
-                    right,
-                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                    allow_throw_exception: None,
-                },
-            )
-            .unwrap()
+        let operator = if matches!(kind, EqualityCase::Eq) {
+            OperatorFunction::Equal
+        } else {
+            OperatorFunction::NotEqual
+        };
+        crate::testkit::claim_author::add_catalogue_predicate(
+            &mut builder,
+            &mut source_pools,
+            operator,
+            vec![left, right],
+        )
+        .unwrap()
     } else {
         let (operand, first, second) = match kind {
             EqualityCase::Columns => (
@@ -131,7 +124,7 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
                         None,
                         floating.clone(),
                         ExprKind::Case {
-                            ieee_float_equality: false,
+                            ieee_float_equality: true,
                             operand: Some(second),
                             when_then: Box::from([(zero, one)]),
                             else_expr: None,
@@ -199,7 +192,12 @@ pub fn equality_program(kind: EqualityCase) -> Fixture {
                 None,
                 result_type.clone(),
                 ExprKind::Case {
-                    ieee_float_equality: false,
+                    ieee_float_equality: matches!(
+                        kind,
+                        EqualityCase::Columns
+                            | EqualityCase::RandomOperand
+                            | EqualityCase::RandomLabels
+                    ),
                     operand: Some(operand),
                     when_then: Box::from([(first, then_first), (second, then_second)]),
                     else_expr: Some(otherwise),

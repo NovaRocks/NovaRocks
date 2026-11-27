@@ -1022,7 +1022,7 @@ mod tests {
                     argument_control: ArgumentControl::Eager,
                     instance_state: FunctionInstanceState::None,
                     observable_effects: ObservableEffects::NONE,
-                    environment_dependencies: vec![SemanticParameterKey::AllowThrowException]
+                    environment_dependencies: vec![SemanticParameterKey::StatementStartUtc]
                         .into_boxed_slice(),
                 },
                 calls: AtomicUsize::new(0),
@@ -1067,7 +1067,7 @@ mod tests {
                 .into());
             }
             let reference = input.environment[0];
-            let Some(SemanticParameterValue::AllowThrowException(strict)) =
+            let Some(SemanticParameterValue::StatementStartUtc(strict)) =
                 input.parameters.get(reference.id)
             else {
                 return Err(FunctionBindingError::InvalidBinding(
@@ -1077,7 +1077,7 @@ mod tests {
             };
             Ok(CallEffects {
                 value_stability: self.declaration.value_stability,
-                own_row_error: if *strict {
+                own_row_error: if strict.seconds() != 0 {
                     FunctionIntrinsicRowError::MayRaise
                 } else {
                     FunctionIntrinsicRowError::NoRowError
@@ -1128,11 +1128,13 @@ mod tests {
         }];
         let environment = [SemanticParameterRef {
             id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterKey::AllowThrowException,
+            expected_key: SemanticParameterKey::StatementStartUtc,
         }];
         let parameters = SemanticParameters::try_new([(
             environment[0].id,
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         )])
         .unwrap();
         let argument_uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
@@ -1385,7 +1387,9 @@ mod tests {
         }
         let relaxed = SemanticParameters::try_new([(
             environment[0].id,
-            SemanticParameterValue::AllowThrowException(false),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+            ),
         )])
         .unwrap();
         let relaxed_input = CallEffectInput {
@@ -1492,21 +1496,25 @@ mod tests {
         let environment = [
             SemanticParameterRef {
                 id: SemanticParameterId::new(1),
-                expected_key: SemanticParameterKey::AllowThrowException,
+                expected_key: SemanticParameterKey::StatementStartUtc,
             },
             SemanticParameterRef {
                 id: SemanticParameterId::new(2),
-                expected_key: SemanticParameterKey::AllowThrowException,
+                expected_key: SemanticParameterKey::StatementStartUtc,
             },
         ];
         let parameters = SemanticParameters::try_new([
             (
                 environment[0].id,
-                SemanticParameterValue::AllowThrowException(true),
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+                ),
             ),
             (
                 environment[1].id,
-                SemanticParameterValue::AllowThrowException(false),
+                SemanticParameterValue::StatementStartUtc(
+                    novarocks_type_contract::StatementStartUtc::try_new(0, 0).unwrap(),
+                ),
             ),
         ])
         .unwrap();
@@ -1565,11 +1573,13 @@ mod tests {
         }];
         let environment = [SemanticParameterRef {
             id: SemanticParameterId::new(1),
-            expected_key: SemanticParameterKey::AllowThrowException,
+            expected_key: SemanticParameterKey::StatementStartUtc,
         }];
         let parameters = SemanticParameters::try_new([(
             environment[0].id,
-            SemanticParameterValue::AllowThrowException(true),
+            SemanticParameterValue::StatementStartUtc(
+                novarocks_type_contract::StatementStartUtc::try_new(1, 0).unwrap(),
+            ),
         )])
         .unwrap();
         let uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];

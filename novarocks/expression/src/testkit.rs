@@ -148,7 +148,7 @@ pub fn register_constant(
 mod claim_author;
 pub use claim_author::{
     ClaimAuthor, add_call, add_catalogue_predicate, declare_call_controls, finish_unit,
-    register_call_requests, try_finish_unit,
+    register_call_requests, seal_catalogue_fixture, try_finish_unit,
 };
 
 /// Rebuild a test's complete input scope from its neutral declared port.

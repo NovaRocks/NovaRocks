@@ -246,40 +246,31 @@ mod tests {
     }
 
     fn eq_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(a),
-                op: BinOp::Eq,
-                right: novarocks_parser::ast::AstBox::new(b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Eq,
+            a,
+            b,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn gt_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
-
-            kind: ExprKind::BinaryOp {
-                left: novarocks_parser::ast::AstBox::new(a),
-                op: BinOp::Gt,
-                right: novarocks_parser::ast::AstBox::new(b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        }
+        crate::common::binary_operator::test_operator(
+            BinOp::Gt,
+            a,
+            b,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
     }
 
     fn and_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
-            kind: ExprKind::BinaryOp {
+            kind: ExprKind::BooleanConnective {
                 left: novarocks_parser::ast::AstBox::new(a),
-                op: BinOp::And,
+                op: crate::common::BooleanOp::And,
                 right: novarocks_parser::ast::AstBox::new(b),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }

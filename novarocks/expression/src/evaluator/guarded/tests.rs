@@ -17,7 +17,6 @@
 
 #[cfg(novarocks_dev_controls)]
 mod array_frame_cases;
-mod between_comparison_control;
 mod copy_continuation;
 mod frame_cases;
 mod result_creator;

@@ -249,17 +249,11 @@ fn node_fields<'a>(
             f.number(2)?;
             f.literal(literal)?;
         }
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => {
+        ScalarNode::BooleanConnective { op, left, right } => {
             f.number(3)?;
             f.number(*op as u128)?;
             f.id(*left)?;
             f.id(*right)?;
-            f.number(*decimal_overflow_policy as u128)?;
         }
         ScalarNode::FunctionCall {
             name,

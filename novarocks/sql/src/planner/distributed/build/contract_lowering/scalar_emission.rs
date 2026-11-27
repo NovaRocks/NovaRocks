@@ -177,24 +177,22 @@ struct LoweredControlExpansion {
 }
 
 fn expanded_conjunction(expression: &TypedExpr, includes_not: bool) -> Option<[&TypedExpr; 2]> {
-    let ExprKind::BinaryOp {
+    let ExprKind::BooleanConnective {
         left, op, right, ..
     } = &expression.kind
     else {
         return None;
     };
     let expected = if includes_not {
-        BinOp::ExpandedNegatedConjunction
+        crate::common::BooleanOp::ExpandedNegatedConjunction
     } else {
-        BinOp::ExpandedConjunction
+        crate::common::BooleanOp::ExpandedConjunction
     };
     (*op == expected).then_some([left, right])
 }
 
 pub(super) struct ScalarEmission<'emission, 'control> {
-    pub(super) root_allow_throw_exception: bool,
     pub(super) constant_policy: novarocks_constant_contract::ConstantValidation,
-    pub(super) root_allow_throw_exception_used: &'emission mut bool,
     pub(super) parameters: &'emission mut BTreeMap<SemanticParameterId, SemanticParameterValue>,
     pub(super) functions: &'emission Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pub(super) control: &'control dyn PureCompileControl,
@@ -206,10 +204,6 @@ pub(super) struct ScalarEmission<'emission, 'control> {
     pub(super) call_sources: &'emission mut SqlLogicalSourceJournal,
 }
 impl ScalarEmission<'_, '_> {
-    pub(super) fn root_allow_throw_reference(&mut self) -> SemanticParameterRef {
-        root_allow_throw_reference(self.root_allow_throw_exception_used)
-    }
-
     pub(super) fn lower_derived_variant_expression(
         &mut self,
         source_value: ValueId,
@@ -297,14 +291,14 @@ impl ScalarEmission<'_, '_> {
     pub(super) fn lower_boolean_connective(
         &mut self,
         root: &TypedExpr,
-        connective: BinOp,
+        connective: crate::common::BooleanOp,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<Box<[ExprId]>, ContractLoweringError> {
         let mut operands: Vec<&TypedExpr> = Vec::new();
         let mut pending: Vec<&TypedExpr> = vec![root];
         while let Some(current) = pending.pop() {
             match &current.kind {
-                ExprKind::BinaryOp {
+                ExprKind::BooleanConnective {
                     left, op, right, ..
                 } if *op == connective => {
                     pending.push(right);
@@ -555,52 +549,15 @@ impl ScalarEmission<'_, '_> {
             }
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
             ExprKind::Constant(value) => return self.lower_constant_expression(value, ty),
-            ExprKind::BinaryOp {
-                op: op @ (BinOp::And | BinOp::Or),
+            ExprKind::BooleanConnective {
+                op: op @ (crate::common::BooleanOp::And | crate::common::BooleanOp::Or),
                 ..
             } => {
                 let args = self.lower_boolean_connective(expression, *op, visible)?;
-                if matches!(op, BinOp::And) {
+                if matches!(op, crate::common::BooleanOp::And) {
                     ContractExprKind::Conjunction { args }
                 } else {
                     ContractExprKind::Disjunction { args }
-                }
-            }
-            ExprKind::BinaryOp {
-                left,
-                op,
-                right,
-                decimal_overflow_policy,
-            } => {
-                let lowered_left = self.lower_expression(left, visible)?;
-                let lowered_right = self.lower_expression(right, visible)?;
-                // A comparison answers about one type. Its operands were
-                // reconciled while the statement was analyzed -- an untyped
-                // NULL, a narrower integer -- and the plan states the
-                // comparison it actually performs rather than two sides the
-                // reader has to reconcile again. Arithmetic keeps its own
-                // operands: its result type is derived from the pair.
-                let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
-                    let left_type = self.expression_value_type(lowered_left)?;
-                    let right_type = self.expression_value_type(lowered_right)?;
-                    let compared = self.common_comparison_value_type(&left_type, &right_type)?;
-                    (
-                        self.cast_expression_to(lowered_left, &compared)?,
-                        self.cast_expression_to(lowered_right, &compared)?,
-                    )
-                } else {
-                    (lowered_left, lowered_right)
-                };
-                let allow_throw_exception =
-                    crate::compiler::selected_scalar_call::arithmetic_allows_throw(*op)
-                        .then(|| self.root_allow_throw_reference());
-                let op = lower_binary_operator(*op);
-                ContractExprKind::Binary {
-                    allow_throw_exception,
-                    left: lowered_left,
-                    op,
-                    right: lowered_right,
-                    decimal_overflow_policy: *decimal_overflow_policy,
                 }
             }
             ExprKind::Cast {
@@ -627,52 +584,19 @@ impl ScalarEmission<'_, '_> {
                 when_then,
                 else_expr,
             } => {
-                let mut operand = operand
+                let operand = operand
                     .as_deref()
                     .map(|item| self.lower_expression(item, visible))
                     .transpose()?;
-                let mut whens = Vec::with_capacity(when_then.len());
-                for (when, _) in when_then {
-                    whens.push(self.lower_expression(when, visible)?);
-                }
-                // A simple CASE compares its operand against every label, so
-                // the plan states the one type it compares them in the same
-                // way a comparison operator does -- an INT operand against a
-                // BIGINT label is one comparison, not two types.
-                if let Some(subject) = operand {
-                    let mut compared = self.expression_value_type(subject)?;
-                    for when in &whens {
-                        let when_type = self.expression_value_type(*when)?;
-                        compared = self.common_comparison_value_type(&compared, &when_type)?;
-                    }
-                    operand = Some(self.cast_expression_to(subject, &compared)?);
-                    for when in &mut whens {
-                        *when = self.cast_expression_to(*when, &compared)?;
-                    }
-                }
-                let lower_branch = |emission: &mut Self, item: &TypedExpr| {
-                    if operand.is_some() {
-                        emission.lower_expression_as(
-                            item,
-                            visible,
-                            &ty,
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                            None,
-                        )
-                    } else {
-                        // Searched CASE types each branch before lowering.
-                        // Actual input NULL promises still flow through the
-                        // emitted cast, definition and call rebind.
-                        emission.lower_expression(item, visible)
-                    }
-                };
                 let mut branches = Vec::with_capacity(when_then.len());
-                for ((_, then), when) in when_then.iter().zip(whens) {
-                    branches.push((when, lower_branch(self, then)?));
+                for (when, then) in when_then {
+                    let when = self.lower_expression(when, visible)?;
+                    let then = self.lower_expression(then, visible)?;
+                    branches.push((when, then));
                 }
                 let else_expr = else_expr
                     .as_deref()
-                    .map(|item| lower_branch(self, item))
+                    .map(|item| self.lower_expression(item, visible))
                     .transpose()?;
                 ContractExprKind::Case {
                     ieee_float_equality: *ieee_float_equality,
@@ -1778,14 +1702,6 @@ impl ScalarEmission<'_, '_> {
     }
 }
 
-pub(super) fn root_allow_throw_reference(used: &mut bool) -> SemanticParameterRef {
-    *used = true;
-    SemanticParameterRef {
-        id: SemanticParameterId::new(0),
-        expected_key: SemanticParameterKey::AllowThrowException,
-    }
-}
-
 pub(super) fn select_canonical_operational_request(
     functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
     control: &dyn PureCompileControl,
@@ -1937,16 +1853,8 @@ pub(super) fn common_comparison_value_type(
 }
 
 pub(super) fn freeze_semantic_parameters(
-    root_used: bool,
-    allow_throw_exception: bool,
-    mut parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
+    parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
 ) -> Result<SemanticParameters, ContractLoweringError> {
-    if root_used {
-        parameters.insert(
-            SemanticParameterId::new(0),
-            SemanticParameterValue::AllowThrowException(allow_throw_exception),
-        );
-    }
     SemanticParameters::try_new(parameters).map_err(|error| {
         ContractLoweringError::InvalidFunctionBinding {
             detail: error.to_string(),

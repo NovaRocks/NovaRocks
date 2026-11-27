@@ -149,3 +149,100 @@ fn binary_operator_resolution_uses_hidden_identity_and_exact_operand_types() {
         .unwrap();
     assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::MayRaise);
 }
+
+#[test]
+fn selected_internal_wide_subtraction_keeps_negative_operands_and_exact_widths() {
+    use arrow_array::builder::FixedSizeBinaryBuilder;
+    use arrow_array::{
+        ArrayRef, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int64Array,
+    };
+    use arrow_buffer::i256;
+    use arrow_schema::DataType;
+    use novarocks_functions::{
+        EvaluatedArgument, FunctionArgument, FunctionBindingRequest, FunctionResultType, Selection,
+    };
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    use std::sync::Arc;
+
+    let nominal = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(2, 16);
+    builder.append_value((-3_i128).to_be_bytes()).unwrap();
+    builder.append_value(i128::MIN.to_be_bytes()).unwrap();
+    let left: ArrayRef = Arc::new(builder.finish());
+    let signed: ArrayRef = Arc::new(Int64Array::from(vec![-7, 1]));
+    let decimal: ArrayRef = Arc::new(
+        Decimal128Array::from(vec![-7, 1])
+            .with_precision_and_scale(2, 1)
+            .unwrap(),
+    );
+    let catalog = builtin_engine_function_catalog();
+    let operator = OperatorFunction::Subtract;
+    for (right, result_type) in [
+        (signed, nominal.with_nullable(true).unwrap()),
+        (
+            decimal,
+            FunctionValueType::new(DataType::Decimal256(41, 1), true),
+        ),
+    ] {
+        let arguments = [
+            FunctionArgument::Value {
+                value_type: nominal.clone(),
+                constant: None,
+            },
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(right.data_type().clone(), false),
+                constant: None,
+            },
+        ];
+        let request = FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: 2,
+            expected_result_type: None,
+        };
+        let selected = catalog
+            .resolve_bound_trusted_by_id(
+                &operator.function_id(),
+                FunctionKind::Scalar,
+                request,
+                &Control,
+            )
+            .unwrap();
+        assert_eq!(
+            selected.selected.result_type,
+            FunctionResultType::Scalar(result_type)
+        );
+        let mut instance = super::scalar_rows::prepare_bound(catalog, selected, request);
+        let inputs = [
+            EvaluatedArgument::Column(&left),
+            EvaluatedArgument::Column(&right),
+        ];
+        let result = instance
+            .evaluate(Selection::all(2), &inputs, &super::scalar_rows::Control)
+            .unwrap();
+        assert!(result.errors().is_empty());
+        if let Some(values) = result
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+        {
+            assert_eq!(values.value(0), 4_i128.to_be_bytes());
+            assert_eq!(values.value(1), i128::MAX.to_be_bytes());
+        } else {
+            let values = result
+                .values()
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap();
+            assert_eq!(values.value(0), i256::from_i128(-23));
+            assert_eq!(
+                values.value(1),
+                i256::from_i128(i128::MIN) * i256::from_i128(10) - i256::ONE
+            );
+        }
+    }
+}

@@ -70,7 +70,6 @@ fn release_query_options() -> novarocks::QueryOptions {
         query_mem_limit: 512 << 20,
         runtime_filter_scan_wait_time_ms: Some(1500),
         runtime_filter_wait_timeout_ms: Some(3000),
-        allow_throw_exception: true,
 
         enable_scan_datacache: true,
         enable_populate_datacache: true,
