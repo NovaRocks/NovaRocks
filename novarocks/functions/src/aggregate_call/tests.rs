@@ -620,35 +620,34 @@ fn phase_contract_rejects_repeated_distinct_order_and_wrong_state_channels() {
         None,
         &CompileControl(None),
     ));
-    for phase in [AggregateKernelPhase::Single] {
-        let legal = AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            true,
-            keys(1),
-            None,
-            &CompileControl(None),
-        )
-        .unwrap();
-        assert!(legal.distinct());
-        assert_eq!(legal.order_keys(), keys(1).as_ref());
-        invalid_program(AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            false,
-            keys(0),
-            None,
-            &CompileControl(None),
-        ));
-        invalid_program(AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            false,
-            keys(1),
-            Some(i64_type(false)),
-            &CompileControl(None),
-        ));
-    }
+    let phase = AggregateKernelPhase::Single;
+    let legal = AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        true,
+        keys(1),
+        None,
+        &CompileControl(None),
+    )
+    .unwrap();
+    assert!(legal.distinct());
+    assert_eq!(legal.order_keys(), keys(1).as_ref());
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        false,
+        keys(0),
+        None,
+        &CompileControl(None),
+    ));
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        false,
+        keys(1),
+        Some(i64_type(false)),
+        &CompileControl(None),
+    ));
     let call = Fixture::new(&[i64_type(true)], &[], i64_type(false)).call();
     for phase in [
         AggregateKernelPhase::Intermediate,

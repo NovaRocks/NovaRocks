@@ -655,6 +655,10 @@ impl OperatorFactory for ProfiledCompiledFactory {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "The fallibly reserved worklist owns each prepared factory without a separate allocation"
+)]
 enum LinearPipelineStep<'a> {
     Project(ProgramNodeId),
     Aggregate(

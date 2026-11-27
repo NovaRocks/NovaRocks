@@ -443,7 +443,7 @@ pub(crate) fn record_frame<'a, E: ReaderGeometryFailure>(
     framing_require(
         range.end == input.len(),
         "constant IPC frame has trailing bytes",
-        admission.as_deref_mut(),
+        admission,
         work,
     )?;
     Ok(RecordFrame {

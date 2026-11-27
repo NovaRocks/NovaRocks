@@ -468,14 +468,13 @@ fn assert_approx_distinct_multiple_filtered_partials(explicit_accuracy: bool) {
         partial.binding.phase.sequence(),
         final_call.binding.phase.sequence()
     );
+    let partial_state = partial.binding.merge_state.as_ref().unwrap();
+    let final_state = final_call.binding.merge_state.as_ref().unwrap();
     assert_eq!(
-        partial.binding.state_format.as_str(),
+        partial_state.state_format.as_str(),
         "novarocks/approx_distinct/hll-xxhash64-parameterized-v2"
     );
-    assert_eq!(
-        final_call.binding.state_format,
-        partial.binding.state_format
-    );
+    assert_eq!(final_state.state_format, partial_state.state_format);
     assert!(partial.filter_root.is_some());
     assert!(final_call.filter_root.is_none());
     let imported = input_value(consumer, merge, final_call.arguments[0]);

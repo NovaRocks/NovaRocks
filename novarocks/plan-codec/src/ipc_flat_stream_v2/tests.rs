@@ -571,7 +571,6 @@ fn explicit_input_and_batch_envelopes_have_near_and_one_over_boundaries() {
             max_buffer_descriptors: 2,
             max_view_validation_bytes: 0,
         },
-        ..limits()
     };
     let control = Control::good();
     preflight_flat_constant_stream(&input, &field, exact, &verifier(), &control).unwrap();

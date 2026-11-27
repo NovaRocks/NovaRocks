@@ -3014,11 +3014,8 @@ mod tests {
 
     #[test]
     fn spi5g_write_default_wide_tree_uses_original_payload_budget() {
-        let wide = ConnectorColumnDefault::Array(
-            (0..=16384)
-                .map(|index| ConnectorColumnDefault::Int32(index as i32))
-                .collect(),
-        );
+        let wide =
+            ConnectorColumnDefault::Array((0..=16384).map(ConnectorColumnDefault::Int32).collect());
         facts_with_write_default(wide.clone(), 1 << 20)
             .expect("wide value fits the original payload budget");
         let error = facts_with_write_default(wide, 4096).expect_err("payload budget exceeded");
