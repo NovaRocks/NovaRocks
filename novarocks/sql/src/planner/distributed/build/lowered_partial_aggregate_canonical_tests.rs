@@ -414,7 +414,7 @@ fn partial_array_agg_refuses_original_order_channels() {
         kind: ExprKind::Constant(pool.value(ordinal).unwrap()),
         value_type: ty.clone(),
     };
-    let mut source = aggregate(
+    let source = aggregate(
         "array_agg",
         vec![expr(1)],
         vec![SortItem {
@@ -424,7 +424,7 @@ fn partial_array_agg_refuses_original_order_channels() {
         }],
         values(vec![], vec![vec![]]),
     );
-    let PhysicalPlanKind::HashAggregate(spec) = &mut source.kind else {
+    let PhysicalPlanKind::HashAggregate(spec) = &source.kind else {
         unreachable!()
     };
     assert!(
@@ -435,14 +435,28 @@ fn partial_array_agg_refuses_original_order_channels() {
             .aggregate
             .is_none()
     );
-    spec.mode = AggMode::Local;
-    let error = authored(&source, &Control::default()).unwrap_err();
+    let control = Control::default();
+    let mut work =
+        CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
     assert!(
-        error
-            .to_string()
-            .contains("ordered call and aggregate state capability differ"),
-        "{error:?}"
+        lower_aggregate_binding(&spec.aggregates[0], AggregatePhase::Single, &mut work)
+            .unwrap()
+            .merge_state
+            .is_none()
     );
+    assert!(matches!(
+        lower_aggregate_binding(
+            &spec.aggregates[0],
+            AggregatePhase::Partial {
+                sequence: novarocks_physical_plan::AggregateSequenceId::new(1)
+            },
+            &mut work
+        ),
+        Err(ContractLoweringError::InvalidAggregate {
+            detail: "ordered call and aggregate state capability differ"
+        })
+    ));
+    work.finish().unwrap();
 }
 
 #[test]
