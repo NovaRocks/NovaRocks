@@ -2684,6 +2684,8 @@ mod tests {
         assert!(fixture.create_instance(identity).is_err());
         drop(instance.release());
         drop(instance);
+        let original_work = fixture.owners.lock().unwrap().remove(&identity).unwrap();
+        test_backend_data_runtime().block_on(original_work.finish());
         let successor = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &successor,
