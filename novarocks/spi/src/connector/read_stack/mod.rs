@@ -68,7 +68,7 @@ pub use page_stream::{
     BudgetConsume, ConnectorOperationExit, ConnectorOperationTicket, ConnectorPageStream,
     ConnectorPollBudget, ConnectorSourceExit, ConnectorSourceExitProof, ConnectorSourceFailure,
     ConnectorSourceFailureEvent, ConnectorSourceFailureReceiver, ConnectorSourceOperations,
-    FileReaderFirstBatch, OwnedConnectorPageStream,
+    ConnectorWorkObservation, FileReaderFirstBatch, OwnedConnectorPageStream,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

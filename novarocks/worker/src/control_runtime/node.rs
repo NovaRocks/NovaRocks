@@ -2647,10 +2647,16 @@ impl WorkerNodeHost {
                     NodeHostRefusal::new("Root parent retirement wake", original)
                 })?;
         } else {
+            let memory_retirement = detached
+                .then(|| host.memory_retirement_after_detachment())
+                .flatten();
             drop(host);
             turn.release(progress.runnable).map_err(|original| {
                 NodeHostRefusal::new("Participation host turn release", original)
             })?;
+            if let Some((original, retired_at)) = memory_retirement {
+                original.retire_memory_after_scope_exit(retired_at);
+            }
         }
         Ok(progress)
     }

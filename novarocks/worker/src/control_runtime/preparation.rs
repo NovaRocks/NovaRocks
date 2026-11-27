@@ -173,6 +173,7 @@ pub(crate) struct PreparationCustody(Arc<Custody>);
 #[must_use = "The actual preparation body or unused input must exit explicitly"]
 pub(crate) struct PreparationJob {
     custody: PreparationCustody,
+    observation: Option<novarocks_memory::lane::LaneShards>,
     active: bool,
 }
 pub(crate) enum PreparationOutcome<T> {
@@ -428,6 +429,7 @@ impl PreparationCustody {
         let owner = Self(custody);
         let job = PreparationJob {
             custody: owner.clone(),
+            observation: None,
             active: true,
         };
         (owner, job)
@@ -700,6 +702,20 @@ impl PreparationCustody {
     }
 }
 impl PreparationJob {
+    pub(crate) fn set_memory_observation(
+        &mut self,
+        observation: Option<novarocks_memory::lane::LaneShards>,
+    ) {
+        self.observation = observation;
+    }
+
+    fn observe<T>(&self, work: impl FnOnce() -> T) -> T {
+        match &self.observation {
+            Some(owner) => owner.run(work),
+            None => work(),
+        }
+    }
+
     pub(super) fn key(&self) -> Key {
         self.custody.key()
     }
@@ -711,51 +727,53 @@ impl PreparationJob {
         host: impl FnOnce(TaskCreationInput, PreparationParent) -> T,
     ) -> PreparationOutcome<T> {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            if self.custody.0.stop.is_set() {
-                drop(host);
-                drop(self.custody.take_input());
-                return PreparationOutcome::TaskStopped;
-            }
-            let start = self
-                .custody
-                .0
-                .state
-                .lock()
-                .expect("preparation custody lock")
-                .work
-                .as_mut()
-                .expect("preparation work")
-                .start();
-            match start {
-                Ok(()) if !self.custody.0.stop.is_set() => {
-                    if let Some(children) = self.custody.host_children()
-                        && let Err(error) = children.bind_runtime(
+            self.observe(|| {
+                if self.custody.0.stop.is_set() {
+                    drop(host);
+                    drop(self.custody.take_input());
+                    return PreparationOutcome::TaskStopped;
+                }
+                let start = self
+                    .custody
+                    .0
+                    .state
+                    .lock()
+                    .expect("preparation custody lock")
+                    .work
+                    .as_mut()
+                    .expect("preparation work")
+                    .start();
+                match start {
+                    Ok(()) if !self.custody.0.stop.is_set() => {
+                        if let Some(children) = self.custody.host_children()
+                            && let Err(error) = children.bind_runtime(
+                                self.custody.0.parent.clone(),
+                                self.custody.0.pending.clone(),
+                            )
+                        {
+                            drop(host);
+                            drop(self.custody.take_input());
+                            return PreparationOutcome::StartRefused(error);
+                        }
+                        PreparationOutcome::Returned(host(
+                            self.custody
+                                .take_input()
+                                .expect("one actual preparation input"),
                             self.custody.0.parent.clone(),
-                            self.custody.0.pending.clone(),
-                        )
-                    {
+                        ))
+                    }
+                    Ok(()) => {
                         drop(host);
                         drop(self.custody.take_input());
-                        return PreparationOutcome::StartRefused(error);
+                        PreparationOutcome::TaskStopped
                     }
-                    PreparationOutcome::Returned(host(
-                        self.custody
-                            .take_input()
-                            .expect("one actual preparation input"),
-                        self.custody.0.parent.clone(),
-                    ))
+                    Err(error) => {
+                        drop(host);
+                        drop(self.custody.take_input());
+                        PreparationOutcome::StartRefused(error)
+                    }
                 }
-                Ok(()) => {
-                    drop(host);
-                    drop(self.custody.take_input());
-                    PreparationOutcome::TaskStopped
-                }
-                Err(error) => {
-                    drop(host);
-                    drop(self.custody.take_input());
-                    PreparationOutcome::StartRefused(error)
-                }
-            }
+            })
         }));
         let outcome = match result {
             Ok(outcome) => {
@@ -774,7 +792,9 @@ impl PreparationJob {
                 // A rejected start can unwind while disposing the callback,
                 // leaving its input in original custody. Dispose separately.
                 let input = self.custody.take_input();
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(input))) {
+                if let Err(payload) =
+                    catch_unwind(AssertUnwindSafe(|| self.observe(|| drop(input))))
+                {
                     self.custody.unresolved(Some((1, payload)));
                 }
                 self.custody.observe_body(false);
@@ -809,7 +829,7 @@ impl PreparationJob {
     #[cfg(test)]
     pub(crate) fn dispose(mut self) -> bool {
         let input = self.custody.take_input();
-        let result = catch_unwind(AssertUnwindSafe(|| drop(input)));
+        let result = catch_unwind(AssertUnwindSafe(|| self.observe(|| drop(input))));
         let exited = match result {
             Ok(()) => true,
             Err(payload) => {

@@ -451,6 +451,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         &mut self,
         executor: IoExecutor,
         runtime_error: Arc<RuntimeErrorState>,
+        observation: Option<&novarocks_memory::lane::LaneShards>,
     ) -> ExecutionResult<()> {
         if self.join.is_some() {
             return Ok(());
@@ -473,8 +474,12 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         self.runtime_error = Some(runtime_error.clone());
         // Install the original guard before the executor can cancel an unpolled
         // task. Its receiver already owns every accepted queued command.
-        let frame = WriterActorFrame::new(start, shared, config, runtime_error.clone());
-        self.join = Some(executor.spawn(task, supervise_actor(frame))?);
+        self.join = Some(
+            executor.spawn_with_memory_observation(task, observation, || {
+                let frame = WriterActorFrame::new(start, shared, config, runtime_error.clone());
+                supervise_actor(frame)
+            })?,
+        );
         Ok(())
     }
 
@@ -2383,6 +2388,7 @@ pub(crate) mod tests {
             .bind(
                 runtime.services().sink_io().clone(),
                 Arc::new(RuntimeErrorState::default()),
+                None,
             )
             .expect("bind writer actor");
         owner.request_finish().expect("request writer finish");
@@ -2468,7 +2474,11 @@ pub(crate) mod tests {
         owner.set_mem_tracker(Arc::clone(&tracker));
         let runtime = runtime();
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         (owner, error, tracker, runtime)
     }
@@ -2911,7 +2921,7 @@ pub(crate) mod tests {
         );
         owner.set_mem_tracker(tracker.clone());
         owner
-            .bind(runtime.services().sink_io().clone(), error.clone())
+            .bind(runtime.services().sink_io().clone(), error.clone(), None)
             .unwrap();
         let _release = ReleaseGate(gate.clone());
         let values_drops = Arc::new(AtomicUsize::new(0));
@@ -3722,7 +3732,11 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .unwrap();
         owner.request_finish().unwrap();
         wait_until(|| started.load(Ordering::Acquire));
@@ -3801,7 +3815,11 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         wait_until(|| started.load(Ordering::Relaxed) == 1);
 
@@ -3861,7 +3879,11 @@ pub(crate) mod tests {
         );
         owner.set_mem_tracker(Arc::clone(&tracker));
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         let input = batch(2);
         let bytes = crate::exec::chunk::record_batch_bytes(&input);
@@ -3933,7 +3955,11 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         owner.request_finish().expect("request finish");
 
@@ -4001,7 +4027,11 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         wait_until(|| opened.load(Ordering::Acquire));
         owner.request_abort();
@@ -4223,7 +4253,11 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner
-            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::clone(&error),
+                None,
+            )
             .expect("bind async writer");
         wait_until(|| opened.load(Ordering::Acquire));
         let started = Instant::now();
@@ -4352,7 +4386,7 @@ pub(crate) mod tests {
                 Box::new(|rows, _| Ok(rows)),
             );
             owner
-                .bind(runtime.services().sink_io().clone(), signal.clone())
+                .bind(runtime.services().sink_io().clone(), signal.clone(), None)
                 .unwrap();
             wait_until(|| opened.load(Ordering::Acquire));
             if required {
@@ -4539,7 +4573,7 @@ pub(crate) mod tests {
         );
         owner.set_mem_tracker(tracker.clone());
         owner
-            .bind(runtime.services().sink_io().clone(), signal.clone())
+            .bind(runtime.services().sink_io().clone(), signal.clone(), None)
             .unwrap();
         let batch = batch(3);
         let original = Arc::downgrade(batch.column(0));
@@ -4819,7 +4853,7 @@ pub(crate) mod tests {
                 std::panic::panic_any(payload);
             }));
             owner
-                .bind(runtime.services().sink_io().clone(), signal.clone())
+                .bind(runtime.services().sink_io().clone(), signal.clone(), None)
                 .unwrap();
             owner.enqueue(actual, bytes).unwrap();
             let notification = if runtime_notice {
@@ -4911,7 +4945,7 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         owner.set_mem_tracker(tracker.clone());
-        owner.bind(executor.clone(), signal.clone()).unwrap();
+        owner.bind(executor.clone(), signal.clone(), None).unwrap();
         let factory = try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
             tracker.clone(),
@@ -5331,7 +5365,7 @@ pub(crate) mod tests {
                 }),
             );
             owner
-                .bind(runtime.services().sink_io().clone(), signal.clone())
+                .bind(runtime.services().sink_io().clone(), signal.clone(), None)
                 .unwrap();
             let input = batch(3);
             let bytes = crate::exec::chunk::record_batch_bytes(&input);

@@ -493,6 +493,11 @@ impl RuntimeState {
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
     }
+
+    /// Observation from the binding checked when the original Task was prepared.
+    pub fn memory_observation(&self) -> Option<&novarocks_memory::lane::LaneShards> {
+        self.query_memory().map(|binding| binding.observation())
+    }
     pub fn with_runtime_filter_session(mut self, session: Option<RuntimeFilterSessionRef>) -> Self {
         self.runtime_filter_session = session;
         self

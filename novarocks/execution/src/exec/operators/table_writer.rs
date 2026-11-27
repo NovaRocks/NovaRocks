@@ -666,7 +666,10 @@ impl OperatorLifecycle for TableWriterOperator {
         let result = state
             .sink_io_executor()
             .map_err(crate::runtime::task::ExecutionFailure::from)
-            .and_then(|executor| self.writer.bind(executor, state.error_state()));
+            .and_then(|executor| {
+                self.writer
+                    .bind(executor, state.error_state(), state.memory_observation())
+            });
         if result.is_err() {
             self.state = TableWriterState::Failed;
         }

@@ -233,7 +233,7 @@ use source_operations::StopRequest;
 pub use source_operations::{
     ConnectorOperationExit, ConnectorOperationTicket, ConnectorSourceExit,
     ConnectorSourceExitProof, ConnectorSourceFailure, ConnectorSourceFailureEvent,
-    ConnectorSourceFailureReceiver, ConnectorSourceOperations,
+    ConnectorSourceFailureReceiver, ConnectorSourceOperations, ConnectorWorkObservation,
 };
 
 #[cfg(test)]

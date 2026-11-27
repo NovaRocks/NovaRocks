@@ -61,6 +61,49 @@ fn resolve_log_filter(config: &NovaRocksConfig) -> String {
         })
 }
 
+#[derive(Clone, Copy)]
+struct MemoryThreadRoles {
+    data: novarocks_memory::attribution::ThreadRole,
+    scan: novarocks_memory::attribution::ThreadRole,
+}
+
+fn memory_thread_roles() -> MemoryThreadRoles {
+    use novarocks_memory::attribution::{freeze_thread_roles, register_thread_role};
+    static ROLES: std::sync::OnceLock<MemoryThreadRoles> = std::sync::OnceLock::new();
+    *ROLES.get_or_init(|| {
+        let roles = MemoryThreadRoles {
+            data: register_thread_role("data_runtime").expect("process data thread role"),
+            scan: register_thread_role("scan_io").expect("process scan thread role"),
+        };
+        for name in [
+            "driver",
+            "root_producer",
+            "worker_host",
+            "native_rpc",
+            "management_http",
+            "scan_control",
+        ] {
+            register_thread_role(name).expect("fixed process memory role");
+        }
+        freeze_thread_roles();
+        roles
+    })
+}
+
+fn start_backend_scan_io(
+    config: &NovaRocksConfig,
+    authority: &MemoryAuthority,
+) -> anyhow::Result<ScanIoRuntime> {
+    let owner = authority.root().create_lane_shards();
+    ScanIoRuntime::start_observed(
+        &config.runtime,
+        novarocks_spi::connector::read_stack::ConnectorWorkObservation::new(move |step| {
+            owner.run(step)
+        }),
+        Some(memory_thread_roles().scan),
+    )
+}
+
 fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runtime> {
     logging::init_with_level(
         &resolve_log_filter(config),
@@ -73,11 +116,16 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
     memory_observation::log_installed();
     memory_observation::log_allocator_configuration();
     memory_limit::log_visible_memory();
+    let role = memory_thread_roles().data;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(config.runtime.actual_data_runtime_threads().max(1))
         .max_blocking_threads(config.runtime.data_runtime_max_blocking_threads.max(1))
         .thread_name("novarocks-data-runtime")
+        .on_thread_start(move || {
+            novarocks_memory::attribution::set_current_thread_role(role)
+                .expect("data runtime thread can install its process memory role");
+        })
         .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
@@ -162,7 +210,7 @@ fn run_backend(
         &role.config,
         runtime.handle().clone(),
     )?;
-    let scan_io = ScanIoRuntime::start(&role.config.runtime)?;
+    let scan_io = start_backend_scan_io(&role.config, &memory_authority)?;
     let backend = match composition::compose_backend_server_config(
         &role.config,
         build,
@@ -191,7 +239,8 @@ fn run_backend(
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
         backend.native_ingress.message_limits(),
-    );
+    )
+    .with_transport_memory_observation(backend.memory_authority.root().create_lane_shards());
     let primary = runtime
         .block_on(crate::roles::backend::run_until_shutdown(
             backend,
@@ -252,7 +301,7 @@ async fn run_all_in_one(
         #[cfg(novarocks_dev_controls)]
         fe.test_session.clone(),
     )?;
-    let scan_io = ScanIoRuntime::start(&be.config.runtime)?;
+    let scan_io = start_backend_scan_io(&be.config, &memory_authority)?;
     let backend = match composition::compose_backend_server_config(
         &be.config,
         build,
@@ -279,7 +328,8 @@ async fn run_all_in_one(
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
         backend.native_ingress.message_limits(),
-    );
+    )
+    .with_transport_memory_observation(backend.memory_authority.root().create_lane_shards());
     let backend_scan_io = scan_io.services();
     let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);

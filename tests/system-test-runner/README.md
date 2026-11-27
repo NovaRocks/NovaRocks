@@ -246,7 +246,7 @@ pass and transport supervisor composition tests, not by these scenarios.
 
 ### 内存归属观测
 
-默认场景 `memory-attribution/observation-families` 启动原生 1FE+3BE，验证分布式查询及连接退出取消前后的每个 BE `/metrics`。证据写入场景目录的 `memory-attribution.json`，关联独立 PID 与 HTTP endpoint；两个进程尺寸段、固定归属分类、记录状态、故障与批量采样族均须存在。S1 未接生产观测 owner，query/residual/service 物理归属事实为零，资金域的生命周期记录独立存在；256 条 immortal unattributed 记录由角色与栈分片组成，`unattributed_bytes{role="unknown"}` 大于零。资金区与观测区分别导出容量、active/residual_retained/pending_reclaim 占用及残留记录上的 tagged/R1 small 字节，两区容量加永生记录数等于总容量；七类归属故障为零。签名的对账、账本盲区及残留字节为独立采样，不要求在并发 scrape 期间瞬时归零。
+默认场景 `memory-attribution/observation-families` 启动原生 1FE+3BE，验证分布式结果、真实取消、客户端和 Worker 资源结清。证据写入 `memory-attribution.json`，绑定独立 BE 进程身份并保存各 BE 原始 Prometheus 采样。生产接线须为具名 Native 传输服务取得观察分片，场景检查其覆盖并记录实际有符号 tagged 字节。进程尺寸段、归属分类、记录状态、故障和独立采样口径由原指标测试覆盖。此场景的主动查询与取消证据不充当 G2 的数值判据。
 
 ## 迁入的显式功能保护与维护频率
 

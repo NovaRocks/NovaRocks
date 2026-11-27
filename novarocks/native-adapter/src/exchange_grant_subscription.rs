@@ -42,6 +42,8 @@ use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureRe
 use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeStreamFacts, ExchangeUnitCloseDisposition,
 };
+use novarocks_memory::attribution::future::AttributedFuture;
+use novarocks_memory::lane::LaneShards;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as wire;
 use novarocks_task_codec::exchange_unit_codec::{self as codec, ExchangeProcessPair};
@@ -169,6 +171,7 @@ struct PeerFeed {
 pub(crate) struct ExchangeGrantPublisher {
     port: Arc<dyn ExchangeReceiverPort>,
     peers: Mutex<BTreeMap<BackendProcessId, PeerFeed>>,
+    observation: Option<LaneShards>,
 }
 
 struct PublisherListener(Weak<ExchangeGrantPublisher>);
@@ -185,7 +188,12 @@ impl ExchangeUnitStateListener for PublisherListener {
             .get(&observation.stream.source().task().backend_process_id())
             .and_then(|peer| peer.active.upgrade());
         if let Some(feed) = feed {
-            feed.push(observation);
+            // The caller can be a query's decode or consumption turn. The
+            // per-peer feed holds changes from any of that peer's queries.
+            match &publisher.observation {
+                Some(owner) => owner.run(|| feed.push(observation)),
+                None => feed.push(observation),
+            }
         }
     }
 }
@@ -193,13 +201,23 @@ impl ExchangeUnitStateListener for PublisherListener {
 impl ExchangeGrantPublisher {
     /// Called only when unit observation is installed, never on the legacy
     /// startup path. A missing receiver capability remains an exact refusal.
-    pub(crate) fn install(port: Arc<dyn ExchangeReceiverPort>) -> Result<Arc<Self>, FailureFact> {
-        let publisher = Arc::new(Self {
-            port: Arc::clone(&port),
-            peers: Mutex::default(),
-        });
-        port.set_unit_state_listener(Arc::new(PublisherListener(Arc::downgrade(&publisher))))?;
-        Ok(publisher)
+    pub(crate) fn install(
+        port: Arc<dyn ExchangeReceiverPort>,
+        observation: Option<&LaneShards>,
+    ) -> Result<Arc<Self>, FailureFact> {
+        let install = || {
+            let publisher = Arc::new(Self {
+                port: Arc::clone(&port),
+                peers: Mutex::default(),
+                observation: observation.cloned(),
+            });
+            port.set_unit_state_listener(Arc::new(PublisherListener(Arc::downgrade(&publisher))))?;
+            Ok(publisher)
+        };
+        match observation {
+            Some(owner) => owner.run(install),
+            None => install(),
+        }
     }
 
     fn reclaim_inactive_peers(&self) {
@@ -557,11 +575,24 @@ impl ExchangeGrantClients {
         })
     }
 
+    pub(crate) fn watch(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: ExchangeStreamIdentity,
+        wake: ExchangeGrantWake,
+    ) -> Result<(), FailureFact> {
+        let watch = || self.watch_peer(destination, stream, wake);
+        match self.runtime.transport_memory_observation() {
+            Some(owner) => owner.run(watch),
+            None => watch(),
+        }
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "Peer subscriptions belong to the process-shared exchange service; see ADR-0218."
     )]
-    pub(crate) fn watch(
+    fn watch_peer(
         &self,
         destination: RuntimeEndpoint,
         stream: ExchangeStreamIdentity,
@@ -625,14 +656,25 @@ impl ExchangeGrantClients {
             let runtime = self.runtime.clone();
             let timeout = self.timeout;
             let generations = Arc::clone(&self.generations);
-            self.runtime.handle().spawn(async move {
-                run_client(runtime, timeout, generations, peer).await;
-            });
+            let run = move || run_client(runtime, timeout, generations, peer);
+            let handle = self.runtime.handle();
+            match self.runtime.transport_memory_observation() {
+                Some(owner) => handle.spawn(AttributedFuture::new(owner.clone(), run)),
+                None => handle.spawn(run()),
+            };
         }
         Ok(())
     }
 
     pub(crate) fn forget(&self, stream: ExchangeStreamIdentity) {
+        let forget = || self.forget_peer_watch(stream);
+        match self.runtime.transport_memory_observation() {
+            Some(owner) => owner.run(forget),
+            None => forget(),
+        }
+    }
+
+    fn forget_peer_watch(&self, stream: ExchangeStreamIdentity) {
         let receiver = stream.destination().backend_process_id();
         let mut peers = self.peers.lock().expect("exchange grant client peers");
         let Some(peer) = peers.get(&receiver).cloned() else {

@@ -188,7 +188,7 @@ pub(crate) mod test_support {
                     )
                 })
                 .collect();
-            self.port.bind_unit_receiver(key, streams, self.state(key.task_key).error_state().clone(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+            self.port.bind_unit_receiver(key, streams, self.state(key.task_key).error_state().clone(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64, None).unwrap();
         }
         pub(crate) fn destination(
             &self,

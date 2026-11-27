@@ -89,8 +89,15 @@ impl ExchangeReceiverPort for TestPort {
         streams: Vec<ExchangeStreamIdentity>,
         control: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
         grantable: u64,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<(), ExchangeFailure> {
-        UnavailableExchangeReceiverPort.bind_unit_receiver(key, streams, control, grantable)
+        UnavailableExchangeReceiverPort.bind_unit_receiver(
+            key,
+            streams,
+            control,
+            grantable,
+            observation,
+        )
     }
 
     fn register_unit_demand(
@@ -283,7 +290,7 @@ async fn snapshot_pages_complete_before_retirement_and_coalesced_live_deltas() {
             .unwrap()
             .insert(sibling(base, node), facts(0, 1));
     }
-    let publisher = ExchangeGrantPublisher::install(port.clone()).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port.clone(), None).unwrap();
     let mut stream = publisher.subscribe(subscription(base, 1), None).unwrap();
     let first = stream.next().await.unwrap().unwrap();
     assert!(first.snapshot && !first.snapshot_complete);
@@ -315,7 +322,7 @@ async fn higher_generation_stops_old_stream_and_delayed_lower_cannot_replace_it(
     let base = base_stream();
     let port = Arc::new(TestPort::default());
     port.states.lock().unwrap().insert(base, facts(0, 1));
-    let publisher = ExchangeGrantPublisher::install(port.clone()).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port.clone(), None).unwrap();
     let mut old = publisher.subscribe(subscription(base, 4), None).unwrap();
     let mut current = publisher.subscribe(subscription(base, 6), None).unwrap();
     for generation in [4, 5, 6] {
@@ -341,7 +348,7 @@ async fn higher_generation_stops_old_stream_and_delayed_lower_cannot_replace_it(
 async fn pending_facts_survive_a_slow_subscriber_and_retirement_without_rebuild() {
     let base = base_stream();
     let port = Arc::new(TestPort::default());
-    let publisher = ExchangeGrantPublisher::install(port.clone()).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port.clone(), None).unwrap();
     let mut stream = publisher.subscribe(subscription(base, 1), None).unwrap();
     // Cross the former 8192-entry quota with one coalesced fact per stream.
     let stream_count = 8193;
@@ -385,7 +392,7 @@ async fn pending_facts_survive_a_slow_subscriber_and_retirement_without_rebuild(
 async fn delta_pages_rotate_past_continuously_refreshed_lower_streams() {
     let base = base_stream();
     let port = Arc::new(TestPort::default());
-    let publisher = ExchangeGrantPublisher::install(port.clone()).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port.clone(), None).unwrap();
     let mut stream = publisher.subscribe(subscription(base, 1), None).unwrap();
     let retired = sibling(base, PAGE);
     let terminal = ExchangeStreamFacts {
@@ -426,7 +433,7 @@ async fn delta_pages_rotate_past_continuously_refreshed_lower_streams() {
 fn observation_peer_metadata_uses_lifecycles_without_a_second_peer_quota() {
     let base = base_stream();
     let port = Arc::new(TestPort::default());
-    let publisher = ExchangeGrantPublisher::install(port).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port, None).unwrap();
     // More than the former observation-layer limit; physical connection
     // admission belongs to the existing Native transport owner.
     let feeds = (0..33)
@@ -482,7 +489,7 @@ fn out_of_order_full_observations_merge_watermarks_and_sticky_termination() {
 async fn contradictory_final_change_is_typed_refusal_not_reconnect() {
     let base = base_stream();
     let port = Arc::new(TestPort::default());
-    let publisher = ExchangeGrantPublisher::install(port.clone()).unwrap();
+    let publisher = ExchangeGrantPublisher::install(port.clone(), None).unwrap();
     let mut stream = publisher.subscribe(subscription(base, 1), None).unwrap();
     port.observe(
         base,
@@ -910,6 +917,17 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
     };
     use novarocks_native_trust::{NativeIncomingAdapter, NativeProcessIdentity};
     use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    let authority = crate::backend_test_support::test_memory_authority();
+    let peer_service = authority
+        .create_account(
+            novarocks_memory::AccountKind::Service,
+            novarocks_memory::ExternalRef::NONE,
+        )
+        .unwrap();
+    let peer_observation = peer_service.create_lane_shards();
+    let expected_origin = peer_observation.explicit_owner().reference().unwrap();
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
         ExchangeSource::new(base.source().task(), base.source().task_key(), 0),
@@ -979,7 +997,8 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         trust,
         crate::BackendNativeTransport::Plaintext,
         crate::TransportMessageLimits::DEFAULT,
-    );
+    )
+    .with_transport_memory_observation(peer_observation);
     let client = NativeRpcClient::new_backend_endpoint(
         runtime.clone(),
         RuntimeEndpoint::from_socket_addr(server.bound_addr())
@@ -1016,10 +1035,21 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
                 if let ExchangeGrantNotice::Facts(facts) = notice
                     && let Some(sender) = notice_tx.lock().unwrap().take()
                 {
-                    let _ = sender.send(facts);
+                    let allocator = novarocks_memory::attribution::AttributingAllocator::new(System);
+                    let layout = Layout::from_size_align(1024, 8).unwrap();
+                    // SAFETY: use the exact same allocator and layout to release below.
+                    let block = unsafe { allocator.alloc(layout) };
+                    assert!(!block.is_null());
+                    // SAFETY: the tagged allocation contains the initialized source tail.
+                    let source = unsafe { novarocks_memory::lane::RecordRef::read(block.add(layout.size())) };
+                    // SAFETY: release that one original block with its original layout.
+                    unsafe { allocator.dealloc(block, layout) };
+                    let _ = sender.send((facts, source));
                 }
             })).unwrap();
-            assert!(notice_rx.await.unwrap().sender_stopped);
+            let (facts, source) = notice_rx.await.unwrap();
+            assert!(facts.sender_stopped);
+            assert_eq!(source, expected_origin, "the original shared peer task observes its own work");
             let generation = clients.generations.load(Ordering::Acquire);
             assert!(generation > prior); prior = generation;
             clients.forget(stream);
@@ -1319,7 +1349,7 @@ fn real_unit_receiver_fixture(
         }
     })
     .unwrap();
-    port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024)
+    port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024, None)
         .unwrap();
     let registry_key = ExchangeKey {
         task_key_hi: key.task_key.high(),

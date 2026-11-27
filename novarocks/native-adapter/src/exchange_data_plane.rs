@@ -37,6 +37,7 @@ pub struct NativeExchangeDataPlane {
     receiver_port: Arc<dyn ExchangeReceiverPort>,
     unit_capabilities: Arc<TaskInboundCapabilities>,
     unit_backend: novarocks_types::BackendProcessId,
+    transport_observation: Option<novarocks_memory::lane::LaneShards>,
     unit_publisher: Arc<
         OnceLock<
             Result<
@@ -53,10 +54,20 @@ impl NativeExchangeDataPlane {
         capabilities: Arc<TaskInboundCapabilities>,
         backend: novarocks_types::BackendProcessId,
     ) -> Self {
+        Self::new_with_observation(receiver_port, capabilities, backend, None)
+    }
+
+    pub(crate) fn new_with_observation(
+        receiver_port: Arc<dyn ExchangeReceiverPort>,
+        capabilities: Arc<TaskInboundCapabilities>,
+        backend: novarocks_types::BackendProcessId,
+        transport_observation: Option<novarocks_memory::lane::LaneShards>,
+    ) -> Self {
         Self {
             receiver_port,
             unit_capabilities: capabilities,
             unit_backend: backend,
+            transport_observation,
             unit_publisher: Arc::new(OnceLock::new()),
         }
     }
@@ -71,9 +82,10 @@ impl NativeExchangeDataPlane {
     > {
         self.unit_publisher
             .get_or_init(|| {
-                crate::exchange_grant_subscription::ExchangeGrantPublisher::install(Arc::clone(
-                    &self.receiver_port,
-                ))
+                crate::exchange_grant_subscription::ExchangeGrantPublisher::install(
+                    Arc::clone(&self.receiver_port),
+                    self.transport_observation.as_ref(),
+                )
             })
             .clone()
     }

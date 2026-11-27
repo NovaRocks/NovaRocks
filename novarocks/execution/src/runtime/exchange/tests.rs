@@ -511,6 +511,7 @@ impl UnitFixture {
                     task.view(TaskFailurePhase::Execution),
                 ))),
                 novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
+                None,
             )
             .unwrap();
         Self {

@@ -586,7 +586,10 @@ impl DriverRunner {
         &mut self,
     ) -> Result<Option<PendingFinishWait>, crate::runtime::observable::ObservableCapacityError>
     {
-        self.driver.pending_finish_wait_on_worker()
+        let observation = self.task_ctx.runtime_state().memory_observation();
+        crate::runtime::execution_services::run_with_memory_observation(observation, || {
+            self.driver.pending_finish_wait_on_worker()
+        })
     }
 
     pub(crate) fn operator_terminal_signal_delivered(&self) -> bool {
@@ -722,7 +725,12 @@ impl GlobalDriverExecutor {
                 thread::Builder::new()
                     .name(format!("novarocks-driver-{index}"))
                     .stack_size(DRIVER_THREAD_STACK_BYTES)
-                    .spawn(move || worker_loop(shared_cloned))
+                    .spawn(move || {
+                        novarocks_memory::attribution::roles::enter_registered_thread_role(
+                            "driver",
+                        );
+                        worker_loop(shared_cloned)
+                    })
                     .expect("spawn pipeline driver worker"),
             );
         }
@@ -1120,21 +1128,25 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
             continue;
         }
 
-        let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            task.driver.process(task.time_slice)
-        }))
-        .unwrap_or_else(|payload| {
-            if crate::exec::operators::scan::is_scan_exit_unwind(payload.as_ref()) {
-                // No output is held in a local Scan frame at this marker.
-                // Its once cleanup/health state is already saved. The next
-                // turn advances the original EOS and actual-exit observers.
-                return DriverState::Ready;
-            }
-            let context = Arc::clone(&task.task_ctx);
-            task.driver.capture_process_panic(payload, |cause| {
-                context.set_final_status(cause);
-            })
-        });
+        let observation = task.task_ctx.runtime_state().memory_observation();
+        let state =
+            crate::runtime::execution_services::run_with_memory_observation(observation, || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task.driver.process(task.time_slice)
+                }))
+                .unwrap_or_else(|payload| {
+                    if crate::exec::operators::scan::is_scan_exit_unwind(payload.as_ref()) {
+                        // No output is held in a local Scan frame at this marker.
+                        // Its once cleanup/health state is already saved. The next
+                        // turn advances the original EOS and actual-exit observers.
+                        return DriverState::Ready;
+                    }
+                    let context = Arc::clone(&task.task_ctx);
+                    task.driver.capture_process_panic(payload, |cause| {
+                        context.set_final_status(cause);
+                    })
+                })
+            });
 
         if shared.admission_closed.load(Ordering::Acquire) || task.completion.should_abort() {
             if let Some(task) =
@@ -1388,6 +1400,111 @@ mod tests {
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("injected driver panic")
         }
+    }
+
+    #[test]
+    fn m03a_driver_polls_and_destroys_each_task_under_its_own_binding() {
+        use crate::runtime::execution_services::test_attributed_allocation;
+        use crate::runtime::query_memory::QueryMemoryBinding;
+        use novarocks_memory::{
+            AccountKind, AuthorityConfig, ExternalRef, LaneShards, MemoryAuthority,
+        };
+        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+
+        struct ObservedSource {
+            owner: LaneShards,
+            observed: Arc<Mutex<Vec<(bool, bool)>>>,
+        }
+        impl ObservedSource {
+            fn observe(&self, drop: bool) {
+                let expected = self.owner.explicit_owner().reference().unwrap();
+                let actual = test_attributed_allocation();
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push((drop, actual == expected));
+            }
+        }
+        impl Drop for ObservedSource {
+            fn drop(&mut self) {
+                self.observe(true);
+            }
+        }
+        impl OperatorLifecycle for ObservedSource {
+            fn name(&self) -> &str {
+                "observed_source"
+            }
+        }
+        impl crate::exec::pipeline::shape::SourceKernel for ObservedSource {
+            fn poll_output(
+                &mut self,
+                _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
+            ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+                self.observe(false);
+                Ok(crate::exec::pipeline::step::StepResult::new(
+                    None,
+                    crate::exec::pipeline::step::NextStep::Finished,
+                    0,
+                ))
+            }
+        }
+
+        let authority = Arc::new(
+            MemoryAuthority::new(AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29)).unwrap(),
+        );
+        let executor = GlobalDriverExecutor::new(1);
+        let submit = |id| {
+            let account = authority
+                .create_account(AccountKind::Work, ExternalRef::NONE)
+                .unwrap();
+            let execution =
+                QueryExecutionId::new(QueryId::new(id, id), AttemptId::new(1).unwrap()).unwrap();
+            let binding =
+                QueryMemoryBinding::try_new(execution, authority.clone(), account).unwrap();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let source = ObservedSource {
+                owner: binding.observation().clone(),
+                observed: observed.clone(),
+            };
+            let runtime = Arc::new(RuntimeState::default().with_query_memory(Some(binding)));
+            let task_ctx = Arc::new(TaskContext::new(
+                None,
+                Arc::clone(&runtime),
+                None,
+                None,
+                None,
+                None,
+            ));
+            let completion = DriverGroupCompletion::new(1, runtime.error_state());
+            assert!(executor.submit(vec![DriverRunner::new(
+                PipelineDriver::new(
+                    1,
+                    vec![Box::new(crate::exec::pipeline::shape::Source::new(source))],
+                    None,
+                    Vec::new(),
+                    runtime,
+                    None,
+                ),
+                completion.clone(),
+                task_ctx,
+                Duration::from_millis(1),
+            )]));
+            (completion, observed)
+        };
+
+        let a = submit(31101);
+        let b = submit(31102);
+        for (completion, observed) in [a, b] {
+            assert!(wait_until(Duration::from_secs(5), || completion
+                .stopped_fact()
+                .is_some()));
+            completion.wait().unwrap();
+            assert_eq!(
+                observed.lock().unwrap().as_slice(),
+                &[(false, true), (true, true)]
+            );
+        }
+        executor.shutdown().unwrap();
     }
 
     #[test]

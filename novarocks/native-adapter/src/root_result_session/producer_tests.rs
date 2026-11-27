@@ -41,8 +41,11 @@ use novarocks_execution::runtime::task::io::{
 };
 use novarocks_execution::runtime::task_control::TaskExecutionControl;
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
 use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+use novarocks_memory::attribution::{ATTRIBUTION_TOKEN_BYTES, binding::flush_current};
+use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, LaneShards, MemoryAuthority};
 use novarocks_result_contract::{
     ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
     RenderPresentation, RootOutputContract, RootProfileId, ScalarField, ScalarRecord, ScalarSchema,
@@ -113,6 +116,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(output: FrozenRootOutput) -> Self {
+        Self::with_observation(output, crate::root_producer_pool::test_job_observation())
+    }
+
+    fn with_observation(output: FrozenRootOutput, observation: &LaneShards) -> Self {
         let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
         let health =
@@ -126,7 +133,7 @@ impl Fixture {
         )
         .unwrap();
         let (session, control, original_node) =
-            open_original(output, &pool, &budget, limits, &health);
+            open_original(output, &pool, &budget, limits, &health, observation);
         let channel = session.channel().clone();
         Self {
             pool,
@@ -146,6 +153,7 @@ fn open_original(
     budget: &Arc<ResultRetainedBudget>,
     limits: WorkerResultRetainedLimits,
     health: &Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    observation: &LaneShards,
 ) -> (
     Arc<NativeRootResultSession>,
     Arc<TaskExecutionControl>,
@@ -155,6 +163,7 @@ fn open_original(
     let pool = pool.clone();
     let budget = budget.clone();
     let body_health = health.clone();
+    let observation = observation.clone();
     let ((session, control), original_node) =
         in_original_preparation(task, health.clone(), move |preparation| {
             let session = open_root_in_preparation(
@@ -167,6 +176,7 @@ fn open_original(
                 budget,
                 limits,
                 body_health,
+                &observation,
             )
             .unwrap();
             // This producer component explicitly takes the original channel's
@@ -856,7 +866,16 @@ async fn unknown_actual_schema_refuses_before_producer_and_drops_chunk_before_cr
 
 #[tokio::test]
 async fn full_window_suspends_original_input_and_abort_exits_with_response_alias_held() {
-    let fixture = Fixture::new(client(1));
+    let authority = MemoryAuthority::new(AuthorityConfig::new(8 << 20, 8 << 20, 0)).unwrap();
+    let producer = authority
+        .create_account(AccountKind::Work, ExternalRef::NONE)
+        .unwrap()
+        .create_lane_shards();
+    let another_query = authority
+        .create_account(AccountKind::Work, ExternalRef::NONE)
+        .unwrap()
+        .create_lane_shards();
+    let fixture = Fixture::with_observation(client(1), &producer);
     let value = "q".repeat(3 << 20);
     let array: ArrayRef = Arc::new(StringArray::from(vec![value.as_str()]));
     let weak = Arc::downgrade(&array);
@@ -909,8 +928,15 @@ async fn full_window_suspends_original_input_and_abort_exits_with_response_alias
     let original_node = fixture._original_node.clone();
     drop(fixture);
     assert!(!channel.physical_idle());
-    drop(alias);
+    let before_release = producer.snapshot().tagged_bytes;
+    let expected = i128::from(NativeResultSupportGeometry::V1.root_segment_backing_capacity_bytes)
+        + ATTRIBUTION_TOKEN_BYTES as i128;
+    assert_eq!(before_release, expected);
+    another_query.run(|| drop(alias));
+    flush_current();
     wait_until(|| channel.physical_idle()).await;
+    assert_eq!(producer.snapshot().tagged_bytes, 0);
+    assert_eq!(another_query.snapshot().tagged_bytes, 0);
     shutdown(&pool).await;
     drop(original_node);
 }
@@ -1155,8 +1181,14 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         Arc::clone(&health),
     )
     .unwrap();
-    let (session, control, original_node) =
-        open_original(FrozenRootOutput::CountOnly, &pool, &budget, limits, &health);
+    let (session, control, original_node) = open_original(
+        FrozenRootOutput::CountOnly,
+        &pool,
+        &budget,
+        limits,
+        &health,
+        crate::root_producer_pool::test_job_observation(),
+    );
     let channel = session.channel().clone();
     assert_eq!(
         session.producer_exit_progress(),
@@ -1711,6 +1743,7 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
             &budget,
             limits,
             &health,
+            crate::root_producer_pool::test_job_observation(),
         );
         let channel = session.channel().clone();
         session.abort(ResultAbort::Cancelled(String::new()));

@@ -652,7 +652,7 @@ impl NativeParticipationHost {
 
         let context = self
             .queries
-            .establish_query_resources(execution_id, options.exec_mem_limit())
+            .establish_participation_query_resources(execution_id, options.exec_mem_limit(), issuer)
             .map_err(|error| {
                 HostRejection::from_domain(super::execution_host::failure_category(&error), error)
             })?;
@@ -2684,6 +2684,8 @@ mod tests {
         assert!(fixture.create_instance(identity).is_err());
         drop(instance.release());
         drop(instance);
+        let original_work = fixture.owners.lock().unwrap().remove(&identity).unwrap();
+        test_backend_data_runtime().block_on(original_work.finish());
         let successor = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &successor,
@@ -2748,6 +2750,8 @@ mod tests {
         let old_leases_released = fixture.query_leases() == 0;
         *fixture.catalog_factory.entered.lock().unwrap() = None;
         *fixture.catalog_factory.proceed.lock().unwrap() = None;
+        let original_work = fixture.owners.lock().unwrap().remove(&identity).unwrap();
+        test_backend_data_runtime().block_on(original_work.finish());
         let successor = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &successor,

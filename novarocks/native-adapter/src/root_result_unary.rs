@@ -345,6 +345,7 @@ impl Body for NativeRootUnaryBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_memory::attribution::AttributingAllocator;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::future::{Ready, poll_fn, ready};
@@ -377,7 +378,8 @@ mod tests {
     struct PrefixAllocationProbe;
 
     #[global_allocator]
-    static ALLOCATOR: PrefixAllocationProbe = PrefixAllocationProbe;
+    static ALLOCATOR: AttributingAllocator<PrefixAllocationProbe> =
+        AttributingAllocator::new(PrefixAllocationProbe);
 
     unsafe impl GlobalAlloc for PrefixAllocationProbe {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

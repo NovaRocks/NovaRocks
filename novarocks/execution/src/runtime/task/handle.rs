@@ -154,9 +154,15 @@ mod owner_tests {
             streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
             control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
             grantable_unit_bytes: u64,
+            observation: Option<novarocks_memory::lane::LaneShards>,
         ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-            self.delegate
-                .bind_unit_receiver(key, streams, control, grantable_unit_bytes)
+            self.delegate.bind_unit_receiver(
+                key,
+                streams,
+                control,
+                grantable_unit_bytes,
+                observation,
+            )
         }
         fn register_unit_demand(
             &self,
@@ -903,6 +909,7 @@ mod owner_tests {
                     Arc::new(owner.view(novarocks_execution_contract::TaskFailurePhase::Execution)),
                 )),
                 64 * 1024 * 1024,
+                None,
             )
             .unwrap();
             port.receive_unit(
@@ -1886,9 +1893,10 @@ mod owner_tests {
             streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
             control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
             grantable_unit_bytes: u64,
+            observation: Option<novarocks_memory::lane::LaneShards>,
         ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
             self.inner
-                .bind_unit_receiver(key, streams, control, grantable_unit_bytes)
+                .bind_unit_receiver(key, streams, control, grantable_unit_bytes, observation)
         }
         fn register_unit_demand(
             &self,

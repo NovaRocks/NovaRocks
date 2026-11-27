@@ -22,7 +22,7 @@
 use novarocks_execution::runtime::{
     mem_tracker::{self, MemTracker},
     profile::Profiler,
-    query_context::{QueryContext, QueryMemoryAccount, QueryMemoryAccountError, QueryTaskGuard},
+    query_context::{QueryContext, QueryMemoryAccountError, QueryTaskGuard},
     query_memory::{QueryMemoryBinding, QueryMemoryBindingError},
     task::{
         LocalTaskPrepareContext,
@@ -30,7 +30,7 @@ use novarocks_execution::runtime::{
     },
 };
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_memory::{AccountKind, ExternalRef, LimitDimension, MemoryAuthority};
+use novarocks_memory::{LimitDimension, MemoryAuthority};
 use novarocks_types::{QueryExecutionId, UniqueId};
 use std::sync::Arc;
 
@@ -79,12 +79,44 @@ impl NativeQueryContextRuntime {
         self.observation_controls.clone()
     }
 
-    /// Called by the original Participation instance during materialization.
-    /// The returned owner remains in that instance until its explicit Release.
+    #[cfg(test)]
     pub(crate) fn establish_query_resources(
         &self,
         execution: QueryExecutionId,
         limit: Option<i64>,
+    ) -> Result<Arc<QueryContext>, NativeTaskAdmissionError> {
+        self.establish_resources(execution, limit, |authority| {
+            use novarocks_memory::{AccountKind, ExternalRef};
+            let query = execution.query_id();
+            let account = authority.create_account(
+                AccountKind::Work,
+                ExternalRef::new(query.high() as u64, query.low() as u64),
+            )?;
+            Ok(
+                QueryMemoryBinding::try_new(execution, authority.clone(), account)
+                    .expect("fixture created this account on the current authority"),
+            )
+        })
+    }
+
+    pub(crate) fn establish_participation_query_resources(
+        &self,
+        execution: QueryExecutionId,
+        limit: Option<i64>,
+        issuer: &novarocks_worker::InstanceWorkIssuer,
+    ) -> Result<Arc<QueryContext>, NativeTaskAdmissionError> {
+        self.establish_resources(execution, limit, |authority| {
+            issuer.open_query_memory_binding(authority)
+        })
+    }
+
+    fn establish_resources(
+        &self,
+        execution: QueryExecutionId,
+        limit: Option<i64>,
+        open: impl FnOnce(
+            &Arc<MemoryAuthority>,
+        ) -> Result<QueryMemoryBinding, novarocks_memory::CapacityError>,
     ) -> Result<Arc<QueryContext>, NativeTaskAdmissionError> {
         let query = execution.query_id();
         let tracker = MemTracker::new_child(
@@ -96,29 +128,20 @@ impl NativeQueryContextRuntime {
                 .install_limit_once(limit)
                 .map_err(NativeTaskAdmissionError::Limit)?;
         }
-        let account = self
-            .memory_authority
-            .create_account(
-                AccountKind::Work,
-                ExternalRef::new(query.high() as u64, query.low() as u64),
-            )
-            .map_err(|error| {
-                NativeTaskAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(error))
-            })?;
+        let memory = open(&self.memory_authority).map_err(|error| {
+            NativeTaskAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(error))
+        })?;
         if let Some(limit) = limit {
             let bytes =
                 u64::try_from(limit).map_err(|_| NativeTaskAdmissionError::InvalidLimit(limit))?;
-            account.install_policy(bytes, LimitDimension::Work);
+            memory.account().install_policy(bytes, LimitDimension::Work);
         }
-        let memory = bind_query_memory(
-            execution,
-            self.memory_authority.clone(),
-            QueryMemoryAccount::new(execution, account),
-        )
-        .map_err(NativeTaskAdmissionError::Binding)?;
-        QueryContext::try_new(execution, tracker, memory)
-            .map(Arc::new)
-            .map_err(NativeTaskAdmissionError::Binding)
+        let observation = memory.observation().clone();
+        observation.run(|| {
+            QueryContext::try_new(execution, tracker, memory)
+                .map(Arc::new)
+                .map_err(NativeTaskAdmissionError::Binding)
+        })
     }
     fn validate_limit(
         &self,
@@ -295,17 +318,6 @@ impl NativeTaskAdmissionResources {
     }
 }
 
-// Account identity is evidence from the actual resource owner, not a new grant.
-fn bind_query_memory(
-    execution: QueryExecutionId,
-    authority: Arc<MemoryAuthority>,
-    owner: QueryMemoryAccount,
-) -> Result<QueryMemoryBinding, QueryMemoryBindingError> {
-    if owner.execution() != execution {
-        return Err(QueryMemoryBindingError::OwnerAttemptMismatch);
-    }
-    QueryMemoryBinding::try_new(execution, authority, owner.into_account())
-}
 #[cfg(test)]
 #[path = "native_query_memory_transport_tests.rs"]
 mod memory_transport_tests;

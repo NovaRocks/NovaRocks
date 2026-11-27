@@ -172,6 +172,7 @@ impl ExchangeSenderGroup {
         transmitter: Arc<dyn ExchangeFrameTransmitter>,
         scheduler: Arc<ExchangeUnitSendScheduler>,
         gates: Arc<ExchangeEdgeGates>,
+        observation: Option<&novarocks_memory::lane::LaneShards>,
     ) -> ExecutionResult<()> {
         let task = control
             .task_identity()
@@ -221,6 +222,7 @@ impl ExchangeSenderGroup {
                 measured.clone(),
                 scheduler.clone(),
                 sender_observable.clone(),
+                observation.cloned(),
             )
             .map_err(ExecutionFailure::from_domain)?;
             let failure = Arc::new(OnceLock::new());
@@ -692,7 +694,7 @@ mod tests {
                 max_unit_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
                 retry_delay: std::time::Duration::from_millis(10),
             }],
-            fixture.transport.clone(), fixture.runtime.exchange_unit_scheduler(), gates.clone(),
+            fixture.transport.clone(), fixture.runtime.exchange_unit_scheduler(), gates.clone(), None,
         ).unwrap();
         // The driver already observed Open. The real gate-owner operation can
         // run before either local publication boundary is entered.

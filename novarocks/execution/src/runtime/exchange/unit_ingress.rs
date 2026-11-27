@@ -33,6 +33,7 @@ use crate::runtime::task::io::exchange_unit::{
 use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeDecodeCommit, ExchangeStreamFacts, ExchangeUnitItem, ExchangeUnitSequence,
 };
+use novarocks_memory::lane::LaneShards;
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
@@ -40,6 +41,7 @@ pub(super) struct UnitReceiverOwner {
     pub(super) slots: ExchangeSlotInstance,
     control: Arc<RuntimeErrorState>,
     streams: Vec<ExchangeStreamIdentity>,
+    observation: Option<LaneShards>,
 }
 
 #[cfg(test)]
@@ -196,6 +198,7 @@ impl ExecutionExchangeRegistry {
         streams: Vec<ExchangeStreamIdentity>,
         control: Arc<RuntimeErrorState>,
         grantable_unit_bytes: u64,
+        observation: Option<LaneShards>,
     ) -> Result<(), ExchangeFailure> {
         let receiver = self
             .receivers
@@ -253,6 +256,7 @@ impl ExecutionExchangeRegistry {
             slots,
             control,
             streams,
+            observation,
         });
         Ok(())
     }
@@ -355,11 +359,30 @@ impl ExecutionExchangeRegistry {
             .slots
             .begin_admission(stream, frame.item)
             .map_err(ExchangeFailure::from)?;
+        let deliver = || receiver.deliver_admitted_unit(&owner, frame, admission, decode);
+        // The Native caller still holds the exact live route. A replay never
+        // acquires a decode permit; only the Decode arm creates new chunks.
+        match &owner.observation {
+            Some(observation) => observation.run(deliver),
+            None => deliver(),
+        }
+    }
+}
+
+impl Receiver {
+    fn deliver_admitted_unit(
+        &self,
+        owner: &UnitReceiverOwner,
+        frame: ExchangeUnitReceiverFrame,
+        admission: ExchangeSlotAdmission,
+        decode: impl FnOnce(ExchangeSenderIdentity, &[u8]) -> Result<Vec<Chunk>, ExchangeFailure>,
+    ) -> Result<ExchangeUnitReceipt, ExchangeFailure> {
+        let stream = frame.stream;
         #[cfg(test)]
         if matches!(frame.item, ExchangeUnitItem::End(_))
             && let ExchangeSlotAdmission::Observed(receipt) = &admission
         {
-            let pause = receiver
+            let pause = self
                 .mu
                 .lock()
                 .expect("exchange receiver lock")
@@ -368,7 +391,7 @@ impl ExecutionExchangeRegistry {
                 .take();
             if let Some(pause) = pause {
                 // The receiver-local test rendezvous owns no slot/queue lock.
-                pause(&receiver, *receipt);
+                pause(self, *receipt);
             }
         }
         let observed_end = owner
@@ -377,8 +400,7 @@ impl ExecutionExchangeRegistry {
             .map_err(ExchangeFailure::from)?
             .observed_end;
         if let Some(end) = observed_end {
-            receiver
-                .mu
+            self.mu
                 .lock()
                 .expect("exchange receiver lock")
                 .units
@@ -391,7 +413,7 @@ impl ExecutionExchangeRegistry {
                 // A decode finishing later sees that End; one finishing earlier
                 // is covered here. Admission facts can predate both transitions.
                 let facts = owner.slots.facts(stream).map_err(ExchangeFailure::from)?;
-                let mut state = receiver.mu.lock().expect("exchange receiver lock");
+                let mut state = self.mu.lock().expect("exchange receiver lock");
                 if matches!(frame.item, ExchangeUnitItem::End(_))
                     && receipt.verdict
                         == crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Applied
@@ -400,13 +422,13 @@ impl ExecutionExchangeRegistry {
                 }
                 state.expose_unit_prefix(stream, facts);
                 drop(state);
-                receiver.observable.defer_notify().arm();
+                self.observable.defer_notify().arm();
                 Ok(receipt)
             }
             ExchangeSlotAdmission::Decode(lease) => {
                 let sequence = lease.sequence();
                 #[cfg(novarocks_dev_controls)]
-                receiver.observe_unit_decode("unit_decode_begin", sequence);
+                self.observe_unit_decode("unit_decode_begin", sequence);
                 let sender = ExchangeSenderIdentity::native(
                     stream.source().task_key(),
                     stream.source().sender_ordinal(),
@@ -422,14 +444,14 @@ impl ExecutionExchangeRegistry {
                         owner.control.set_error(error.clone());
                         lease.abandon();
                         #[cfg(novarocks_dev_controls)]
-                        receiver.observe_unit_decode("unit_decode_exited", sequence);
-                        receiver.observable.defer_notify().arm();
+                        self.observe_unit_decode("unit_decode_exited", sequence);
+                        self.observable.defer_notify().arm();
                         return Err(ExchangeFailure::Execution(error));
                     }
                 };
                 let receipt = lease
                     .finish_with(|result| {
-                        let mut st = receiver.mu.lock().expect("exchange receiver lock");
+                        let mut st = self.mu.lock().expect("exchange receiver lock");
                         if result.disposition != ExchangeDecodeCommit::Discarded {
                             if let Some(tracker) = st.mem_tracker.as_ref() {
                                 for chunk in &mut chunks {
@@ -454,8 +476,8 @@ impl ExecutionExchangeRegistry {
                     })
                     .map_err(ExchangeFailure::from)?;
                 #[cfg(novarocks_dev_controls)]
-                receiver.observe_unit_decode("unit_decode_exited", sequence);
-                receiver.observable.defer_notify().arm();
+                self.observe_unit_decode("unit_decode_exited", sequence);
+                self.observable.defer_notify().arm();
                 Ok(receipt)
             }
         }
@@ -587,10 +609,15 @@ mod tests {
             Self::with_registry(
                 Arc::new(ExecutionExchangeRegistry::with_flow_limits(limits)),
                 grantable,
+                None,
             )
         }
 
-        fn with_registry(registry: Arc<ExecutionExchangeRegistry>, grantable: u64) -> Self {
+        fn with_registry(
+            registry: Arc<ExecutionExchangeRegistry>,
+            grantable: u64,
+            observation: Option<LaneShards>,
+        ) -> Self {
             let task = Owner::new();
             let destination = task.identity();
             let key = ExchangeKey {
@@ -636,6 +663,7 @@ mod tests {
                         task.view(TaskFailurePhase::Execution),
                     ))),
                     grantable,
+                    observation,
                 )
                 .unwrap();
             Self {
@@ -712,6 +740,78 @@ mod tests {
     }
 
     #[test]
+    fn unique_decoder_attributes_to_the_receiver_and_replay_does_not_decode() {
+        use novarocks_memory::attribution::{ATTRIBUTION_TOKEN_BYTES, AttributingAllocator};
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::ptr::NonNull;
+
+        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        let create_owner = || {
+            runtime
+                .memory_authority()
+                .create_account(
+                    novarocks_memory::AccountKind::Work,
+                    novarocks_memory::ExternalRef::NONE,
+                )
+                .unwrap()
+        };
+        let receiver_account = create_owner();
+        let outside_account = create_owner();
+        let receiver = receiver_account.create_lane_shards();
+        let outside = outside_account.create_lane_shards();
+        let f = Fixture::with_registry(
+            runtime.exchange_registry(),
+            64 * 1024 * 1024,
+            Some(receiver.clone()),
+        );
+        let frame = f.frame(1, &[17, 19], false);
+        f.register(&frame);
+
+        let allocator = AttributingAllocator::new(System);
+        let layout = Layout::from_size_align(1024, 8).unwrap();
+        let mut scratch = None;
+        outside.run(|| {
+            let new = f
+                .registry
+                .receive_unit_with(f.key, frame.clone(), |sender, payload| {
+                    // SAFETY: this layout is valid; the same allocator releases it below.
+                    scratch = Some(NonNull::new(unsafe { allocator.alloc(layout) }).unwrap());
+                    f.registry.decode_chunks_for_sender(f.key, sender, payload)
+                })
+                .unwrap();
+            assert_eq!(
+                new.verdict,
+                crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Applied
+            );
+        });
+        let scratch = scratch.expect("the unique decode permit ran the decoder");
+        let while_live = (
+            receiver.snapshot().tagged_bytes,
+            outside.snapshot().tagged_bytes,
+        );
+        outside.run(|| {
+            // SAFETY: the unique original test block uses this allocator and layout.
+            unsafe { allocator.dealloc(scratch.as_ptr(), layout) };
+            let replay = f
+                .registry
+                .receive_unit_with(f.key, frame, |_, _| {
+                    panic!("replay cannot decode the unit again")
+                })
+                .unwrap();
+            assert_eq!(
+                replay.verdict,
+                crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Idempotent
+            );
+        });
+        assert_eq!(
+            while_live,
+            ((layout.size() + ATTRIBUTION_TOKEN_BYTES) as i128, 0)
+        );
+        assert_eq!(receiver.snapshot().tagged_bytes, 0);
+        assert_eq!(f.values(&f.receiver()), [17, 19]);
+    }
+
+    #[test]
     fn end_admitted_during_decode_finishes_real_source_without_a_future_producer_wake() {
         use crate::exec::operators::ExchangeSourceFactory;
         use crate::exec::pipeline::{
@@ -745,7 +845,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let f = Fixture::with_registry(runtime.exchange_registry(), 64 * 1024 * 1024);
+        let f = Fixture::with_registry(runtime.exchange_registry(), 64 * 1024 * 1024, None);
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
             f.task.view(TaskFailurePhase::Execution),
         )));
