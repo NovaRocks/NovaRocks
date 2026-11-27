@@ -1224,21 +1224,24 @@ impl<B: AsyncSinkBackend> OperatorLifecycle for AsyncSinkOperator<B> {
         let shared = self.shared.clone();
         // Synchronous outer guard exists before executor.spawn can consume or
         // drop the future. All real provider/queue fields are already protected.
-        let frame = SinkActorFrame {
-            future: Some(ManuallyDrop::new(Box::pin(drain_loop(
-                start,
-                shared.clone(),
-                control.clone(),
-                bind_unknown,
-            )))),
-            shared,
-            control: control.clone(),
-        };
         self.join_wake = Some(Arc::new(ActorWake {
             shared: self.shared.clone(),
             control: self.error_state.as_ref().unwrap().clone(),
         }));
-        self.join = Some(executor.spawn(task, frame)?);
+        self.join = Some(executor.spawn_with_memory_observation(
+            task,
+            state.memory_observation(),
+            || SinkActorFrame {
+                future: Some(ManuallyDrop::new(Box::pin(drain_loop(
+                    start,
+                    shared.clone(),
+                    control.clone(),
+                    bind_unknown,
+                )))),
+                shared,
+                control: control.clone(),
+            },
+        )?);
         binding
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {

@@ -201,6 +201,7 @@ impl<'a> TaskPreparationContext<'a> {
             admission: self.admission.clone(),
             execution: self.owner.identity().query_execution_id(),
             task_key: self.task_key,
+            memory_observation: None,
         }
     }
     pub fn scan_source(
@@ -240,8 +241,19 @@ pub struct TaskScanSourceIssuer {
     admission: novarocks_control_runtime::obligation::AdmissionProof,
     execution: novarocks_types::QueryExecutionId,
     task_key: novarocks_types::UniqueId,
+    memory_observation: Option<novarocks_memory::lane::LaneShards>,
 }
 impl TaskScanSourceIssuer {
+    pub fn with_memory_observation(
+        mut self,
+        binding: &novarocks_execution::runtime::query_memory::QueryMemoryBinding,
+    ) -> Result<Self, novarocks_execution::runtime::query_memory::QueryMemoryBindingError> {
+        if self.execution != binding.execution() {
+            return Err(novarocks_execution::runtime::query_memory::QueryMemoryBindingError::OwnerAttemptMismatch);
+        }
+        self.memory_observation = Some(binding.observation().clone());
+        Ok(self)
+    }
     /// Worker supplies every identity component from its original Task record;
     /// the execution host supplies only the scan node from the compiled program.
     pub fn issue(
@@ -263,10 +275,12 @@ impl TaskScanSourceIssuer {
             self.task_key.low(),
             node_id,
         )?;
-        Ok((
-            range,
-            novarocks_spi::connector::read_stack::ConnectorSourceOperations::root(&self.admission),
-        ))
+        let mut operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::root(&self.admission);
+        if let Some(owner) = self.memory_observation.clone() {
+            operations = operations.with_work_observer(move |step| owner.run(step));
+        }
+        Ok((range, operations))
     }
     #[cfg(any(test, novarocks_dev_controls))]
     pub fn for_test(
@@ -296,6 +310,7 @@ impl TaskScanSourceIssuer {
             admission: work.child_authority().unwrap().verify_live().unwrap(),
             execution,
             task_key,
+            memory_observation: None,
         };
         work.body_exited().unwrap();
         work.captures_exited().unwrap();

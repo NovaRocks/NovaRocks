@@ -116,6 +116,7 @@ pub struct TaskTerminalAction {
     body: TaskTerminalCallback,
     observation: Option<crate::TaskTerminalPermit>,
     original: crate::control_runtime::causal_input::CausalInputCustody,
+    memory_observation: Option<novarocks_memory::LaneShards>,
 }
 impl TaskTerminalAction {
     pub fn new(observation: crate::TaskTerminalPermit, body: TaskTerminalCallback) -> Self {
@@ -124,8 +125,14 @@ impl TaskTerminalAction {
             body,
             observation: Some(observation),
             original,
+            memory_observation: None,
         }
     }
+    pub fn with_memory_observation(mut self, owner: Option<&novarocks_memory::LaneShards>) -> Self {
+        self.memory_observation = owner.cloned();
+        self
+    }
+
     fn identity(&self) -> TaskIdentity {
         self.observation
             .as_ref()
@@ -221,7 +228,7 @@ impl CompletionWork {
         }
     }
 
-    fn run(&mut self, withdrawn: bool) -> bool {
+    fn run_original_holders(&mut self, withdrawn: bool) -> bool {
         let mut failed = false;
         if !withdrawn {
             let Self { action, fact, .. } = self;
@@ -276,6 +283,18 @@ impl CompletionWork {
             failed = true;
             self.dispose_panic(payload);
         }
+        failed
+    }
+
+    fn run(&mut self, withdrawn: bool) -> bool {
+        let memory = match self.action.as_ref() {
+            Some(CompletionAction::Terminal(action)) => action.memory_observation.clone(),
+            _ => None,
+        };
+        let mut failed = match memory {
+            Some(owner) => owner.run(|| self.run_original_holders(withdrawn)),
+            None => self.run_original_holders(withdrawn),
+        };
         if let Some(exit) = self.exit.take() {
             // No action, fact or reporter holder from this original work can
             // remain on the success path. A failed phase publishes no stopped

@@ -19,6 +19,7 @@
 //! This is cold start/rejection ownership, not a driver-step scheduling layer.
 
 use super::*;
+use crate::runtime::execution_services::run_with_memory_observation;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::ExecutionReason;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
@@ -808,6 +809,12 @@ impl Retirement {
             return Poll::Unresolved;
         }
         let control: &RuntimeErrorState = self.control.as_ref().expect("original control holder");
+        let observation = self
+            .context
+            .as_deref()
+            .and_then(|context| context.runtime_state().memory_observation())
+            .cloned();
+        let observation = observation.as_ref();
         if !self.phases[0].started {
             let context = self.context.as_ref().expect("original context");
             // A hint: a delayed stop only causes an extra losing proposal.
@@ -835,7 +842,11 @@ impl Retirement {
             self.phases[11].run(
                 control,
                 ExecutionReason::DriverRetirementFailureDrop.code().get(),
-                || drop(ManuallyDrop::into_inner(proposal)),
+                || {
+                    run_with_memory_observation(observation, || {
+                        drop(ManuallyDrop::into_inner(proposal))
+                    })
+                },
             );
         }
         if !self.phases[1].started {
@@ -846,7 +857,9 @@ impl Retirement {
                     .code()
                     .get(),
                 || {
-                    driver.cancel_for_task_abort();
+                    run_with_memory_observation(observation, || {
+                        driver.cancel_for_task_abort();
+                    });
                 },
             );
         }
@@ -859,7 +872,7 @@ impl Retirement {
             match self.phases[2].run(
                 control,
                 ExecutionReason::DriverRetirementPendingFinish.code().get(),
-                || driver.has_pending_finish(),
+                || run_with_memory_observation(observation, || driver.has_pending_finish()),
             ) {
                 Some(true) => {
                     self.phases[2].reset_observation();
@@ -875,7 +888,11 @@ impl Retirement {
             self.phases[3].run(
                 control,
                 ExecutionReason::DriverRetirementDriverDrop.code().get(),
-                || drop(ManuallyDrop::into_inner(driver)),
+                || {
+                    run_with_memory_observation(observation, || {
+                        drop(ManuallyDrop::into_inner(driver))
+                    })
+                },
             );
         }
         if self.phases[3].unknown {
@@ -906,7 +923,11 @@ impl Retirement {
             self.phases[4].run(
                 control,
                 ExecutionReason::DriverRetirementContextDrop.code().get(),
-                || drop(ManuallyDrop::into_inner(context)),
+                || {
+                    run_with_memory_observation(observation, || {
+                        drop(ManuallyDrop::into_inner(context))
+                    })
+                },
             );
         }
         if self.phases[4].unknown {

@@ -118,6 +118,7 @@ impl Fixture {
                 admission: admission.clone(),
                 class: TransportClass::Data,
                 root_results: None,
+                observation: None,
             }),
             Some((
                 verifier.server_admission(),

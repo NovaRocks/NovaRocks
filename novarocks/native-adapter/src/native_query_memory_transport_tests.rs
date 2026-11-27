@@ -154,24 +154,22 @@ fn mem_a1_native_binder_checks_actual_owner_attempt_and_authority() {
     let context = runtime
         .establish_query_resources(execution(1), Some(8192))
         .unwrap();
-    let owner = QueryMemoryAccount::new(
+    let owner = novarocks_execution::runtime::query_context::QueryMemoryAccount::new(
         context.execution(),
         context.memory_binding().account().clone(),
     );
     assert!(matches!(
-        bind_query_memory(execution(2), authority.clone(), owner.clone()),
+        owner.clone().bind(execution(2), authority.clone()),
         Err(QueryMemoryBindingError::OwnerAttemptMismatch)
     ));
     assert!(matches!(
-        bind_query_memory(execution(1), self::authority(32), owner.clone()),
+        owner.clone().bind(execution(1), self::authority(32)),
         Err(QueryMemoryBindingError::Authority(CapacityError::Invalid {
             detail: "account belongs to another authority"
         }))
     ));
     assert_eq!(
-        bind_query_memory(execution(1), authority, owner)
-            .unwrap()
-            .execution(),
+        owner.bind(execution(1), authority).unwrap().execution(),
         execution(1)
     );
 }
@@ -216,7 +214,7 @@ fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() 
     );
 }
 #[test]
-fn mem_a1_v2_owner_release_waits_for_actual_task_and_last_binding_drop() {
+fn mem_a1_v2_owner_release_waits_for_actual_task_and_account_retirement() {
     let authority = authority(32);
     let runtime = NativeQueryContextRuntime::new(authority.clone());
     let before = authority.root().committed_bytes();
@@ -240,8 +238,19 @@ fn mem_a1_v2_owner_release_waits_for_actual_task_and_last_binding_drop() {
     assert_eq!(authority.live_accounts(), 2);
     assert_eq!(held.account().snapshot().granted_bytes, 0);
     assert!(!held.account().is_retired());
+    let account = held.account().clone();
     drop(held);
+    assert_eq!(authority.live_accounts(), 2);
+    account
+        .retire(&novarocks_memory::TeardownEvidence {
+            tasks_exited: true,
+            operators_destroyed: true,
+            io: &[],
+            now_ns: 0,
+        })
+        .unwrap();
     assert_eq!(authority.live_accounts(), 1);
+    drop(account);
     assert_eq!(authority.root().committed_bytes(), before);
 }
 #[test]

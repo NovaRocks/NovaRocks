@@ -119,6 +119,21 @@ pub fn thread_role_labels() -> RoleLabels {
     ROLES.lock().expect("thread role table poisoned").labels
 }
 
+/// Marks the current worker at startup using a role registered by process
+/// assembly. Standalone components without role assembly remain unknown.
+pub fn enter_registered_thread_role(label: &'static str) {
+    let index = ROLES
+        .lock()
+        .expect("thread role table poisoned")
+        .labels
+        .iter()
+        .position(|name| *name == Some(label));
+    if let Some(index) = index {
+        set_current_thread_role(ThreadRole(index as u8))
+            .expect("worker startup has live thread-local attribution state");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

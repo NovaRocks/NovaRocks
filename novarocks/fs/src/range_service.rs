@@ -21,20 +21,25 @@
 // Design: ADR-0158 (docs/adr/ADR-0158-bounded-parquet-range-preparation.md)
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use novarocks_spi::connector::read_stack::{ConnectorOperationTicket, ConnectorSourceOperations};
+use novarocks_spi::connector::read_stack::{
+    ConnectorOperationTicket, ConnectorSourceOperations, ConnectorWorkObservation,
+};
 use novarocks_spi::connector::{ConnectorError, ConnectorRangeScope};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
 
 use crate::{
-    BoundFile, FileCancellation, FileError, FileErrorKind, FileIoSpawner, FileReadRange,
-    FileResult, PreparedFileInput,
+    BoundFile, FileCancellation, FileError, FileErrorKind, FileIoFuture, FileIoSpawner,
+    FileReadRange, FileResult, PreparedFileInput,
 };
 
 const SEGMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -730,6 +735,15 @@ struct RequestState {
     holds: Vec<Box<dyn std::any::Any + Send>>,
 }
 
+impl RequestState {
+    fn work_observation(&self) -> ConnectorWorkObservation {
+        self.ticket
+            .as_ref()
+            .map(ConnectorOperationTicket::work_observation)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 struct State {
     closed: bool,
@@ -748,6 +762,7 @@ struct Dispatch {
     file: BoundFile,
     cancellation: FileCancellation,
     unit: DispatchUnit,
+    observation: ConnectorWorkObservation,
 }
 
 pub struct FileRangeService {
@@ -762,6 +777,28 @@ pub struct FileRangeService {
     /// Segment supervisors that have not exited yet.
     live_supervisors: AtomicUsize,
     changed: Notify,
+    observation: ConnectorWorkObservation,
+}
+
+struct ObservedFileIo {
+    observation: ConnectorWorkObservation,
+    body: Option<FileIoFuture>,
+}
+
+impl Future for ObservedFileIo {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let body = this.body.as_mut().expect("live physical range job");
+        this.observation.run(|| body.as_mut().poll(cx))
+    }
+}
+
+impl Drop for ObservedFileIo {
+    fn drop(&mut self) {
+        self.observation.run(|| drop(self.body.take()));
+    }
 }
 
 /// Settles one dispatched segment exactly once: with the supervisor's real
@@ -779,10 +816,16 @@ struct SegmentSettlement {
     scope: FileRangeScope,
     result_delivered: bool,
     settled: bool,
+    observation: ConnectorWorkObservation,
 }
 
 impl SegmentSettlement {
-    fn new(service: Arc<FileRangeService>, id: u64, scope: FileRangeScope) -> Self {
+    fn new(
+        service: Arc<FileRangeService>,
+        id: u64,
+        scope: FileRangeScope,
+        observation: ConnectorWorkObservation,
+    ) -> Self {
         service.live_supervisors.fetch_add(1, Ordering::AcqRel);
         Self {
             service,
@@ -790,12 +833,13 @@ impl SegmentSettlement {
             scope,
             result_delivered: false,
             settled: false,
+            observation,
         }
     }
 
     fn deliver(&mut self, result: FileResult<UnitOutput>) {
         self.result_delivered = true;
-        self.service.unit_result(self.id, result);
+        self.service.unit_result(self.id, result, &self.observation);
     }
 
     fn settle(mut self, exit: FileResult<()>) {
@@ -809,13 +853,10 @@ impl Drop for SegmentSettlement {
     fn drop(&mut self) {
         if !self.settled {
             if !self.result_delivered {
-                self.service.unit_result(
-                    self.id,
-                    Err(FileError::new(
-                        FileErrorKind::Internal,
-                        "range segment supervisor ended before its result",
-                    )),
-                );
+                self.deliver(Err(FileError::new(
+                    FileErrorKind::Internal,
+                    "range segment supervisor ended before its result",
+                )));
             }
             self.service.segment_exit(
                 self.id,
@@ -856,6 +897,23 @@ impl FileRangeService {
         io_spawner: Arc<dyn FileIoSpawner>,
         scan_handle: Handle,
     ) -> Arc<Self> {
+        Self::new_observed(
+            process_window,
+            source_window,
+            queue_capacity,
+            io_spawner,
+            scan_handle,
+            ConnectorWorkObservation::default(),
+        )
+    }
+    pub fn new_observed(
+        process_window: NonZeroUsize,
+        source_window: NonZeroUsize,
+        queue_capacity: NonZeroUsize,
+        io_spawner: Arc<dyn FileIoSpawner>,
+        scan_handle: Handle,
+        observation: ConnectorWorkObservation,
+    ) -> Arc<Self> {
         Arc::new(Self {
             process_window: process_window.get(),
             source_window: source_window.get(),
@@ -867,6 +925,7 @@ impl FileRangeService {
             state: Mutex::new(State::default()),
             live_supervisors: AtomicUsize::new(0),
             changed: Notify::new(),
+            observation,
         })
     }
 
@@ -950,7 +1009,10 @@ impl FileRangeService {
                 return Ok(Queued::Deferred(admission));
             }
         }
-        let (pending, completed, partial_copy_bytes) = prepare_segments(offset, length, present)?;
+        let (pending, completed, partial_copy_bytes) = admission
+            .ticket
+            .work_observation()
+            .run(|| prepare_segments(offset, length, present))?;
         let (result_sender, result) = oneshot::channel();
         let (exit_sender, exit) = oneshot::channel();
         let Admission {
@@ -1181,11 +1243,15 @@ impl FileRangeService {
         let Some(request) = state.requests.get_mut(&id) else {
             return;
         };
-        if !request.failed {
-            request.cancellation.cancel();
-            request.failed = true;
-            request.work.fail(error);
-        }
+        request.work_observation().run(|| {
+            if !request.failed {
+                request.cancellation.cancel();
+                request.failed = true;
+                request.work.fail(error);
+            } else {
+                drop(error);
+            }
+        });
         if request.active == 0 {
             self.finish_locked(state, id);
         }
@@ -1195,14 +1261,29 @@ impl FileRangeService {
         let Some(mut request) = state.requests.remove(&id) else {
             return;
         };
-        request.work.publish();
-        // Released before the exit is announced, so whoever observes the
-        // exit also observes its charges returned.
-        drop(std::mem::take(&mut request.holds));
-        if let Some(ticket) = request.ticket.take() {
-            ticket.end(match &request.exit_error {
+        let observation = request.work_observation();
+        let ticket = request.ticket.take();
+        let (exit, error, cleanup_unresolved) = observation.run(|| {
+            let RequestState {
+                work,
+                exit,
+                exit_error,
+                cleanup_unresolved,
+                holds,
+                file,
+                cancellation,
+                ..
+            } = request;
+            work.publish();
+            drop((holds, file, cancellation));
+            (exit, exit_error, cleanup_unresolved)
+        });
+        // The holders and their query scope exit before Worker can see the
+        // original I/O-exit notification.
+        if let Some(ticket) = ticket {
+            ticket.end(match &error {
                 None => novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited,
-                Some(error) if request.cleanup_unresolved => {
+                Some(error) if cleanup_unresolved => {
                     novarocks_spi::connector::read_stack::ConnectorOperationExit::CleanupUnresolved(
                         ConnectorError::from(error),
                     )
@@ -1214,50 +1295,57 @@ impl FileRangeService {
                 }
             });
         }
-        if let Some(sender) = request.exit.take() {
-            let _ = sender.send(request.exit_error.map_or(Ok(()), Err));
+        if let Some(sender) = exit {
+            let _ = sender.send(error.map_or(Ok(()), Err));
         }
         self.changed.notify_waiters();
     }
 
     fn dispatch(self: &Arc<Self>) {
-        loop {
-            let work = {
-                let Ok(mut state) = self.state.lock() else {
-                    return;
-                };
-                if state.closed || state.active >= self.process_window {
-                    return;
-                }
-                let id = self.choose_locked(&mut state);
-                let Some(id) = id else {
-                    return;
-                };
-                let request = state.requests.get_mut(&id).expect("queued range request");
-                let unit = request.work.next_unit();
-                let work = Dispatch {
-                    id,
-                    scope: request.scope,
-                    file: request.file.clone(),
-                    cancellation: request.cancellation.child(),
-                    unit,
-                };
-                let has_more = request.work.has_pending();
-                let class = request.class;
-                request.active += 1;
-                state.active += 1;
-                *state.source_active.entry(work.scope).or_default() += 1;
-                if has_more {
-                    match class {
-                        FileRangeClass::Demand => state.demand.push_back(id),
-                        FileRangeClass::Prefetch => state.prefetch.push_back(id),
+        self.observation.run(|| {
+            loop {
+                let work = {
+                    let Ok(mut state) = self.state.lock() else {
+                        return;
+                    };
+                    if state.closed || state.active >= self.process_window {
+                        return;
                     }
-                }
-                work
-            };
-            self.changed.notify_waiters();
-            self.spawn_segment(work);
-        }
+                    let id = self.choose_locked(&mut state);
+                    let Some(id) = id else {
+                        return;
+                    };
+                    let request = state.requests.get_mut(&id).expect("queued range request");
+                    let observation = request.work_observation();
+                    let (file, cancellation, unit) = observation.run(|| {
+                        let unit = request.work.next_unit();
+                        (request.file.clone(), request.cancellation.child(), unit)
+                    });
+                    let work = Dispatch {
+                        id,
+                        scope: request.scope,
+                        file,
+                        cancellation,
+                        unit,
+                        observation,
+                    };
+                    let has_more = request.work.has_pending();
+                    let class = request.class;
+                    request.active += 1;
+                    state.active += 1;
+                    *state.source_active.entry(work.scope).or_default() += 1;
+                    if has_more {
+                        match class {
+                            FileRangeClass::Demand => state.demand.push_back(id),
+                            FileRangeClass::Prefetch => state.prefetch.push_back(id),
+                        }
+                    }
+                    work
+                };
+                self.changed.notify_waiters();
+                self.spawn_segment(work);
+            }
+        });
     }
 
     fn choose_locked(&self, state: &mut State) -> Option<u64> {
@@ -1356,40 +1444,49 @@ impl FileRangeService {
             file,
             cancellation,
             unit,
+            observation,
         } = work;
         let (sender, receiver) = oneshot::channel();
-        let task = match unit {
-            DispatchUnit::Segment(Segment {
-                offset,
-                mut bytes,
-                index,
-            }) => {
-                let len = bytes.len() as u64;
-                self.io_spawner.spawn(Box::pin(async move {
-                    let result = file
-                        .read_into(
-                            FileReadRange::Bounded {
-                                offset,
-                                length: len,
-                            },
-                            &mut bytes,
-                            &cancellation,
-                        )
-                        .await
-                        .map(|()| UnitOutput::Segment { index, bytes });
+        let task = observation.run(|| -> FileIoFuture {
+            let body: FileIoFuture = match unit {
+                DispatchUnit::Segment(Segment {
+                    offset,
+                    mut bytes,
+                    index,
+                }) => {
+                    let len = bytes.len() as u64;
+                    Box::pin(async move {
+                        let result = file
+                            .read_into(
+                                FileReadRange::Bounded {
+                                    offset,
+                                    length: len,
+                                },
+                                &mut bytes,
+                                &cancellation,
+                            )
+                            .await
+                            .map(|()| UnitOutput::Segment { index, bytes });
+                        let _ = sender.send(result);
+                    })
+                }
+                DispatchUnit::Stat => Box::pin(async move {
+                    let result = file.stat(&cancellation).await.map(UnitOutput::Stat);
                     let _ = sender.send(result);
-                }))
-            }
-            DispatchUnit::Stat => self.io_spawner.spawn(Box::pin(async move {
-                let result = file.stat(&cancellation).await.map(UnitOutput::Stat);
-                let _ = sender.send(result);
-            })),
-        };
+                }),
+            };
+            Box::pin(ObservedFileIo {
+                observation: observation.clone(),
+                body: Some(body),
+            })
+        });
+        let task = self.io_spawner.spawn(task);
         match task {
             Ok(mut task) => {
                 // Created before the spawn: a supervisor the runtime never
                 // runs still releases its slot when its future is dropped.
-                let mut settlement = SegmentSettlement::new(Arc::clone(self), id, scope);
+                let mut settlement =
+                    SegmentSettlement::new(Arc::clone(self), id, scope, observation);
                 // The supervisor is the one owner of the physical task; its
                 // handle is not kept, the settlement accounts for its exit.
                 drop(self.scan_handle.spawn(async move {
@@ -1405,24 +1502,29 @@ impl FileRangeService {
                 }));
             }
             Err(error) => {
-                self.unit_result(id, Err(error));
+                self.unit_result(id, Err(error), &observation);
                 self.segment_exit(id, scope, SegmentExit::Drained(Ok(())));
             }
         }
     }
 
-    fn unit_result(&self, id: u64, result: FileResult<UnitOutput>) {
+    fn unit_result(
+        &self,
+        id: u64,
+        result: FileResult<UnitOutput>,
+        observation: &ConnectorWorkObservation,
+    ) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         match result {
-            Ok(output) => {
+            Ok(output) => observation.run(|| {
                 if let Some(request) = state.requests.get_mut(&id)
                     && !request.failed
                 {
                     request.work.record(output);
                 }
-            }
+            }),
             Err(error) => self.fail_request_locked(&mut state, id, error),
         }
     }
@@ -1538,6 +1640,192 @@ mod tests {
 
     fn range(offset: u64, length: u64) -> FileReadRange {
         FileReadRange::bounded(offset, length).expect("range")
+    }
+
+    thread_local! {
+        static RANGE_OWNER: std::cell::Cell<&'static str> = const { std::cell::Cell::new("outside") };
+    }
+
+    fn with_range_owner<T>(owner: &'static str, step: impl FnOnce() -> T) -> T {
+        struct Restore(&'static str);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RANGE_OWNER.set(self.0);
+            }
+        }
+        let _restore = Restore(RANGE_OWNER.replace(owner));
+        step()
+    }
+
+    type RangeOwnerTrace = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
+
+    fn observe_range(
+        trace: RangeOwnerTrace,
+        owner: &'static str,
+    ) -> impl Fn(&mut dyn FnMut()) + Send + Sync + 'static {
+        move |step| {
+            trace.lock().unwrap().push((RANGE_OWNER.get(), owner));
+            with_range_owner(owner, step);
+        }
+    }
+
+    #[derive(Debug)]
+    enum ObservedIoAction {
+        DropBeforePoll(&'static str),
+        Run(&'static str),
+    }
+
+    struct ObservedIoSpawner {
+        trace: RangeOwnerTrace,
+        jobs: tokio::sync::mpsc::UnboundedSender<oneshot::Sender<ObservedIoAction>>,
+    }
+
+    impl FileIoSpawner for ObservedIoSpawner {
+        fn spawn(&self, mut task: FileIoFuture) -> FileResult<FileIoJob> {
+            assert_eq!(RANGE_OWNER.get(), "service");
+            let (action, next) = oneshot::channel();
+            self.jobs.send(action).expect("test retains the dispatcher");
+            let trace = self.trace.clone();
+            Ok(FileIoJob::new(tokio::spawn(async move {
+                match next.await.expect("test directs every admitted job") {
+                    ObservedIoAction::DropBeforePoll(owner) => {
+                        let before = trace.lock().unwrap().len();
+                        drop(task);
+                        assert_eq!(&trace.lock().unwrap()[before..], &[("outside", owner)]);
+                        assert_eq!(RANGE_OWNER.get(), "outside");
+                    }
+                    ObservedIoAction::Run(owner) => {
+                        std::future::poll_fn(|cx| {
+                            let before = trace.lock().unwrap().len();
+                            let progress = task.as_mut().poll(cx);
+                            assert_eq!(&trace.lock().unwrap()[before..], &[("outside", owner)]);
+                            assert_eq!(RANGE_OWNER.get(), "outside");
+                            progress
+                        })
+                        .await;
+                    }
+                }
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn m03a_file_range_keeps_its_owner_across_queue_and_never_polled_exit() {
+        #[derive(Default)]
+        struct ExitTrace(Mutex<Vec<(&'static str, &'static str)>>);
+        impl std::task::Wake for ExitTrace {
+            fn wake(self: Arc<Self>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("source-exit", RANGE_OWNER.get()));
+            }
+        }
+        struct Hold(Arc<ExitTrace>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(("retained-drop", RANGE_OWNER.get()));
+            }
+        }
+
+        let (_dir, file) = fixture();
+        let trace = RangeOwnerTrace::default();
+        let (jobs, mut originals) = tokio::sync::mpsc::unbounded_channel();
+        let one = NonZeroUsize::new(1).unwrap();
+        let service = FileRangeService::new_observed(
+            one,
+            one,
+            one,
+            Arc::new(ObservedIoSpawner {
+                trace: trace.clone(),
+                jobs,
+            }),
+            Handle::current(),
+            ConnectorWorkObservation::new(observe_range(trace.clone(), "service")),
+        );
+        let a = ConnectorSourceOperations::for_test()
+            .with_work_observer(observe_range(trace.clone(), "query-a"));
+        let b = ConnectorSourceOperations::for_test()
+            .with_work_observer(observe_range(trace.clone(), "query-b"));
+        let mut first = service
+            .bind(scope(1, 1), a.clone())
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("first physical operation");
+        let first_job = originals.try_recv().expect("first physical slot");
+        let before_queue = trace.lock().unwrap().len();
+        let mut second = with_range_owner("query-a", || {
+            service
+                .bind(scope(2, 1), b.clone())
+                .start(
+                    FileRangeClass::Demand,
+                    file,
+                    range(4, 4),
+                    FileCancellation::new(),
+                )
+                .expect("second operation enters the queue")
+        });
+        assert_eq!(RANGE_OWNER.get(), "outside");
+        assert!(trace.lock().unwrap()[before_queue..].contains(&("query-a", "query-b")));
+        assert!(
+            originals.try_recv().is_err(),
+            "A still owns the only physical slot"
+        );
+
+        let exits = Arc::new(ExitTrace::default());
+        first.retain_until_exit(Box::new(Hold(exits.clone())));
+        second.retain_until_exit(Box::new(Hold(exits.clone())));
+        a.seal();
+        assert!(first.result_ready().await.is_err());
+        {
+            let wake = std::task::Waker::from(exits.clone());
+            let mut proof = std::pin::pin!(a.exited());
+            assert!(
+                proof
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&wake))
+                    .is_pending()
+            );
+        }
+        assert!(exits.0.lock().unwrap().is_empty());
+
+        first_job
+            .send(ObservedIoAction::DropBeforePoll("query-a"))
+            .expect("drop the admitted job before its first body poll");
+        first.drained().await.expect("first physical exit");
+        assert!(a.is_exited());
+        assert_eq!(
+            &*exits.0.lock().unwrap(),
+            &[("retained-drop", "query-a"), ("source-exit", "outside")],
+        );
+
+        originals
+            .recv()
+            .await
+            .expect("second physical slot")
+            .send(ObservedIoAction::Run("query-b"))
+            .expect("run the queued query");
+        assert_eq!(
+            second.result_ready().await.expect("second bytes").as_ref(),
+            b"efgh"
+        );
+        second.drained().await.expect("second physical exit");
+        b.seal();
+        assert!(b.is_exited());
+        assert_eq!(
+            exits.0.lock().unwrap().last(),
+            Some(&("retained-drop", "query-b"))
+        );
+        service.close_admission();
+        service.drain().await.expect("service drain");
     }
 
     #[tokio::test]
@@ -2123,8 +2411,18 @@ mod tests {
                     },
                 );
             }
-            let lost = SegmentSettlement::new(Arc::clone(&service), 7, scope);
-            let failed = SegmentSettlement::new(Arc::clone(&service), 7, scope);
+            let lost = SegmentSettlement::new(
+                Arc::clone(&service),
+                7,
+                scope,
+                ConnectorWorkObservation::default(),
+            );
+            let failed = SegmentSettlement::new(
+                Arc::clone(&service),
+                7,
+                scope,
+                ConnectorWorkObservation::default(),
+            );
             let error = FileError::new(FileErrorKind::Internal, "segment task failed");
             if unresolved_first {
                 drop(lost);

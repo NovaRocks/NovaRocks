@@ -27,6 +27,7 @@ pub use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeAdmissionVerdict, ExchangeStreamFacts, ExchangeUnitDemand, ExchangeUnitItem,
     ExchangeUnitSequence,
 };
+use novarocks_memory::lane::LaneShards;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
 
@@ -107,18 +108,35 @@ pub enum ExchangeDemandCallOutcome {
 /// aliases. A deadline observation must not drop it while that owner is live.
 pub struct ExchangeCallActivity {
     on_exit: Option<Box<dyn FnOnce() + Send + 'static>>,
+    observation: Option<LaneShards>,
 }
 
 impl ExchangeCallActivity {
-    pub(crate) fn new(on_exit: impl FnOnce() + Send + 'static) -> Self {
+    pub(crate) fn new(
+        observation: Option<&LaneShards>,
+        on_exit: impl FnOnce() + Send + 'static,
+    ) -> Self {
         Self {
             on_exit: Some(Box::new(on_exit)),
+            observation: observation.cloned(),
         }
+    }
+
+    pub fn memory_observation(&self) -> Option<&LaneShards> {
+        self.observation.as_ref()
     }
 
     #[cfg(any(test, novarocks_dev_controls))]
     pub fn for_test(on_exit: impl FnOnce() + Send + 'static) -> Self {
-        Self::new(on_exit)
+        Self::new(None, on_exit)
+    }
+
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test_with_observation(
+        observation: &LaneShards,
+        on_exit: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self::new(Some(observation), on_exit)
     }
 }
 

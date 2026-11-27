@@ -40,6 +40,7 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
         streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
         control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
         grantable_unit_bytes: u64,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure>;
     fn register_unit_demand(
         &self,
@@ -166,12 +167,14 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
         control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
         grantable_unit_bytes: u64,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         self.runtime.exchange_registry().bind_unit_receiver(
             Self::key(key),
             streams,
             control,
             grantable_unit_bytes,
+            observation,
         )
     }
 
@@ -348,6 +351,7 @@ impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
         _streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
         _control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
         _grantable_unit_bytes: u64,
+        _observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
         Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
@@ -509,6 +513,7 @@ mod tests {
         });
         port.bind_unit_receiver(key, streams.to_vec(), control,
             novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
+            None,
         ).unwrap();
         let frame = |stream| super::super::exchange_unit::ExchangeUnitReceiverFrame {
             stream,

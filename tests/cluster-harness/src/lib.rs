@@ -4744,7 +4744,7 @@ impl CrossProcessCluster {
     }
 
     /// Read the original backend registry without synthesizing missing samples.
-    pub fn backend_exchange_flow_metrics(&self, index: usize) -> Result<String> {
+    pub fn backend_metrics_text(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         scrape_prometheus_metrics(self.runtime.be[index].http)
     }

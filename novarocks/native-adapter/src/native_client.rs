@@ -121,36 +121,42 @@ impl NativeRpcClient {
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<proto::DeliverExchangeUnitResponse, ExchangeRpcFailure> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                ExchangeRpcFailure::NotProcessed("exchange deadline cannot be represented".into())
-            })?;
-        let mut client = tokio::select! {
-            biased;
-            _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange stopped before dispatch".into())),
-            result = self.make_deadline_async_client("exchange unit", NativeRpcMethod::DeliverExchangeUnit, deadline) => {
-                result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+        let owner = self.runtime.transport_memory_observation().cloned();
+        let call = async move {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    ExchangeRpcFailure::NotProcessed(
+                        "exchange deadline cannot be represented".into(),
+                    )
+                })?;
+            let mut client = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange stopped before dispatch".into())),
+                result = self.make_deadline_async_client("exchange unit", NativeRpcMethod::DeliverExchangeUnit, deadline) => {
+                    result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+                }
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ExchangeRpcFailure::NotProcessed(
+                    "exchange deadline elapsed before dispatch".into(),
+                ));
+            }
+            let mut request = Request::new(value);
+            request.set_timeout(remaining);
+            // This future owns this local request. Cancellation drops it in this
+            // scope; no detached subrequest outlives the outer activity owner.
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange stopped after dispatch".into())),
+                result = tokio::time::timeout_at(deadline, client.deliver_exchange_unit(request)) => {
+                    result.map_err(|_| ExchangeRpcFailure::Unknown("exchange unit transmission deadline elapsed".into()))?
+                        .map(|response| response.into_inner()).map_err(exchange_rpc_status)
+                }
             }
         };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(ExchangeRpcFailure::NotProcessed(
-                "exchange deadline elapsed before dispatch".into(),
-            ));
-        }
-        let mut request = Request::new(value);
-        request.set_timeout(remaining);
-        // This future owns this local request. Cancellation drops it in this
-        // scope; no detached subrequest outlives the outer activity owner.
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange stopped after dispatch".into())),
-            result = tokio::time::timeout_at(deadline, client.deliver_exchange_unit(request)) => {
-                result.map_err(|_| ExchangeRpcFailure::Unknown("exchange unit transmission deadline elapsed".into()))?
-                    .map(|response| response.into_inner()).map_err(exchange_rpc_status)
-            }
-        }
+        crate::native_server::observe_native_work(owner, || call).await
     }
 
     pub(crate) async fn register_exchange_demand_async(
@@ -159,34 +165,40 @@ impl NativeRpcClient {
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<proto::RegisterExchangeDemandResponse, ExchangeRpcFailure> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                ExchangeRpcFailure::NotProcessed("exchange deadline cannot be represented".into())
-            })?;
-        let mut client = tokio::select! {
-            biased;
-            _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange demand stopped before dispatch".into())),
-            result = self.make_deadline_async_client("exchange demand", NativeRpcMethod::RegisterExchangeDemand, deadline) => {
-                result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+        let owner = self.runtime.transport_memory_observation().cloned();
+        let call = async move {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    ExchangeRpcFailure::NotProcessed(
+                        "exchange deadline cannot be represented".into(),
+                    )
+                })?;
+            let mut client = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(ExchangeRpcFailure::NotProcessed("exchange demand stopped before dispatch".into())),
+                result = self.make_deadline_async_client("exchange demand", NativeRpcMethod::RegisterExchangeDemand, deadline) => {
+                    result.map_err(|error| ExchangeRpcFailure::NotProcessed(error.into_boxed_str()))?
+                }
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ExchangeRpcFailure::NotProcessed(
+                    "exchange deadline elapsed before dispatch".into(),
+                ));
+            }
+            let mut request = Request::new(value);
+            request.set_timeout(remaining);
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange demand stopped after dispatch".into())),
+                result = tokio::time::timeout_at(deadline, client.register_exchange_demand(request)) => {
+                    result.map_err(|_| ExchangeRpcFailure::Unknown("exchange demand transmission deadline elapsed".into()))?
+                        .map(|response| response.into_inner()).map_err(exchange_rpc_status)
+                }
             }
         };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(ExchangeRpcFailure::NotProcessed(
-                "exchange deadline elapsed before dispatch".into(),
-            ));
-        }
-        let mut request = Request::new(value);
-        request.set_timeout(remaining);
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => Err(ExchangeRpcFailure::Unknown("exchange demand stopped after dispatch".into())),
-            result = tokio::time::timeout_at(deadline, client.register_exchange_demand(request)) => {
-                result.map_err(|_| ExchangeRpcFailure::Unknown("exchange demand transmission deadline elapsed".into()))?
-                    .map(|response| response.into_inner()).map_err(exchange_rpc_status)
-            }
-        }
+        crate::native_server::observe_native_work(owner, || call).await
     }
 
     pub(crate) async fn subscribe_exchange_grants_async(
@@ -195,31 +207,35 @@ impl NativeRpcClient {
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<tonic::Streaming<proto::ExchangeGrantBatch>, tonic::Status> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                tonic::Status::invalid_argument(
-                    "exchange subscription deadline cannot be represented",
-                )
-            })?;
-        let mut client = tokio::select! {
-            biased;
-            _ = stop.cancelled() => return Err(tonic::Status::cancelled("exchange subscription stopped before dispatch")),
-            result = self.make_deadline_async_client("exchange grant subscription", NativeRpcMethod::SubscribeExchangeGrants, deadline) => {
-                result.map_err(tonic::Status::unavailable)?
+        let owner = self.runtime.transport_memory_observation().cloned();
+        let call = async move {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    tonic::Status::invalid_argument(
+                        "exchange subscription deadline cannot be represented",
+                    )
+                })?;
+            let mut client = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(tonic::Status::cancelled("exchange subscription stopped before dispatch")),
+                result = self.make_deadline_async_client("exchange grant subscription", NativeRpcMethod::SubscribeExchangeGrants, deadline) => {
+                    result.map_err(tonic::Status::unavailable)?
+                }
+            };
+            // The deadline bounds establishment only. Sending grpc-timeout would
+            // incorrectly turn an otherwise healthy observation stream into an
+            // input-idle timer after its headers had already arrived.
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Err(tonic::Status::cancelled("exchange subscription stopped during establishment")),
+                result = tokio::time::timeout_at(deadline, client.subscribe_exchange_grants(Request::new(value))) => {
+                    result.map_err(|_| tonic::Status::deadline_exceeded("exchange subscription establishment deadline elapsed"))?
+                        .map(|response| response.into_inner())
+                }
             }
         };
-        // The deadline bounds establishment only. Sending grpc-timeout would
-        // incorrectly turn an otherwise healthy observation stream into an
-        // input-idle timer after its headers had already arrived.
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => Err(tonic::Status::cancelled("exchange subscription stopped during establishment")),
-            result = tokio::time::timeout_at(deadline, client.subscribe_exchange_grants(Request::new(value))) => {
-                result.map_err(|_| tonic::Status::deadline_exceeded("exchange subscription establishment deadline elapsed"))?
-                    .map(|response| response.into_inner())
-            }
-        }
+        crate::native_server::observe_native_work(owner, || call).await
     }
 
     pub fn new_membership_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
@@ -267,30 +283,35 @@ impl NativeRpcClient {
         request: filter::RuntimeFilterEnvelope,
         deadline: Duration,
     ) -> Result<filter::RuntimeFilterEnvelopeResponse, String> {
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        let mut client = self
-            .make_deadline_async_client(
-                "runtime filter envelope",
-                NativeRpcMethod::TransmitRuntimeFilterEnvelope,
+        let owner = self.runtime.transport_memory_observation().cloned();
+        let call = async move {
+            let deadline_at = tokio::time::Instant::now() + deadline;
+            let mut client = self
+                .make_deadline_async_client(
+                    "runtime filter envelope",
+                    NativeRpcMethod::TransmitRuntimeFilterEnvelope,
+                    deadline_at,
+                )
+                .await?;
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "runtime filter envelope deadline exceeded before unary RPC submission"
+                        .to_string(),
+                );
+            }
+            let mut request = Request::new(request);
+            request.set_timeout(remaining);
+            tokio::time::timeout_at(
                 deadline_at,
+                client.transmit_runtime_filter_envelope(request),
             )
-            .await?;
-        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(
-                "runtime filter envelope deadline exceeded before unary RPC submission".to_string(),
-            );
-        }
-        let mut request = Request::new(request);
-        request.set_timeout(remaining);
-        tokio::time::timeout_at(
-            deadline_at,
-            client.transmit_runtime_filter_envelope(request),
-        )
-        .await
-        .map_err(|_| "runtime filter envelope deadline exceeded during unary RPC".to_string())?
-        .map(|response| response.into_inner())
-        .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
+            .await
+            .map_err(|_| "runtime filter envelope deadline exceeded during unary RPC".to_string())?
+            .map(|response| response.into_inner())
+            .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
+        };
+        crate::native_server::observe_native_work(owner, || call).await
     }
 
     pub fn blocking_announce_backend_with_timeout(
@@ -298,7 +319,8 @@ impl NativeRpcClient {
         request: proto::AnnounceBackendRequest,
         timeout: Duration,
     ) -> Result<proto::AnnounceBackendResponse, String> {
-        self.runtime.block_on(async {
+        let owner = self.runtime.transport_memory_observation().cloned();
+        let call = async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
                 .make_deadline_async_client(
@@ -321,7 +343,9 @@ impl NativeRpcClient {
                 .map_err(|error| format!("announce_backend rpc failed: {error}"))?
                 .into_inner();
             Ok(response)
-        })
+        };
+        self.runtime
+            .block_on(crate::native_server::observe_native_work(owner, || call))
     }
 }
 
@@ -341,6 +365,9 @@ pub(crate) fn native_endpoint(
 ) -> Result<tonic::transport::Endpoint, String> {
     let endpoint =
         channel_endpoint(endpoint).map_err(|error| format!("invalid endpoint: {error}"))?;
+    let endpoint = endpoint.executor(crate::native_server::TransportExecutor(
+        runtime.transport_memory_observation().cloned(),
+    ));
     if runtime.transport_admission().is_some() {
         Ok(crate::native_lane::configure_native_endpoint(endpoint))
     } else {

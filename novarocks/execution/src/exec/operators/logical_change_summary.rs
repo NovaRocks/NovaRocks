@@ -1209,7 +1209,7 @@ pub(crate) mod tests {
                     .unwrap()
                 })
                 .collect();
-            registry.bind_unit_receiver(key, streams.clone(), state.error_state(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+            registry.bind_unit_receiver(key, streams.clone(), state.error_state(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64, None).unwrap();
             Self {
                 kind,
                 registry,

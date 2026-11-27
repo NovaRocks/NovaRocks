@@ -45,6 +45,7 @@ pub struct BackendRpcService {
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
     heartbeat: BackendHeartbeatResponder,
     exchange_data_plane: NativeExchangeDataPlane,
+    observation: Option<novarocks_memory::LaneShards>,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
@@ -59,16 +60,38 @@ impl BackendRpcService {
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
         heartbeat: BackendHeartbeatResponder,
     ) -> Self {
+        Self::new_observed(
+            task_execution_ingress,
+            catalog_reachability,
+            runtime_filter_ingress,
+            exchange_receiver_port,
+            task_inbound_capabilities,
+            heartbeat,
+            None,
+        )
+    }
+
+    pub(crate) fn new_observed(
+        task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+        catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
+        runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
+        exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+        task_inbound_capabilities: Arc<TaskInboundCapabilities>,
+        heartbeat: BackendHeartbeatResponder,
+        observation: Option<novarocks_memory::LaneShards>,
+    ) -> Self {
         let unit_backend = heartbeat.process_id();
         Self {
             task_execution_ingress,
             catalog_reachability,
             heartbeat,
-            exchange_data_plane: NativeExchangeDataPlane::new(
+            exchange_data_plane: NativeExchangeDataPlane::new_with_observation(
                 exchange_receiver_port,
                 task_inbound_capabilities,
                 unit_backend,
+                observation.clone(),
             ),
+            observation,
             runtime_filter_ingress,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
@@ -95,6 +118,35 @@ fn retired_fetch_result_status() -> tonic::Status {
     tonic::Status::unimplemented("FetchResult is retired; use FetchRootResult")
 }
 
+struct NativeBlockingDispatch<F> {
+    observation: Option<novarocks_memory::LaneShards>,
+    handler: Option<F>,
+}
+
+impl<F> NativeBlockingDispatch<F> {
+    fn run<T>(mut self) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let handler = self.handler.take().expect("one original Native dispatch");
+        match &self.observation {
+            Some(owner) => owner.run(handler),
+            None => handler(),
+        }
+    }
+}
+
+impl<F> Drop for NativeBlockingDispatch<F> {
+    fn drop(&mut self) {
+        if let Some(handler) = self.handler.take() {
+            match &self.observation {
+                Some(owner) => owner.run(|| drop(handler)),
+                None => drop(handler),
+            }
+        }
+    }
+}
+
 // Design: ADR-0218 (docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)
 // RPC blocking dispatch belongs to the listener service. Its captured ingress
 // ownership remains live until the handler actually returns; query operations
@@ -104,9 +156,14 @@ fn retired_fetch_result_status() -> tonic::Status {
     reason = "Listener-owned blocking RPC service dispatch; see ADR-0218."
 )]
 fn serve_blocking<T: Send + 'static>(
+    observation: Option<novarocks_memory::LaneShards>,
     handler: impl FnOnce() -> T + Send + 'static,
 ) -> tokio::task::JoinHandle<T> {
-    tokio::task::spawn_blocking(handler)
+    let dispatch = NativeBlockingDispatch {
+        observation,
+        handler: Some(handler),
+    };
+    tokio::task::spawn_blocking(move || dispatch.run())
 }
 
 #[tonic::async_trait]
@@ -139,7 +196,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let kernel = self.exchange_data_plane.clone();
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = serve_blocking(move || {
+        let response = serve_blocking(self.observation.clone(), move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "exchange_unit",
                 queued_at.elapsed(),
@@ -161,7 +218,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let kernel = self.exchange_data_plane.clone();
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = serve_blocking(move || {
+        let response = serve_blocking(self.observation.clone(), move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "exchange_demand",
                 queued_at.elapsed(),
@@ -207,7 +264,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = serve_blocking(move || {
+        let response = serve_blocking(self.observation.clone(), move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "runtime_filter",
                 queued_at.elapsed(),
@@ -239,7 +296,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = serve_blocking(move || {
+        let response = serve_blocking(self.observation.clone(), move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "prune_catalogs",
                 queued_at.elapsed(),
@@ -262,7 +319,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = serve_blocking(move || {
+        let response = serve_blocking(self.observation.clone(), move || {
             crate::backend_metrics::native_blocking_queue_wait("heartbeat", queued_at.elapsed());
             let _ownership = ownership;
             heartbeat.respond(raw)

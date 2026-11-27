@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle, Thread, ThreadId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_execution_contract::failure::FailureProjection;
+use novarocks_memory::LaneShards;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 
 const MAX_THREADS: usize = 64;
@@ -65,6 +66,13 @@ impl RootCleanupPredecessors {
     }
 }
 pub(crate) trait RootProducerJob: Send + Sync {
+    /// The admitted work's observation travels with the job across pool threads.
+    #[cfg(not(test))]
+    fn memory_observation(&self) -> &LaneShards;
+    #[cfg(test)]
+    fn memory_observation(&self) -> &LaneShards {
+        test_job_observation()
+    }
     fn turn(&self) -> RootProducerTurn;
     fn cancel(&self);
     /// Each supplied synchronous phase is invoked once. The domain must move
@@ -76,6 +84,24 @@ pub(crate) trait RootProducerJob: Send + Sync {
         phase: u16,
         predecessors: RootCleanupPredecessors,
     ) -> RootCleanupProgress;
+}
+
+#[cfg(test)]
+pub(crate) fn test_job_observation() -> &'static LaneShards {
+    use novarocks_memory::{AccountKind, ExternalRef, MemoryAuthority};
+    use std::sync::OnceLock;
+
+    static TEST: OnceLock<(Arc<MemoryAuthority>, LaneShards)> = OnceLock::new();
+    &TEST
+        .get_or_init(|| {
+            let authority = crate::backend_test_support::test_memory_authority();
+            let account = authority
+                .create_account(AccountKind::Work, ExternalRef::NONE)
+                .unwrap();
+            let observation = account.create_lane_shards();
+            (authority, observation)
+        })
+        .1
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootCleanupProgress {
@@ -774,8 +800,12 @@ impl RootProducerPool {
             let worker = Arc::clone(&core);
             match thread::Builder::new()
                 .stack_size(stack_bytes)
-                .spawn(move || run(worker))
-            {
+                .spawn(move || {
+                    novarocks_memory::attribution::roles::enter_registered_thread_role(
+                        "root_producer",
+                    );
+                    run(worker)
+                }) {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     stop(&core);
@@ -1271,9 +1301,10 @@ fn execution_fault(
     kind: RootProducerPoolFailure,
     cell: usize,
     payload: PanicPayload,
+    observation: &LaneShards,
 ) {
     execution_unresolved(core, ticket, kind);
-    if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+    if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| observation.run(|| drop(payload)))) {
         let mut state = core.state.lock().expect("root producer pool lock");
         let entry = &mut state.slots[ticket.index].faults[cell];
         assert!(entry.is_none(), "each closed plan phase executes once");
@@ -1382,7 +1413,7 @@ fn run(core: Arc<Core>) {
             }
         };
         if matches!(call, Call::Dispose) {
-            let (exit, work, failed, cell) = {
+            let (exit, work, cell) = {
                 let mut state = core.state.lock().expect("root producer pool lock");
                 let slot = &mut state.slots[ticket.index];
                 (
@@ -1392,18 +1423,24 @@ fn run(core: Arc<Core>) {
                     } else {
                         slot.job.take()
                     },
-                    slot.execution_failed,
                     slot.plan.len() + 2,
                 )
             };
-            if !failed && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(work))) {
-                execution_fault(
-                    &core,
-                    ticket,
-                    RootProducerPoolFailure::JobDrop,
-                    cell,
-                    payload,
-                );
+            if let Some(work) = work {
+                // The scope must outlive the last copy of the job.
+                let observation = work.memory_observation().clone();
+                if let Err(payload) =
+                    catch_unwind(AssertUnwindSafe(|| observation.run(|| drop(work))))
+                {
+                    execution_fault(
+                        &core,
+                        ticket,
+                        RootProducerPoolFailure::JobDrop,
+                        cell,
+                        payload,
+                        &observation,
+                    );
+                }
             }
             let unknown = core.state.lock().expect("root producer pool lock").slots[ticket.index]
                 .execution_failed;
@@ -1420,9 +1457,10 @@ fn run(core: Arc<Core>) {
             continue;
         }
         let job = borrowed.as_ref().unwrap();
+        let observation = job.memory_observation();
         let mut requeue = true;
         match call {
-            Call::Turn => match catch_unwind(AssertUnwindSafe(|| job.turn())) {
+            Call::Turn => match catch_unwind(AssertUnwindSafe(|| observation.run(|| job.turn()))) {
                 Ok(RootProducerTurn::Complete) => {
                     core.state.lock().expect("root producer pool lock").slots[ticket.index]
                         .cleaning = true
@@ -1430,21 +1468,39 @@ fn run(core: Arc<Core>) {
                 Ok(RootProducerTurn::Yielded) => {}
                 Ok(RootProducerTurn::Blocked | RootProducerTurn::Idle) => requeue = false,
                 Err(payload) => {
-                    execution_fault(&core, ticket, RootProducerPoolFailure::Turn, 0, payload);
+                    execution_fault(
+                        &core,
+                        ticket,
+                        RootProducerPoolFailure::Turn,
+                        0,
+                        payload,
+                        observation,
+                    );
                     core.state.lock().expect("root producer pool lock").slots[ticket.index]
                         .cancel_requested = true;
                 }
             },
             Call::Cancel => {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| job.cancel())) {
-                    execution_fault(&core, ticket, RootProducerPoolFailure::Cancel, 1, payload);
+                if let Err(payload) =
+                    catch_unwind(AssertUnwindSafe(|| observation.run(|| job.cancel())))
+                {
+                    execution_fault(
+                        &core,
+                        ticket,
+                        RootProducerPoolFailure::Cancel,
+                        1,
+                        payload,
+                        observation,
+                    );
                 }
             }
             Call::Cleanup {
                 id,
                 ordinal,
                 predecessors,
-            } => match catch_unwind(AssertUnwindSafe(|| job.cleanup_step(id, predecessors))) {
+            } => match catch_unwind(AssertUnwindSafe(|| {
+                observation.run(|| job.cleanup_step(id, predecessors))
+            })) {
                 Ok(RootCleanupProgress::Exited) => {
                     let mut state = core.state.lock().expect("root producer pool lock");
                     let slot = &mut state.slots[ticket.index];
@@ -1461,6 +1517,7 @@ fn run(core: Arc<Core>) {
                     RootProducerPoolFailure::Cleanup,
                     ordinal + 2,
                     payload,
+                    observation,
                 ),
             },
             Call::Dispose => unreachable!(),
@@ -1615,6 +1672,86 @@ mod tests {
                 .all(|s| s.job.is_none() || s.phase == Phase::Unresolved),
             "all schedulable CPU calls drain; Unresolved is not physical exit"
         );
+    }
+
+    #[test]
+    fn m03a_pool_cancel_and_dispose_run_under_the_original_work_observation() {
+        use novarocks_memory::attribution::{ATTRIBUTION_TOKEN_BYTES, binding::flush_current};
+        use novarocks_memory::{AccountKind, ExternalRef};
+        use std::hint::black_box;
+
+        struct ObservedJob {
+            observation: LaneShards,
+            entered: Arc<Gate>,
+            phases: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl ObservedJob {
+            fn record(&self, phase: &'static str) {
+                let before = self.observation.snapshot().tagged_bytes;
+                let held = black_box(vec![0u8; 1024]);
+                flush_current();
+                assert_eq!(
+                    self.observation.snapshot().tagged_bytes - before,
+                    (1024 + ATTRIBUTION_TOKEN_BYTES) as i128,
+                    "{phase} allocation belongs to the original job",
+                );
+                drop(black_box(held));
+                self.phases.lock().unwrap().push(phase);
+            }
+        }
+        impl RootProducerJob for ObservedJob {
+            fn memory_observation(&self) -> &LaneShards {
+                &self.observation
+            }
+            fn turn(&self) -> RootProducerTurn {
+                self.record("turn");
+                self.entered.enter();
+                RootProducerTurn::Idle
+            }
+            fn cancel(&self) {
+                self.record("cancel");
+            }
+            fn cleanup_step(
+                &self,
+                _phase: u16,
+                _predecessors: RootCleanupPredecessors,
+            ) -> RootCleanupProgress {
+                self.record("cleanup");
+                RootCleanupProgress::Exited
+            }
+        }
+        impl Drop for ObservedJob {
+            fn drop(&mut self) {
+                self.record("dispose");
+            }
+        }
+
+        let authority = crate::backend_test_support::test_memory_authority();
+        let owner = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap()
+            .create_lane_shards();
+        let (pool, budget) = pool(1);
+        let phases = Arc::new(Mutex::new(Vec::with_capacity(4)));
+        let gate = Arc::new(Gate::default());
+        let release = ReleaseGate(gate.clone());
+        let job = Arc::new(ObservedJob {
+            observation: owner.clone(),
+            entered: gate.clone(),
+            phases: phases.clone(),
+        });
+        let registration = install(&pool, &budget, EXIT, job);
+        let exit = registration.exit_observation();
+        registration.wake().unwrap();
+        gate.wait_entered();
+        drop(release);
+        pool.shutdown().unwrap();
+        assert_eq!(exit.status(), RootProducerExitStatus::Exited);
+        assert_eq!(
+            &*phases.lock().unwrap(),
+            &["turn", "cancel", "cleanup", "dispose"]
+        );
+        assert_eq!(owner.snapshot().tagged_bytes, 0);
     }
     // These regressions exercise real once cleanup callbacks and the Native
     // session's exact phase-8 predicate. Field emptiness is deliberately a

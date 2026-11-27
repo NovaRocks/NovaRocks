@@ -236,12 +236,17 @@ impl ExecutionRuntime {
                 .transport_exchange_inflight_per_peer,
         )
         .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
-        let exchange_unit_scheduler = ExchangeUnitSendScheduler::try_new(
-            config.exchange_io_max_inflight_bytes,
-            peer_calls,
-            exchange_flow_limits.max_unit_payload_bytes(),
-        )
-        .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
+        let exchange_scheduler_observation = memory_authority.root().create_lane_shards();
+        let exchange_unit_scheduler = exchange_scheduler_observation
+            .run(|| {
+                ExchangeUnitSendScheduler::try_new(
+                    config.exchange_io_max_inflight_bytes,
+                    peer_calls,
+                    exchange_flow_limits.max_unit_payload_bytes(),
+                    Some(exchange_scheduler_observation.clone()),
+                )
+            })
+            .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
         Ok(Self {
             execution_health: Arc::new(crate::runtime::execution_health::ExecutionHealth::default()),
             config,

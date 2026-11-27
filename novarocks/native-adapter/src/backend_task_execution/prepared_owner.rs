@@ -168,18 +168,29 @@ pub(crate) struct NativePreparationChild {
     self_weak: std::sync::Weak<Self>,
     task_stopped: std::sync::atomic::AtomicBool,
     readiness_waker: std::task::Waker,
+    observation: Option<novarocks_memory::lane::LaneShards>,
     #[cfg(novarocks_dev_controls)]
     prepared_exit_gate: Mutex<Option<super::prepared_exit_control::PreparedExitGate>>,
 }
 impl NativePreparationChild {
+    #[cfg(test)]
     pub(crate) fn register(
         scope: &TaskPreparationContext<'_>,
         health: Arc<ExecutionHealth>,
+    ) -> ExecutionResult<Arc<Self>> {
+        Self::register_observed(scope, health, None)
+    }
+
+    pub(crate) fn register_observed(
+        scope: &TaskPreparationContext<'_>,
+        health: Arc<ExecutionHealth>,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> ExecutionResult<Arc<Self>> {
         let child = Self::new(
             scope.runtime_control().identity(),
             health,
             scope.readiness_waker(),
+            observation,
         );
         scope
             .register_child(child.clone())
@@ -190,11 +201,13 @@ impl NativePreparationChild {
         identity: TaskIdentity,
         health: Arc<ExecutionHealth>,
         readiness_waker: std::task::Waker,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             identity,
             health,
             readiness_waker,
+            observation,
             state: Arc::new(Mutex::new(State {
                 retained: None,
                 rollback: false,
@@ -217,6 +230,17 @@ impl NativePreparationChild {
             prepared_exit_gate: Mutex::new(None),
         })
     }
+    pub(crate) fn memory_observation(&self) -> Option<&novarocks_memory::LaneShards> {
+        self.observation.as_ref()
+    }
+
+    pub(crate) fn observe<T>(&self, work: impl FnOnce() -> T) -> T {
+        match &self.observation {
+            Some(owner) => owner.run(work),
+            None => work(),
+        }
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn inject_prepared_exit_failure(
         &self,
@@ -426,8 +450,10 @@ impl NativePreparationChild {
         }
         let mut primary = self.state.lock().unwrap().primary[phase as usize].take();
         if primary.is_some() {
-            let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                ManuallyDrop::drop(primary.as_mut().unwrap());
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                self.observe(|| unsafe {
+                    ManuallyDrop::drop(primary.as_mut().unwrap());
+                })
             }));
             unsafe {
                 std::ptr::write(&mut primary, None);
@@ -517,11 +543,13 @@ impl NativePreparationChild {
         }
         let mut root = self.state.lock().unwrap().root.take();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            if let Some(root) = root.as_mut() {
-                unsafe {
-                    ManuallyDrop::drop(root);
+            self.observe(|| {
+                if let Some(root) = root.as_mut() {
+                    unsafe {
+                        ManuallyDrop::drop(root);
+                    }
                 }
-            }
+            })
         }));
         unsafe {
             std::ptr::write(&mut root, None);
@@ -603,7 +631,7 @@ impl NativePreparationChild {
             .map(ManuallyDrop::into_inner);
         let mut slot = dormant;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            PreparedTaskExecution::try_drain_stopped(&mut slot)
+            self.observe(|| PreparedTaskExecution::try_drain_stopped(&mut slot))
         }));
         // Restore any unconsumed original before health/diagnostic publication.
         if let Some(dormant) = slot.take() {
@@ -626,11 +654,13 @@ impl NativePreparationChild {
         if self.claim(Phase::LocalTaskHolder) {
             let mut running = self.state.lock().unwrap().running.take();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(running) = running.as_mut() {
-                    unsafe {
-                        ManuallyDrop::drop(running);
+                self.observe(|| {
+                    if let Some(running) = running.as_mut() {
+                        unsafe {
+                            ManuallyDrop::drop(running);
+                        }
                     }
-                }
+                })
             }));
             unsafe {
                 std::ptr::write(&mut running, None);
@@ -663,7 +693,7 @@ impl NativePreparationChild {
     fn finish_control(&self) {
         if self.claim(Phase::Control) {
             let control = self.state.lock().unwrap().control.take();
-            match catch_unwind(AssertUnwindSafe(|| drop(control))) {
+            match catch_unwind(AssertUnwindSafe(|| self.observe(|| drop(control)))) {
                 Ok(()) => self.exited(Phase::Control),
                 Err(payload) => self.fault(Phase::Control, Some(payload), None),
             }
@@ -838,11 +868,13 @@ impl NativePreparationChild {
         };
         let mut dormant = Some(dormant);
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let dormant = ManuallyDrop::into_inner(dormant.take().unwrap());
-            match initial_failure {
-                Some(cause) => dormant.start_failed(cause),
-                None => dormant.start(),
-            }
+            self.observe(|| {
+                let dormant = ManuallyDrop::into_inner(dormant.take().unwrap());
+                match initial_failure {
+                    Some(cause) => dormant.start_failed(cause),
+                    None => dormant.start(),
+                }
+            })
         }));
         if let Some(dormant) = dormant.take() {
             self.state.lock().unwrap().dormant = Some(dormant);
@@ -877,7 +909,7 @@ impl NativePreparationChild {
         }
         if self.claim(Phase::Control) {
             let control = self.state.lock().unwrap().control.take();
-            match catch_unwind(AssertUnwindSafe(|| drop(control))) {
+            match catch_unwind(AssertUnwindSafe(|| self.observe(|| drop(control)))) {
                 Ok(()) => self.exited(Phase::Control),
                 Err(payload) => {
                     self.fault(Phase::Control, Some(payload), None);
@@ -1068,8 +1100,12 @@ mod tests {
         );
         let original = Arc::new(OriginalReadiness::default());
         let health = Arc::new(ExecutionHealth::new());
-        let owner =
-            NativePreparationChild::new(identity, health.clone(), Waker::from(original.clone()));
+        let owner = NativePreparationChild::new(
+            identity,
+            health.clone(),
+            Waker::from(original.clone()),
+            None,
+        );
         *original.owner.lock().unwrap() = Arc::downgrade(&owner);
         let mut publisher = owner.terminal_publisher(None);
         assert_eq!(original.notifications.load(Ordering::Acquire), 0);

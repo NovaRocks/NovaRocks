@@ -183,6 +183,7 @@ pub struct ExchangeUnitSendScheduler {
     max_calls_per_peer: usize,
     max_unit_bytes: usize,
     state: Mutex<ScheduleState>,
+    observation: Option<novarocks_memory::lane::LaneShards>,
 }
 
 impl ExchangeUnitSendScheduler {
@@ -194,6 +195,7 @@ impl ExchangeUnitSendScheduler {
         max_bytes: usize,
         max_calls_per_peer: usize,
         max_unit_bytes: usize,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<Arc<Self>, ExchangeUnitSenderError> {
         if max_bytes == 0 || max_calls_per_peer == 0 || max_unit_bytes == 0 {
             return Err(ExchangeUnitSenderError::InvalidLimits);
@@ -202,6 +204,7 @@ impl ExchangeUnitSendScheduler {
             max_bytes,
             max_calls_per_peer,
             max_unit_bytes,
+            observation,
             state: Mutex::new(ScheduleState {
                 bytes: 0,
                 calls: 0,
@@ -233,12 +236,19 @@ impl ExchangeUnitSendScheduler {
         })
     }
 
+    fn update_state<T>(&self, step: impl FnOnce(&mut ScheduleState) -> T) -> T {
+        let update = || step(&mut self.state.lock().expect("exchange unit scheduler lock"));
+        match &self.observation {
+            Some(owner) => owner.run(update),
+            None => update(),
+        }
+    }
+
     fn request(self: &Arc<Self>, sender: &Arc<ExchangeStreamSender>) {
-        {
-            let mut state = self.state.lock().expect("exchange unit scheduler lock");
+        self.update_state(|state| {
             state.enqueue(sender, false);
             state.revision = state.revision.wrapping_add(1);
-        }
+        });
         self.drive();
     }
 
@@ -257,10 +267,7 @@ impl ExchangeUnitSendScheduler {
             };
             let mut sent = false;
             for _ in 0..count {
-                let entry = {
-                    let mut state = self.state.lock().expect("exchange unit scheduler lock");
-                    state.pop()
-                };
+                let entry = self.update_state(ScheduleState::pop);
                 let Some((stream, weak)) = entry else {
                     continue;
                 };
@@ -271,8 +278,7 @@ impl ExchangeUnitSendScheduler {
                     continue;
                 };
                 let peer = stream.destination().backend_process_id();
-                let (reserved, wait_for_bytes) = {
-                    let mut state = self.state.lock().expect("exchange unit scheduler lock");
+                let (reserved, wait_for_bytes) = self.update_state(|state| {
                     let peer_calls = state.peers.get(&peer).copied().unwrap_or(0);
                     let fits = state
                         .bytes
@@ -292,7 +298,7 @@ impl ExchangeUnitSendScheduler {
                         state.enqueue(&sender, wait_for_bytes);
                         (false, wait_for_bytes)
                     }
-                };
+                });
                 if wait_for_bytes {
                     break;
                 }
@@ -302,6 +308,8 @@ impl ExchangeUnitSendScheduler {
                         peer,
                         bytes: candidate.bytes,
                     };
+                    // Neither the scheduler lock nor its observation scope
+                    // encloses the original sender's dispatch and callbacks.
                     sender.dispatch(candidate, permit);
                     sent = true;
                     break;
@@ -326,12 +334,7 @@ struct SendPermit {
 }
 impl Drop for SendPermit {
     fn drop(&mut self) {
-        {
-            let mut state = self
-                .scheduler
-                .state
-                .lock()
-                .expect("exchange unit scheduler lock");
+        self.scheduler.update_state(|state| {
             state.bytes -= self.bytes;
             state.calls -= 1;
             state.revision = state.revision.wrapping_add(1);
@@ -343,7 +346,7 @@ impl Drop for SendPermit {
             if *count == 0 {
                 state.peers.remove(&self.peer);
             }
-        }
+        });
         self.scheduler.drive();
     }
 }
@@ -474,6 +477,7 @@ pub struct ExchangeStreamSender {
     cancellation: CancellationToken,
     stop_cancellation: CancellationToken,
     state: Mutex<SenderState>,
+    observation: Option<novarocks_memory::lane::LaneShards>,
 }
 
 impl ExchangeStreamSender {
@@ -482,6 +486,7 @@ impl ExchangeStreamSender {
         transmitter: Arc<dyn ExchangeFrameTransmitter>,
         scheduler: Arc<ExchangeUnitSendScheduler>,
         observable: Arc<Observable>,
+        observation: Option<novarocks_memory::lane::LaneShards>,
     ) -> Result<Arc<Self>, ExchangeUnitSenderError> {
         if config.sender_count == 0
             || config.stream.source().sender_ordinal() >= config.sender_count
@@ -514,6 +519,7 @@ impl ExchangeStreamSender {
             observable,
             cancellation: CancellationToken::new(),
             stop_cancellation: CancellationToken::new(),
+            observation,
             state: Mutex::new(SenderState {
                 kernel,
                 payloads: BTreeMap::new(),
@@ -544,6 +550,13 @@ impl ExchangeStreamSender {
 
     pub fn observable(&self) -> &Arc<Observable> {
         &self.observable
+    }
+
+    fn run_observed<T>(&self, step: impl FnOnce() -> T) -> T {
+        match &self.observation {
+            Some(owner) => owner.run(step),
+            None => step(),
+        }
     }
 
     pub fn snapshot(&self) -> ExchangeStreamSenderSnapshot {
@@ -654,7 +667,7 @@ impl ExchangeStreamSender {
     }
 
     pub fn stop(self: &Arc<Self>) {
-        self.terminate(ExchangeStreamSenderStatus::Stopped);
+        self.run_observed(|| self.terminate(ExchangeStreamSenderStatus::Stopped));
     }
 
     fn notify(&self) {
@@ -765,7 +778,7 @@ impl ExchangeStreamSender {
     // callback flag. It grants no DATA position, byte permit or remote fact.
     fn control_activity(self: &Arc<Self>) -> ExchangeCallActivity {
         let sender = Arc::clone(self);
-        ExchangeCallActivity::new(move || {
+        ExchangeCallActivity::new(self.observation.as_ref(), move || {
             {
                 let mut state = sender.state.lock().expect("exchange stream sender lock");
                 state.active_control_calls = state
@@ -781,7 +794,7 @@ impl ExchangeStreamSender {
     // Their reservation is made under the same lock as the retry-waiting flag.
     fn retry_activity(self: &Arc<Self>) -> ExchangeCallActivity {
         let sender = Arc::downgrade(self);
-        ExchangeCallActivity::new(move || {
+        ExchangeCallActivity::new(self.observation.as_ref(), move || {
             if let Some(sender) = sender.upgrade() {
                 {
                     let mut state = sender.state.lock().expect("exchange stream sender lock");
@@ -1101,7 +1114,7 @@ impl ExchangeStreamSender {
                     self.config.stream,
                     Arc::new(move |notice| {
                         if let Some(sender) = weak.upgrade() {
-                            sender.observe(notice);
+                            sender.run_observed(|| sender.observe(notice));
                         }
                     }),
                 ) {
@@ -1287,6 +1300,11 @@ impl ExchangeStreamSender {
     }
 
     fn dispatch(self: &Arc<Self>, candidate: SendCandidate, permit: SendPermit) {
+        // The shared scheduler can drive another query on the current stack.
+        self.run_observed(|| self.dispatch_observed(candidate, permit));
+    }
+
+    fn dispatch_observed(self: &Arc<Self>, candidate: SendCandidate, permit: SendPermit) {
         let prepared = {
             let mut state = self.state.lock().expect("exchange stream sender lock");
             if state.status != ExchangeStreamSenderStatus::Open
@@ -1358,7 +1376,7 @@ impl ExchangeStreamSender {
             return;
         };
         let sender = Arc::clone(self);
-        let activity = ExchangeCallActivity::new(move || {
+        let activity = ExchangeCallActivity::new(self.observation.as_ref(), move || {
             {
                 let mut state = sender.state.lock().expect("exchange stream sender lock");
                 if state.active.get(&candidate.sequence) == Some(&call) {

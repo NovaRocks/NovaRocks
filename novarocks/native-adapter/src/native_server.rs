@@ -131,6 +131,7 @@ pub(crate) struct ListenerAdmission {
     pub(crate) class: TransportClass,
     /// The Backend data listener's bounded root reader, if it serves roots.
     pub(crate) root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
+    pub(crate) observation: Option<novarocks_memory::LaneShards>,
 }
 
 /// Instance-owned native gRPC listener lifecycle.
@@ -185,6 +186,7 @@ impl NativeRpcListener {
                 admission,
                 class: TransportClass::Membership,
                 root_results: None,
+                observation: None,
             },
         )
     }
@@ -193,6 +195,7 @@ impl NativeRpcListener {
         clippy::too_many_arguments,
         reason = "role identity and its authentication metric remain explicit composition inputs"
     )]
+    #[cfg(test)]
     pub(crate) fn start_with_admission<S, F, H>(
         host: &str,
         port: u16,
@@ -208,6 +211,51 @@ impl NativeRpcListener {
         admission: NativeTransportAdmission,
         class: TransportClass,
         root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
+    ) -> Result<Self, String>
+    where
+        S: NovaRocksGrpc + Clone + Send + Sync + 'static,
+        F: Fn() + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Self::start_backend_observed(
+            host,
+            port,
+            service,
+            native_trust,
+            incoming_adapter,
+            role_label,
+            domain,
+            thread_name,
+            on_authentication_failure,
+            on_transport_handshake_failure,
+            ingress_config,
+            admission,
+            class,
+            root_results,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "role identity and its authentication metric remain explicit composition inputs"
+    )]
+    pub(crate) fn start_backend_observed<S, F, H>(
+        host: &str,
+        port: u16,
+        service: S,
+        native_trust: Arc<NativeTrust>,
+        incoming_adapter: NativeIncomingAdapter,
+        role_label: &'static str,
+        domain: NativeEndpointDomain,
+        thread_name: &'static str,
+        on_authentication_failure: F,
+        on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
+        admission: NativeTransportAdmission,
+        class: TransportClass,
+        root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
+        observation: Option<novarocks_memory::LaneShards>,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -230,6 +278,7 @@ impl NativeRpcListener {
                 admission,
                 class,
                 root_results,
+                observation,
             },
         )
     }
@@ -323,6 +372,7 @@ impl NativeRpcListener {
         let join_handle = std::thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
+                novarocks_memory::attribution::roles::enter_registered_thread_role("native_rpc");
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
@@ -332,11 +382,15 @@ impl NativeRpcListener {
                         })
                         .max_blocking_threads(ingress_config.max_blocking_threads)
                         .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
+                        .on_thread_start(|| {
+                            novarocks_memory::attribution::roles::enter_registered_thread_role("native_rpc");
+                        })
                         .build()
                         .map_err(|error| {
                             format!("build native {role_label} gRPC runtime: {error}")
                         })?;
-                    let outcome = runtime.block_on(async move {
+                    let listener_observation = admission.observation.clone();
+                    let outcome = runtime.block_on(observe_native_work(listener_observation, || async move {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native {role_label} gRPC listener: {error}")
                         })?;
@@ -416,7 +470,7 @@ impl NativeRpcListener {
                             Some((native_trust.server_admission(), domain)),
                         )
                         .await
-                    });
+                    }));
                     // Dropping this runtime cancels every connection task it
                     // still owns. Each one reports itself on the way out.
                     drop(runtime);
@@ -496,11 +550,65 @@ fn box_native_response(
     response.map(boxed)
 }
 
+/// The runtime owner remains Tokio's normal executor. This adapter installs
+/// the Native transport observation on each independently polled task.
+#[derive(Clone)]
+pub(crate) struct TransportExecutor(pub(crate) Option<novarocks_memory::LaneShards>);
+
+impl TransportExecutor {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The original Native transport service starts and drains its connection and stream tasks; see ADR-0218."
+    )]
+    fn start<F>(&self, make: impl FnOnce() -> F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        hyper::rt::Executor::execute(
+            &TokioExecutor::new(),
+            observe_native_work(self.0.clone(), make),
+        );
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for TransportExecutor
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        self.start(|| future);
+    }
+}
+
+pub(crate) fn observe_native_work<F: std::future::Future, Make: FnOnce() -> F>(
+    owner: Option<novarocks_memory::LaneShards>,
+    make: Make,
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    enum Work<F> {
+        Observed(novarocks_memory::attribution::future::AttributedFuture<F>),
+        Plain(F),
+    }
+    let work = match owner {
+        Some(owner) => Work::Observed(
+            novarocks_memory::attribution::future::AttributedFuture::new(owner, make),
+        ),
+        None => Work::Plain(make()),
+    };
+    async move {
+        match work {
+            Work::Observed(future) => future.await,
+            Work::Plain(future) => future.await,
+        }
+    }
+}
+
 /// Apply the frozen public HTTP/2 limits to one Native connection, admitted or
 /// not. These bound the counts and per-item sizes inside Hyper/H2; the bytes
 /// those libraries allocate under them are covered by the transport
 /// measurement gate.
-fn configure_native_server(builder: &mut http2::Builder<TokioExecutor>) {
+fn configure_native_server(builder: &mut http2::Builder<TransportExecutor>) {
     let g = NativeResultSupportGeometry::V1;
     builder
         .initial_stream_window_size(g.transport_h2_stream_receive_window_bytes as u32)
@@ -563,6 +671,7 @@ impl NativeIncomingHeadAdmission {
 }
 
 struct ConnectionInputs<S> {
+    observation: Option<novarocks_memory::LaneShards>,
     stream: tokio::net::TcpStream,
     app: S,
     incoming: NativeIncomingAdapter,
@@ -590,6 +699,7 @@ where
     S::Future: Send + 'static,
 {
     let ConnectionInputs {
+        observation,
         stream,
         app,
         incoming,
@@ -632,7 +742,7 @@ where
         // composition requires role-matched admission before listener startup.
         None => (novarocks_transport_io::OwnedIo::new(stream), None),
     };
-    let mut builder = http2::Builder::new(TokioExecutor::new());
+    let mut builder = http2::Builder::new(TransportExecutor(observation));
     configure_native_server(&mut builder);
     let close = head.as_ref().map(|head| Arc::clone(&head.close));
     let handshake = head.as_ref().map(|head| head.handshake.clone());
@@ -722,10 +832,6 @@ async fn notified_or_forever(close: Option<&Notify>) {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "The original native listener admits and drains connection service tasks; see ADR-0218."
-)]
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,
@@ -830,7 +936,9 @@ where
                     &next_connection_id,
                     &live_connections,
                 );
-                tokio::spawn(serve_connection(ConnectionInputs {
+                let observation = admission.as_ref().and_then(|listener| listener.observation.clone());
+                let inputs = ConnectionInputs {
+                    observation: observation.clone(),
                     stream,
                     app: app.clone(),
                     incoming: incoming.clone(),
@@ -838,7 +946,8 @@ where
                     served,
                     drain: drain_rx.clone(),
                     on_transport_handshake_failure: Arc::clone(&on_transport_handshake_failure),
-                }));
+                };
+                TransportExecutor(observation).start(|| serve_connection(inputs));
             }
         }
     }

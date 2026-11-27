@@ -1146,6 +1146,9 @@ impl BackendApplicationHost {
         let metrics_registry = Arc::new(
             BackendMetricsRegistry::new()
                 .and_then(|registry| registry.with_process_memory(process_memory))
+                .and_then(|registry| {
+                    registry.with_transport_memory(readiness_runtime.transport_memory_observation())
+                })
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
@@ -1181,7 +1184,7 @@ impl BackendApplicationHost {
             runtime_filter_ingress;
         let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
             Arc::new(services.task_control.clone());
-        let service = BackendRpcService::new(
+        let service = BackendRpcService::new_observed(
             Arc::clone(&services.task_execution_ingress),
             Arc::clone(&services.participation_host)
                 as Arc<
@@ -1195,6 +1198,7 @@ impl BackendApplicationHost {
                 Arc::clone(&services.drain),
                 admission_epoch,
             ),
+            readiness_runtime.transport_memory_observation().cloned(),
         );
         #[cfg(novarocks_dev_controls)]
         let service = match &test_session {
@@ -1212,7 +1216,7 @@ impl BackendApplicationHost {
                     .as_ref()
                     .and_then(|session| session.observation.clone()),
             );
-        let mut grpc_server = match NativeRpcListener::start_with_admission(
+        let mut grpc_server = match NativeRpcListener::start_backend_observed(
             &bind_host,
             grpc_port,
             service.clone(),
@@ -1227,6 +1231,7 @@ impl BackendApplicationHost {
             transport_admission.clone(),
             TransportClass::Data,
             Some(Arc::new(root_reader)),
+            readiness_runtime.transport_memory_observation().cloned(),
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -1242,7 +1247,7 @@ impl BackendApplicationHost {
             }
         };
 
-        let mut control_grpc_server = match NativeRpcListener::start_with_admission(
+        let mut control_grpc_server = match NativeRpcListener::start_backend_observed(
             &bind_host,
             control_grpc_port,
             service,
@@ -1257,6 +1262,7 @@ impl BackendApplicationHost {
             transport_admission,
             TransportClass::Control,
             None,
+            readiness_runtime.transport_memory_observation().cloned(),
         ) {
             Ok(server) => server,
             Err(error) => {

@@ -57,6 +57,7 @@ pub struct BackendMetricsRegistry {
     protocol_retention_available: IntGaugeVec,
     inbound_retention: Option<Arc<novarocks_worker::TaskInboundCapabilities>>,
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
+    transport_memory: Option<(novarocks_memory::LaneShards, IntGauge, IntGauge)>,
     exchange_flow: ExchangeFlowMetrics,
     exchange_runtime:
         Option<Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime>>,
@@ -719,6 +720,7 @@ impl BackendMetricsRegistry {
             protocol_retention_available,
             inbound_retention: None,
             process_memory: None,
+            transport_memory: None,
             exchange_flow,
             exchange_runtime: None,
             scrape_lock: std::sync::Mutex::new(()),
@@ -796,6 +798,32 @@ impl BackendMetricsRegistry {
                 attribution,
             },
         ));
+        Ok(self)
+    }
+
+    pub(crate) fn with_transport_memory(
+        mut self,
+        owner: Option<&novarocks_memory::LaneShards>,
+    ) -> Result<Self, String> {
+        if let Some(owner) = owner {
+            let bytes = IntGauge::new(
+                "novarocks_backend_native_transport_attributed_bytes",
+                "Signed tagged allocation bytes observed for the shared Native transport service.",
+            )
+            .map_err(|error| error.to_string())?;
+            let covered = IntGauge::new(
+                "novarocks_backend_native_transport_attribution_covered",
+                "Whether the shared Native transport service obtained observation lanes.",
+            )
+            .map_err(|error| error.to_string())?;
+            self.registry
+                .register(Box::new(bytes.clone()))
+                .map_err(|error| error.to_string())?;
+            self.registry
+                .register(Box::new(covered.clone()))
+                .map_err(|error| error.to_string())?;
+            self.transport_memory = Some((owner.clone(), bytes, covered));
+        }
         Ok(self)
     }
 
@@ -1002,6 +1030,11 @@ impl BackendMetricsRegistry {
         if let Some((observation, gauges)) = &self.process_memory {
             let (counted, physical) = (observation.sample)();
             publish_process_memory(gauges, counted, physical);
+        }
+        if let Some((owner, bytes, covered)) = &self.transport_memory {
+            let sample = owner.snapshot();
+            covered.set(i64::from(sample.coverage.is_ok()));
+            bytes.set(signed_gauge_value(sample.tagged_bytes));
         }
         // Contexts leave only through the original instance resource teardown. The owner is
         // the only source for these gauges, and the lock keeps concurrent

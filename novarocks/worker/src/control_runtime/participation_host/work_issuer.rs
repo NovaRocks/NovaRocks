@@ -44,6 +44,7 @@ use novarocks_execution_contract::{
     ParticipationRef,
     failure::{FailureClass, FailureFact, FailureProjection},
 };
+use novarocks_memory::{Account, AccountKind, CapacityError, ExternalRef, MemoryAuthority};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -125,12 +126,33 @@ struct Entry {
     panic: PanicSink,
     observer_settled: bool,
 }
+
+// Design: ADR-0278 (docs/adr/ADR-0278-query-memory-follows-original-execution-ownership.md)
+/// The original Participation owns this account even if materialization
+/// cannot publish its QueryContext. Checked by the host removal gate.
+#[must_use = "The original query account must settle or remain in host custody"]
+struct QueryMemoryRetirementObligation(Account);
+
+enum QueryMemoryRetirement {
+    Pending(QueryMemoryRetirementObligation),
+    Settling,
+    Settled {
+        _receipt: novarocks_memory::TransferReceipt,
+    },
+    Unresolved {
+        _obligation: QueryMemoryRetirementObligation,
+        _error: novarocks_memory::TeardownError,
+    },
+}
+
 struct State {
     entries: BTreeMap<WorkId, Entry>,
     retained: Option<Arc<Inner>>,
     scan_requested: bool,
     scan_upper: Option<WorkId>,
     scan_after: Option<WorkId>,
+    query_memory: Option<QueryMemoryRetirement>,
+    query_observation: Option<novarocks_memory::lane::LaneShards>,
 }
 struct Wake {
     runtime: ActorRuntime<WorkerActor>,
@@ -188,6 +210,8 @@ impl ParticipationWorkRegistry {
                 scan_requested: false,
                 scan_upper: None,
                 scan_after: None,
+                query_memory: None,
+                query_observation: None,
             }),
         })))
     }
@@ -456,6 +480,76 @@ impl ParticipationWorkRegistry {
             wake.notice.notify();
         }
     }
+
+    pub(super) fn has_unsettled_query_memory(&self) -> bool {
+        matches!(
+            self.0
+                .state
+                .lock()
+                .expect("Participation work registry lock")
+                .query_memory,
+            Some(
+                QueryMemoryRetirement::Pending(_)
+                    | QueryMemoryRetirement::Settling
+                    | QueryMemoryRetirement::Unresolved { .. }
+            )
+        )
+    }
+
+    pub(super) fn query_memory_observation(&self) -> Option<novarocks_memory::lane::LaneShards> {
+        self.0
+            .state
+            .lock()
+            .expect("Participation work registry lock")
+            .query_observation
+            .clone()
+    }
+
+    pub(in crate::control_runtime) fn retire_memory_after_scope_exit(
+        &self,
+        retired_at: novarocks_worker_protocol::lease::MonotonicInstant,
+    ) {
+        let obligation = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .expect("Participation work registry lock");
+            if !matches!(state.query_memory, Some(QueryMemoryRetirement::Pending(_))) {
+                return;
+            }
+            let Some(QueryMemoryRetirement::Pending(obligation)) =
+                state.query_memory.replace(QueryMemoryRetirement::Settling)
+            else {
+                unreachable!("pending original account under the same lock");
+            };
+            state.query_observation = None;
+            obligation
+        };
+        let outcome = match obligation.0.retire_after_owner_exit() {
+            Ok(receipt) => QueryMemoryRetirement::Settled { _receipt: receipt },
+            Err(error) => {
+                // Current attributed work and explicit external responsibility
+                // must be gone by the original execution-scope exit. Retain
+                // the account and surface a health fault if that contract fails.
+                tracing::error!(participation = ?self.0.participation, account = ?obligation.0.id(), ?retired_at, ?error, "Query memory retirement did not settle");
+                self.0.health.report_unresolved(
+                    ExecutionExitOrigin::Local,
+                    ParticipationWorkError::Unresolved.failure_fact(),
+                );
+                QueryMemoryRetirement::Unresolved {
+                    _obligation: obligation,
+                    _error: error,
+                }
+            }
+        };
+        self.0
+            .state
+            .lock()
+            .expect("Participation work registry lock")
+            .query_memory = Some(outcome);
+        self.notify();
+    }
 }
 
 /// Only Worker can issue this bundle for its original Participation. It moves
@@ -485,7 +579,7 @@ impl Drop for ParticipationInstanceGrant {
     }
 }
 
-/// This issuer can only derive RF sender work under its original live instance.
+/// Opens the query account and derives RF sender work for the exact instance.
 /// It exposes no general child authority, caller-supplied identity or capacity.
 #[derive(Clone)]
 pub struct InstanceWorkIssuer {
@@ -493,6 +587,40 @@ pub struct InstanceWorkIssuer {
     parent: Parent,
 }
 impl InstanceWorkIssuer {
+    /// Opens the original Participation's sole query account and records its
+    /// retirement obligation before returning anything to materialization.
+    pub fn open_query_memory_binding(
+        &self,
+        authority: &Arc<MemoryAuthority>,
+    ) -> Result<novarocks_execution::runtime::query_memory::QueryMemoryBinding, CapacityError> {
+        let original = &self.registry.0;
+        let mut state = original
+            .state
+            .lock()
+            .expect("Participation work registry lock");
+        if state.query_memory.is_some() {
+            return Err(CapacityError::Invalid {
+                detail: "original Participation already opened a query memory account",
+            });
+        }
+        let execution = original.participation.query_execution_id();
+        let query = execution.query_id();
+        let account = authority.create_account(
+            AccountKind::Work,
+            ExternalRef::new(query.high() as u64, query.low() as u64),
+        )?;
+        state.query_memory = Some(QueryMemoryRetirement::Pending(
+            QueryMemoryRetirementObligation(account.clone()),
+        ));
+        let binding = novarocks_execution::runtime::query_context::QueryMemoryAccount::new(
+            execution, account,
+        )
+        .bind(execution, authority.clone())
+        .expect("the original account was opened by this authority");
+        state.query_observation = Some(binding.observation().clone());
+        Ok(binding)
+    }
+
     pub fn runtime_filter_sender(&self) -> Result<RuntimeFilterSenderWork, ParticipationWorkError> {
         let (work, _, panic) = self
             .registry
@@ -500,6 +628,7 @@ impl InstanceWorkIssuer {
         Ok(RuntimeFilterSenderWork {
             work: Some(work),
             panic,
+            observation: self.registry.query_memory_observation(),
             wake: ParticipationWorkWake {
                 registry: self.registry.clone(),
             },
@@ -511,8 +640,13 @@ pub struct RuntimeFilterSenderWork {
     work: Option<ExitObligation>,
     panic: PanicSink,
     wake: ParticipationWorkWake,
+    observation: Option<novarocks_memory::LaneShards>,
 }
 impl RuntimeFilterSenderWork {
+    pub fn observation(&self) -> Option<&novarocks_memory::LaneShards> {
+        self.observation.as_ref()
+    }
+
     pub fn into_parts(mut self) -> (ExitObligation, PanicSink, ParticipationWorkWake) {
         (
             self.work.take().expect("one original sender obligation"),

@@ -34,6 +34,7 @@ pub(super) struct ParticipationTeardownState {
     pub(super) parent_retire_authorized: bool,
     pub(super) failed_owner_completed: bool,
     parent_exit_observed: bool,
+    execution_retired_at: Option<novarocks_worker_protocol::lease::MonotonicInstant>,
 }
 
 /// Removal failure never reconstructs an already-consumed host claim. After
@@ -211,6 +212,7 @@ impl ParticipationHostRecord {
         let retired_at = novarocks_worker_protocol::lease::MonotonicInstant::from_origin(
             std::time::Duration::from_nanos(clock.now().0),
         );
+        self.resources.teardown.execution_retired_at = Some(retired_at);
         self.resources
             .lifecycle
             .as_mut()
@@ -311,6 +313,7 @@ impl ParticipationHostRecord {
         let retired_at = novarocks_worker_protocol::lease::MonotonicInstant::from_origin(
             std::time::Duration::from_nanos(clock.now().0),
         );
+        self.resources.teardown.execution_retired_at = Some(retired_at);
         self.resources
             .lifecycle
             .as_mut()
@@ -369,6 +372,19 @@ impl ParticipationHostRecord {
             Some(original) => original.advance_metadata(turn, budget),
             None => Ok(false),
         }
+    }
+
+    pub(in crate::control_runtime) fn memory_retirement_after_detachment(
+        &self,
+    ) -> Option<(
+        super::work_issuer::ParticipationWorkRegistry,
+        novarocks_worker_protocol::lease::MonotonicInstant,
+    )> {
+        let retired_at = self.resources.teardown.execution_retired_at?;
+        self.resources
+            .work_registry
+            .clone()
+            .map(|work| (work, retired_at))
     }
 
     pub(crate) fn stage_removal(
@@ -481,7 +497,13 @@ impl ParticipationHostRecord {
         {
             return Ok(false);
         }
-        if self.resources.scope.is_some() {
+        if self.resources.scope.is_some()
+            || self
+                .resources
+                .work_registry
+                .as_ref()
+                .is_some_and(|work| work.has_unsettled_query_memory())
+        {
             return Ok(false);
         }
         if !self.resources.registered {
