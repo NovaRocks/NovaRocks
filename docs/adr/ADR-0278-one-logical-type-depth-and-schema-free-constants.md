@@ -19,7 +19,7 @@ code-anchors:
 
 # ADR-0278 统一逻辑类型深度与常量记录
 
-- 状态：已接受设计，实施验证中
+- 状态：已接受设计，目标提交已完成本地验证
 - 日期：2026-11-27
 - 关联：[ADR-0176](ADR-0176-recursive-execution-types-and-independent-storage-ownership.md)、[ADR-0214](ADR-0214-iceberg-schema-depth-by-decoder-owner.md)、[ADR-0221](ADR-0221-schema-free-online-units-and-prepared-layout-recipes.md)、[ADR-0233](ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md)、[ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md)
 
@@ -62,7 +62,9 @@ SQL 逻辑嵌套、Arrow 物理结构、Iceberg 私有 protobuf 的位置和 Par
 
 在 dev 和 release 中用每种生产线程允许的最小配置验证。D 深的值走原生准入和实际消费。进程隔离的 2D 样本由白盒探查交给实际线程和适用的库入口，覆盖 List、Struct、Map、支持的 Dictionary 叶和最坏混合形状。记录实际栈容量、类型及操作、构建身份、返回和真正退出。形状在 2D 上通过给出所测路径的余量下界。更早生效的格式能力拒绝和真实栈溢出分别取证。
 
-目前开发预探查通过了 FE bounded worker 和 Iceberg catalog bridge 的 D/2D 样本。Darwin 报告的实际栈容量分别为 16,789,504 和 2,109,440 字节。探查调用了 Arrow 形状构造、比较、哈希、Debug、Clone 与析构，以及 LIST schema 的原 SDK 序列化和反序列化。材料见任务证据目录的 `20261127T091802Z-P09-owner-preflight.GY9jGyCo`。最终两种构建的线程覆盖、配置下限与原生通过范围待补齐。
+目标提交 `4f3b889a9a8cb9c3a1e74b27e56da51c28f68928` 在 Darwin arm64 上以 dev 和 release 各完成 126 项隔离探查。每种构建包含 102 项生产运行时线程样本，以及 24 项 FE bounded worker 和 Iceberg catalog bridge 样本。Root producer 使用现行最低 1 MiB 配置，实际栈容量 1,060,864 字节。Pipeline driver、rejected-driver reaper 和 catalog bridge 实测 2,109,440 字节。Native worker 与阻塞线程、FE runtime 与阻塞线程、scan/sink I/O 和 FE bounded worker 实测 16,789,504 字节。
+
+样本以 D=64 与 2D=128 覆盖所测形状的构造、比较、哈希、Debug、Clone、受控取消和最后别名退出。scan/sink 路径包含实际 Parquet 非 NULL 叶读写，catalog 探查包含 SDK schema 编解码。原生 D 与 D+1 验收来自干净 Server 的 1FE+3BE。测量的保留证据位于任务工作树的 `logs/experiments/7b3f-f9/20261127T123735Z-P10.naFnvdzj/candidate-4f3b889a9a/stack`。证据的适用范围为本次平台与构建。
 
 ## 接受的妥协
 
