@@ -405,11 +405,11 @@ fn writer_schema_actual_small_checkpoint_prefixes_and_ordinary_tails_keep_three_
         ]
         .into(),
     ));
-    let ordinary =
-        field(DataType::Int64).with_metadata(HashMap::from([("k".into(), "v".repeat(65537))]));
-    for (f, is_error) in [(&success, false), (&ordinary, true)] {
+    let ordinary = field(DataType::Int64);
+    let near_overflow = usize::MAX - WRITE_FIELD_ALLOCATION_CHARGE - ordinary.name().len();
+    for (f, start, is_error) in [(&success, 0, false), (&ordinary, near_overflow, true)] {
         let c = Control::default();
-        let mut bytes = 0;
+        let mut bytes = start;
         let result = observed(f, 1, &mut bytes, &c);
         assert_eq!(result.is_err(), is_error);
         if is_error {
@@ -425,7 +425,7 @@ fn writer_schema_actual_small_checkpoint_prefixes_and_ordinary_tails_keep_three_
                     stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
-                let mut bytes = 0;
+                let mut bytes = start;
                 assert!(
                     matches!(observed(f,1,&mut bytes,&c),Err(Error::Control(actual)) if actual==cause)
                 );

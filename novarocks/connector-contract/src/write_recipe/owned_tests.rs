@@ -442,11 +442,12 @@ fn coexistence_overflow_is_typed_resource_before_any_late_checkpoint() {
 #[test]
 fn original_writer_law_resource_error_stays_ordinary_provider_error() {
     let (binding, payload) = envelope();
+    let payload = ConnectorEncodedPayload::new(
+        payload.header().clone(),
+        bytes::Bytes::from(vec![42; MAX_CONNECTOR_WRITER_HANDLE_BYTES + 1]),
+    );
     let input = ConnectorWriteInputShape::Data {
-        fields: vec![ConnectorWriteFieldBinding::new(
-            ConnectorWriteFieldToken::from_bytes([1; 32]),
-            Field::new("x".repeat(1025), DataType::Int64, false),
-        )],
+        fields: vec![field(1, DataType::Int64)],
     };
     let expected =
         ConnectorWriteRecipeDraft::try_new(binding.clone(), payload.clone(), input.clone())
@@ -457,7 +458,7 @@ fn original_writer_law_resource_error_stays_ordinary_provider_error() {
         &binding,
         &payload,
         &input,
-        1024 * 1024,
+        MAX_CONNECTOR_WRITER_HANDLE_BYTES + 1024 * 1024,
         &mut |_| Ok(()),
         &mut work,
     )

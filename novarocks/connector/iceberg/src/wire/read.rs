@@ -4068,7 +4068,7 @@ mod compile_control_tests {
         };
         decode(identity.clone()).unwrap();
         let error = decode(wrap(identity, MAX_VALUE_TYPE_DEPTH as i32 + 1)).unwrap_err();
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::Capacity);
     }
 
     fn column() -> IcebergColumnHandle {

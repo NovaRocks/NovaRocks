@@ -594,7 +594,7 @@ pub(crate) mod tests {
         let baseline = physical_schema(Schema::new(fields.clone())).unwrap();
         let mut remaining = MAX_STATIC_SCAN_RETAINED_BYTES - baseline.charged_bytes();
         for field in &mut fields {
-            let value_bytes = remaining.min((16 * 1024));
+            let value_bytes = remaining.min(16 * 1024);
             *field =
                 field
                     .clone()
