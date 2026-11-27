@@ -72,9 +72,12 @@ SELECT count(*) AS n_root_aliased
   WHERE s.parent_id IS NULL;
 
 -- query 11
+SELECT * FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots" LIMIT 0;
+
+-- query 12
 -- @skip_result_check=true
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0};
 
--- query 12
+-- query 13
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

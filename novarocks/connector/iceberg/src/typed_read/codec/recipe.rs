@@ -341,14 +341,16 @@ mod tests {
             CatalogHandle::new(instance, CatalogVersion::from_bytes([7; 32])),
         );
         let table = IcebergRuntimeRelation::SystemTable(
-            IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
-                schema_table_name: SchemaTableName::try_new("db", "events").unwrap(),
-                system_table_type: IcebergSystemTableType::Files,
-                metadata_file_location: "s3://warehouse/db/events/metadata/v1.json".to_string(),
-                table_uuid: "00000000-0000-0000-0000-000000000007".to_string(),
-                snapshot_id: Some(11),
-            })
-            .unwrap(),
+            crate::typed_read::SystemTableScan::empty_for_test(
+                IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
+                    schema_table_name: SchemaTableName::try_new("db", "events").unwrap(),
+                    system_table_type: IcebergSystemTableType::Files,
+                    metadata_file_location: "s3://warehouse/db/events/metadata/v1.json".to_string(),
+                    table_uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                    snapshot_id: Some(11),
+                })
+                .unwrap(),
+            ),
         );
         let view = IcebergReadView::new(HiveTransactionHandle::new(true, [3; 16]));
         let column = IcebergColumnHandle::try_new(IcebergColumnHandleParams {

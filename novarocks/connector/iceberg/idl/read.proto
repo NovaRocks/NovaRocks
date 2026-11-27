@@ -253,6 +253,15 @@ message IcebergSystemTableReference {
   optional int64 snapshot_id = 5;
 }
 
+message IcebergSystemTableScan {
+  IcebergSystemTableReference reference = 1;
+  uint32 format_version = 2;
+  string table_schema_json = 3;
+  map<int32, string> partition_spec_jsons = 4;
+  repeated int32 partition_slot_field_ids = 5;
+  bool table_has_variant_history = 6;
+}
+
 message IcebergInsertTableHandle {
   SchemaTableName schema_table_name = 1;
   string table_schema_json = 2;
@@ -274,7 +283,7 @@ message IcebergReadTablePayload {
     IcebergTableHandle table = 10;
     TableChangesFunctionHandle table_function = 11;
     IcebergChangeWindowHandle change_window = 12;
-    IcebergSystemTableReference system_table = 13;
+    IcebergSystemTableScan system_table = 13;
     IcebergMergeTableHandle merge_table = 15;
   }
 }
@@ -412,16 +421,12 @@ message TrinoManifestFile {
 }
 
 message SystemManifestSplit {
-  repeated int32 partition_slot_field_ids = 10;
-  IcebergSystemTableReference reference = 9;
-  bool table_has_variant_history = 8;
+  reserved 2 to 8, 10;
+  reserved "table_schema_json", "metadata_table_schema_json", "partition_spec_jsons",
+    "partition_column_type_json", "bounds_column_type_json", "encryption_key_id",
+    "table_has_variant_history", "partition_slot_field_ids";
   TrinoManifestFile manifest = 1;
-  string table_schema_json = 2;
-  string metadata_table_schema_json = 3;
-  map<int32, string> partition_spec_jsons = 4;
-  optional string partition_column_type_json = 5;
-  optional string bounds_column_type_json = 6;
-  optional string encryption_key_id = 7;
+  IcebergSystemTableReference reference = 9;
 }
 
 message SystemRelationSplit {

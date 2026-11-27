@@ -696,7 +696,7 @@ impl TrackedWindowPartition {
                     self.checked.push(last_checked);
                 }
                 TrackedWindowOwner::Utf8Extrema(kernel) => {
-                    let PreparedExtrema::Utf8(kernel) = kernel.as_ref() else {
+                    let PreparedExtrema::Bytes(kernel) = kernel.as_ref() else {
                         return Err(internal("VARCHAR window uses a foreign extrema owner"));
                     };
                     let mut winner = if prefix == 0 { None } else { last_checked };

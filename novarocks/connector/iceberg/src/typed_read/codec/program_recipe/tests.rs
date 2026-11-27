@@ -480,7 +480,16 @@ fn system_fixture(kind: IcebergSystemTableType) -> Fixture {
         snapshot_id: Some(11),
     })
     .unwrap();
-    let relation = IcebergRuntimeRelation::SystemTable(reference);
+    let relation = IcebergRuntimeRelation::SystemTable(
+        crate::typed_read::SystemTableScan::from_facts(
+            reference,
+            crate::iceberg::spec::FormatVersion::V2,
+            schema,
+            specs,
+            false,
+        )
+        .unwrap(),
+    );
     Fixture {
         source: source_for(&relation),
         domains: BTreeMap::new(),
@@ -749,7 +758,7 @@ fn complete_metadata_kind_relation_kind_revision_and_private_bytes_refuse() {
         &table.build_modified(None, Some(bytes::Bytes::new()), None),
         ConnectorCodecErrorKind::MissingField,
     );
-    let bad_revision = table.build_modified(None, None, Some(ICEBERG_READ_CODEC_REVISION + 1));
+    let bad_revision = fixture.build_modified(None, None, Some(ICEBERG_READ_CODEC_REVISION - 1));
     assert!(matches!(
         ConnectorReadProgramRecipe::try_compile_with_provider(
             &bad_revision,

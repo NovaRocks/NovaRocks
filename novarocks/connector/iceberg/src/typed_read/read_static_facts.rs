@@ -152,7 +152,7 @@ fn project(
             )
         }
         IcebergRuntimeRelation::SystemTable(reference) => {
-            let frozen = work.opaque(|| reference.to_proto().encode_to_vec())?;
+            let frozen = work.opaque(|| reference.reference().to_proto().encode_to_vec())?;
             let properties = unconstrained_read_properties(work)?;
             let input_digest =
                 static_digest(b"iceberg-final-static-system-table-v1", &frozen, work)?;
@@ -274,8 +274,8 @@ mod tests {
     use crate::typed_boundary::final_static_facts_tests::table_handle;
     use crate::typed_read::{
         IcebergChangeWindowHandle, IcebergChangeWindowHandleParams, IcebergSystemTableReference,
-        IcebergSystemTableReferenceParams, IcebergSystemTableType, TableChangesFunctionHandle,
-        TableChangesFunctionHandleParams,
+        IcebergSystemTableReferenceParams, IcebergSystemTableType, SystemTableScan,
+        TableChangesFunctionHandle, TableChangesFunctionHandleParams,
     };
     use novarocks_spi::connector::read_stack::{ConnectorTableHandle as _, SchemaTableName};
     use std::collections::BTreeMap;
@@ -312,7 +312,7 @@ mod tests {
         ]
     }
     fn system(kind: IcebergSystemTableType) -> IcebergRuntimeRelation {
-        IcebergRuntimeRelation::SystemTable(
+        IcebergRuntimeRelation::SystemTable(SystemTableScan::empty_for_test(
             IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
                 schema_table_name: SchemaTableName::try_new("db", "orders").unwrap(),
                 system_table_type: kind,
@@ -321,7 +321,7 @@ mod tests {
                 snapshot_id: Some(41),
             })
             .unwrap(),
-        )
+        ))
     }
     fn change() -> IcebergRuntimeRelation {
         let table = table_handle();
@@ -407,7 +407,7 @@ mod tests {
             };
             assert_eq!(
                 facts.coverage_evidence(),
-                reference.to_proto().encode_to_vec()
+                reference.reference().to_proto().encode_to_vec()
             );
         }
     }

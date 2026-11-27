@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact Utf8 byte extrema; host memory scopes own replacement coexistence.
+//! Exact Utf8 and Binary byte extrema; host memory scopes own replacement coexistence.
 
 use super::aggregate_extrema::ExtremaOperation;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, GenericByteArray, StringArray,
+    types::{ByteArrayType, GenericBinaryType, GenericStringType},
+};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use std::{alloc::Layout, cmp::Ordering, ops::Range, sync::Arc};
@@ -29,16 +32,16 @@ use std::{alloc::Layout, cmp::Ordering, ops::Range, sync::Arc};
 /// Inline state belongs to the host arena; only this Vec's actual capacity is
 /// additional retained heap. None and Some(empty) are distinct SQL values.
 #[derive(Debug)]
-pub(super) struct Utf8ExtremaState {
+pub(super) struct BytesExtremaState {
     value: Option<Vec<u8>>,
 }
-impl Utf8ExtremaState {
+impl BytesExtremaState {
     pub(super) fn retained_bytes(&self) -> usize {
         self.value.as_ref().map_or(0, Vec::capacity)
     }
 }
 #[derive(Debug)]
-pub(super) struct Utf8ExtremaKernel {
+pub(super) struct BytesExtremaKernel {
     pub(super) contract: Arc<AggregateCallContract>,
     pub(super) operation: ExtremaOperation,
 }
@@ -71,27 +74,39 @@ fn reserve<T>(count: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<
     work.flush()?;
     Ok(values)
 }
-fn read<'a>(
+struct SelectedBytes<'a> {
+    array: &'a dyn Array,
+    row: usize,
+    value: &'a [u8],
+}
+
+fn read_array<'a, T: ByteArrayType<Offset = i32>>(
     argument: EvaluatedArgument<'a>,
     ordinal: usize,
     row: usize,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<(&'a StringArray, usize)>, KernelFailure> {
-    let array = argument.array().as_any().downcast_ref::<StringArray>();
+) -> Result<Option<SelectedBytes<'a>>, KernelFailure> {
+    let array = argument
+        .array()
+        .as_any()
+        .downcast_ref::<GenericByteArray<T>>();
     work.step()?;
-    let array =
-        array.ok_or_else(|| internal("UTF8 MIN/MAX has a foreign concrete source carrier"))?;
+    let array = array.ok_or_else(|| internal("MIN/MAX has a foreign concrete byte carrier"))?;
     let at = argument.value_row(ordinal, row);
     let valid = at < array.len();
     work.step()?;
     if !valid {
         return Err(internal(
-            "UTF8 MIN/MAX source address is outside its carrier",
+            "MIN/MAX source address is outside its byte carrier",
         ));
     }
     let null = array.is_null(at);
     work.step()?;
-    Ok((!null).then_some((array, at)))
+    Ok((!null).then(|| SelectedBytes {
+        array,
+        row: at,
+        value: array.value(at).as_ref(),
+    }))
 }
 fn compare(
     candidate: &[u8],
@@ -110,15 +125,19 @@ fn compare(
     Ok(order)
 }
 fn replacement(
-    state: &Utf8ExtremaState,
-    source: Option<(&StringArray, usize)>,
+    state: &BytesExtremaState,
+    source: Option<SelectedBytes<'_>>,
     operation: ExtremaOperation,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<Vec<u8>>, KernelFailure> {
-    let Some((array, at)) = source else {
+    let Some(SelectedBytes {
+        array,
+        row: at,
+        value: bytes,
+    }) = source
+    else {
         return Ok(None);
     };
-    let bytes = array.value(at).as_bytes();
     let replace = if let Some(current) = &state.value {
         compare(bytes, current, work)?
             == match operation {
@@ -157,7 +176,8 @@ fn replacement(
     }
     Ok(Some(replacement))
 }
-impl Utf8ExtremaKernel {
+
+impl BytesExtremaKernel {
     /// Retain the actual frame winner under the original input source owner.
     /// Compare its physical UTF-8 bytes exactly as ordinary MIN/MAX does.
     pub(super) fn window_candidate(
@@ -191,9 +211,47 @@ impl Utf8ExtremaKernel {
         }
         Ok(Some(candidate))
     }
+
+    fn carrier(&self) -> &DataType {
+        self.contract.intermediate_type().data_type()
+    }
+
+    fn accepts(&self, array: &dyn Array) -> bool {
+        match self.carrier() {
+            DataType::Utf8 => array.as_any().is::<StringArray>(),
+            DataType::Binary => array.as_any().is::<BinaryArray>(),
+            _ => false,
+        }
+    }
+
+    fn read<'a>(
+        &self,
+        argument: EvaluatedArgument<'a>,
+        ordinal: usize,
+        row: usize,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Option<SelectedBytes<'a>>, KernelFailure> {
+        match self.carrier() {
+            DataType::Utf8 => read_array::<GenericStringType<i32>>(argument, ordinal, row, work),
+            DataType::Binary => read_array::<GenericBinaryType<i32>>(argument, ordinal, row, work),
+            _ => Err(internal("MIN/MAX has an unsupported byte carrier")),
+        }
+    }
+
+    fn build<'a>(
+        &self,
+        states: impl ExactSizeIterator<Item = &'a BytesExtremaState>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure> {
+        match self.carrier() {
+            DataType::Utf8 => build_array::<GenericStringType<i32>>(states, control),
+            DataType::Binary => build_array::<GenericBinaryType<i32>>(states, control),
+            _ => Err(internal("MIN/MAX cannot emit its byte carrier")),
+        }
+    }
 }
 
-impl PreparedAggregateKernel for Utf8ExtremaKernel {
+impl PreparedAggregateKernel for BytesExtremaKernel {
     fn supports_local_stages(&self) -> bool {
         true
     }
@@ -213,7 +271,7 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
             operation: self.operation,
         }))
     }
-    type State = Utf8ExtremaState;
+    type State = BytesExtremaState;
     type PreparedUpdateBatch<'batch> = SelectedAggregateUpdateInput<'batch, 'batch>;
     type PreparedMergeBatch<'batch> = SelectedAggregateMergeInput<'batch, 'batch>;
     fn contract(&self) -> &Arc<AggregateCallContract> {
@@ -233,7 +291,7 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
     ) -> Result<Self::State, KernelFailure> {
         observed(control, |work| {
             work.step()?;
-            Ok(Utf8ExtremaState { value: None })
+            Ok(BytesExtremaState { value: None })
         })
     }
     fn prepare_update<'batch>(
@@ -249,17 +307,14 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
             work.step()?;
             if !exact {
                 return Err(invalid(
-                    "UTF8 MIN/MAX update differs from its exact contract or channels",
+                    "Byte MIN/MAX update differs from its exact contract or channels",
                 ));
             }
-            let concrete = input.logical_arguments()[0]
-                .array()
-                .as_any()
-                .is::<StringArray>();
+            let concrete = self.accepts(input.logical_arguments()[0].array().as_ref());
             work.step()?;
             if !concrete {
                 return Err(internal(
-                    "UTF8 MIN/MAX update has a foreign concrete carrier",
+                    "Byte MIN/MAX update has a foreign concrete carrier",
                 ));
             }
             Ok(input)
@@ -276,10 +331,10 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
             let row = input.selection().row(ordinal);
             work.step()?;
             let row =
-                row.ok_or_else(|| invalid("UTF8 MIN/MAX update ordinal is outside its selection"))?;
+                row.ok_or_else(|| invalid("Byte MIN/MAX update ordinal is outside its selection"))?;
             replacement(
                 state,
-                read(input.logical_arguments()[0], ordinal, row, work)?,
+                self.read(input.logical_arguments()[0], ordinal, row, work)?,
                 self.operation,
                 work,
             )
@@ -302,14 +357,14 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
             work.step()?;
             if !exact {
                 return Err(invalid(
-                    "UTF8 MIN/MAX merge differs from its exact contract or phase",
+                    "Byte MIN/MAX merge differs from its exact contract or phase",
                 ));
             }
-            let concrete = input.state().array().as_any().is::<StringArray>();
+            let concrete = self.accepts(input.state().array().as_ref());
             work.step()?;
             if !concrete {
                 return Err(internal(
-                    "UTF8 MIN/MAX merge has a foreign concrete carrier",
+                    "Byte MIN/MAX merge has a foreign concrete carrier",
                 ));
             }
             Ok(input)
@@ -326,10 +381,10 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
             let row = input.selection().row(ordinal);
             work.step()?;
             let row =
-                row.ok_or_else(|| invalid("UTF8 MIN/MAX merge ordinal is outside its selection"))?;
+                row.ok_or_else(|| invalid("Byte MIN/MAX merge ordinal is outside its selection"))?;
             replacement(
                 state,
-                read(input.state(), ordinal, row, work)?,
+                self.read(input.state(), ordinal, row, work)?,
                 self.operation,
                 work,
             )
@@ -347,7 +402,7 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
     where
         I: ExactSizeIterator<Item = &'state Self::State>,
     {
-        build(states, control)
+        self.build(states, control)
     }
     fn build_final<'state, I>(
         &self,
@@ -357,25 +412,24 @@ impl PreparedAggregateKernel for Utf8ExtremaKernel {
     where
         I: ExactSizeIterator<Item = &'state Self::State>,
     {
-        build(states, control)
+        self.build(states, control)
     }
 }
-fn build<'state, I: ExactSizeIterator<Item = &'state Utf8ExtremaState>>(
-    states: I,
+fn build_array<'state, T: ByteArrayType<Offset = i32>>(
+    states: impl ExactSizeIterator<Item = &'state BytesExtremaState>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<ArrayRef, KernelFailure> {
     observed(control, |work| {
         let rows = states.len();
-        crate::selected_copy::guarded_interleave_extent(&DataType::Utf8, rows)
-            .map_err(copy_error)?;
-        let mut sources = reserve::<&Utf8ExtremaState>(rows, work)?;
+        crate::selected_copy::guarded_interleave_extent(&T::DATA_TYPE, rows).map_err(copy_error)?;
+        let mut sources = reserve::<&BytesExtremaState>(rows, work)?;
         let mut bytes = 0usize;
         for state in states {
             let within = sources.len() < rows;
             work.step()?;
             if !within {
                 return Err(internal(
-                    "UTF8 MIN/MAX emission iterator exceeds its declared extent",
+                    "Byte MIN/MAX emission iterator exceeds its declared extent",
                 ));
             }
             bytes = bytes
@@ -390,7 +444,7 @@ fn build<'state, I: ExactSizeIterator<Item = &'state Utf8ExtremaState>>(
         work.step()?;
         if !exact {
             return Err(internal(
-                "UTF8 MIN/MAX emission iterator differs from its declared extent",
+                "Byte MIN/MAX emission iterator differs from its declared extent",
             ));
         }
         let mut offsets = reserve::<i32>(
@@ -423,15 +477,14 @@ fn build<'state, I: ExactSizeIterator<Item = &'state Utf8ExtremaState>>(
         }
         work.flush()?;
         let nulls = NullBuffer::new(BooleanBuffer::new(Buffer::from(validity), 0, rows));
-        let result = StringArray::try_new(
+        let result = GenericByteArray::<T>::try_new(
             OffsetBuffer::new(offsets.into()),
             Buffer::from(values),
             Some(nulls),
         );
         work.flush()?;
-        let result = result.map_err(|_| {
-            internal("UTF8 MIN/MAX state emission violated its original UTF8 format")
-        })?;
+        let result = result
+            .map_err(|_| internal("MIN/MAX state emission violated its exact byte format"))?;
         work.flush()?;
         let array = Arc::new(result) as ArrayRef;
         work.flush()?;

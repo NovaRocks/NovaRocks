@@ -15,7 +15,7 @@ code-anchors:
   - "novarocks/query-application/src/api/native.rs (RuntimeSplitPlacement, NativeScanWork)"
   - "novarocks/frontend-application/src/query_execution/provider_read_facts.rs (placement_of, read_properties)"
   - "novarocks/worker/src/typed_connector_runtime/stream.rs (TypedConnectorScanStream)"
-  - "novarocks/sql/src/analyzer/iceberg_partitions.rs (partitions_query)"
+  - "novarocks/connector/iceberg/src/metadata_partitions_view.rs (Provider-derived view)"
 related:
   - "ADR-0156-connector-control-and-execution-resources.md"
   - "ADR-0159-driver-polled-connector-scan-streams.md"
@@ -42,9 +42,9 @@ Iceberg 的 `$snapshots`、`$history`、`$refs`、`$manifests` 各枚举一个 `
 
 `SystemTableUnitHint::{SingleUnit, ManyUnits}` 映射到 FE 的 `RuntimeSplitPlacement::{SingleUnit, Spread}`。它们是放置提示，不进入 frozen physical package 或 native wire。静态 metadata scan 的分布仍是 `Unconstrained`；把单例单元强制放进多 Task 图时，只有获分配的 Task 读它，其余 Task 正常完成零单元 scan，并履行 exchange EOS。既有精确静态工作量 `FrozenUnits` 的事实表达保留；它不为 provider 新建读取通道。
 
-`$partitions` 没有 provider reader：SQL 在同一冻结 `$files` binding 上过滤 `content=0`，按统一 partition ROW 聚合，或在无分区字段时用全局聚合加 `HAVING COUNT(*) > 0`。因此它只统计数据文件，`SUM` 沿用可空声明，`COUNT(*)` 必填；空输入输出零个分区统计行。普通全局聚合自身仍遵守空输入 `COUNT=0`、`SUM=NULL` 的 SQL 初始状态语义。
+Iceberg Provider 从同一次 `$files` 观察生成 `$partitions` 派生视图。SQL 在独立作用域使用原冻结 binding，过滤 `content=0`，按统一 partition ROW 聚合，或在无分区字段时用全局聚合加 `HAVING COUNT(*) > 0`。因此它只统计数据文件，`SUM` 沿用可空声明，`COUNT(*)` 必填；空输入输出零个分区统计行。普通全局聚合自身仍遵守空输入 `COUNT=0`、`SUM=NULL` 的 SQL 初始状态语义。
 
-改这类代码前，先读 `SystemTableUnitHint` 与 `placement_of` 的提示边界，再读 `TypedConnectorScanStream` 的逐 split 推进与退出；涉及视图时读 `partitions_query`，它显式保留 metadata 名称身份，避免普通表或 CTE 同名时遮蔽冻结来源。
+改这类代码前，先读 `SystemTableUnitHint` 与 `placement_of` 的提示边界，再读 `TypedConnectorScanStream` 的逐 split 推进与退出；涉及视图时读 Provider 的派生定义与 SQL 的隔离展开。SQL 保留原预绑定身份，外层普通表和 CTE 无法遮蔽冻结来源。
 
 ## 考虑过的选项
 
@@ -61,7 +61,7 @@ Iceberg 的 `$snapshots`、`$history`、`$refs`、`$manifests` 各枚举一个 `
 2. **提示只放置规则。** 单元提示只影响 FE 的放置选择，既不成为 wire 事实，也不约束 Task 数、静态分布或 DOP。忽略提示、强制多 Task 仍须得到相同结果。只有调度得到 Task 的 backend 才是本次查询参与者，不从集群规模推测参与数。
 3. **分布独立规则。** `Unconstrained` 的 scan 必须按普通分布规则规划聚合与交换。单例关系仍允许 partial → exchange → final；零单元 Task 正常结束并发送 EOS，不能靠“它应该没有被调度”跳过终止义务。Scan 只有一个推进 driver，下游并行度在 scan 分支交接处按计划兑现，遵守 [ADR-0159](ADR-0159-driver-polled-connector-scan-streams.md)。
 4. **分层唯一性规则。** Provider 保证枚举完整且不重叠，FE 将单元分配给一个目标，BE 对本 Task 的重复分配消息按原序列幂等接收。完整消费同一次成功 attempt 时，三层共同避免重复或漏读；这不是跨 attempt 的全局 exactly-once 账本。LIMIT 正常早停允许不读取余下单元。失败后的新 attempt 重新枚举和读取，并重建该 attempt 的聚合、exchange 状态，不在旧输出后直接续读剩余单元。
-5. **冻结身份与 SQL 视图规则。** Provider 验证精确 metadata 位置、表 UUID、snapshot 与 schema，不重解析最新状态或猜默认值。派生关系复用同一冻结底层 binding：`$partitions` 使用显式 Files metadata AST，保留限定名、别名和 CTE 作用域的正确边界。统一 partition ROW 按 field ID 构造；展示名消歧不改变身份，不把合法同名字段当成损坏。
+5. **冻结身份与 SQL 视图规则。** Provider 验证精确 metadata 位置、表 UUID、snapshot 与 schema。共享 schema、分区规则、输出声明及统计解释依据由 Iceberg scan 拥有，一个 Task 绑定一次。manifest split 携带自身描述和原冻结引用，Provider 在打开对象前核对引用、分区规则与投影。Iceberg Provider 用同一次 Files 观察生成 `$partitions` 的 SQL 与精确声明，SQL 在隔离作用域展开并消费原 Files binding，保留限定名、别名和 CTE 边界。统一 partition ROW 按 field ID 构造，展示名消歧保留原字段身份。
 6. **资源与错误保留规则。** 统一通道不删除原有非法输入、provider、取消、deadline 和真实资源拒绝。BE 在 Task 准入后绑定执行资源；FE 发现仍是操作控制与普通所有权，遵守 [ADR-0156](ADR-0156-connector-control-and-execution-resources.md)。退出仍须观察在途工作真实结束，不能以 EOS 或 Drop 代替。共享 page-source 接口不新增免准入 reader。
 7. **单次契约演进规则。** 删除旧工作来源词汇与整关系读取方法时，同时更新 frozen package、native codec 与 provider 私有 split vocabulary，退役字段/tag 保持 reserved，保留仍有效的 split 类别身份。按 [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) 使用唯一 compiled 解释链和准确兼容岛，不通过旧 decoder、协商或混合模式连接新旧进程。
 

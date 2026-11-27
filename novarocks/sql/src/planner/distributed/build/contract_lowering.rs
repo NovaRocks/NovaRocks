@@ -272,8 +272,11 @@ fn drive_ordinary_write_emission(
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
     let finish_count_mode = write.finish_count_mode;
     let (source, write) = visitor.lower_ordinary_write_layout(source, write)?;
+    // Ordinary writers consume each row once without a relational distribution
+    // requirement. Partition affinity, when requested, is carried by the exchange.
     let writer = visitor.lower_table_writer(
         source,
+        Distribution::Unconstrained,
         write,
         write_target_ordinal,
         auxiliary,
@@ -3820,6 +3823,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     fn lower_table_writer(
         &mut self,
         source: LoweredNode,
+        required_distribution: Distribution,
         write: SqlWritePlanInput,
         ordinal: WriteTargetOrdinal,
         auxiliary: &WriterAuxiliaryPlan,
@@ -4025,7 +4029,11 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.fragment_mut().add_row_consuming(
             node,
             Box::from([projected.node]),
-            RequiredInputs::AsProduced,
+            RequiredInputs::Exact(Box::new([PhysicalProperties {
+                distribution: required_distribution.clone(),
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            }])),
             Distribution::Unconstrained,
             output.clone(),
             NodeKind::TableWriter {
@@ -4033,7 +4041,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     handle,
                     write_target_ordinal: ordinal,
                     input: projected.output,
-                    required_distribution: projected.properties.distribution.clone(),
+                    required_distribution,
                     target_fields: target_fields.into_boxed_slice(),
                     output_schema,
                     partial_aggregates: partial_aggregates.into_boxed_slice(),
@@ -4824,12 +4832,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     routing_only: Box::default(),
                 },
             };
+            let receiver_distribution = partitioning.destination_output_distribution();
             self.fragment_mut().add_exchange_source(
                 receiver,
                 edge,
                 imports.clone().into_boxed_slice(),
                 imported.clone().into_boxed_slice(),
-                partitioning.destination_output_distribution(),
+                receiver_distribution.clone(),
                 RowMultiplicity::SingleCopy,
             )?;
             let receiver_properties = self
@@ -4915,6 +4924,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let handle = targets.take(ordinal).map_err(invalid_write)?;
             let writer = self.lower_table_writer(
                 writer_source,
+                receiver_distribution,
                 route.sink,
                 ordinal,
                 auxiliary,
@@ -4929,6 +4939,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let handle = targets.take(ordinal).map_err(invalid_write)?;
             let writer = self.lower_table_writer(
                 source,
+                Distribution::Singleton,
                 group.writer,
                 ordinal,
                 auxiliary,
@@ -15268,6 +15279,87 @@ mod tests {
             vec![novarocks_physical_plan::FinishCountMode::WriterReported]
         );
         assert_eq!(plan.result_port().unwrap().fields.len(), 12);
+    }
+
+    #[test]
+    fn ordinary_writer_does_not_require_the_hash_layout_of_a_grouped_source() {
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+        use crate::planner::physical::{
+            AggregateOutputLayout, HashSource, PhysicalHashAggregateNode,
+        };
+
+        let key = column(1, "order_id", DataType::Int64, false);
+        let shuffled = redistribute(
+            values(vec![key.clone()], vec![vec![literal_int(7)]; 2]),
+            RedistributeMode::Hash {
+                cols: vec![key.column_id],
+                source: HashSource::ShuffleAgg,
+            },
+        );
+        let source = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Single,
+                group_by: vec![column_ref(&key)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: AggregateOutputLayout::new(vec![key.clone()], Vec::new()),
+                output_columns: vec![key.clone()],
+                topn_runtime_filter_builds: Vec::new(),
+            })),
+            children: vec![shuffled],
+            output_columns: vec![key],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let finished = lower_final_physical_write_plan(
+            &source,
+            version(),
+            dop(),
+            FinalWriteLowering {
+                reads: None,
+                write: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+                write_target_ordinal: ordinal,
+                auxiliary: &WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap(),
+                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
+            },
+            crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            false,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap()
+        .finish_observed(&control)
+        .unwrap();
+        let (fragment, writer, target) = finished
+            .plan()
+            .fragments()
+            .values()
+            .find_map(|fragment| {
+                let root = &fragment.nodes()[&fragment.root()];
+                match &root.kind {
+                    NodeKind::TableWriter { target } => Some((fragment, root, target)),
+                    _ => None,
+                }
+            })
+            .unwrap();
+        let input = &fragment.nodes()[&writer.inputs[0]];
+        assert!(matches!(input.kind, NodeKind::Aggregate { .. }));
+        assert!(matches!(
+            input.output_properties.distribution,
+            Distribution::Hash { .. }
+        ));
+        assert_eq!(target.required_distribution, Distribution::Unconstrained);
+        assert_eq!(
+            writer.required_inputs.as_ref(),
+            &[PhysicalProperties {
+                distribution: Distribution::Unconstrained,
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            }]
+        );
     }
 
     #[test]

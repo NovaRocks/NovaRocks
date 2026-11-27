@@ -509,17 +509,29 @@ impl IcebergPageSourceProvider {
         context: FileReadContext,
         options: IcebergPageSourceProviderOptions,
     ) -> Self {
+        Self::with_execution_resources(access_binding, context, options, None)
+    }
+
+    pub(crate) fn with_execution_resources(
+        access_binding: IcebergReadBinding,
+        context: FileReadContext,
+        options: IcebergPageSourceProviderOptions,
+        resources: Option<novarocks_spi::connector::ConnectorExecutionResources>,
+    ) -> Self {
         let delete_manager = Arc::new(DeleteManager::new(access_binding.clone(), context.clone()));
-        let system_tables = Arc::new(super::system_page_source::IcebergSystemTableProvider::new(
-            access_binding.clone(),
-            context.clone(),
-            std::num::NonZeroUsize::new(
-                novarocks_spi::connector::ENGINE_OUTPUT_POLICY
-                    .max_rows
-                    .get() as usize,
+        let system_tables = Arc::new(
+            super::system_page_source::IcebergSystemTableProvider::new(
+                access_binding.clone(),
+                context.clone(),
+                std::num::NonZeroUsize::new(
+                    novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+                        .max_rows
+                        .get() as usize,
+                )
+                .expect("output engine policy is nonzero"),
             )
-            .expect("output engine policy is nonzero"),
-        ));
+            .with_execution_resources(resources),
+        );
         Self {
             access_binding,
             context,
@@ -627,11 +639,11 @@ where
             .collect::<Vec<_>>();
         match (table, split) {
             (
-                IcebergRuntimeRelation::SystemTable(reference),
+                IcebergRuntimeRelation::SystemTable(scan),
                 IcebergReadSplit::SystemManifest(_) | IcebergReadSplit::SystemRelation(_),
             ) => self
                 .system_tables
-                .create_page_stream(reference, split, &columns, budget),
+                .create_page_stream(scan, split, &columns, budget),
             (
                 IcebergRuntimeRelation::ChangeWindow(handle),
                 IcebergReadSplit::ChangeWindow(split),

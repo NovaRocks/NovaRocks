@@ -7,3 +7,7 @@ n_history
 -- types	bigint
 n_ancestors
 2
+
+-- query 7
+-- types	timestamp(6) with time zone	bigint	bigint	boolean
+made_current_at	snapshot_id	parent_id	is_current_ancestor

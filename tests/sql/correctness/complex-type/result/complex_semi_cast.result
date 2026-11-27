@@ -1,54 +1,29 @@
--- query 2
--- legacy
-_col0
-2
-
 -- query 3
--- legacy
+-- types	bigint
 _col0
 2
 
 -- query 4
--- legacy
+-- types	bigint
 _col0
 2
 
 -- query 5
--- legacy
+-- types	bigint
 _col0
 39999
 
 -- query 6
--- legacy
+-- types	bigint
 _col0
 40000
-
--- query 7
--- legacy
-_col0
-40000
-
--- query 8
--- legacy
-_col0
-2
 
 -- query 9
--- legacy
+-- types	bigint
 _col0
 40000
 
--- query 10
--- legacy
-_col0
-2
-
--- query 11
--- legacy
-_col0
-2
-
 -- query 12
--- legacy
+-- types	bigint
 _col0
 39999

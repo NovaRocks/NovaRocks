@@ -16,8 +16,7 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Validate SELECT * FROM <tbl>$partitions surfaces per-partition row counts.
--- Tests Phase A (metadata table SQL routing) — partitions flavour.
+-- Verify per-partition counts and typed data statistics.
 
 -- query 1
 -- @skip_result_check=true
@@ -43,9 +42,17 @@ SELECT sum(record_count) AS total_records
   FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metapart_${uuid0}$partitions";
 
 -- query 6
+SELECT p."partition".region AS region, p.data.id.min AS min_id, p.data.id.max AS max_id
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metapart_${uuid0}$partitions" p
+ ORDER BY region;
+
+-- query 7
+SELECT * FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metapart_${uuid0}$partitions" LIMIT 0;
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metapart_${uuid0};
 
--- query 7
+-- query 9
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

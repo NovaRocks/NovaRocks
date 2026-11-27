@@ -37,9 +37,9 @@ use crate::catalog_config::{
 };
 
 use super::{
-    IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
-    IcebergSystemTableReference, IcebergTableHandle, SystemManifestSplit, SystemRelationSplit,
-    TableChangesFunctionHandle, TableChangesSplit,
+    IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle, IcebergTableHandle,
+    SystemManifestSplit, SystemRelationSplit, SystemTableScan, TableChangesFunctionHandle,
+    TableChangesSplit,
 };
 
 #[cfg_attr(novarocks_dev_controls, derive(serde::Deserialize))]
@@ -154,7 +154,7 @@ pub enum IcebergRuntimeRelation {
     Table(IcebergTableHandle),
     TableFunction(TableChangesFunctionHandle),
     ChangeWindow(IcebergChangeWindowHandle),
-    SystemTable(IcebergSystemTableReference),
+    SystemTable(SystemTableScan),
     MergeTable(IcebergMergeTableHandle),
 }
 
@@ -174,7 +174,7 @@ impl IcebergRuntimeRelation {
             Self::Table(handle) => handle.schema_table_name(),
             Self::TableFunction(handle) => handle.schema_table_name(),
             Self::ChangeWindow(handle) => handle.schema_table_name(),
-            Self::SystemTable(handle) => handle.schema_table_name(),
+            Self::SystemTable(scan) => scan.reference().schema_table_name(),
             Self::MergeTable(handle) => handle.schema_table_name(),
         }
     }

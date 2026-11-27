@@ -27,8 +27,13 @@ use crate::catalog::{
     PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlMvViewDependency,
     SqlViewDefinition,
 };
+use crate::planner::table::{
+    ScanSource, SqlMetadataTableKind as MetadataTableKind, SqlScanKind, SqlTableVersionSelector,
+};
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueKind as K, ValueTypeRef};
+use novarocks_types::naming::TableIdentity;
+use std::cell::Cell;
 
 #[derive(Clone, Default)]
 pub(super) struct ViewAnalysisStack(std::rc::Rc<std::cell::RefCell<ActiveViews>>);
@@ -119,35 +124,9 @@ impl AnalyzerContext<'_> {
             inner: self.catalog,
             catalog: &view.default_catalog,
         };
-        let child = AnalyzerContext {
-            purpose: self.purpose,
-            grouping_scope: std::cell::RefCell::new(None),
-            control: self.control,
-            constant_policy: self.constant_policy,
-            materialized_values: None,
-            statement_relation: None,
-            prepared_parameters: None,
-            table_sequence: self.table_sequence,
-            catalog: &catalog,
-            current_database: &view.default_database,
-            function_catalog: self.function_catalog,
-            // Saved namespace controls lookups. The original admitted session
-            // remains authoritative for expressions in the stored body.
-            sql_semantics: self.sql_semantics.clone(),
-            factory: self.factory.clone(),
-            view_stack: self.view_stack.clone(),
-            ctes: Default::default(),
-            pending_ctes: Default::default(),
-            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-            collected_subqueries: Default::default(),
-            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
-        };
         self.view_stack.push(view, span)?;
-        let result = child.analyze_query(&query);
+        let result = self.analyze_isolated_view_body(&query, &catalog, &view.default_database);
         self.view_stack.pop();
-        // CTE identities and counters remain globally unique, while neither
-        // caller CTE visibility nor correlation enters the stored body.
-        self.absorb_semantic_scope(&child);
         let mut resolved = result.map_err(|error| stored_body_error(view, error, span))?;
         let row_id = if retain_row_id {
             let field = resolved
@@ -351,6 +330,147 @@ impl AnalyzerContext<'_> {
                 local_cte_ids: Vec::new(),
             };
         }
+        self.expose_view_relation(
+            resolved,
+            &view.identity,
+            alias,
+            relation_name,
+            row_id.as_ref(),
+        )
+    }
+
+    pub(super) fn analyze_derived_metadata_view(
+        &self,
+        source: &ResolvedAnalyzerTable,
+        view_name: &str,
+        alias: Option<super::resolve_from::RelationAlias<'_>>,
+        relation_name: &str,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        self.check_control()?;
+        let view = source
+            .derived_view
+            .as_deref()
+            .filter(|view| view.identity.table == view_name)
+            .ok_or_else(|| AnalyzeError::internal("metadata binding lacks its derived view"))?;
+        let ScanSource::Sql(scan) = &source.planner.source;
+        let identity = &source.catalog.identity;
+        if scan.binding != view.binding
+            || scan.kind
+                != (SqlScanKind::Metadata {
+                    kind: MetadataTableKind::Files,
+                    version: SqlTableVersionSelector::Current,
+                })
+            || scan.table.catalog != identity.catalog
+            || scan.table.namespace != identity.namespace
+            || scan.table.table != identity.table
+            || view.identity.catalog != identity.catalog
+            || view.identity.namespace != identity.namespace
+        {
+            return Err(AnalyzeError::internal(
+                "metadata view dependency differs from its source binding",
+            ));
+        }
+
+        let query = novarocks_parser::parser::parse_query(&view.raw_sql).map_err(|error| {
+            AnalyzeError::internal(format!("connector derived view has invalid SQL: {error}"))
+        })?;
+        crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
+            .map_err(derived_view_error)?;
+        let query = super::query_prepass::preanalyze(query).map_err(derived_view_error)?;
+        let catalog = DerivedViewCatalog {
+            dependency: source,
+            quoted_files: format!("{}$files", identity.table),
+            used: Cell::new(false),
+        };
+        let resolved = self
+            .analyze_isolated_view_body(&query, &catalog, &identity.namespace)
+            .map_err(derived_view_error)?;
+        if !catalog.used.get() {
+            return Err(AnalyzeError::internal(
+                "connector derived view omitted its source binding",
+            ));
+        }
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)
+            .map_err(AnalyzeError::control)?;
+        if resolved.output_columns.len() != view.columns.len() {
+            return Err(AnalyzeError::internal(
+                "connector derived view output width differs from its declaration",
+            ));
+        }
+        for (ordinal, (actual, expected)) in resolved
+            .output_columns
+            .iter()
+            .zip(view.columns.iter())
+            .enumerate()
+        {
+            work.step().map_err(AnalyzeError::control)?;
+            let equal = actual
+                .value_type
+                .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                    &expected.value_type,
+                    || {
+                        work.step()
+                            .map_err(novarocks_functions::FunctionBindingError::from)
+                    },
+                )
+                .map_err(AnalyzeError::function_binding)
+                .map_err(derived_view_error)?;
+            if actual.is_internal
+                || actual.field_name.as_deref() != Some(expected.name.as_ref())
+                || !equal
+            {
+                return Err(AnalyzeError::internal(format!(
+                    "connector derived view differs from its declaration at column {}",
+                    ordinal + 1,
+                )));
+            }
+        }
+        work.finish().map_err(AnalyzeError::control)?;
+        self.expose_view_relation(resolved, &view.identity, alias, relation_name, None)
+    }
+
+    fn analyze_isolated_view_body(
+        &self,
+        query: &ast::Query,
+        catalog: &dyn PlannerTableProvider,
+        database: &str,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
+        let child = AnalyzerContext {
+            purpose: self.purpose,
+            grouping_scope: std::cell::RefCell::new(None),
+            control: self.control,
+            constant_policy: self.constant_policy,
+            materialized_values: None,
+            statement_relation: None,
+            prepared_parameters: None,
+            table_sequence: self.table_sequence,
+            catalog,
+            current_database: database,
+            function_catalog: self.function_catalog,
+            sql_semantics: self.sql_semantics.clone(),
+            factory: self.factory.clone(),
+            view_stack: self.view_stack.clone(),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Cell::new(self.next_subquery_id.get()),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
+        };
+        let result = child.analyze_query(query);
+        // CTE identities and counters remain globally unique. Caller CTE
+        // visibility and correlation are absent from this body.
+        self.absorb_semantic_scope(&child);
+        result
+    }
+
+    fn expose_view_relation(
+        &self,
+        resolved: ResolvedQuery,
+        identity: &TableIdentity,
+        alias: Option<super::resolve_from::RelationAlias<'_>>,
+        relation_name: &str,
+        row_id: Option<&AnalyzedOutputField>,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         let qualifier = alias
             .map_or(relation_name, |alias| alias.name.value.as_str())
             .to_string();
@@ -360,13 +480,11 @@ impl AnalyzerContext<'_> {
         }
         if self.factory.borrow().prepared_description.is_some() {
             let ids: Vec<_> = fields.iter().map(|field| field.column_id).collect();
-            self.describe_table_origin(&ids, &view.identity);
+            self.describe_table_origin(&ids, identity);
         }
         let mut scope = self.new_scope();
         for field in &fields {
-            if row_id
-                .as_ref()
-                .is_some_and(|row_id| field.is_internal && field.column_id == row_id.column_id)
+            if row_id.is_some_and(|row_id| field.is_internal && field.column_id == row_id.column_id)
             {
                 scope.add_hidden_field(&qualifier, field);
             } else {
@@ -381,6 +499,64 @@ impl AnalyzerContext<'_> {
             },
             scope,
         ))
+    }
+}
+
+fn derived_view_error(error: AnalyzeError) -> AnalyzeError {
+    if error.control_error().is_some() || error.source_failure().is_some() {
+        return error;
+    }
+    AnalyzeError::internal(format!(
+        "connector derived view failed analysis: {}",
+        error.message()
+    ))
+}
+
+/// A generated body can consume only its original, fully qualified dependency.
+struct DerivedViewCatalog<'a> {
+    dependency: &'a ResolvedAnalyzerTable,
+    quoted_files: String,
+    used: Cell<bool>,
+}
+
+impl PlannerTableProvider for DerivedViewCatalog<'_> {
+    fn resolve_table_for_analysis(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        Err("connector derived view referenced an undeclared relation".into())
+    }
+
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &ast::ObjectName,
+        _: Option<&str>,
+        _: &str,
+    ) -> Option<QuotedMetadataTable> {
+        let identity = &self.dependency.catalog.identity;
+        let [catalog, namespace, table] = name.parts.as_slice() else {
+            return None;
+        };
+        if !catalog.quoted
+            || !namespace.quoted
+            || !table.quoted
+            || catalog.value != identity.catalog
+            || namespace.value != identity.namespace
+            || table.value != self.quoted_files
+        {
+            return None;
+        }
+        Some(QuotedMetadataTable {
+            relation: identity.clone(),
+            kind: MetadataTableKind::Files,
+            resolved: if self.used.replace(true) {
+                Err("connector derived view referenced its source more than once".into())
+            } else {
+                Ok(self.dependency.clone())
+            },
+        })
     }
 }
 
