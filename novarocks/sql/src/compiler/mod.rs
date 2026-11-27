@@ -3936,7 +3936,7 @@ pub use crate::planner::distributed::build::writer_state_fixture::{
 pub use crate::planner::distributed::build::state_source_fixture::ordinary_extrema_constant_state_source_for_test;
 
 #[cfg(novarocks_dev_controls)]
-pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;
+pub use crate::planner::distributed::build::state_source_fixture::ordered_array_source_for_test;
 
 #[cfg(test)]
 mod c16_p1_json_object_error_effect_tests;

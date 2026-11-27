@@ -5472,7 +5472,7 @@ mod aggregate_recipe_tests {
         }
     }
     #[test]
-    fn ordered_array_state_and_topk_preserve_complete_nominal_argument_children() {
+    fn ordered_array_result_and_topk_preserve_complete_nominal_argument_children() {
         let json = FunctionValueType::try_with_logical_type(
             DataType::LargeBinary,
             false,
@@ -5495,13 +5495,12 @@ mod aggregate_recipe_tests {
         resolver
             .validate_selected(&selected, request, &Control)
             .unwrap();
-        let state = &selected.aggregate.as_ref().unwrap().intermediate_type;
-        let ValueKind::Struct(fields) = state.value_type().kind() else {
-            panic!("ordered state is a struct");
+        assert!(selected.aggregate.is_none());
+        let FunctionResultType::Scalar(output) = &selected.result_type else {
+            panic!("array_agg selects a scalar result");
         };
-        assert_eq!(fields[0].name(), "c0");
-        let ValueKind::List(item) = fields[0].value_type().kind() else {
-            panic!("each order channel is a list");
+        let ValueKind::List(item) = output.value_type().kind() else {
+            panic!("ordered array_agg selects a list");
         };
         assert_eq!(item.domain(), Some(ValueLogicalType::Json));
         assert!(item.nullable());
@@ -5567,8 +5566,7 @@ mod aggregate_recipe_tests {
             expected_result_type: None,
         };
         let other = resolver.resolve(drift, &Control).unwrap();
-        selected.aggregate.as_mut().unwrap().intermediate_type =
-            other.aggregate.unwrap().intermediate_type;
+        selected.result_type = other.result_type;
         assert!(
             resolver
                 .validate_selected(&selected, request, &Control)
