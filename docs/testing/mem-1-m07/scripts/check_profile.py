@@ -57,7 +57,30 @@ components = {
 }
 fe_peak = checked_sum(*components.values())
 b = p['be_root_result']
-be_peak = checked_sum(b['original_input_backing_capacity_bytes'], b['additional_hydrate_backing_capacity_bytes'], b['scratch_capacity_bytes'], b['small_row_staging_bytes'], (b['active_segment_positions'] + b['queued_segment_positions'] + b['retired_segment_tail_positions'] + b['live_send_holders'] * b['independent_payload_copies_per_send']) * b['segment_backing_capacity_bytes'], b['fixed_schema_cursor_driver_capacity_bytes'], 4096)
+segment_positions = checked_sum(
+    b['active_segment_positions'], b['queued_segment_positions'], b['retired_segment_tail_positions'])
+be_peak = checked_sum(
+    b['original_input_backing_capacity_bytes'], b['additional_hydrate_backing_capacity_bytes'],
+    b['scratch_capacity_bytes'], b['small_row_staging_bytes'],
+    checked_product(segment_positions, b['segment_backing_capacity_bytes']),
+    b['fixed_schema_cursor_driver_capacity_bytes'], c['fixed_envelope_bytes'])
 assert be_peak <= b['joint_retained_bytes_per_root'] <= b['joint_retained_bytes_per_process']
-report = {'status': 'V6_TARGET_ARITHMETIC_PASS_NOT_PRODUCT_ENFORCEMENT_OR_MEASUREMENT', 'frontend_owned_component_bytes': components, 'frontend_owned_subtotal_bytes': fe_peak, 'frontend_transport_structural_bytes': native['structural_bytes'], 'frontend_subtotal_without_measured_coefficients_bytes': checked_sum(fe_peak, native['structural_bytes']), 'frontend_total_bytes': None, 'native_connections': native['connections'], 'native_streams': native['streams'], 'be_root_target_bytes': be_peak, 'local_target_bytes': local_peak, 'domain_target_bytes': domain_peak, 'tail_positions': tail}
+backend = transport['roles']['backend']
+report = {
+    'status': 'V6_TARGET_ARITHMETIC_PASS_NOT_PRODUCT_ENFORCEMENT_OR_MEASUREMENT',
+    'frontend_owned_component_bytes': components,
+    'frontend_owned_subtotal_bytes': fe_peak,
+    'frontend_transport_structural_bytes': native['structural_bytes'],
+    'frontend_subtotal_without_measured_coefficients_bytes': checked_sum(fe_peak, native['structural_bytes']),
+    'frontend_total_bytes': None,
+    'native_connections': native['connections'],
+    'native_streams': native['streams'],
+    'be_root_target_bytes': be_peak,
+    'be_transport_lane_structural_bytes': backend['structural_bytes'],
+    'be_transport_root_encode': backend['root_encode'],
+    'be_transport_known_structural_bytes': backend['known_structural_bytes'],
+    'local_target_bytes': local_peak,
+    'domain_target_bytes': domain_peak,
+    'tail_positions': tail,
+}
 print(json.dumps(report, indent=2))

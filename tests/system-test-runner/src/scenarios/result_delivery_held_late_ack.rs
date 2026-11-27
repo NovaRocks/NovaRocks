@@ -17,7 +17,7 @@
 
 //! One original S+8 Trino query, a real held Native replay and two sealed ACKs.
 //! Ordinary explicit registry entry; the original Native driver owns its actual
-//! response/credit and Join. The FE proxy copy is not that encoded response.
+//! encoded response and Join. The FE proxy copy has a separate owner.
 use super::independent_root_target::{
     FrontendIdentitySource, IndependentRootObserver, IndependentRootTarget,
 };
@@ -392,13 +392,14 @@ fn roots_match(
         && root["producers_exited"] == 1
         && root["ends_published"] == 1
         && root["ends_acknowledged"] == 0
-        && root["sealed"] == u64::from(sealed);
+        && root["sealed"] == u64::from(sealed)
+        && root["retained_reservations"] == 0;
     if !common {
         return Ok(false);
     }
-    // The completed unary encode copies the body into its own backing. A held
-    // Native send keeps that copy's grant, delivery and metadata alive, while
-    // seal retires the two original Worker segments. These are separate facts.
+    // The completed unary encode owns its transport backing, so seal retires
+    // both Worker segments even while the held send owns delivery and metadata.
+    // The exited producer has already returned its input and scratch credits.
     if sealed {
         if root["data_positions"] != 0 || root["payload_bytes"] != 0 || root["segments"] != 0 {
             return Ok(false);
@@ -408,14 +409,9 @@ fn roots_match(
         return Ok(false);
     }
     if positive_holder {
-        Ok(root["deliveries"] > 0
-            && root["retained_reservations"] > 0
-            && root["metadata_holders"] > 0
-            && root["metadata_bytes"] > 0)
+        Ok(root["deliveries"] > 0 && root["metadata_holders"] > 0 && root["metadata_bytes"] > 0)
     } else {
-        Ok(root["deliveries"] == 0
-            && root["retained_reservations"] == 0
-            && root["metadata_holders"] == 0)
+        Ok(root["deliveries"] == 0 && root["metadata_holders"] == 0)
     }
 }
 fn same_target(
@@ -907,7 +903,7 @@ fn run_owned(
         "ordinary_trino_health":facts.health,"proxy_before_shutdown":proxy_before.as_ref().ok(),"proxy_after_shutdown":proxy,
         "failed_source_slots":errors.each_ref().map(Option::is_some),
         "failure_facts":errors.each_ref().map(|error|error.as_ref().map(error_fact)),"raw_error_formatter_invoked":false,
-        "scope":"Context-owned unique Root real encoded replay delivery/reservation holders; proxy copy is separate; excludes allocator deallocation, final Arc alias and full Closing pool"});
+        "scope":"Context-owned unique Root encoded replay delivery and metadata holders with zero retained reservations; proxy copy is separate; excludes allocator deallocation, final Arc alias and full Closing pool"});
     if let Err(error) = proxy_before {
         retain_secondary(&mut errors[11], error.into());
     }

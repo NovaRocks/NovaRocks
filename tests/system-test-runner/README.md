@@ -145,8 +145,10 @@ producer guard 已退出且 task 已为退休记录、最终 End 尚未 ACK。�
 及公开 owner 收敛。输入由 `result_delivery_inputs.rs` 声明。BE ownership 指标只在
 1024 个 context/root 扫描位置内作非阻塞 census；锁忙或覆盖不完整时明确
 不可用并省略 ownership family。它不包含移出 context 的固定 backing 或其它
-Arc 尾部，归零不证明 allocator dealloc。原 Worker encoded response 的持有与释放
-由显式 `result-delivery/held-response-late-ack` 单独保护，proxy 副本不替代该原件。
+Arc 尾部，归零不证明 allocator dealloc。显式 `result-delivery/held-response-late-ack`
+单独保护原 tonic 编码响应。seal 后原 Worker segment 归零，受原 H2 actor 流控的响应
+继续持有交付与动态元数据。生产者退出后的 `retained_reservations` 始终为零。场景分别
+核对原响应、FE proxy 副本与实际 Join 后的资源收束。
 
 `tools/ci/local-full-ci.sh` runs this registry as its own stable stage,
 between the server binary smoke and the SQL suites. The stage discovers

@@ -183,7 +183,8 @@ message NativeResultSupportGeometry {
   uint64 root_terminal_positions = 63;
   uint64 root_segment_backing_capacity_bytes = 64;
   uint64 root_live_send_holders = 65;
-  uint64 root_independent_payload_copies_per_send = 66;
+  reserved 66;
+  reserved "root_independent_payload_copies_per_send";
   uint64 root_fixed_schema_cursor_driver_capacity_bytes = 67;
   uint64 root_actual_exit_deadline_ms = 68;
   uint64 root_retired_segment_tail_positions = 69;
@@ -1814,11 +1815,12 @@ message RootReadReceipt {
   }
 }
 message RootReadDeferred {
+  reserved 4;
+  reserved "send_backing_busy";
   oneof reason {
     bool preparing = 1;
     FailureResourceFacts read_holders_busy = 2;
     FailureResourceFacts send_metadata_busy = 3;
-    FailureResourceFacts send_backing_busy = 4;
   }
 }
 message RootReadRefusal {

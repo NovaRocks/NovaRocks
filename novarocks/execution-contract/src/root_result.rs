@@ -205,7 +205,6 @@ pub enum RootReadDeferral {
     Preparing,
     ReadHoldersBusy(crate::failure::ResourceFacts),
     SendMetadataBusy(crate::failure::ResourceFacts),
-    SendBackingBusy(crate::failure::ResourceFacts),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

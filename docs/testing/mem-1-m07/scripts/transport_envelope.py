@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Recompute v6 public-configuration arithmetic, without claiming measurement."""
+import argparse
 import json
 from pathlib import Path
 
@@ -21,7 +22,46 @@ def mul(a, b):
     return checked(checked(a) * checked(b))
 
 
-def envelope(profile):
+def root_encode_envelope(profile, root_process_limit_bytes):
+    transport = profile['transport_support']
+    root = profile['be_root_result']
+    if root_process_limit_bytes is None:
+        root_process_limit_bytes = root['joint_retained_bytes_per_process']
+        limit_source = 'profile_default'
+    else:
+        limit_source = 'supplied_effective_limit'
+    limit = checked(root_process_limit_bytes)
+    fixed_charge = checked(root['fixed_schema_cursor_driver_capacity_bytes'])
+    if not limit or not fixed_charge:
+        raise ValueError("Root process limit and fixed charge must be positive")
+
+    frontends = transport['authenticated_live_frontends_per_backend']
+    send_holders = checked(root['live_send_holders'])
+    roots = mul(frontends, transport['worst_case_roots_per_frontend_per_backend'])
+    live_connections = mul(frontends, transport['connections_per_frontend_backend']['result'])
+    live_streams = mul(live_connections, transport['streams_per_connection'])
+    # Mirror the actual Root ingress admission, including its original tail terms.
+    metadata = add(root['maximum_root_drivers'], send_holders, 1)
+    ingress = add(live_streams, mul(roots, add(metadata, send_holders)))
+    data = min(ingress, mul(send_holders, limit // fixed_charge))
+
+    control_max = checked(profile['client_rows']['fixed_envelope_bytes'])
+    data_max = checked(root['segment_backing_capacity_bytes'])
+    data_increment = checked(data_max - control_max)
+    return {
+        'root_process_limit_source': limit_source,
+        'root_process_limit_bytes': limit,
+        'fixed_root_charge_bytes': fixed_charge,
+        'ingress_owner_limit': ingress,
+        'data_owner_limit': data,
+        'control_frame_max_bytes': control_max,
+        'data_frame_max_bytes': data_max,
+        'encoding_requested_bytes': add(mul(ingress, control_max), mul(data, data_increment)),
+        'profile_example_data_send_positions': mul(roots, send_holders),
+    }
+
+
+def envelope(profile, *, root_process_limit_bytes=None):
     t = profile['transport_support']
     tails = add(t['connecting_positions_per_lane'], t['closing_positions_per_lane'])
     per_peer = {
@@ -85,13 +125,28 @@ def envelope(profile):
             'coefficients': None,
             'total_bytes': None,
         }
+    backend = roles['backend']
+    root_encode = root_encode_envelope(profile, root_process_limit_bytes)
+    backend['root_encode'] = root_encode
+    backend['known_structural_bytes'] = add(
+        backend['structural_bytes'], root_encode['encoding_requested_bytes'])
     return {
         'schema_version': 1,
         'status': 'STRUCTURAL_ARITHMETIC_ONLY_COEFFICIENTS_NOT_FROZEN',
-        'source_contract': 'native_transport_geometry::envelope; NativeResultSupportGeometry::V1',
+        'source_contract': ('native_transport_geometry::envelope; '
+                            'root_result_ingress_owner_limit; NativeResultSupportGeometry::V1'),
         'roles': roles,
     }
 
 
 if __name__ == '__main__':
-    print(json.dumps(envelope(json.loads((ROOT / 'profile-v1.json').read_text())), indent=2))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--effective-root-process-limit-bytes', type=int,
+                        help='Use a supplied effective BE Root process limit instead of the profile default')
+    args = parser.parse_args()
+    profile = json.loads((ROOT / 'profile-v1.json').read_text())
+    try:
+        report = envelope(profile, root_process_limit_bytes=args.effective_root_process_limit_bytes)
+    except ValueError as error:
+        parser.error(str(error))
+    print(json.dumps(report, indent=2))

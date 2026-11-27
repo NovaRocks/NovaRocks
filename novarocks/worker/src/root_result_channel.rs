@@ -1020,9 +1020,8 @@ impl RootResultChannel {
     const WRITABLE_CALLBACK_CAPACITY: usize = ROOT_WRITABLE_ENTRIES;
 
     fn retained_reservation_positions() -> usize {
-        let geometry = NativeResultSupportGeometry::V1;
-        2 + (geometry.root_live_send_holders * geometry.root_independent_payload_copies_per_send)
-            as usize
+        // One original input and one encoder scratch reservation.
+        2
     }
 
     fn credit_control_backing_bytes(task: novarocks_execution_contract::TaskIdentity) -> usize {
@@ -1367,7 +1366,7 @@ impl RootResultChannel {
             if !state.lifetime.allows_read() {
                 return Err(RootChannelError::Closed);
             }
-            // Scratch, input and exact independent send copies.
+            // Scratch and input are the only retained reservation authors.
             // Small reservations cannot grow an unbounded list of credit objects.
             let positions = Self::retained_reservation_positions();
             if !self.physical.retained_reservations.try_admit(positions) {
@@ -1981,7 +1980,7 @@ impl RootResultChannel {
 
     /// Apply only the request's cumulative ACK. No payload alias or new read
     /// position is constructed here. Retired allocations exit outside the
-    /// channel lock, before a native sender asks for independent copy space.
+    /// channel lock, before the admitted read offers a new payload.
     fn apply_consumed(
         &self,
         consumed: u64,
@@ -2165,7 +2164,7 @@ impl RootChannelRead {
         };
         position.request_body.set(holder)
     }
-    /// Apply this original admission's ACK before reserving native copy space.
+    /// Apply this original admission's ACK before offering the next payload.
     /// This neither offers a payload nor creates another read holder. A repeat
     /// by `read()` is idempotent; seal winning this cut refuses the late ACK.
     pub fn apply_consumed(&self) -> Result<u64, RootChannelError> {
@@ -2173,36 +2172,10 @@ impl RootChannelRead {
             .apply_consumed(self.request.consumed(), &self.guard)
     }
     /// Snapshot the actual applied ACK frontier of this original admission.
-    /// In particular, send pregrant losing to seal can return a closed marker
+    /// In particular, metadata admission losing to seal can return a closed marker
     /// without rerouting, applying the late ACK or minting another read owner.
     pub fn accepted_consumed(&self) -> u64 {
         self.channel.snapshot().consumed_through
-    }
-    /// The admitted read position is already counted under the context fence.
-    /// Reserve all independent native payload backings before any prost/HTTP
-    /// allocation, using this original root/process budget. A concurrent seal
-    /// rejects growth; it does not invent a new read position or a new wallet.
-    pub fn try_reserve_native_send_backing(
-        &self,
-    ) -> Result<ResultWriteAdmission, RootChannelError> {
-        let geometry = NativeResultSupportGeometry::V1;
-        let bytes = geometry
-            .root_segment_backing_capacity_bytes
-            .checked_mul(geometry.root_independent_payload_copies_per_send)
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or(RootChannelError::SendGeometry)?;
-        self.channel.try_reserve(bytes)
-    }
-    /// Actual copy demand, without inventing a budget limit or live usage.
-    /// The caller uses these facts only after this root refuses copy capacity.
-    pub fn native_send_backing_refusal(&self) -> Result<RootCapacityRefusal, RootChannelError> {
-        let geometry = NativeResultSupportGeometry::V1;
-        let bytes = geometry
-            .root_segment_backing_capacity_bytes
-            .checked_mul(geometry.root_independent_payload_copies_per_send)
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or(RootChannelError::SendGeometry)?;
-        Ok(RootCapacityRefusal::unavailable(bytes))
     }
     /// Suballocate finite native wrapper/Arc metadata from the original fixed
     /// root envelope before constructing them. The returned owner follows the
@@ -3398,11 +3371,10 @@ mod tests {
         assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
     }
 
-    fn channel_with_native_send_budget() -> (Arc<RootResultChannel>, Arc<ResultRetainedBudget>) {
+    fn channel_with_one_segment_budget() -> (Arc<RootResultChannel>, Arc<ResultRetainedBudget>) {
         let geometry = NativeResultSupportGeometry::V1;
         let bytes = (geometry.root_fixed_schema_cursor_driver_capacity_bytes
-            + geometry.root_independent_payload_copies_per_send
-                * geometry.root_segment_backing_capacity_bytes) as usize;
+            + geometry.root_segment_backing_capacity_bytes) as usize;
         let limits = WorkerResultRetainedLimits::try_new(bytes, bytes).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
         let channel = RootResultChannel::try_open(
@@ -3420,13 +3392,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_fetch_ack_retires_backing_before_send_copy_pregrant() {
-        let (channel, budget) = channel_with_native_send_budget();
+    async fn native_fetch_ack_retires_backing_before_offering_next_payload() {
+        let (channel, budget) = channel_with_one_segment_budget();
         publish(&channel, b"a", false);
         drop(channel.read(&read(&channel, Some(1), 0)).await.unwrap());
         let admitted = channel.begin_read(&read(&channel, Some(2), 1)).unwrap();
         assert!(matches!(
-            admitted.try_reserve_native_send_backing().unwrap(),
+            channel.try_reserve(1).unwrap(),
             ResultWriteAdmission::Blocked
         ));
         assert_eq!(channel.snapshot().consumed_through, 0);
@@ -3438,25 +3410,18 @@ mod tests {
         );
         assert_eq!(channel.snapshot().data_positions, 0);
         assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
-        let ResultWriteAdmission::Granted(send) =
-            admitted.try_reserve_native_send_backing().unwrap()
-        else {
-            panic!("actual ACK retirement freed enough space for the same admitted read");
-        };
         assert_eq!(channel.physical.deliveries.load(Ordering::Acquire), 1);
         let reply = admitted.read().await.unwrap();
         assert_eq!(reply.reply().accepted_consumed, 1);
         assert_eq!(reply.reply().outcome, RootReadOutcome::NotReady);
         drop(reply);
-        assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024 + send.bytes());
-        drop(send);
         assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
         assert!(channel.physical_idle());
     }
 
     #[tokio::test]
-    async fn native_pregrant_ack_cannot_return_a_live_segment_alias_budget() {
-        let (channel, budget) = channel_with_native_send_budget();
+    async fn native_ack_cannot_return_a_live_segment_alias_budget() {
+        let (channel, budget) = channel_with_one_segment_budget();
         publish(&channel, b"a", false);
         let offered = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let alias = data(&offered).body().clone();
@@ -3467,23 +3432,18 @@ mod tests {
         assert_eq!(channel.snapshot().data_positions, 0);
         assert_eq!(budget.retained_bytes_for_test(), retained);
         assert!(matches!(
-            admitted.try_reserve_native_send_backing().unwrap(),
+            channel.try_reserve(1).unwrap(),
             ResultWriteAdmission::Blocked
         ));
         drop(alias);
-        let ResultWriteAdmission::Granted(send) =
-            admitted.try_reserve_native_send_backing().unwrap()
-        else {
-            panic!("last actual alias exit returned the capacity");
-        };
+        assert_eq!(budget.retained_bytes_for_test(), 1024 * 1024);
         assert_eq!(admitted.accepted_consumed(), 1);
-        drop(send);
         drop(admitted);
         assert!(channel.physical_idle());
     }
 
     #[tokio::test]
-    async fn seal_before_native_ack_pregrant_preserves_the_applied_frontier() {
+    async fn seal_before_native_ack_preserves_the_applied_frontier() {
         let (channel, _) = channel(facts());
         channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
@@ -3492,10 +3452,6 @@ mod tests {
         channel.close(RootRetentionClose::ParticipationReleased);
         assert_eq!(admitted.apply_consumed(), Err(RootChannelError::Closed));
         assert_eq!(admitted.accepted_consumed(), 0);
-        assert!(matches!(
-            admitted.try_reserve_native_send_backing(),
-            Err(RootChannelError::Closed)
-        ));
         let reply = admitted.read().await.unwrap();
         assert_eq!(reply.reply().accepted_consumed, 0);
         assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
@@ -3815,7 +3771,7 @@ mod tests {
     fn even_tiny_credits_have_finite_physical_object_positions() {
         let (channel, _) = channel(facts());
         let mut credits = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..2 {
             let ResultWriteAdmission::Granted(credit) = channel.try_reserve(1).unwrap() else {
                 panic!("finite credit position");
             };

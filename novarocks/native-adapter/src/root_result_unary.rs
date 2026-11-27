@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Owned, transport-independent Native root reads. No RPC is installed here.
-
 //! Post-admission unary root encoding and physical DATA ownership.
 //!
 //! This helper installs no RPC. Its caller must own bounded pre-decode
 //! lane/stream/request/header/future resources. Closed and refused routes use
-//! that control capacity. A concrete response body must reach Hyper without
-//! an unaccounted outer Box; H2's independent connection copies need their
-//! own connection owner. Those composition gates remain separate.
+//! that control capacity. Tonic allocates the encoding backing as transport
+//! headroom. The response body and H2 DATA aliases keep the original Root
+//! delivery and metadata owner until their actual exit.
 
-use std::alloc::Layout;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -41,7 +38,7 @@ use novarocks_proto_models::novarocks as wire;
 use novarocks_result_contract::RootProfileV1;
 use novarocks_task_codec::root_result::{decode_read, encode_reply, encode_response};
 use prost::Message;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBody, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http;
 use tonic::server::UnaryService;
 use tonic::{Code, Request, Response, Status};
@@ -51,7 +48,9 @@ use crate::root_result_reader::{
 };
 
 const GRPC_PREFIX: usize = 5;
-const PAYLOAD_CAPACITY: usize = RootProfileV1::SEGMENT_BYTES + RootProfileV1::ENVELOPE_BYTES;
+pub(crate) const ROOT_CONTROL_FRAME_MAX_BYTES: usize = RootProfileV1::ENVELOPE_BYTES;
+pub(crate) const ROOT_DATA_FRAME_MAX_BYTES: usize =
+    RootProfileV1::SEGMENT_BYTES + ROOT_CONTROL_FRAME_MAX_BYTES;
 
 struct OwnedWireReply {
     // The DTO (including the original offered alias) exits before its owner.
@@ -59,23 +58,67 @@ struct OwnedWireReply {
     _ownership: Option<NativeRootSendOwnership>,
 }
 
-type RootEncodedBody = EncodeBody<RootEncoder, tokio_stream::Once<Result<OwnedWireReply, Status>>>;
+// Design: ADR-0276 (docs/adr/ADR-0276-third-party-encoding-buffers-use-transport-headroom.md)
+#[derive(Clone, Copy)]
+enum RootFrameEncoding {
+    Ready {
+        protobuf_bytes: usize,
+        framed_bytes: usize,
+    },
+    Empty,
+    Oversized,
+}
 
-/// Exact post-admission allocations introduced by this locked Tonic path.
-/// The outer Body is inline; Tonic's inner EncodeBody Box, split/freeze Shared
-/// header, one owned DATA wrapper and the 16-byte backend UUID are covered.
-/// Byte buffers use the separate full-copy grant; no logical-length credit.
+impl RootFrameEncoding {
+    fn for_reply(message: &wire::FetchRootResultResponse) -> Self {
+        let limit = match &message.result {
+            Some(wire::fetch_root_result_response::Result::Reply(wire::RootReadReceipt {
+                outcome: Some(wire::root_read_receipt::Outcome::Data(_)),
+                ..
+            })) => ROOT_DATA_FRAME_MAX_BYTES,
+            _ => ROOT_CONTROL_FRAME_MAX_BYTES,
+        };
+        let protobuf_bytes = message.encoded_len();
+        if protobuf_bytes == 0 {
+            return Self::Empty;
+        }
+        match protobuf_bytes.checked_add(GRPC_PREFIX) {
+            Some(framed_bytes) if framed_bytes <= limit => Self::Ready {
+                protobuf_bytes,
+                framed_bytes,
+            },
+            _ => Self::Oversized,
+        }
+    }
+
+    fn allocation_bytes(self) -> usize {
+        match self {
+            Self::Ready { framed_bytes, .. } => framed_bytes,
+            Self::Empty | Self::Oversized => GRPC_PREFIX,
+        }
+    }
+
+    fn protobuf_bytes(self) -> Result<usize, Status> {
+        match self {
+            Self::Ready { protobuf_bytes, .. } => Ok(protobuf_bytes),
+            Self::Empty => Err(Status::internal("empty root reply protobuf")),
+            Self::Oversized => Err(Status::resource_exhausted(
+                "root reply exceeds fixed send envelope",
+            )),
+        }
+    }
+}
+
+struct RootReplyHandoff {
+    encoding: RootFrameEncoding,
+    ownership: Option<NativeRootSendOwnership>,
+}
+
+/// Root-owned reply metadata covers the DATA wrapper and the DTO's backend UUID.
+/// Tonic owns its encoding body, shared header and byte backing.
 pub fn native_root_unary_metadata_bytes() -> usize {
-    Layout::new::<RootEncodedBody>()
-        .size()
-        .checked_add(novarocks_worker::guarded_bytes::BYTES_MUT_SHARED_HEADER_BYTES)
-        .and_then(|bytes| {
-            bytes.checked_add(novarocks_worker::guarded_bytes::owner_wrapper_bytes::<
-                Bytes,
-                NativeRootSendOwnership,
-            >())
-        })
-        .and_then(|bytes| bytes.checked_add(16))
+    novarocks_worker::guarded_bytes::owner_wrapper_bytes::<Bytes, NativeRootSendOwnership>()
+        .checked_add(16)
         .expect("fixed root unary metadata fits usize")
 }
 
@@ -104,9 +147,13 @@ where
     // encoder buffer, not an additional uncompression buffer or reencode.
     let mut grpc = tonic::server::Grpc::new(codec)
         .max_decoding_message_size(RootProfileV1::ENVELOPE_BYTES)
-        .max_encoding_message_size(PAYLOAD_CAPACITY - GRPC_PREFIX);
+        .max_encoding_message_size(ROOT_DATA_FRAME_MAX_BYTES - GRPC_PREFIX);
     let response = grpc.unary(service, request).await;
-    let ownership = handoff.lock().expect("root unary handoff lock").take();
+    let ownership = handoff
+        .lock()
+        .expect("root unary handoff lock")
+        .take()
+        .and_then(|handoff| handoff.ownership);
     let (parts, inner) = response.into_parts();
     http::Response::from_parts(
         parts,
@@ -120,7 +167,7 @@ where
 
 struct RootService<'a> {
     reader: &'a NativeRootResultReader,
-    handoff: &'a Mutex<Option<NativeRootSendOwnership>>,
+    handoff: &'a Mutex<Option<RootReplyHandoff>>,
 }
 impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
     type Response = OwnedWireReply;
@@ -170,7 +217,10 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
             // Projection follows the same metadata pregrant. Publish the
             // strong handoff before returning Ready to Tonic's map_response,
             // which allocates its encoding buffer before the first body poll.
-            *handoff.lock().expect("root unary handoff lock") = ownership.clone();
+            *handoff.lock().expect("root unary handoff lock") = Some(RootReplyHandoff {
+                encoding: RootFrameEncoding::for_reply(&message),
+                ownership: ownership.clone(),
+            });
             Ok(Response::new(OwnedWireReply {
                 message,
                 _ownership: ownership,
@@ -180,7 +230,7 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
 }
 
 struct RootCodec<'a> {
-    handoff: &'a Mutex<Option<NativeRootSendOwnership>>,
+    handoff: &'a Mutex<Option<RootReplyHandoff>>,
 }
 impl Codec for RootCodec<'_> {
     type Encode = OwnedWireReply;
@@ -190,19 +240,13 @@ impl Codec for RootCodec<'_> {
 
     fn encoder(&mut self) -> Self::Encoder {
         // Tonic 0.12.3 calls codec.encoder() before EncodedBytes::new.
-        let ownership = self
-            .handoff
-            .lock()
-            .expect("root unary handoff lock")
-            .clone();
-        let capacity = ownership
+        let handoff = self.handoff.lock().expect("root unary handoff lock");
+        let reply = handoff
             .as_ref()
-            .map_or(RootProfileV1::ENVELOPE_BYTES, |owner| {
-                owner.backing_capacity_bytes() / 2
-            });
+            .expect("successful root unary reply handoff");
         RootEncoder {
-            capacity,
-            _ownership: ownership,
+            encoding: reply.encoding,
+            _ownership: reply.ownership.clone(),
         }
     }
     fn decoder(&mut self) -> Self::Decoder {
@@ -223,27 +267,18 @@ impl Decoder for RootDecoder {
     }
 }
 struct RootEncoder {
-    capacity: usize,
+    encoding: RootFrameEncoding,
     _ownership: Option<NativeRootSendOwnership>,
 }
 impl Encoder for RootEncoder {
     type Item = OwnedWireReply;
     type Error = Status;
     fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        let length = item.message.encoded_len();
-        if length
-            .checked_add(GRPC_PREFIX)
-            .is_none_or(|n| n > self.capacity)
-        {
-            return Err(Status::new(
-                Code::ResourceExhausted,
-                "root reply exceeds fixed send envelope",
-            ));
-        }
-        // remaining_mut is usize::MAX for BytesMut, not actual capacity.
+        let protobuf_bytes = self.encoding.protobuf_bytes()?;
+        // remaining_mut reports the growable bound, not actual capacity.
         // The single unary item has already consumed the five-byte prefix;
-        // chunk_mut exposes the actual preallocated contiguous remainder.
-        if dst.chunk_mut().len() < length {
+        // only a nonempty reply can inspect the preallocated remainder.
+        if dst.chunk_mut().len() < protobuf_bytes {
             return Err(Status::new(
                 Code::Internal,
                 "root encoder lost its preallocated backing",
@@ -254,7 +289,10 @@ impl Encoder for RootEncoder {
             .map_err(|_| Status::new(Code::Internal, "root protobuf encoding failed"))
     }
     fn buffer_settings(&self) -> BufferSettings {
-        BufferSettings::new(self.capacity, self.capacity)
+        let framed_bytes = self.encoding.allocation_bytes();
+        #[cfg(test)]
+        tests::arm_prefix_probe(framed_bytes);
+        BufferSettings::new(framed_bytes, framed_bytes)
     }
 }
 
@@ -301,5 +339,217 @@ impl Body for NativeRootUnaryBody {
     }
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::future::{Ready, poll_fn, ready};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PrefixBacking {
+        Disabled,
+        WaitingForSettings,
+        WaitingForBacking,
+        Live(usize),
+        Exited,
+        Grew,
+    }
+
+    // Tonic creates the backing immediately after asking for BufferSettings.
+    // Follow that address through polling even when error handling allocates
+    // other values of the same size.
+    thread_local! {
+        static PREFIX_BACKING: Cell<PrefixBacking> = const { Cell::new(PrefixBacking::Disabled) };
+    }
+
+    pub(super) fn arm_prefix_probe(framed_bytes: usize) {
+        PREFIX_BACKING.with(|backing| {
+            if backing.get() == PrefixBacking::WaitingForSettings && framed_bytes == GRPC_PREFIX {
+                backing.set(PrefixBacking::WaitingForBacking);
+            }
+        });
+    }
+
+    struct PrefixAllocationProbe;
+
+    #[global_allocator]
+    static ALLOCATOR: PrefixAllocationProbe = PrefixAllocationProbe;
+
+    unsafe impl GlobalAlloc for PrefixAllocationProbe {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if layout.size() == GRPC_PREFIX && !pointer.is_null() {
+                let _ = PREFIX_BACKING.try_with(|backing| {
+                    if backing.get() == PrefixBacking::WaitingForBacking {
+                        backing.set(PrefixBacking::Live(pointer as usize));
+                    }
+                });
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            let _ = PREFIX_BACKING.try_with(|backing| {
+                if backing.get() == PrefixBacking::Live(pointer as usize) {
+                    backing.set(PrefixBacking::Exited);
+                }
+            });
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = PREFIX_BACKING.try_with(|backing| {
+                if backing.get() == PrefixBacking::Live(pointer as usize) {
+                    backing.set(PrefixBacking::Grew);
+                }
+            });
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+    }
+
+    fn data_message(body_bytes: usize) -> wire::FetchRootResultResponse {
+        wire::FetchRootResultResponse {
+            result: Some(wire::fetch_root_result_response::Result::Reply(
+                wire::RootReadReceipt {
+                    outcome: Some(wire::root_read_receipt::Outcome::Data(
+                        novarocks_proto_models::result::RootData {
+                            body: Bytes::from(vec![0; body_bytes]),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn control_message(detail_bytes: usize) -> wire::FetchRootResultResponse {
+        wire::FetchRootResultResponse {
+            result: Some(wire::fetch_root_result_response::Result::Refused(
+                wire::RootReadRefusal {
+                    safe_detail: "x".repeat(detail_bytes),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    // The seed lengths straddle neither protobuf length-varint boundary.
+    fn framed_message(
+        build: fn(usize) -> wire::FetchRootResultResponse,
+        framed_bytes: usize,
+    ) -> wire::FetchRootResultResponse {
+        let seed = framed_bytes - 32;
+        let framed_seed = build(seed).encoded_len() + GRPC_PREFIX;
+        let message = build(seed + (framed_bytes - framed_seed));
+        assert_eq!(message.encoded_len() + GRPC_PREFIX, framed_bytes);
+        message
+    }
+
+    struct SyntheticReply(Option<OwnedWireReply>);
+
+    impl UnaryService<wire::FetchRootResultRequest> for SyntheticReply {
+        type Response = OwnedWireReply;
+        type Future = Ready<Result<Response<Self::Response>, Status>>;
+
+        fn call(&mut self, _: Request<wire::FetchRootResultRequest>) -> Self::Future {
+            ready(Ok(Response::new(self.0.take().unwrap())))
+        }
+    }
+
+    async fn encode_synthetic(
+        message: wire::FetchRootResultResponse,
+        encoding: RootFrameEncoding,
+    ) -> tonic::body::BoxBody {
+        let handoff = Mutex::new(Some(RootReplyHandoff {
+            encoding,
+            ownership: None,
+        }));
+        let mut grpc = tonic::server::Grpc::new(RootCodec { handoff: &handoff })
+            .max_encoding_message_size(ROOT_DATA_FRAME_MAX_BYTES - GRPC_PREFIX);
+        // The synthetic service supplies the reply independent of the request.
+        let request = http::Request::new(axum::body::Body::from(Bytes::from_static(
+            &[0; GRPC_PREFIX],
+        )));
+        let reply = SyntheticReply(Some(OwnedWireReply {
+            message,
+            _ownership: None,
+        }));
+        grpc.unary(reply, request).await.into_body()
+    }
+
+    #[tokio::test]
+    async fn exact_data_and_control_limits_encode_and_oversize_keeps_tonic_trailers() {
+        for (build, max_bytes) in [
+            (
+                data_message as fn(usize) -> wire::FetchRootResultResponse,
+                ROOT_DATA_FRAME_MAX_BYTES,
+            ),
+            (control_message, ROOT_CONTROL_FRAME_MAX_BYTES),
+        ] {
+            let message = framed_message(build, max_bytes);
+            let encoding = RootFrameEncoding::for_reply(&message);
+            assert_eq!(encoding.allocation_bytes(), max_bytes);
+            let mut body = encode_synthetic(message, encoding).await;
+            let data = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            assert_eq!(data.len(), max_bytes);
+            let trailers = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .unwrap()
+                .unwrap()
+                .into_trailers()
+                .unwrap();
+            assert_eq!(trailers["grpc-status"], "0");
+
+            assert_tonic_rejection(
+                framed_message(build, max_bytes + 1),
+                Code::ResourceExhausted,
+            )
+            .await;
+        }
+    }
+
+    async fn assert_tonic_rejection(message: wire::FetchRootResultResponse, local_code: Code) {
+        let encoding = RootFrameEncoding::for_reply(&message);
+        assert_eq!(encoding.protobuf_bytes().unwrap_err().code(), local_code);
+        assert_eq!(encoding.allocation_bytes(), GRPC_PREFIX);
+        PREFIX_BACKING.with(|backing| backing.set(PrefixBacking::WaitingForSettings));
+        let mut body = encode_synthetic(message, encoding).await;
+        assert!(matches!(
+            PREFIX_BACKING.with(Cell::get),
+            PrefixBacking::Live(_)
+        ));
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        let final_backing = PREFIX_BACKING.with(|backing| backing.replace(PrefixBacking::Disabled));
+        assert!(
+            matches!(
+                final_backing,
+                PrefixBacking::Live(_) | PrefixBacking::Exited
+            ),
+            "prefix backing changed during encoding: {final_backing:?}"
+        );
+        let trailers = frame
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .expect("no DATA on error");
+        assert_eq!(trailers["grpc-status"], "13");
+        assert!(body.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn empty_protobuf_never_grows_the_prefix_only_backing() {
+        assert_tonic_rejection(wire::FetchRootResultResponse::default(), Code::Internal).await;
     }
 }

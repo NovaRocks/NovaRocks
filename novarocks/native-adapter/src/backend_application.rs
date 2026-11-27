@@ -979,9 +979,9 @@ impl BackendApplicationHost {
                 "backend result retained process capacity cannot cover the frozen bounded root profile",
             ));
         }
-        let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
-            result_retained_limits.per_process(),
-        );
+        let root_process_limit = result_retained_limits.per_process();
+        let result_retained_budget =
+            novarocks_worker::result_buffer::ResultRetainedBudget::new(root_process_limit);
         // The frozen transport geometry is refused here if inconsistent; the
         // count part of its envelope is logged. Per-object coefficients are
         // frozen by P00b, so no byte bound is claimed before then.
@@ -1020,6 +1020,28 @@ impl BackendApplicationHost {
             "Native transport admission composed; envelope count part only until P00b \
              freezes per-object coefficients"
         );
+        let root_ingress_limit = transport_admission.root_result_ingress_owner_limit();
+        match transport_geometry.backend_root_encoding_report(
+            &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1,
+            root_process_limit.get(),
+            root_ingress_limit,
+        ) {
+            Ok(report) => tracing::info!(
+                root_process_limit_bytes = report.root_process_limit_bytes,
+                root_ingress_owner_limit = report.ingress_owner_limit,
+                root_data_owner_limit = report.data_owner_limit,
+                lane_structural_bytes = transport_geometry.backend.structural_bytes,
+                root_encoding_requested_bytes = report.encoding_requested_bytes,
+                known_structural_bytes = report.known_structural_bytes,
+                "BE Native transport known structural request bytes"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                root_process_limit_bytes = root_process_limit.get(),
+                root_ingress_owner_limit = root_ingress_limit,
+                "BE Native transport Root encoding request bound unavailable"
+            ),
+        }
         // The same process identity signs Native calls and appears in the
         // announce, heartbeat and local execution owners. Bind before channels
         // or role workers can issue an outbound RPC.

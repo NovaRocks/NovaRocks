@@ -58,7 +58,8 @@ use novarocks_execution_contract::failure::{
 };
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_result::{
-    RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultRead,
+    RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultData,
+    RootResultEnd, RootResultRead, RootResultReply,
 };
 use novarocks_execution_contract::task_execution::creation::{
     CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
@@ -83,6 +84,7 @@ use novarocks_execution_contract::task_execution::status::{AbortCause, CancelRea
 use novarocks_execution_contract::task_execution::transition::ParticipationState;
 use novarocks_native_adapter::root_result_reader::{
     NativeRootReadResponse, NativeRootResultReader, NativeRootResultReply,
+    native_root_send_metadata_bytes,
 };
 use novarocks_result_contract::{
     ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
@@ -103,7 +105,7 @@ use novarocks_worker::{
 
 const FIXED: usize = RootProfileV1::SCHEMA_BACKING_BYTES;
 const SEGMENT: usize = RootProfileV1::SEGMENT_BYTES + RootProfileV1::ENVELOPE_BYTES;
-const COPY: usize = 2 * SEGMENT;
+const ROOT: usize = 256 * 1024 * 1024;
 const PROCESS: usize = 512 * 1024 * 1024;
 
 #[path = "root_result_reader/node_retention.rs"]
@@ -634,7 +636,7 @@ impl Fixture {
                 .unwrap(),
             )
         };
-        let limits = WorkerResultRetainedLimits::try_new(256 * 1024 * 1024, PROCESS).unwrap();
+        let limits = WorkerResultRetainedLimits::try_new(ROOT, PROCESS).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
         let health =
             Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default());
@@ -1107,18 +1109,7 @@ fn read_holders_busy() -> RootReadDeferral {
         committed: Some(positions),
     })
 }
-fn send_backing_busy() -> RootReadDeferral {
-    RootReadDeferral::SendBackingBusy(ResourceFacts {
-        request_scope: Some(ResourceScope::Request),
-        constraint_scope: None,
-        dimension: ResourceDimension::Bytes,
-        requested: Some(COPY as u64),
-        required_growth: None,
-        limit: None,
-        live: None,
-        committed: None,
-    })
-}
+
 fn send_metadata_busy(requested: usize, committed: usize) -> RootReadDeferral {
     RootReadDeferral::SendMetadataBusy(ResourceFacts {
         request_scope: Some(ResourceScope::Request),
@@ -1472,10 +1463,6 @@ async fn count_only_end_and_ack_only_use_typed_reply() {
     assert!(matches!(end.reply().outcome, RootReadOutcome::End(e) if e.output_rows == 1));
     drop(end);
     let ack = owned(fixture.reader.read(&fixture.request(None, 1, 1)).await);
-    assert_eq!(
-        ack.ownership().backing_capacity_bytes(),
-        2 * RootProfileV1::ENVELOPE_BYTES
-    );
     assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
     drop(ack);
     drop(fixture);
@@ -1538,50 +1525,69 @@ async fn two_send_positions_follow_last_exported_owner() {
 }
 
 #[tokio::test]
-async fn full_copy_credit_stays_until_actual_owner_drop() {
+async fn root_metadata_and_delivery_stay_until_actual_owner_drop() {
     let fixture = Fixture::new(false);
+    let baseline = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     let reply = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
     let owner = reply.ownership();
-    assert_eq!(owner.backing_capacity_bytes(), COPY);
     drop(reply);
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY);
-    assert!(matches!(
-        fixture.budget.try_reserve_process(1).unwrap(),
-        ResultWriteAdmission::Blocked
-    ));
+
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(held.deliveries, 1);
+    assert_eq!(held.retained_reservations, 0);
+    assert_eq!(held.metadata_holders, 1);
+    assert_eq!(
+        held.metadata_bytes,
+        baseline.metadata_bytes + native_root_send_metadata_bytes()
+    );
+    let filler = fixture.fill_process(PROCESS - FIXED);
     assert!(!fixture.root.physical_idle());
     drop(owner);
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(COPY));
+    assert_eq!(
+        fixture.root.try_ownership_snapshot().unwrap().unwrap(),
+        baseline
+    );
     drop(filler);
 }
 
 #[tokio::test]
-async fn shared_process_and_root_pregrants_refuse_without_leaking_read_positions() {
+async fn published_data_is_readable_with_a_full_process_or_root_wallet() {
     let fixture = Fixture::new(false);
+    fixture.finish();
     let request = fixture.request(Some(1), 0, 1);
-    let process = fixture.fill_process(PROCESS - FIXED - COPY + 1);
+
+    let process = fixture.fill_process(PROCESS - FIXED - SEGMENT);
+    let reply = owned(fixture.reader.read(&request).await);
+    assert!(matches!(reply.reply().outcome, RootReadOutcome::Data(_)));
+    assert!(matches!(
+        fixture.budget.try_reserve_process(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     assert_eq!(
-        deferred(fixture.reader.read(&request).await, &request),
-        send_backing_busy()
+        (held.segments, held.retained_reservations, held.deliveries),
+        (1, 0, 1)
     );
-    assert!(fixture.root.physical_idle());
-    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
+    drop(reply);
     drop(process);
-    let root = granted(
-        fixture
-            .root
-            .try_reserve(256 * 1024 * 1024 - FIXED - COPY + 1)
-            .unwrap(),
-    );
+
+    let root = granted(fixture.root.try_reserve(ROOT - FIXED - SEGMENT).unwrap());
+    assert!(matches!(
+        fixture.root.try_reserve(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    let spare = fixture.fill_process(PROCESS - ROOT);
+    let reply = owned(fixture.reader.read(&request).await);
+    assert!(matches!(reply.reply().outcome, RootReadOutcome::Data(_)));
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     assert_eq!(
-        deferred(fixture.reader.read(&request).await, &request),
-        send_backing_busy()
+        (held.segments, held.retained_reservations, held.deliveries),
+        (1, 1, 1)
     );
-    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
+    drop(reply);
+    drop(spare);
     drop(root);
-    drop(owned(fixture.reader.read(&request).await));
-    assert!(fixture.root.physical_idle());
 }
 
 #[tokio::test]
@@ -1594,10 +1600,6 @@ async fn full_budget_ack_only_uses_fixed_control_metadata() {
     let ack = owned(fixture.reader.read(&fixture.request(None, 1, 1)).await);
     assert_eq!(ack.reply().accepted_consumed, 1);
     assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
-    assert_eq!(
-        ack.ownership().backing_capacity_bytes(),
-        2 * RootProfileV1::ENVELOPE_BYTES
-    );
     drop(ack);
     drop(fixture.fill_process(SEGMENT));
     drop(filler);
@@ -1611,7 +1613,13 @@ async fn fixed_metadata_refusal_does_not_apply_ack_or_keep_admission() {
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
     // Reserve almost all fixed metadata, independently of data capacity.
-    let metadata = fixture.root.try_reserve_metadata(FIXED - 8192).unwrap();
+    let baseline = fixture
+        .root
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_bytes;
+    let metadata = fixture.root.try_reserve_metadata(FIXED - baseline).unwrap();
     let request = fixture.request(None, 1, 1);
     let committed = fixture
         .root
@@ -1621,11 +1629,7 @@ async fn fixed_metadata_refusal_does_not_apply_ack_or_keep_admission() {
         .metadata_bytes;
     assert_eq!(
         deferred(fixture.reader.read(&request).await, &request),
-        send_metadata_busy(
-            novarocks_native_adapter::root_result_reader::native_root_send_metadata_bytes()
-                + 2 * RootProfileV1::ENVELOPE_BYTES,
-            committed,
-        )
+        send_metadata_busy(native_root_send_metadata_bytes(), committed,)
     );
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
     drop(metadata);
@@ -1648,10 +1652,27 @@ async fn two_ack_only_sends_share_one_fixed_reservation_each() {
     let fixture = Fixture::new(false);
     let filler = fixture.fill_process(PROCESS - FIXED);
     let request = fixture.request(None, 0, 1);
+    let baseline = fixture
+        .root
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_bytes;
     let first = owned(fixture.reader.read(&request).await);
     let second = owned(fixture.reader.read(&request).await);
-    assert_eq!(first.ownership().backing_capacity_bytes(), 8192);
-    assert_eq!(second.ownership().backing_capacity_bytes(), 8192);
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (
+            held.deliveries,
+            held.metadata_holders,
+            held.retained_reservations
+        ),
+        (2, 2, 0)
+    );
+    assert_eq!(
+        held.metadata_bytes,
+        baseline + 2 * native_root_send_metadata_bytes()
+    );
     assert_eq!(
         deferred(fixture.reader.read(&request).await, &request),
         read_holders_busy()
@@ -1663,23 +1684,24 @@ async fn two_ack_only_sends_share_one_fixed_reservation_each() {
 }
 
 #[tokio::test]
-async fn ack_and_fetch_retire_original_backing_before_copy_pregrant() {
+async fn ack_and_fetch_retire_original_backing_and_return_end() {
     let fixture = Fixture::new(false);
     fixture.finish();
     drop(owned(
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY);
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT);
     let end = owned(fixture.reader.read(&fixture.request(Some(2), 1, 1)).await);
     assert_eq!(end.reply().accepted_consumed, 1);
     assert!(matches!(end.reply().outcome, RootReadOutcome::End(_)));
+    let released = fixture.fill_process(SEGMENT);
     drop(end);
-    drop(fixture.fill_process(COPY));
+    drop(released);
     drop(filler);
 }
 
 #[tokio::test]
-async fn acknowledged_original_alias_still_blocks_copy_pregrant() {
+async fn acknowledged_original_alias_keeps_its_own_backing_until_exit() {
     let fixture = Fixture::new(false);
     fixture.finish();
     let reply = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
@@ -1688,22 +1710,27 @@ async fn acknowledged_original_alias_still_blocks_copy_pregrant() {
         _ => panic!("Data"),
     };
     drop(reply);
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY);
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT);
     let request = fixture.request(Some(2), 1, 1);
-    assert_eq!(
-        deferred(fixture.reader.read(&request).await, &request),
-        send_backing_busy()
-    );
-    assert_eq!(
-        fixture.root.snapshot().consumed_through,
-        1,
-        "ACK applied despite copy refusal"
-    );
-    drop(alias);
-    // The failed copy offer also owns its original R until actual cleanup.
-    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let end = owned(fixture.reader.read(&request).await);
     assert_eq!(end.reply().accepted_consumed, 1);
+    assert!(matches!(end.reply().outcome, RootReadOutcome::End(_)));
+    assert_eq!(fixture.root.snapshot().data_positions, 0);
+    assert_eq!(
+        fixture
+            .root
+            .try_ownership_snapshot()
+            .unwrap()
+            .unwrap()
+            .segments,
+        1
+    );
+    assert!(matches!(
+        fixture.budget.try_reserve_process(1).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    drop(alias);
+    drop(fixture.fill_process(SEGMENT));
     drop(end);
     drop(filler);
 }
@@ -1747,7 +1774,7 @@ async fn release_wakes_admitted_long_poll_and_late_route_uses_real_ack() {
 }
 
 #[tokio::test]
-async fn ack_retirement_callback_seals_before_send_growth_and_returns_actual_frontier() {
+async fn ack_retirement_callback_seals_before_read_and_returns_actual_frontier() {
     let fixture = Fixture::new(false);
     fixture.finish();
     drop(owned(
@@ -1801,12 +1828,11 @@ async fn ack_retirement_callback_seals_before_send_growth_and_returns_actual_fro
             wait_until(|| root.upgrade().unwrap().is_closed());
         }))
         .unwrap();
-    assert!(matches!(
-        fixture.reader.read(&fixture.request(Some(2), 1, 1)).await,
-        NativeRootReadResponse::AwaitTerminalControl {
-            accepted_consumed: 1
-        }
-    ));
+    let reply = owned(fixture.reader.read(&fixture.request(Some(2), 1, 1)).await);
+    assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
+    assert_eq!(reply.reply().accepted_consumed, 1);
+    assert!(!fixture.root.physical_idle());
+    drop(reply);
     assert!(fired.load(Ordering::Acquire));
     assert_eq!(fixture.root.snapshot().consumed_through, 1);
     assert!(
@@ -1930,6 +1956,7 @@ struct PhysicalAllocation {
     pointer: usize,
     bytes: usize,
     align: usize,
+    reallocated: bool,
     dealloc_returned: bool,
 }
 impl PhysicalAllocation {
@@ -1937,6 +1964,7 @@ impl PhysicalAllocation {
         pointer: 0,
         bytes: 0,
         align: 0,
+        reallocated: false,
         dealloc_returned: false,
     };
 }
@@ -1971,6 +1999,7 @@ impl PhysicalProbe {
             pointer: pointer as usize,
             bytes: layout.size(),
             align: layout.align(),
+            reallocated: false,
             dealloc_returned: false,
         };
         self.used += 1;
@@ -1980,25 +2009,19 @@ impl PhysicalProbe {
             .iter()
             .position(|record| record.pointer == pointer as usize && !record.dealloc_returned)
     }
-    fn reallocated(
-        &mut self,
-        pointer: *mut u8,
-        result: *mut u8,
-        layout: Layout,
-        size: usize,
-    ) -> bool {
+    fn reallocated(&mut self, pointer: *mut u8, result: *mut u8, layout: Layout, size: usize) {
         let Some(index) = self.live_pointer(pointer) else {
-            return false;
+            return;
         };
-        // Reallocation is never accepted as the no-growth proof. Keep enough
-        // exact identity to observe the eventual free, including realloc fail.
-        self.invalid = true;
+        // Short frames can share a size with unrelated temporary allocations.
+        // Track growth on the allocation that actually backs the frame.
+        let record = &mut self.records[index];
+        record.reallocated = true;
         if !result.is_null() {
-            self.records[index].pointer = result as usize;
-            self.records[index].bytes = size;
-            self.records[index].align = layout.align();
+            record.pointer = result as usize;
+            record.bytes = size;
+            record.align = layout.align();
         }
-        true
     }
     fn deallocated_after_return(&mut self, pointer: *mut u8, layout: Layout) {
         let Some(index) = self.live_pointer(pointer) else {
@@ -2042,14 +2065,18 @@ impl PhysicalProbe {
                 );
             }
         }
-        matched.expect("actual alias must belong to one captured live allocation")
+        let index = matched.expect("actual alias must belong to one captured live allocation");
+        assert!(
+            !self.records[index].reallocated,
+            "the encoded frame backing grew"
+        );
+        index
     }
 }
 
 thread_local! {
     static SEND_PHYSICAL: Cell<PhysicalProbe> = const { Cell::new(PhysicalProbe::EMPTY) };
     static SEND_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
-    static SEND_REALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
     // Compatibility aggregate for existing tests: every selected allocation
     // must have returned from System.dealloc, not merely the last pointer.
     static SEND_FREED: Cell<bool> = const { Cell::new(false) };
@@ -2076,11 +2103,7 @@ unsafe impl GlobalAlloc for SendAllocationProbe {
         let result = unsafe { System.realloc(pointer, layout, size) };
         let _ = SEND_PHYSICAL.try_with(|cell| {
             let mut probe = cell.get();
-            if probe.reallocated(pointer, result, layout, size) {
-                let _ =
-                    SEND_REALLOC_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
-                let _ = SEND_FREED.try_with(|freed| freed.set(false));
-            }
+            probe.reallocated(pointer, result, layout, size);
             cell.set(probe);
         });
         result
@@ -2102,7 +2125,6 @@ fn start_send_probe(capacity: usize) {
         cell.set(probe);
     });
     SEND_ALLOC_COUNT.with(|value| value.set(0));
-    SEND_REALLOC_COUNT.with(|value| value.set(0));
     SEND_FREED.with(|value| value.set(false));
 }
 fn stop_send_probe() {
@@ -2130,6 +2152,34 @@ impl Drop for SendCapture {
         stop_send_probe();
     }
 }
+// Encode a separate expected domain reply. Do not derive the requested
+// allocation length from the candidate's returned DATA frame length.
+fn framed_reply_len(
+    read: &RootResultRead,
+    accepted_consumed: u64,
+    outcome: RootReadOutcome,
+) -> usize {
+    let reply = RootResultReply {
+        root_task: read.root_task(),
+        profile: read.profile(),
+        kind: read.kind(),
+        accepted_consumed,
+        outcome,
+    };
+    let expected = novarocks_task_codec::root_result::encode_reply(&reply).unwrap();
+    5 + expected.encoded_len()
+}
+
+fn framed_data_reply_len(read: &RootResultRead, bytes: Bytes) -> usize {
+    let end = RootResultEnd {
+        sequence: NonZeroU64::new(2).unwrap(),
+        output_rows: 1,
+    };
+    let data = RootResultData::try_new(read.kind(), NonZeroU64::new(1).unwrap(), bytes, Some(end))
+        .unwrap();
+    framed_reply_len(read, 0, RootReadOutcome::Data(data))
+}
+
 fn unary_request(read: &RootResultRead) -> axum::http::Request<axum::body::Body> {
     let message = novarocks_task_codec::root_result::encode_read(read);
     let mut bytes = Vec::with_capacity(5 + message.encoded_len());
@@ -2188,34 +2238,47 @@ fn unary_decoded_response(
 }
 
 #[tokio::test]
-async fn unary_unpolled_body_keeps_preallocated_buffer_and_full_credit() {
+async fn unary_unpolled_body_holds_exact_encoding_buffer_without_copy_credit() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
-    start_send_probe(SEGMENT);
-    let response = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(Some(1), 0, 1)),
-    )
-    .await;
-    stop_send_probe();
+    let read = fixture.request(Some(1), 0, 1);
+    let framed_bytes = framed_data_reply_len(&read, Bytes::from_static(b"\x03\0\0\0[1]"));
+    let request = unary_request(&read);
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
+    let capture = SendCapture::begin(framed_bytes);
+    let response = root_result_unary(&fixture.reader, request).await;
+    capture.stop();
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     assert_eq!(
-        SEND_ALLOC_COUNT.with(Cell::get),
-        1,
-        "one buffer before first body poll"
+        (held.segments, held.deliveries, held.retained_reservations),
+        (1, 1, 0)
     );
-    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
-    assert!(!SEND_FREED.with(Cell::get));
-    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - COPY - fixture.header_bytes());
+    assert_eq!(held.metadata_holders, 1);
+    let before = send_snapshot();
+    assert!(!before.invalid, "{before:?}");
+    let mut live = before.records[..before.used]
+        .iter()
+        .filter(|record| !record.dealloc_returned);
+    let backing = live
+        .next()
+        .expect("a live backing before the first body poll");
+    assert!(
+        live.next().is_none(),
+        "only the encoded reply backing stays live"
+    );
+    assert_eq!(backing.bytes, framed_bytes);
+    assert!(!backing.reallocated);
     assert!(matches!(
         fixture.budget.try_reserve_process(1).unwrap(),
         ResultWriteAdmission::Blocked
     ));
     drop(response);
-    assert!(
-        SEND_FREED.with(Cell::get),
-        "actual buffer exits before credit can be reused"
+    assert!(send_snapshot().all_deallocated());
+    let exited = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (exited.segments, exited.deliveries, exited.metadata_holders),
+        (1, 0, 0)
     );
-    drop(fixture.fill_process(COPY));
     drop(filler);
 }
 
@@ -2223,15 +2286,17 @@ async fn unary_unpolled_body_keeps_preallocated_buffer_and_full_credit() {
 async fn unary_last_data_slice_outlives_body_and_participation_seal() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
-    start_send_probe(SEGMENT);
-    let response = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(Some(1), 0, 1)),
-    )
-    .await;
-    stop_send_probe();
-    let mut body = response.into_body();
+    let read = fixture.request(Some(1), 0, 1);
+    let framed_bytes = framed_data_reply_len(&read, Bytes::from_static(b"\x03\0\0\0[1]"));
+    let request = unary_request(&read);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
+        .await
+        .into_body();
     let data = unary_data(&mut body).await;
+    capture.stop();
+    assert_eq!(data.len(), framed_bytes);
+    send_snapshot().live_alias(data.as_ptr(), data.len());
     let message = unary_message(&data);
     let RootReadResponse::Reply(decoded) = novarocks_task_codec::root_result::decode_response(
         message,
@@ -2254,7 +2319,7 @@ async fn unary_last_data_slice_outlives_body_and_participation_seal() {
     drop(body);
     assert!(!SEND_FREED.with(Cell::get));
     assert!(!fixture.root.physical_idle());
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    let filler = fixture.fill_process(PROCESS - FIXED - fixture.header_bytes());
     assert!(matches!(
         fixture.budget.try_reserve_process(1).unwrap(),
         ResultWriteAdmission::Blocked
@@ -2262,38 +2327,46 @@ async fn unary_last_data_slice_outlives_body_and_participation_seal() {
     drop(tail);
     assert!(SEND_FREED.with(Cell::get));
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(COPY));
     drop(filler);
 }
 
 #[tokio::test]
-async fn unary_ack_only_encodes_from_metadata_when_process_data_pool_is_full() {
+async fn unary_ack_only_encodes_with_no_extra_root_credit_when_process_data_pool_is_full() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
     drop(owned(
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
     let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
-    start_send_probe(RootProfileV1::ENVELOPE_BYTES);
-    let response =
-        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
-    stop_send_probe();
-    // This size also selects the separate pre-admission request decoder.
-    assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 2);
-    let mut body = response.into_body();
+    let read = fixture.request(None, 1, 1);
+    let request = unary_request(&read);
+    let framed_bytes = framed_reply_len(&read, 1, RootReadOutcome::AckOnly);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
+        .await
+        .into_body();
     let data = unary_data(&mut body).await;
+    capture.stop();
+    assert_eq!(data.len(), framed_bytes);
+    send_snapshot().live_alias(data.as_ptr(), data.len());
     let message = unary_receipt(unary_message(&data));
     assert_eq!(message.accepted_consumed_sequence, 1);
     assert_eq!(
         message.outcome,
         Some(wire::root_read_receipt::Outcome::AckOnly(true))
     );
+    let returned_segment = fixture.fill_process(SEGMENT);
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (held.segments, held.retained_reservations, held.deliveries),
+        (0, 0, 1)
+    );
+    assert_eq!(held.metadata_holders, 1);
     drop(body);
     assert!(!fixture.root.physical_idle());
     drop(data);
-    assert!(SEND_FREED.with(Cell::get));
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(SEGMENT));
+    drop(returned_segment);
     drop(filler);
 }
 
@@ -2304,9 +2377,7 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     drop(owned(
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
-    let reader_metadata =
-        novarocks_native_adapter::root_result_reader::native_root_send_metadata_bytes()
-            + 2 * RootProfileV1::ENVELOPE_BYTES;
+    let reader_metadata = native_root_send_metadata_bytes();
     // Core owner layout is independent of the wire envelope. Account the
     // actual already reserved metadata at this cut, then leave exactly the
     // reader-only demand; the unary transport's additional demand must fail.
@@ -2368,14 +2439,13 @@ async fn unary_cancellation_of_admitted_long_poll_exits_all_original_grants() {
     let mut future = Box::pin(root_result_unary(&fixture.reader, request));
     pending(future.as_mut()).await;
     assert!(!fixture.root.physical_idle());
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    let filler = fixture.fill_process(PROCESS - FIXED - fixture.header_bytes());
     assert!(matches!(
         fixture.budget.try_reserve_process(1).unwrap(),
         ResultWriteAdmission::Blocked
     ));
     drop(future);
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(COPY));
     drop(filler);
 }
 
@@ -2458,17 +2528,18 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     builder.output()[..4].copy_from_slice(&((count - 4) as u32).to_le_bytes());
     fixture.root.publish_segment(builder, count, true).unwrap();
     assert!(producer.finish_encoder().is_none());
-    start_send_probe(SEGMENT);
-    let mut body = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(Some(1), 0, 1)),
-    )
-    .await
-    .into_body();
-    stop_send_probe();
+    let read = fixture.request(Some(1), 0, 1);
+    let framed_bytes = framed_data_reply_len(&read, Bytes::from(vec![0; count]));
+    let request = unary_request(&read);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
+        .await
+        .into_body();
     let data = unary_data(&mut body).await;
+    capture.stop();
+    assert_eq!(data.len(), framed_bytes);
+    send_snapshot().live_alias(data.as_ptr(), data.len());
     assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 1);
-    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
     assert!(data.len() > RootProfileV1::SEGMENT_BYTES && data.len() <= SEGMENT);
     let message = unary_receipt(unary_message(&data));
     let Some(wire::root_read_receipt::Outcome::Data(payload)) = message.outcome else {
@@ -2516,10 +2587,22 @@ async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
     let fixture = UnaryFixture::new(true);
     fixture.finish();
     let read = fixture.request(Some(1), 0, 1);
-    let mut body = root_result_unary(&fixture.reader, unary_request(&read))
+    let end = RootResultEnd {
+        sequence: NonZeroU64::new(1).unwrap(),
+        output_rows: 1,
+    };
+    let framed_bytes = framed_reply_len(&read, 0, RootReadOutcome::End(end));
+    let request = unary_request(&read);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
         .await
         .into_body();
-    let message = unary_message(&unary_data(&mut body).await);
+    let data = unary_data(&mut body).await;
+    capture.stop();
+    assert_eq!(data.len(), framed_bytes);
+    send_snapshot().live_alias(data.as_ptr(), data.len());
+    let message = unary_message(&data);
+    drop(data);
     let RootReadResponse::Reply(reply) = novarocks_task_codec::root_result::decode_response(
         message,
         &read,
@@ -2538,30 +2621,28 @@ async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
 }
 
 #[tokio::test]
-async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_slice_drops() {
+async fn unary_exact_data_backing_survives_all_nonfinal_clone_and_short_slice_drops() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
-    let capture = SendCapture::begin(SEGMENT);
-    let response = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(Some(1), 0, 1)),
-    )
-    .await;
-    capture.stop();
-    let mut body = response.into_body();
+    let read = fixture.request(Some(1), 0, 1);
+    let framed_bytes = framed_data_reply_len(&read, Bytes::from_static(b"\x03\0\0\0[1]"));
+    let request = unary_request(&read);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
+        .await
+        .into_body();
     let data = unary_data(&mut body).await;
+    capture.stop();
     let open = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     assert_eq!((open.segments, open.deliveries), (1, 1));
-    assert!(open.retained_reservations > 0 && open.metadata_holders > 0 && open.metadata_bytes > 0);
+    assert_eq!(open.retained_reservations, 0);
+    assert!(open.metadata_holders > 0 && open.metadata_bytes > 0);
     let before = send_snapshot();
-    assert!(!before.invalid);
-    assert_eq!(before.used, 1);
-    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    assert!(!before.invalid, "{before:?}");
     let allocation = before.live_alias(data.as_ptr(), data.len());
-    assert_eq!(before.records[allocation].bytes, SEGMENT);
-    // The visible protobuf/wire bytes are genuinely short, but their original
-    // encoder allocation is the full granted SEGMENT-sized backing.
-    assert!(data.len() > 5 && data.len() < SEGMENT / 1024);
+    assert_eq!(before.records[allocation].bytes, framed_bytes);
+    assert_eq!(data.len(), framed_bytes);
+    assert!(data.len() < SEGMENT / 1024);
     assert_eq!(before.live_alias(data.as_ptr(), 1), allocation);
     let message = unary_message(&data);
     let RootReadResponse::Reply(decoded) = novarocks_task_codec::root_result::decode_response(
@@ -2587,15 +2668,12 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     fixture.seal();
     drop(body);
     // Encoding already dropped its original segment alias. Seal releases the
-    // queued segment while the independent full-copy DATA remains owned.
+    // queued segment while the independent Tonic DATA remains owned.
     let sealed = fixture.root.try_ownership_snapshot().unwrap().unwrap();
     assert_eq!((sealed.segments, sealed.deliveries), (0, 1));
-    assert!(
-        sealed.retained_reservations > 0
-            && sealed.metadata_holders > 0
-            && sealed.metadata_bytes > 0
-    );
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    assert_eq!(sealed.retained_reservations, 0);
+    assert!(sealed.metadata_holders > 0 && sealed.metadata_bytes > 0);
+    let filler = fixture.fill_process(PROCESS - FIXED - fixture.header_bytes());
     for alias in [clone, short] {
         drop(alias);
         let state = send_snapshot();
@@ -2604,9 +2682,8 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
         assert!(!fixture.root.physical_idle());
         let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
         assert_eq!((held.segments, held.deliveries), (0, 1));
-        assert!(
-            held.retained_reservations > 0 && held.metadata_holders > 0 && held.metadata_bytes > 0
-        );
+        assert_eq!(held.retained_reservations, 0);
+        assert!(held.metadata_holders > 0 && held.metadata_bytes > 0);
         assert!(matches!(
             fixture.budget.try_reserve_process(1).unwrap(),
             ResultWriteAdmission::Blocked
@@ -2629,38 +2706,31 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
         ),
         (0, 0, 0, 0)
     );
-    drop(fixture.fill_process(COPY));
     drop(filler);
 }
 
 #[tokio::test]
-async fn unary_ack_same_size_decoder_and_send_backings_are_distinct_until_last_data_alias_exit() {
+async fn unary_ack_exact_frame_backing_follows_last_data_alias() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
     drop(owned(
         fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
     ));
     let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
-    let capture = SendCapture::begin(RootProfileV1::ENVELOPE_BYTES);
-    let response =
-        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
-    capture.stop();
-    let mut body = response.into_body();
+    let read = fixture.request(None, 1, 1);
+    let request = unary_request(&read);
+    let framed_bytes = framed_reply_len(&read, 1, RootReadOutcome::AckOnly);
+    assert!(framed_bytes < RootProfileV1::ENVELOPE_BYTES);
+    let capture = SendCapture::begin(framed_bytes);
+    let mut body = root_result_unary(&fixture.reader, request)
+        .await
+        .into_body();
     let data = unary_data(&mut body).await;
+    capture.stop();
     let before = send_snapshot();
     assert!(!before.invalid);
-    assert_eq!(
-        before.used, 2,
-        "actual decoder and send buffers are both recorded"
-    );
-    assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
+    assert_eq!(data.len(), framed_bytes);
     let send_id = before.live_alias(data.as_ptr(), data.len());
-    let decoder_id = 1 - send_id;
-    assert!(before.records[decoder_id].dealloc_returned);
-    assert!(!before.records[send_id].dealloc_returned);
-    // Freed decoder and live send storage may legally reuse the same address.
-    // Their distinct ordinal/lifecycle facts, not pointer inequality, identify
-    // this response's actual DATA allocation.
     let message = unary_receipt(unary_message(&data));
     assert_eq!(message.accepted_consumed_sequence, 1);
     assert_eq!(
@@ -2674,24 +2744,29 @@ async fn unary_ack_same_size_decoder_and_send_backings_are_distinct_until_last_d
     drop(data);
     drop(clone);
     let middle = send_snapshot();
-    assert!(middle.records[decoder_id].dealloc_returned);
     assert!(!middle.records[send_id].dealloc_returned);
-    assert!(!middle.all_deallocated());
     assert!(!fixture.root.physical_idle());
-    // ACK retires the data position before projection, so its backing is held
-    // by the original fixed metadata reservation, not by process data credit.
-    // Do not assert that the already-released process data slot is blocked.
+    let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (
+            held.deliveries,
+            held.metadata_holders,
+            held.retained_reservations
+        ),
+        (1, 1, 0)
+    );
+    let returned_segment = fixture.fill_process(SEGMENT);
     drop(last);
     let after = send_snapshot();
     assert!(!after.invalid);
-    assert!(after.all_deallocated());
+    assert!(after.records[send_id].dealloc_returned);
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(SEGMENT));
+    drop(returned_segment);
     drop(filler);
 }
 
 #[tokio::test]
-async fn unary_backing_deferral_has_no_ack_receipt_after_actual_ack_applies() {
+async fn unary_ack_and_end_advance_while_the_original_segment_alias_is_live() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
     let original = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
@@ -2700,55 +2775,41 @@ async fn unary_backing_deferral_has_no_ack_receipt_after_actual_ack_applies() {
     };
     let alias = data.body().clone();
     drop(original);
-    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
     let read = fixture.request(Some(2), 1, 1);
-    let response = root_result_unary(&fixture.reader, unary_request(&read)).await;
-    assert!(!response.headers().contains_key("grpc-status"));
-    let mut body = response.into_body();
+    let mut body = root_result_unary(&fixture.reader, unary_request(&read))
+        .await
+        .into_body();
     let raw = unary_data(&mut body).await;
-    assert!(matches!(
-        unary_message(&raw).result,
-        Some(wire::fetch_root_result_response::Result::Deferred(_)),
-    ));
+    let RootReadResponse::Reply(reply) = unary_decoded_response(&raw, &read, 1) else {
+        panic!("expected the original read receipt");
+    };
+    assert_eq!(reply.accepted_consumed, 1);
+    assert!(matches!(reply.outcome, RootReadOutcome::End(_)));
+    assert_eq!(fixture.root.snapshot().consumed_through, 1);
     assert_eq!(
-        unary_decoded_response(&raw, &read, 1),
-        RootReadResponse::Deferred(
-            novarocks_execution_contract::root_result::RootReadDeferred::for_request(
-                &read,
-                send_backing_busy(),
-            )
-        ),
-    );
-    assert_eq!(
-        fixture.root.snapshot().consumed_through,
-        1,
-        "the real ACK applied before copy admission"
-    );
-    assert!(
-        !fixture.root.physical_idle(),
-        "the actual original Data alias remains live"
+        fixture
+            .root
+            .try_ownership_snapshot()
+            .unwrap()
+            .unwrap()
+            .segments,
+        1
     );
     assert!(matches!(
-        fixture.budget.try_reserve_process(COPY).unwrap(),
+        fixture.budget.try_reserve_process(1).unwrap(),
         ResultWriteAdmission::Blocked
     ));
     drop(raw);
     drop(body);
     drop(alias);
-    // This fixture owns its Node exclusively. The prior data and deferred ACK
-    // reads must retire their original R/report/header charges before replay;
-    // dropping a reply or its last data alias alone does not prove that step.
     wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let replay = owned(fixture.reader.read(&read).await);
-    assert_eq!(
-        replay.reply().accepted_consumed,
-        1,
-        "replaying the same cumulative ACK is idempotent"
-    );
+    assert_eq!(replay.reply().accepted_consumed, 1);
     assert!(matches!(replay.reply().outcome, RootReadOutcome::End(_)));
     drop(replay);
     assert!(fixture.root.physical_idle());
-    drop(fixture.fill_process(COPY));
+    drop(fixture.fill_process(SEGMENT));
     drop(filler);
 }
 

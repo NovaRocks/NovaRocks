@@ -549,7 +549,7 @@ pub(crate) struct NodeRootDelivery {
 }
 impl NodeRootRead {
     // These forward the same admitted read. Native can reserve metadata before
-    // applying the actual caller ACK, then acquire payload backing and read.
+    // applying the actual caller ACK, then read the original payload.
     pub(crate) fn try_reserve_native_send_metadata(
         &self,
         bytes: usize,
@@ -561,17 +561,6 @@ impl NodeRootRead {
     }
     pub(crate) fn accepted_consumed(&self) -> u64 {
         self.read.accepted_consumed()
-    }
-    pub(crate) fn try_reserve_native_send_backing(
-        &self,
-    ) -> Result<novarocks_execution::runtime::task::io::ResultWriteAdmission, RootChannelError>
-    {
-        self.read.try_reserve_native_send_backing()
-    }
-    pub(crate) fn native_send_backing_refusal(
-        &self,
-    ) -> Result<crate::root_result_channel::RootCapacityRefusal, RootChannelError> {
-        self.read.native_send_backing_refusal()
     }
     pub(crate) async fn read(self) -> Result<NodeRootDelivery, RootReadError> {
         let delivery = self.read.read().await.map_err(RootReadError::Channel)?;

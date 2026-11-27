@@ -35,6 +35,7 @@ use novarocks_execution_contract::native_result_support::NativeResultSupportGeom
 
 use crate::native_lane::{NativeLane, StreamDirection};
 use crate::native_transport_admission::{AdmissionDimensions, TransportRole};
+use crate::root_result_unary::{ROOT_CONTROL_FRAME_MAX_BYTES, ROOT_DATA_FRAME_MAX_BYTES};
 
 /// Tonic 0.12.3's `Endpoint` does not expose these HTTP/2 client settings, so
 /// the Hyper 1.8 / H2 0.4 client defaults apply. They are constants of the
@@ -137,6 +138,60 @@ pub struct NativeTransportGeometryReport {
     pub frontend: NativeTransportEnvelope,
     pub backend_socket_positions: u64,
     pub frontend_socket_positions: u64,
+}
+
+/// Requested-byte bounds using the BE's effective Root wallet and ingress limit.
+/// The lane subtotal stays independently comparable with the static report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackendRootEncodingReport {
+    pub root_process_limit_bytes: u64,
+    pub ingress_owner_limit: u64,
+    pub data_owner_limit: u64,
+    pub encoding_requested_bytes: u64,
+    pub known_structural_bytes: u64,
+}
+
+impl NativeTransportGeometryReport {
+    // Design: ADR-0276 (docs/adr/ADR-0276-third-party-encoding-buffers-use-transport-headroom.md)
+    pub(crate) fn backend_root_encoding_report(
+        &self,
+        geometry: &NativeResultSupportGeometry,
+        effective_process_limit: usize,
+        actual_ingress_limit: usize,
+    ) -> io::Result<BackendRootEncodingReport> {
+        let process_limit = u64::try_from(effective_process_limit)
+            .map_err(|_| refuse("effective Root process limit does not fit u64"))?;
+        let ingress_limit = u64::try_from(actual_ingress_limit)
+            .map_err(|_| refuse("Root ingress owner limit does not fit u64"))?;
+        let fixed_charge = positive(
+            "root_fixed_schema_cursor_driver_capacity_bytes",
+            geometry.root_fixed_schema_cursor_driver_capacity_bytes,
+        )?;
+        let control_frame = ROOT_CONTROL_FRAME_MAX_BYTES as u64;
+        let additional_data_bytes = (ROOT_DATA_FRAME_MAX_BYTES as u64)
+            .checked_sub(control_frame)
+            .ok_or_else(|| refuse("Root data frame limit is below the control frame limit"))?;
+
+        // Data retains its original delivery position until the encoded backing
+        // exits. Each Root represented here still holds its fixed wallet charge.
+        // Control replies may lack a Root owner but all encoded replies hold
+        // their original ingress permit, including DATA left in h2 after Body.
+        let data_owner_limit = ingress_limit.min(mul(
+            process_limit / fixed_charge,
+            geometry.root_live_send_holders,
+        )?);
+        let encoding_requested_bytes = add(
+            mul(ingress_limit, control_frame)?,
+            mul(data_owner_limit, additional_data_bytes)?,
+        )?;
+        Ok(BackendRootEncodingReport {
+            root_process_limit_bytes: process_limit,
+            ingress_owner_limit: ingress_limit,
+            data_owner_limit,
+            encoding_requested_bytes,
+            known_structural_bytes: add(self.backend.structural_bytes, encoding_requested_bytes)?,
+        })
+    }
 }
 
 fn refuse(detail: impl Into<String>) -> io::Error {
@@ -514,6 +569,64 @@ mod tests {
         assert_eq!(report.frontend.handshake_positions, 160);
         assert!(report.backend_socket_positions <= 1024);
         assert!(report.frontend_socket_positions <= 2048);
+    }
+
+    #[test]
+    fn backend_root_encoding_uses_the_effective_wallet_and_original_ingress_limit() {
+        use crate::native_transport_admission::root_result_ingress_owner_limit;
+
+        let geometry = NativeResultSupportGeometry::V1;
+        let report = validate_native_transport_geometry(&geometry).unwrap();
+        let ingress = root_result_ingress_owner_limit(TransportRole::Backend, &geometry).unwrap();
+        assert_eq!(
+            ROOT_DATA_FRAME_MAX_BYTES as u64,
+            geometry.root_segment_backing_capacity_bytes
+        );
+        let nominal = report
+            .backend_root_encoding_report(&geometry, 4 << 30, ingress)
+            .unwrap();
+        let larger = report
+            .backend_root_encoding_report(&geometry, 8 << 30, ingress)
+            .unwrap();
+        assert_eq!(nominal.root_process_limit_bytes, 4 << 30);
+        assert_eq!(nominal.ingress_owner_limit, 45_184);
+        assert_eq!(nominal.data_owner_limit, 8_192);
+        assert_eq!(nominal.encoding_requested_bytes, 8_775_008_256);
+        assert_eq!(larger.root_process_limit_bytes, 8 << 30);
+        assert_eq!(larger.data_owner_limit, 16_384);
+        assert_eq!(larger.encoding_requested_bytes, 17_364_942_848);
+        assert_eq!(nominal.known_structural_bytes, 59_899_379_712);
+        assert_eq!(
+            larger.known_structural_bytes,
+            report.backend.structural_bytes + larger.encoding_requested_bytes
+        );
+
+        let clipped = report
+            .backend_root_encoding_report(&geometry, 4 << 30, 7)
+            .unwrap();
+        assert_eq!(clipped.data_owner_limit, 7);
+        assert_eq!(
+            clipped.encoding_requested_bytes,
+            7 * ROOT_DATA_FRAME_MAX_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn backend_root_encoding_diagnostic_rejects_overflow_or_zero_fixed_charge() {
+        let mut geometry = NativeResultSupportGeometry::V1;
+        let mut report = validate_native_transport_geometry(&geometry).unwrap();
+        report.backend.structural_bytes = u64::MAX;
+        assert!(
+            report
+                .backend_root_encoding_report(&geometry, 4 << 30, 1)
+                .is_err()
+        );
+        geometry.root_fixed_schema_cursor_driver_capacity_bytes = 0;
+        assert!(
+            report
+                .backend_root_encoding_report(&geometry, 4 << 30, 1)
+                .is_err()
+        );
     }
 
     #[test]
