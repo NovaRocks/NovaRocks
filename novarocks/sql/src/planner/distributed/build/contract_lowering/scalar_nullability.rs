@@ -413,10 +413,12 @@ mod tests {
                 &control,
             )
             .unwrap();
-        let binding = SqlFunctionBinding::new_with_row_constructor_constraint(
+        let binding = SqlFunctionBinding::from_plan_with_constraint(
+            crate::binding::PlanBindingAuthority::Test,
             selected,
             DecimalOverflowPolicy::OutputNull,
-            original.clone(),
+            crate::binding::SqlResultConstraintOrigin::RowConstructor,
+            Some(original.clone()),
         );
 
         arguments[0] = FunctionArgument::Value {

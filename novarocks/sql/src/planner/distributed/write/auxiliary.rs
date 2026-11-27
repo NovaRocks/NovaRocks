@@ -414,7 +414,11 @@ pub fn plan_writer_statistics(
                 )
                 .into());
             }
-            let resolved = SqlFunctionBinding::new(resolved, decimal_overflow_policy);
+            let resolved = SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
+                resolved,
+                decimal_overflow_policy,
+            );
             let source = crate::binding::AggregateArgumentSource::logical_update(
                 vec![input_expr],
                 Vec::new(),

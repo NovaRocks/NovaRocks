@@ -225,7 +225,10 @@ fn check_source_definitions(
                     let lifecycle = match &source {
                         SqlCallDependencySite::Window { source, .. } => {
                             if source.binding.kind == novarocks_functions::FunctionKind::Aggregate {
-                                PureCallLifecycle::AggregateWindow
+                                PureCallLifecycle::AggregateWindow {
+                                    distinct: source.distinct,
+                                    ordered: !source.order_by.is_empty(),
+                                }
                             } else {
                                 PureCallLifecycle::Window
                             }

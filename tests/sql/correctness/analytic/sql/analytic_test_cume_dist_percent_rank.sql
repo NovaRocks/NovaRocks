@@ -92,7 +92,7 @@ VALUES ROW(1, 10, 15, 2.5, DATE '2023-01-01', 'apple'),
 
 -- query 2
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 3
 -- @order_sensitive=true
@@ -100,19 +100,19 @@ SELECT *, CUME_DIST() OVER (ORDER BY v2 DESC) AS cume_dist_v2 FROM ${case_db}.cu
 
 -- query 4
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v3) AS cume_dist_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v3 NULLS FIRST) AS cume_dist_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 5
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v4) AS cume_dist_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v4 NULLS FIRST) AS cume_dist_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 6
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 7
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v2) AS percent_rank_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v2 NULLS FIRST) AS percent_rank_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 8
 -- @order_sensitive=true
@@ -120,7 +120,7 @@ SELECT *, PERCENT_RANK() OVER (ORDER BY v3 DESC) AS percent_rank_v3 FROM ${case_
 
 -- query 9
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v4) AS percent_rank_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v4 NULLS FIRST) AS percent_rank_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 10
 -- @order_sensitive=true
@@ -172,11 +172,11 @@ SELECT *, PERCENT_RANK() OVER (ORDER BY k1 DESC, k2 ASC) AS percent_rank_k1_desc
 
 -- query 22
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v1 ORDER BY v2) AS cume_dist_v1_partition_v2 FROM ${case_db}.cume_test ORDER BY k1, k2, v1;
+SELECT *, CUME_DIST() OVER (PARTITION BY v1 ORDER BY v2 NULLS FIRST) AS cume_dist_v1_partition_v2 FROM ${case_db}.cume_test ORDER BY k1, k2, v1;
 
 -- query 23
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4) AS cume_dist_v3_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
+SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4 NULLS FIRST) AS cume_dist_v3_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
 
 -- query 24
 -- @order_sensitive=true
@@ -184,15 +184,15 @@ SELECT *, CUME_DIST() OVER (PARTITION BY k1 ORDER BY k2) AS cume_dist_k1_partiti
 
 -- query 25
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v4 ORDER BY v3) AS cume_dist_v4_partition_v3 FROM ${case_db}.cume_test ORDER BY v2 DESC, k1, k2;
+SELECT *, CUME_DIST() OVER (PARTITION BY v4 ORDER BY v3 NULLS FIRST) AS cume_dist_v4_partition_v3 FROM ${case_db}.cume_test ORDER BY v2 DESC, k1, k2;
 
 -- query 26
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (PARTITION BY v1 ORDER BY v3) AS percent_rank_v1_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
+SELECT *, PERCENT_RANK() OVER (PARTITION BY v1 ORDER BY v3 NULLS FIRST) AS percent_rank_v1_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
 
 -- query 27
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (PARTITION BY v2 ORDER BY v4) AS percent_rank_v2_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (PARTITION BY v2 ORDER BY v4 NULLS FIRST) AS percent_rank_v2_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 28
 -- @order_sensitive=true
@@ -200,79 +200,79 @@ SELECT *, PERCENT_RANK() OVER (PARTITION BY k2 ORDER BY k1) AS percent_rank_k2_p
 
 -- query 29
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (PARTITION BY v4 ORDER BY v2) AS percent_rank_v4_partition_v2 FROM ${case_db}.cume_test ORDER BY v2 DESC, k1, k2;
+SELECT *, PERCENT_RANK() OVER (PARTITION BY v4 ORDER BY v2 NULLS FIRST) AS percent_rank_v4_partition_v2 FROM ${case_db}.cume_test ORDER BY v2 DESC, k1, k2;
 
 -- query 30
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1, ROW_NUMBER() OVER (ORDER BY v1, v3) AS row_number_v1_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1, ROW_NUMBER() OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS row_number_v1_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 31
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v2) AS cume_dist_v2, RANK() OVER (ORDER BY v1) AS rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v2 NULLS FIRST) AS cume_dist_v2, RANK() OVER (ORDER BY v1 NULLS FIRST) AS rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 32
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v3) AS cume_dist_v3, DENSE_RANK() OVER (ORDER BY v1) AS dense_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v3 NULLS FIRST) AS cume_dist_v3, DENSE_RANK() OVER (ORDER BY v1 NULLS FIRST) AS dense_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 33
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v4) AS cume_dist_v4, NTILE(5) OVER (ORDER BY v1, v3) AS ntile_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v4 NULLS FIRST) AS cume_dist_v4, NTILE(5) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS ntile_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 34
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1, LAG(v2) OVER (ORDER BY v1, v3) AS lag_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1, LAG(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS lag_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 35
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v2) AS cume_dist_v2, LEAD(v2) OVER (ORDER BY v1, v3) AS lead_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v2 NULLS FIRST) AS cume_dist_v2, LEAD(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS lead_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 36
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v3) AS cume_dist_v3, FIRST_VALUE(v2) OVER (ORDER BY v1, v3) AS first_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v3 NULLS FIRST) AS cume_dist_v3, FIRST_VALUE(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS first_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 37
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v4) AS cume_dist_v4, LAST_VALUE(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v4 NULLS FIRST) AS cume_dist_v4, LAST_VALUE(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 38
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1, ROW_NUMBER() OVER (ORDER BY v1, v3) AS row_number_v1_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1, ROW_NUMBER() OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS row_number_v1_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 39
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v2) AS percent_rank_v2, RANK() OVER (ORDER BY v1) AS rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v2 NULLS FIRST) AS percent_rank_v2, RANK() OVER (ORDER BY v1 NULLS FIRST) AS rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 40
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v3) AS percent_rank_v3, DENSE_RANK() OVER (ORDER BY v1) AS dense_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v3 NULLS FIRST) AS percent_rank_v3, DENSE_RANK() OVER (ORDER BY v1 NULLS FIRST) AS dense_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 41
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v4) AS percent_rank_v4, NTILE(5) OVER (ORDER BY v1, v3) AS ntile_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v4 NULLS FIRST) AS percent_rank_v4, NTILE(5) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS ntile_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 42
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1, LAG(v2) OVER (ORDER BY v1, v3) AS lag_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1, LAG(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS lag_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 43
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v2) AS percent_rank_v2, LEAD(v2) OVER (ORDER BY v1, v3) AS lead_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v2 NULLS FIRST) AS percent_rank_v2, LEAD(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS lead_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 44
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v3) AS percent_rank_v3, FIRST_VALUE(v2) OVER (ORDER BY v1, v3) AS first_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v3 NULLS FIRST) AS percent_rank_v3, FIRST_VALUE(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST) AS first_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 45
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v4) AS percent_rank_v4, LAST_VALUE(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v4 NULLS FIRST) AS percent_rank_v4, LAST_VALUE(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_value_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 46
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1, PERCENT_RANK() OVER (ORDER BY v3) AS percent_rank_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1, PERCENT_RANK() OVER (ORDER BY v3 NULLS FIRST) AS percent_rank_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 47
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v2) AS cume_dist_v2, PERCENT_RANK() OVER (ORDER BY v2) AS percent_rank_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v2 NULLS FIRST) AS cume_dist_v2, PERCENT_RANK() OVER (ORDER BY v2 NULLS FIRST) AS percent_rank_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 48
 -- @order_sensitive=true
@@ -284,32 +284,32 @@ SELECT *, CUME_DIST() OVER (ORDER BY v4 DESC) AS cume_dist_v4, PERCENT_RANK() OV
 
 -- query 50
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY k1 ORDER BY k2) AS percent_rank_k1_partition_k2, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (PARTITION BY k1 ORDER BY k2) AS percent_rank_k1_partition_k2, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 51
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4) AS percent_rank_v3_partition_v4, PERCENT_RANK() OVER (PARTITION BY v4 ORDER BY v3) AS percent_rank_v4_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4 NULLS FIRST) AS percent_rank_v3_partition_v4, PERCENT_RANK() OVER (PARTITION BY v4 ORDER BY v3 NULLS FIRST) AS percent_rank_v4_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 52
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1, AVG(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS avg_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1, AVG(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS avg_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 53
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v2) AS cume_dist_v2, SUM(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sum_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v2 NULLS FIRST) AS cume_dist_v2, SUM(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sum_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 54
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (ORDER BY v1) AS cume_dist_v1, MIN(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS min_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (ORDER BY v1 NULLS FIRST) AS cume_dist_v1, MIN(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS min_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 55
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1, AVG(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS avg_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1, AVG(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS avg_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 56
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v2) AS percent_rank_v2, SUM(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sum_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v2 NULLS FIRST) AS percent_rank_v2, SUM(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sum_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
 
 -- query 57
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (ORDER BY v1) AS percent_rank_v1, MIN(v2) OVER (ORDER BY v1, v3 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS min_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (ORDER BY v1 NULLS FIRST) AS percent_rank_v1, MIN(v2) OVER (ORDER BY v1 NULLS FIRST, v3 NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS min_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;

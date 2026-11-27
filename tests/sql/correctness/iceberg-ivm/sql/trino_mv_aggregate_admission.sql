@@ -70,19 +70,25 @@ CREATE MATERIALIZED VIEW ${case_db}.trc_l7_approx_distinct AS
 SELECT k, approx_distinct(v) AS n FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 10
+-- @expect_error=Iceberg IMV requires an installed persistent state author for overload builtin.aggregate/approx_distinct/explicit-error-hll-v1
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_approx_distinct_explicit AS
+SELECT k, approx_distinct(v, DOUBLE '0.023') AS n
+FROM ${case_db}.trc_l7_measurements GROUP BY k;
+
+-- query 11
 SELECT table_name
 FROM iceberg_ivm_cat_${suite_uuid0}.information_schema.tables
 WHERE table_schema = '${case_db}'
-  AND table_name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct');
+  AND table_name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct', 'trc_l7_approx_distinct_explicit');
 
--- query 11
+-- query 12
 SELECT name
 FROM system.runtime.materialized_view_states
 WHERE catalog_name = 'iceberg_ivm_cat_${suite_uuid0}'
   AND schema_name = '${case_db}'
-  AND name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct');
+  AND name IN ('trc_l7_count_control', 'trc_l7_count_filtered', 'trc_l7_approx_distinct', 'trc_l7_approx_distinct_explicit');
 
--- query 12
+-- query 13
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_star;
@@ -93,4 +99,5 @@ DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_filtered;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_count_control;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_unnamed_avg;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_approx_distinct;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_approx_distinct_explicit;
 DROP TABLE IF EXISTS ${case_db}.trc_l7_measurements;

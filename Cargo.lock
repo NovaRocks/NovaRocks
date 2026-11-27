@@ -3298,6 +3298,7 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-fs",
  "novarocks-functions",
+ "novarocks-parser",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",

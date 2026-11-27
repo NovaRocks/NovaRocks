@@ -108,7 +108,13 @@ fn sum(arena: &mut ScalarArena, value: ConstantValue, output: u32) -> ScalarAggr
         source: crate::binding::AggregateArgumentSource::uncertified(
             vec![insert(arena, value)],
             vec![],
-            crate::binding::SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::OutputNull),
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
+                resolved,
+                DecimalOverflowPolicy::OutputNull,
+            ),
         ),
     }
 }

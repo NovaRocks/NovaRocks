@@ -227,7 +227,7 @@ const DISTINCT: &[Overload] = &[
         "(unknown)->i64",
         [Unknown],
         Count,
-        "unknown-v1",
+        "unknown-v2",
         true
     ),
     overload!(
@@ -235,7 +235,7 @@ const DISTINCT: &[Overload] = &[
         "(bool)->i64",
         [Boolean],
         Count,
-        "boolean-set-v1",
+        "boolean-set-v2",
         true
     ),
     overload!(
@@ -243,7 +243,7 @@ const DISTINCT: &[Overload] = &[
         "(any)->i64",
         [AnyHash],
         Count,
-        "hll-xxhash64-p11-v1",
+        "hll-xxhash64-parameterized-v2",
         true
     ),
     overload!(
@@ -251,24 +251,24 @@ const DISTINCT: &[Overload] = &[
         "(unknown,f64)->i64",
         [Unknown, Double],
         Count,
-        "unknown-error-v1",
-        false
+        "unknown-v2",
+        true
     ),
     overload!(
         "boolean-error-v1",
         "(bool,f64)->i64",
         [Boolean, Double],
         Count,
-        "boolean-error-v1",
-        false
+        "boolean-set-v2",
+        true
     ),
     overload!(
         "explicit-error-hll-v1",
         "(any,f64)->i64",
         [AnyHash, Double],
         Count,
-        "explicit-error-hll-v1",
-        false
+        "hll-xxhash64-parameterized-v2",
+        true
     ),
 ];
 
@@ -446,9 +446,13 @@ fn catalogue_error(error: impl std::fmt::Display) -> FunctionCatalogError {
 
 pub(super) fn definitions() -> Result<[FunctionDefinition; 3], FunctionCatalogError> {
     Ok([
-        definition(Family::Distinct, prepare_distinct)?,
-        definition(Family::Percentile, ApproxHistogramKernel::percentile)?,
-        definition(Family::Frequency, ApproxHistogramKernel::frequency)?,
+        definition(Family::Distinct, ApproxDistinctKernel::prepare)?,
+        definition(Family::Percentile, |contract, _| {
+            ApproxHistogramKernel::percentile(contract)
+        })?,
+        definition(Family::Frequency, |contract, _| {
+            ApproxHistogramKernel::frequency(contract)
+        })?,
     ])
 }
 
@@ -511,7 +515,8 @@ fn definition<K: PreparedAggregateKernel>(
     .map_err(catalogue_error)
 }
 
-type PrepareKernel<K> = fn(Arc<AggregateCallContract>) -> Result<K, KernelFailure>;
+type PrepareKernel<K> =
+    fn(Arc<AggregateCallContract>, FunctionBindingRequest<'_>) -> Result<K, KernelFailure>;
 
 struct ApproximateOwner<K> {
     binding: Arc<ApproximateBinding>,
@@ -747,7 +752,7 @@ impl<K: Send + Sync> ApproximateOwner<K> {
             ));
         }
         if self.binding.family == Family::Distinct
-            && !matches!(selected.argument_types.as_ref(), [FunctionArgumentType::Value(value)] if ApproxProfile::prepare(value).is_some())
+            && !matches!(selected.argument_types.first(), Some(FunctionArgumentType::Value(value)) if ApproxProfile::prepare(value).is_some())
         {
             return Err(FunctionBindingError::UnavailableImplementation(
                 selected.overload.clone(),
@@ -795,17 +800,6 @@ impl<K: Send + Sync> PureFunctionMetadataOwner for ApproximateOwner<K> {
         control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
         self.validate_profile(selected, logical_argument_count)
     }
-}
-
-fn prepare_distinct(
-    contract: Arc<AggregateCallContract>,
-) -> Result<ApproxDistinctKernel, KernelFailure> {
-    let profile = contract
-        .logical_argument_types()
-        .next()
-        .and_then(ApproxProfile::prepare)
-        .ok_or_else(|| invalid("approx_distinct requires its installed input profile"))?;
-    Ok(ApproxDistinctKernel { contract, profile })
 }
 
 impl<K: Send + Sync> ApproximateOwner<K> {
@@ -985,7 +979,7 @@ impl<K: Send + Sync> ApproximateOwner<K> {
                 }
             }
             work.flush().map_err(compile_failure)?;
-            let prepared = Arc::new((self.prepare)(contract)?);
+            let prepared = Arc::new((self.prepare)(contract, input.request)?);
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();

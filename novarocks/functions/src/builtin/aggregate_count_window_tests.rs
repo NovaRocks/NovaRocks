@@ -700,7 +700,10 @@ fn every_actual_window_lifecycle_callback_preserves_seven_causes_and_poison_with
                     part.evaluate(selected, 2, &baseline).unwrap();
                 }
                 2 => {
-                    assert!(part.evaluate(selected, 1, &baseline).is_err());
+                    assert_eq!(
+                        part.evaluate(selected, 1, &baseline).unwrap_err(),
+                        invalid("window output Selection exceeds host row grant")
+                    );
                 }
                 _ => {
                     part.finish(&baseline).unwrap();
@@ -708,7 +711,11 @@ fn every_actual_window_lifecycle_callback_preserves_seven_causes_and_poison_with
             }
         }
         let trace = baseline.trace.lock().unwrap().clone();
-        assert!(trace.len() >= 2);
+        if stage == 2 {
+            assert_eq!(trace, [0]);
+        } else {
+            assert!(trace.len() >= 2);
+        }
         for at in 0..trace.len() {
             for cause in causes() {
                 let control = Control {

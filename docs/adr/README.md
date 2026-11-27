@@ -130,6 +130,7 @@ code-anchors:
 
 ### pipeline-execution
 
+- [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
 - [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 为何逐分支绑定既有 stream sink，撤回、End、实际退出与共享 backing 如何分工（active）
 - [ADR-0248](ADR-0248-parquet-reader-sizing-and-scan-output-policy.md) — Parquet 读取规模和扫描输出为何各有作者，完整前缀、来源持有和合作调度如何交接（active，替代 ADR-0014 的批预算与会话属性 ADR-0222 的读设置传递阶段安排）
 - [ADR-0252](ADR-0252-trino-casts-and-row-error-scopes.md) — Trino 转换语境、完整类型与选中行错误作用域如何在编译、折叠和执行中保持一致（active）
@@ -342,13 +343,16 @@ code-anchors:
 ### sql-compiler
 
 - [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
+- [ADR-0275](ADR-0275-approximate-distinct-freezes-precision-for-split.md) — 近似去重怎样从原参数取得固定精度，统一 HLL 状态并复核分阶段来源（active，部分替代 ADR-0259 的普通近似去重状态）
+- [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
+
 - [ADR-0272](ADR-0272-collection-lambdas-use-bound-body-requests.md) — 集合 lambda 如何定稿原重载、按需请求准确体，以及如何沿原宿主保管捕获、错误与资源（active）
 - [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
 - [ADR-0266](ADR-0266-array-scalar-overloads-and-host-admission.md) — 数组标量重载如何共用值关系、转换与宿主准入，以及与 Trino 484 的接口差异（active）
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
 
-- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；原重载、行域、结果及聚合状态交换继续有效）
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — 聚合所选重载如何贯穿原行更新、状态交换和实际物化发布（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；普通近似去重状态由 ADR-0275 部分替代；原重载、行域、结果及其它聚合状态交换继续有效）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 集合调用、关系区间、MAP 键与复合成员判断如何保留各自的定型和执行事实（active）
 - [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — ROW 字段如何随原类型约束冻结，MAP 规范身份如何贯穿分组和分区，有序调用如何按行短路（active）
 - [ADR-0270](ADR-0270-recursive-casts-and-composite-sql-predicates.md) — 嵌套转换和普通复合谓词如何保留完整类型、选行、行错误及关系需求（active）
@@ -426,7 +430,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
 领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
 
-- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；原重载、行域、结果及聚合状态交换继续有效）
+- [ADR-0259](ADR-0259-trino-aggregate-state-and-published-semantics.md) — MAP 聚合空结果、所选状态以及已发布聚合语义的准入（active；第 4、5 条中的旧解释布局与结果语义重绑由 ADR-0267 部分替代；普通近似去重状态由 ADR-0275 部分替代；原重载、行域、结果及其它聚合状态交换继续有效）
 - [ADR-0265](ADR-0265-row-declarations-and-canonical-map-keys.md) — MAP 键关系如何贯穿查找、规范身份、分组和分区（active）
 - [ADR-0255](ADR-0255-collection-calls-and-relational-sequence.md) — 构造、DDL 属性和聚合如何共用 MAP 键契约，查找如何沿普通等值（active；部分替代 ADR-0183 的作者及判重合同）
 - [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；键域和合并规则保留，构造作者及判重合同见 ADR-0255）

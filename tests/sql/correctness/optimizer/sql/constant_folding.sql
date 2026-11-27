@@ -261,3 +261,30 @@ SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 SET SESSION sql_mode = '32';
 SET SESSION disable_optimizer_rules = '';
+
+-- Prove the installed interval field author runs in folding and in scan projections.
+CREATE TABLE ${case_db}.t_fold_intervals (
+    id INTEGER, month_text VARCHAR, months_text VARCHAR, compact_text VARCHAR, wide_text VARCHAR
+);
+INSERT INTO ${case_db}.t_fold_intervals VALUES
+    (1, '25', '2-1', '36', '-0 23:59:59.999999999999'),
+    (2, NULL, NULL, NULL, NULL);
+
+-- @explain_contains=[25 AS leading_month, 1 AS month_component, 36 AS leading_hour, -59 AS second_component]
+SELECT month(INTERVAL '25' MONTH) AS leading_month,
+       month(INTERVAL '2-1' YEAR TO MONTH) AS month_component,
+       EXTRACT(HOUR FROM INTERVAL '36' HOUR) AS leading_hour,
+       EXTRACT(SECOND FROM INTERVAL '-0 23:59:59.999999999999' DAY TO SECOND(12)) AS second_component;
+
+-- @explain_contains=STAGE PLACEMENT: scan-work
+-- @explain_contains=t_fold_intervals
+-- @explain_contains=month(value_domain_conversion(month_text)) AS leading_month
+-- @explain_contains=month(value_domain_conversion(months_text)) AS month_component
+-- @explain_contains=hour(value_domain_conversion(compact_text)) AS leading_hour
+-- @explain_contains=second(value_domain_conversion(wide_text)) AS second_component
+SELECT id, month(CAST(month_text AS INTERVAL MONTH)) AS leading_month,
+       month(CAST(months_text AS INTERVAL YEAR TO MONTH)) AS month_component,
+       EXTRACT(HOUR FROM CAST(compact_text AS INTERVAL HOUR)) AS leading_hour,
+       EXTRACT(SECOND FROM CAST(wide_text AS INTERVAL DAY TO SECOND(12))) AS second_component
+FROM ${case_db}.t_fold_intervals
+ORDER BY id;

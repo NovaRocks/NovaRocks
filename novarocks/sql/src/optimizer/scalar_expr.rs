@@ -1510,7 +1510,10 @@ mod intrinsic_error_consumer_tests {
                 name: name.into(),
                 args,
                 distinct: false,
-                binding: crate::binding::SqlFunctionBinding::new(
+                binding: crate::binding::SqlFunctionBinding::from_plan(
+                    crate::binding::PlanBindingAuthority::Optimizer(
+                        crate::optimizer::BindingAuthority(()),
+                    ),
                     binding,
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 ),
@@ -1589,8 +1592,11 @@ mod intrinsic_error_consumer_tests {
         );
         let result = result.clone();
         let volatility = selected.semantics.volatility;
-        let binding =
-            crate::binding::SqlFunctionBinding::new(selected, DecimalOverflowPolicy::OutputNull);
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            selected,
+            DecimalOverflowPolicy::OutputNull,
+        );
         assert!(scalar_call_can_fail(&binding));
         for (left, expected) in [
             (implicit, false),
@@ -1657,8 +1663,11 @@ mod intrinsic_error_consumer_tests {
             ]
         );
         let volatility = selected.semantics.volatility;
-        let binding =
-            crate::binding::SqlFunctionBinding::new(selected, DecimalOverflowPolicy::OutputNull);
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            selected,
+            DecimalOverflowPolicy::OutputNull,
+        );
         assert!(scalar_call_can_fail(&binding));
         for (literal, expected) in [(1000, false), (0, true), (-1, true)] {
             let original = arena.intern(
@@ -1733,8 +1742,11 @@ mod intrinsic_error_consumer_tests {
             facts.semantics.intrinsic_row_error,
             novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
         );
-        *binding =
-            crate::binding::SqlFunctionBinding::new(facts, binding.decimal_overflow_policy());
+        *binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            facts,
+            binding.decimal_overflow_policy(),
+        );
         *name = "arbitrary_display_name".into();
         let positive = arena.intern(node, arena.value_type(total).clone());
         assert_ne!(positive, total);
@@ -1759,8 +1771,11 @@ mod intrinsic_error_consumer_tests {
         let mut exact = binding.as_ref().clone();
         exact.semantics.failure_behavior =
             novarocks_functions::FunctionFailureBehavior::ReturnsNull;
-        *binding =
-            crate::binding::SqlFunctionBinding::new(exact, binding.decimal_overflow_policy());
+        *binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            exact,
+            binding.decimal_overflow_policy(),
+        );
         let catching = arena.intern(
             catching,
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

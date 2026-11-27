@@ -270,6 +270,8 @@ pub enum AnalyzeErrorKind {
     TooManyArguments,
     InvalidQueryShape,
     UnsupportedExpression,
+    /// The exact bound definition depends on refresh-varying effects.
+    MvDefinitionEffect,
     /// A bound overload has no installed pure implementation.
     UnavailableImplementation,
     UnsupportedQueryShape,
@@ -311,7 +313,7 @@ impl AnalyzeErrorKind {
             Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
             Self::TooManyArguments => TOO_MANY_ARGUMENTS,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
-            Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
+            Self::UnsupportedExpression | Self::MvDefinitionEffect => UNSUPPORTED_EXPRESSION,
             Self::UnavailableImplementation => UNAVAILABLE_IMPLEMENTATION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
             Self::MissingColumnName => MISSING_COLUMN_NAME,
@@ -880,7 +882,7 @@ impl AnalyzeError {
     /// Attach the existing user type-error context without reclassifying an
     /// outer control failure as a user expression error.
     pub(crate) fn at_type_mismatch(self, span: Span) -> Self {
-        if self.control.is_some() {
+        if self.control.is_some() || self.kind == AnalyzeErrorKind::MvDefinitionEffect {
             self
         } else if matches!(
             self.kind,
@@ -907,7 +909,7 @@ impl AnalyzeError {
     }
 
     pub(crate) fn at_invalid_argument(self, span: Span) -> Self {
-        if self.control.is_some() {
+        if self.control.is_some() || self.kind == AnalyzeErrorKind::MvDefinitionEffect {
             self
         } else if matches!(
             self.kind,

@@ -176,21 +176,6 @@ where
     )
     .map(|_| ())
 }
-pub(in crate::planner::distributed::build) fn assert_window_unavailable(
-    result: Result<(), ContractLoweringError>,
-    original: &SqlFunctionBinding,
-) {
-    assert_eq!(original.resolved().kind, FunctionKind::Aggregate);
-    assert!(
-        matches!(result,
-            Err(ContractLoweringError::FunctionBinding(
-                novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
-            )) if overload == &original.resolved().selected.overload
-        ),
-        "the real AggregateWindow admission must retain its exact missing implementation: {result:?}"
-    );
-}
-
 pub(in crate::planner::distributed::build) fn window_source(
     owner: &SqlAuthoredPhysicalPlan,
 ) -> (
@@ -370,7 +355,11 @@ pub(in crate::planner::distributed::build) fn table_fixture(
             .unwrap();
         outputs.push(output);
     }
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let input = column(1, "outer", DataType::Int64, false);
     let source = PhysicalPlanNode {
         kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
@@ -409,7 +398,22 @@ pub(in crate::planner::distributed::build) fn window_fixture(
         panic!("aggregate window scalar")
     };
     let result = result.clone();
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let order_keys = function_order_by
+        .iter()
+        .map(|order| novarocks_type_contract::AggregateStateOrderKey {
+            ascending: order.asc,
+            nulls_first: order.nulls_first,
+        })
+        .collect();
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    )
+    .with_aggregate_state_source(novarocks_type_contract::AggregateStateInterpretation {
+        distinct: false,
+        order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(order_keys),
+    });
     let input = column(1, "k", DataType::Int64, false);
     let mut output = column(
         2,
@@ -675,7 +679,7 @@ fn window_journal_orders_only_logical_and_function_order_channels_with_original_
         Ok(())
     });
     assert_eq!(seen, 1);
-    assert_window_unavailable(result, &binding);
+    result.unwrap();
 }
 
 #[test]
@@ -926,7 +930,7 @@ fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_e
 
 #[test]
 fn window_and_table_actual_capture_recording_preserve_every_lowering_control_prefix() {
-    let (window, binding) = window_fixture(
+    let (window, _) = window_fixture(
         vec![integer(7)],
         vec![SortItem {
             expr: integer(41),
@@ -947,7 +951,7 @@ fn window_and_table_actual_capture_recording_preserve_every_lowering_control_pre
     };
     let control = Control::default();
     let mut seen = 0;
-    assert_window_unavailable(invoke_window(&control, &mut seen), &binding);
+    invoke_window(&control, &mut seen).unwrap();
     assert_eq!(seen, 1);
     let baseline = control.trace();
     assert!(
@@ -1030,7 +1034,11 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         ]
         .into_boxed_slice(),
     );
-    let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
+    let binding = SqlFunctionBinding::from_plan(
+        crate::planner::BINDING_AUTHORITY,
+        resolved,
+        DecimalOverflowPolicy::ReportError,
+    );
     let PhysicalPlanKind::Window(payload) = &mut source.kind else {
         unreachable!()
     };

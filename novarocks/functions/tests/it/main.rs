@@ -29,6 +29,7 @@ mod native_inlist;
 mod public_function_metadata;
 mod scalar_rows;
 mod synopse;
+mod temporal_fields;
 mod time_text_cast;
 mod trino_numeric;
 mod uuid;

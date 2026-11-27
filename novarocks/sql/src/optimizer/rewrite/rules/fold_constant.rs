@@ -329,7 +329,10 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
                 for spec in &mut window.window_exprs {
                     // OVER's lifecycle comes from the original normalized source author.
                     let lifecycle = if spec.aggregate_binding.is_some() {
-                        novarocks_functions::PureCallLifecycle::AggregateWindow
+                        novarocks_functions::PureCallLifecycle::AggregateWindow {
+                            distinct: spec.distinct,
+                            ordered: !spec.function_order_by.is_empty(),
+                        }
                     } else {
                         novarocks_functions::PureCallLifecycle::Window
                     };
@@ -339,6 +342,7 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
                         self.work.control(),
                     )?;
                     changed |= self.fold_slots(&mut spec.args)?;
+                    changed |= self.fold_sort_keys(&mut spec.function_order_by)?;
                     changed |= self.fold_slots(&mut spec.partition_by)?;
                     changed |= self.fold_sort_keys(&mut spec.order_by)?;
                 }
@@ -521,10 +525,15 @@ fn fold_scalar_uncached(
         ScalarNode::WindowCall {
             binding,
             aggregate_binding,
+            distinct,
+            function_order_by,
             ..
         } => {
             let lifecycle = if aggregate_binding.is_some() {
-                Lifecycle::AggregateWindow
+                Lifecycle::AggregateWindow {
+                    distinct: *distinct,
+                    ordered: !function_order_by.is_empty(),
+                }
             } else {
                 Lifecycle::Window
             };
@@ -587,6 +596,7 @@ fn fold_scalar_uncached(
         }
         ScalarNode::WindowCall {
             args,
+            function_order_by,
             partition_by,
             order_by,
             ..
@@ -597,7 +607,7 @@ fn fold_scalar_uncached(
             for expr in partition_by.iter_mut() {
                 *expr = fold_scalar_id(arena, *expr, ctx, memo, work)?;
             }
-            for key in order_by.iter_mut() {
+            for key in function_order_by.iter_mut().chain(order_by) {
                 key.expr = fold_scalar_id(arena, key.expr, ctx, memo, work)?;
             }
         }

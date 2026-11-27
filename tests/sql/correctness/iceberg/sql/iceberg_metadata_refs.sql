@@ -46,17 +46,20 @@ SELECT name, type
   ORDER BY name;
 
 -- query 7
--- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0} EXECUTE drop_tag(name => 'v1', if_exists => false);
+SELECT * FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metaref_${uuid0}$refs" LIMIT 0;
 
 -- query 8
 -- @skip_result_check=true
-DROP BRANCH dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0};
+ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0} EXECUTE drop_tag(name => 'v1', if_exists => false);
 
 -- query 9
 -- @skip_result_check=true
-DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0};
+DROP BRANCH dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0};
 
 -- query 10
+-- @skip_result_check=true
+DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0};
+
+-- query 11
 -- @skip_result_check=true
 DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0};

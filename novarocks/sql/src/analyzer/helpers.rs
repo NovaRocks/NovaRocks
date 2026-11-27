@@ -878,6 +878,12 @@ pub(super) fn sort_item_flags(item: &ast::SortItem) -> (bool, bool) {
     (ascending, nulls_first)
 }
 
+/// A Trino window orders NULLs last in either direction unless stated explicitly.
+pub(super) fn window_sort_item_flags(item: &ast::SortItem) -> (bool, bool) {
+    let ascending = matches!(item.ordering, ast::SortOrdering::Ascending);
+    (ascending, sort_item_explicit_nulls(item).unwrap_or(false))
+}
+
 fn sort_item_explicit_nulls(item: &ast::SortItem) -> Option<bool> {
     match item.null_ordering {
         ast::NullOrdering::First => Some(true),

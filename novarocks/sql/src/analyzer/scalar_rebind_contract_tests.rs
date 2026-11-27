@@ -299,13 +299,11 @@ fn bind(
         }
         Path::Resolved => {
             let expr = super::resolve_expr::resolved_scalar_call_at(
-                catalog,
+                &super::BindingFinalizer::ordinary(catalog, policy, control),
                 "rebind_probe",
                 args,
                 SPAN,
-                policy,
                 crate::constant::test_constant_policy(),
-                control,
             )?;
             let ExprKind::FunctionCall { args, binding, .. } = expr.kind else {
                 panic!("bound call");

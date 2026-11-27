@@ -60,6 +60,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 novarocks-fs.workspace = true
 novarocks-functions.workspace = true
+novarocks-parser.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true

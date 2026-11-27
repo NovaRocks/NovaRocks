@@ -1333,6 +1333,7 @@ impl ScalarEmission<'_, '_> {
         let site = self.storage.source_site();
         let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
+            crate::planner::BINDING_AUTHORITY,
             self.functions.as_ref(),
             &source,
             target,

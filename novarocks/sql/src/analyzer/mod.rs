@@ -52,7 +52,10 @@ mod collection_expression_tests;
 #[cfg(test)]
 mod control_expression_tests;
 pub(crate) mod declaration_widening;
+mod definition_effects;
 mod expression_typing;
+pub(crate) use definition_effects::FinalizedAnalysisCall;
+use definition_effects::{BindingFinalizer, DefinitionEffects};
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) use expression_typing::negation_for_test;
 #[cfg(test)]
@@ -84,7 +87,9 @@ mod scope;
 mod subquery_rewrite;
 
 pub mod iceberg_metadata;
-mod iceberg_partitions;
+#[cfg(test)]
+#[path = "iceberg_partitions_tests.rs"]
+mod iceberg_metadata_partitions_tests;
 pub mod iceberg_ref;
 pub(crate) mod mv_lineage;
 
@@ -196,12 +201,26 @@ pub(crate) fn analyze_with_function_catalog(
     )
 }
 
-pub(crate) type MvDefinitionAnalysis = (
+/// The resolved form of a definition that passed the original effect check.
+pub(crate) struct AdmittedMvDefinition(
     ResolvedQuery,
     crate::analysis::cte::CTERegistry,
     crate::column_id::ColumnRefFactory,
     Vec<crate::catalog::SqlMvViewDependency>,
 );
+
+impl AdmittedMvDefinition {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+        Vec<crate::catalog::SqlMvViewDependency>,
+    ) {
+        (self.0, self.1, self.2, self.3)
+    }
+}
 
 /// Analyze the defining query of a materialized view with its binding diagnostics.
 pub(crate) fn analyze_mv_definition(
@@ -211,7 +230,7 @@ pub(crate) fn analyze_mv_definition(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<MvDefinitionAnalysis, AnalyzeError> {
+) -> Result<AdmittedMvDefinition, AnalyzeError> {
     analyze_mv_definition_with_factory(
         query,
         catalog,
@@ -231,7 +250,7 @@ pub(crate) fn analyze_mv_definition_with_factory(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<MvDefinitionAnalysis, AnalyzeError> {
+) -> Result<AdmittedMvDefinition, AnalyzeError> {
     let views = view::ViewAnalysisStack::recording();
     let (query, registry, factory) =
         analyze_with_factory_and_function_catalog_and_assignments_inner(
@@ -252,7 +271,12 @@ pub(crate) fn analyze_mv_definition_with_factory(
             None,
             views.clone(),
         )?;
-    Ok((query, registry, factory, views.take_dependencies()))
+    Ok(AdmittedMvDefinition(
+        query,
+        registry,
+        factory,
+        views.take_dependencies(),
+    ))
 }
 
 /// Analyze using the semantic setting frozen by the SQL compiler.
@@ -334,7 +358,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     statement_relation: Option<&crate::compiler::StatementSystemRelationSource>,
     prepared_parameters: Option<&crate::compiler::SqlPreparedParameters>,
     table_sequence: Option<&crate::compiler::table_sequence::TableSequencePass>,
-    first_refresh_view_row_lineage: bool,
+    purpose: QueryAnalysisPurpose,
 ) -> Result<
     (
         ResolvedQuery,
@@ -357,11 +381,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         root_session_admitted,
         statement_relation,
         prepared_parameters,
-        if first_refresh_view_row_lineage {
-            QueryAnalysisPurpose::FirstRefreshViewRowLineage
-        } else {
-            QueryAnalysisPurpose::Ordinary
-        },
+        purpose,
         table_sequence,
         view::ViewAnalysisStack::default(),
     )
@@ -611,6 +631,11 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
         purpose,
+        effects: if purpose.is_mv_definition() {
+            DefinitionEffects::materialized_view()
+        } else {
+            DefinitionEffects::default()
+        },
         catalog,
         current_database,
         function_catalog,
@@ -642,6 +667,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         None => resolved,
     };
     ctx.check_control()?;
+    ctx.effects.admit_definition()?;
     let registry = ctx.cte_registry.into_inner();
     let col_factory = std::rc::Rc::try_unwrap(factory)
         .map(|cell| cell.into_inner())
@@ -741,14 +767,25 @@ impl GroupingSyntax {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum QueryAnalysisPurpose {
+pub(crate) enum QueryAnalysisPurpose {
     Ordinary,
     MaterializedViewDefinition,
     FirstRefreshViewRowLineage,
 }
 
+impl QueryAnalysisPurpose {
+    fn is_mv_definition(self) -> bool {
+        matches!(self, Self::MaterializedViewDefinition)
+    }
+
+    fn retains_view_row_lineage(self) -> bool {
+        matches!(self, Self::FirstRefreshViewRowLineage)
+    }
+}
+
 pub(super) struct AnalyzerContext<'a> {
     purpose: QueryAnalysisPurpose,
+    effects: DefinitionEffects,
     grouping_scope: std::cell::RefCell<Option<std::rc::Rc<GroupingAnalysis>>>,
     view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
@@ -783,6 +820,16 @@ pub(super) struct AnalyzerContext<'a> {
 }
 
 impl<'a> AnalyzerContext<'a> {
+    fn binding_finalizer(&self) -> BindingFinalizer<'_> {
+        BindingFinalizer::new(
+            self.function_catalog,
+            &self.effects,
+            self.sql_semantics.statement_time(),
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.control,
+        )
+    }
+
     pub(super) fn check_control(&self) -> Result<(), AnalyzeError> {
         novarocks_type_contract::PureCompileControl::checkpoint(
             self.control,
@@ -1121,6 +1168,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut child_ctx = AnalyzerContext {
             grouping_scope: std::cell::RefCell::new(None),
             purpose: self.purpose,
+            effects: self.effects.clone(),
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
@@ -1577,12 +1625,11 @@ impl<'a> AnalyzerContext<'a> {
                     // lowering VALUES. A physical carrier cast cannot author a
                     // nested temporal declaration.
                     *cell = value_conversion::coerce_array_common_argument(
-                        self.function_catalog,
+                        &self.binding_finalizer(),
                         cell.clone(),
                         &column.value_type,
-                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
                         self.constant_policy,
-                        self.control,
+                        source.span(),
                     )?;
                 } else if temporal && !cell.value_type.same_value_domain(&column.value_type) {
                     *cell = self.cast_to_value_type(
@@ -1722,8 +1769,12 @@ impl<'a> AnalyzerContext<'a> {
                 group_by.push(projection[pos - 1].expr.clone());
                 continue;
             }
-            match self.analyze_expr(gb_expr, &scope) {
+            match self
+                .effects
+                .try_scope(|| self.analyze_expr(gb_expr, &scope))
+            {
                 Ok(typed) => {
+                    self.effects.admit_selected_scope()?;
                     if contains_subquery_placeholder(&typed) {
                         return Err(AnalyzeError::unsupported_query_shape(
                             "subquery is not supported in GROUP BY",
@@ -1741,7 +1792,10 @@ impl<'a> AnalyzerContext<'a> {
                             alias_scope.add_column(None, name, item.expr.value_type.clone());
                         }
                     }
-                    let typed = self.analyze_expr(gb_expr, &alias_scope)?;
+                    let typed = self
+                        .effects
+                        .try_scope(|| self.analyze_expr(gb_expr, &alias_scope))?;
+                    self.effects.admit_selected_scope()?;
                     // Substitute alias ref with original expression
                     let typed = self.substitute_select_aliases(typed, &projection);
                     if contains_subquery_placeholder(&typed) {
@@ -1788,9 +1842,10 @@ impl<'a> AnalyzerContext<'a> {
         let having = match &select.having {
             Some(expr) => {
                 let prior_subqueries = self.collected_subqueries.borrow().len();
-                let analyzed = self.analyze_expr(expr, &scope);
+                let analyzed = self.effects.try_scope(|| self.analyze_expr(expr, &scope));
                 match analyzed {
                     Ok(h) => {
+                        self.effects.admit_selected_scope()?;
                         Some(self.require_boolean_predicate(h, "HAVING clause", expr.span())?)
                     }
                     Err(error) if error.control_error().is_some() => return Err(error),
@@ -1806,7 +1861,10 @@ impl<'a> AnalyzerContext<'a> {
                                 alias_scope.add_column(None, name, item.expr.value_type.clone());
                             }
                         }
-                        let h = self.analyze_expr(expr, &alias_scope)?;
+                        let h = self
+                            .effects
+                            .try_scope(|| self.analyze_expr(expr, &alias_scope))?;
+                        self.effects.admit_selected_scope()?;
                         // Substitute alias refs with real expressions
                         Some(self.require_boolean_predicate(
                             self.substitute_select_aliases(h, &projection),
@@ -3360,8 +3418,12 @@ impl<'a> AnalyzerContext<'a> {
                         alias_ref
                     } else {
                         // Try projection scope first, then fall back to FROM scope
-                        match self.analyze_expr(&ob.sort_key, &projection_scope) {
+                        match self
+                            .effects
+                            .try_scope(|| self.analyze_expr(&ob.sort_key, &projection_scope))
+                        {
                             Ok(typed) => {
+                                self.effects.admit_selected_scope()?;
                                 if let QueryBody::Select(sel) = body {
                                     self.substitute_select_aliases(typed, &sel.projection)
                                 } else {
@@ -3373,9 +3435,11 @@ impl<'a> AnalyzerContext<'a> {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
                                         let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
-                                        match self.analyze_expr(&ob.sort_key, &from_scope) {
-                                            Ok(typed) => self
-                                                .substitute_select_aliases(typed, &sel.projection),
+                                        match self.effects.try_scope(|| self.analyze_expr(&ob.sort_key, &from_scope)) {
+                                            Ok(typed) => {
+                                                self.effects.admit_selected_scope()?;
+                                                self.substitute_select_aliases(typed, &sel.projection)
+                                            }
                                             Err(error) if error.control_error().is_some() => {
                                                 return Err(error);
                                             }
@@ -3405,12 +3469,12 @@ impl<'a> AnalyzerContext<'a> {
                                                         );
                                                     }
                                                 }
-                                                match self.analyze_expr(&ob.sort_key, &alias_scope)
+                                                match self.effects.try_scope(|| self.analyze_expr(&ob.sort_key, &alias_scope))
                                                 {
-                                                    Ok(typed) => self.substitute_select_aliases(
-                                                        typed,
-                                                        &sel.projection,
-                                                    ),
+                                                    Ok(typed) => {
+                                                        self.effects.admit_selected_scope()?;
+                                                        self.substitute_select_aliases(typed, &sel.projection)
+                                                    }
                                                     Err(error)
                                                         if error.control_error().is_some() =>
                                                     {
@@ -7594,6 +7658,7 @@ mod tests {
         let ctx = AnalyzerContext {
             grouping_scope: Default::default(),
             purpose: QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             view_stack: Default::default(),
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
@@ -7939,6 +8004,7 @@ mod tests {
         let ctx = AnalyzerContext {
             grouping_scope: Default::default(),
             purpose: QueryAnalysisPurpose::Ordinary,
+            effects: Default::default(),
             view_stack: Default::default(),
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
@@ -8460,26 +8526,6 @@ mod tests {
                 ),
             }
         }
-
-        fn metadata_table_def(
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-            metadata_table_type: SqlMetadataTableKind,
-        ) -> TableDef {
-            let mut table_def = Self::table_def(catalog, database, table);
-            table_def.columns = metadata_table_columns(&metadata_table_type);
-            table_def.source = sql_test_scan_source(
-                catalog.unwrap_or("default_catalog"),
-                database,
-                table,
-                SqlScanKind::Metadata {
-                    kind: metadata_table_type,
-                    version: SqlTableVersionSelector::Current,
-                },
-            );
-            table_def
-        }
     }
 
     impl crate::catalog::PlannerTableProvider for CatalogAwareTestCatalog {
@@ -8493,26 +8539,6 @@ mod tests {
                 catalog,
                 database,
                 Self::table_def(catalog, database, table),
-            ))
-        }
-
-        fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-            Some(self)
-        }
-    }
-
-    impl IcebergMetadataTableProvider for CatalogAwareTestCatalog {
-        fn get_iceberg_metadata_table(
-            &self,
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-            metadata_table_type: SqlMetadataTableKind,
-        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
-                catalog,
-                database,
-                Self::metadata_table_def(catalog, database, table, metadata_table_type),
             ))
         }
     }
@@ -8551,125 +8577,168 @@ mod tests {
         assert_eq!(scan.table.name, "ice_db_orders");
     }
 
+    #[derive(Default)]
+    struct PartitionsLookupCatalog {
+        lookups: std::cell::Cell<usize>,
+        extra_predicate: &'static str,
+    }
+
+    impl crate::catalog::PlannerTableProvider for PartitionsLookupCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            Err("partitions fixture requires a metadata lookup".into())
+        }
+
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+    }
+
+    impl IcebergMetadataTableProvider for PartitionsLookupCatalog {
+        fn get_iceberg_metadata_table(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            metadata_table_type: SqlMetadataTableKind,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            use crate::catalog::SqlViewColumn;
+            use crate::planning::catalog::{bind_derived_metadata_view, resolved_metadata_table};
+            use novarocks_type_contract::FunctionValueType;
+
+            assert_eq!((catalog, database, table), (Some("ice"), "db", "orders"));
+            assert_eq!(metadata_table_type, SqlMetadataTableKind::Files);
+            self.lookups.set(self.lookups.get() + 1);
+            let slot = SqlTableBindingId::new_for_test(73);
+            let columns = [
+                ("content", DataType::Int32),
+                ("record_count", DataType::Int64),
+                ("file_size_in_bytes", DataType::Int64),
+            ]
+            .map(|(name, data_type)| {
+                ColumnDef::from_value_type(
+                    name.into(),
+                    FunctionValueType::new(data_type, false),
+                    None,
+                )
+                .unwrap()
+            });
+            let source = resolved_metadata_table(
+                catalog.unwrap(),
+                database,
+                table,
+                metadata_table_type,
+                columns.into(),
+                vec![],
+                slot,
+            );
+            let view_columns = [
+                ("record_count", true),
+                ("file_count", false),
+                ("total_size", true),
+            ]
+            .map(|(name, nullable)| SqlViewColumn {
+                name: name.into(),
+                value_type: FunctionValueType::new(DataType::Int64, nullable),
+            });
+            bind_derived_metadata_view(
+                source,
+                slot,
+                "orders$partitions",
+                format!(
+                    r#"SELECT sum(record_count) AS record_count, count(*) AS file_count,
+                       sum(file_size_in_bytes) AS total_size FROM "ice"."db"."orders$files"
+                       WHERE content = 0 {} HAVING count(*) > 0"#,
+                    self.extra_predicate,
+                )
+                .into(),
+                std::sync::Arc::from(view_columns),
+            )
+        }
+    }
+
     #[test]
     fn analyzer_uses_files_metadata_provider_for_partitions_view() {
-        struct MetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::catalog::PlannerTableProvider for MetadataModeCatalog {
-            fn resolve_table_for_analysis(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
-            }
-
-            fn resolve_quoted_iceberg_metadata(
-                &self,
-                name: &novarocks_parser::ast::ObjectName,
-                catalog: Option<&str>,
-                database: &str,
-            ) -> Option<crate::catalog::QuotedMetadataTable> {
-                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
-                    name, catalog, database, self,
-                )
-            }
-
-            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-                Some(self)
-            }
-        }
-
-        impl IcebergMetadataTableProvider for MetadataModeCatalog {
-            fn get_iceberg_metadata_table(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-                metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Files);
-                CatalogAwareTestCatalog.get_iceberg_metadata_table(
-                    catalog,
-                    database,
-                    table,
-                    metadata_table_type,
-                )
-            }
-        }
-
-        let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
+        let catalog = PartitionsLookupCatalog::default();
         let query = parse_native_query("SELECT record_count FROM ice.db.\"orders$partitions\"")
             .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
-        assert!(
-            catalog.0.get(),
-            "Files metadata provider was not requested by the partitions view"
+        assert_eq!(
+            catalog.lookups.get(),
+            1,
+            "partitions must consume one Files lookup"
         );
     }
 
     #[test]
     fn analyzer_uses_lowercase_catalog_for_metadata_provider() {
-        struct LowercaseMetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::catalog::PlannerTableProvider for LowercaseMetadataModeCatalog {
-            fn resolve_table_for_analysis(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
-            }
-
-            fn resolve_quoted_iceberg_metadata(
-                &self,
-                name: &novarocks_parser::ast::ObjectName,
-                catalog: Option<&str>,
-                database: &str,
-            ) -> Option<crate::catalog::QuotedMetadataTable> {
-                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
-                    name, catalog, database, self,
-                )
-            }
-
-            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
-                Some(self)
-            }
-        }
-
-        impl IcebergMetadataTableProvider for LowercaseMetadataModeCatalog {
-            fn get_iceberg_metadata_table(
-                &self,
-                catalog: Option<&str>,
-                database: &str,
-                table: &str,
-                metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-                assert_eq!(catalog, Some("ice"));
-                assert_eq!(database, "db");
-                assert_eq!(table, "orders");
-                self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Files);
-                CatalogAwareTestCatalog.get_iceberg_metadata_table(
-                    catalog,
-                    database,
-                    table,
-                    metadata_table_type,
-                )
-            }
-        }
-
-        let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
+        let catalog = PartitionsLookupCatalog::default();
         let query = parse_native_query("SELECT record_count FROM ICE.DB.\"ORDERS$partitions\"")
             .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
-        assert!(
-            catalog.0.get(),
-            "Files metadata provider was not requested by the partitions view"
+        assert_eq!(
+            catalog.lookups.get(),
+            1,
+            "partitions must consume one canonical Files lookup"
         );
+    }
+
+    #[test]
+    fn mv_definition_effects_include_derived_metadata_view_bodies() {
+        let sql = r#"SELECT record_count FROM ice.db."orders$partitions""#;
+        let query = parse_native_query(sql).expect("parse");
+        for (extra_predicate, diagnostic) in [
+            (
+                "AND IF(false, random() < 0e0, true)",
+                "volatile function 'random'",
+            ),
+            (
+                "AND CURRENT_SCHEMA IS NOT NULL",
+                "depend on the caller's session",
+            ),
+        ] {
+            let catalog = PartitionsLookupCatalog {
+                extra_predicate,
+                ..PartitionsLookupCatalog::default()
+            };
+            let error = analyze_mv_definition(
+                &query,
+                &catalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .err()
+            .expect("metadata view effects must participate in definition admission");
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::MvDefinitionEffect
+            );
+            assert!(error.message().contains(diagnostic), "{error}");
+            let span = error.span().expect("caller relation position");
+            assert_eq!(
+                &sql[span.start()..span.end()],
+                r#"ice.db."orders$partitions""#
+            );
+            assert!(
+                error
+                    .stored_view_definition_source()
+                    .is_some_and(|body| body.contains(extra_predicate))
+            );
+            assert_eq!(catalog.lookups.get(), 1);
+        }
     }
 
     #[test]

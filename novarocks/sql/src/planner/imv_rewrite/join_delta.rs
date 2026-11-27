@@ -486,7 +486,8 @@ fn join_row_key_expr(
         object_id_binary_literal(&evidence.right_base.table_object_id),
         column_ref_expr(&evidence.right_row_id_column),
     ];
-    let binding = crate::analysis::resolve_function_binding(
+    let binding = crate::binding::SqlFunctionBinding::resolve_for_plan(
+        crate::planner::BINDING_AUTHORITY,
         function_catalog,
         "join_row_key",
         &args,
@@ -1838,7 +1839,11 @@ mod tests {
             .expect("installed DOUBLE equality");
         let condition = crate::common::binary_operator::typed_call(
             operator,
-            crate::binding::SqlFunctionBinding::new(binding, DecimalOverflowPolicy::OutputNull),
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::planner::BINDING_AUTHORITY,
+                binding,
+                DecimalOverflowPolicy::OutputNull,
+            ),
             operands,
         );
         let plan = delta(LogicalPlanNode::new(

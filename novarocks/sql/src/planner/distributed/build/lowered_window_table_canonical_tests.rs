@@ -272,8 +272,6 @@ fn canonical_window_real_row_number_and_min_over_use_one_emitted_selection() {
 
 #[test]
 fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
-    // ARRAY_AGG is a genuine metadata resolver/emitter seam here, not an
-    // installed pure AggregateWindow lifecycle or runtime execution claim.
     let ty = ValueType::new(DataType::Int64, false);
     let root = Arc::new(
         ty.try_to_field("original.window.channels")
@@ -332,6 +330,11 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
         );
         assert_eq!(aggregate.intermediate_type, state.intermediate_type);
         assert_eq!(aggregate.state_format, state.state_format);
+        assert_eq!(
+            aggregate.state_interpretation.as_ref(),
+            receipt.captured().binding().aggregate_state_source(),
+        );
+
         let output = receipt.builder().value(source.output).unwrap();
         assert_eq!(&output.ty, selected_result);
         assert!(
@@ -424,9 +427,7 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
         Ok(())
     });
     assert_eq!(seen, 1);
-    assert_window_unavailable(result, &binding);
-    // Actual publication/result-port/owner-clone assertions remain with the
-    // supported ROW_NUMBER/MIN cases in the unchanged checked_window helper.
+    result.unwrap();
 }
 
 #[test]

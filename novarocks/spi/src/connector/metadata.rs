@@ -1323,6 +1323,13 @@ pub struct ConnectorTableMetadataHeader {
     pub table: ConnectorTableHandle,
 }
 
+/// A named SQL relation derived from the same immutable table observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorDerivedView {
+    pub name: Arc<str>,
+    pub definition: super::ConnectorViewDefinition,
+}
+
 #[derive(Clone)]
 pub struct ConnectorTableMetadata {
     pub identity: ConnectorTableIdentity,
@@ -1334,9 +1341,19 @@ pub struct ConnectorTableMetadata {
     pub statistics_data_version: Option<StatisticsDataVersion>,
     pub table: ConnectorTableHandle,
     source_read_facts: Option<super::ConnectorProcessLocalPayload>,
+    derived_view: Option<Arc<ConnectorDerivedView>>,
     _source_storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl ConnectorTableMetadata {
+    pub fn with_derived_view(mut self, view: Arc<ConnectorDerivedView>) -> Self {
+        self.derived_view = Some(view);
+        self
+    }
+
+    pub fn derived_view(&self) -> Option<&ConnectorDerivedView> {
+        self.derived_view.as_deref()
+    }
+
     /// Immutable Provider facts from this exact observation, retained only in
     /// this process. They may describe frozen metadata and non-secret renewal
     /// provenance, but must not hold FileIO, credentials, a running Future or
@@ -1499,6 +1516,7 @@ impl ConnectorTableMetadata {
             statistics_data_version: header.statistics_data_version,
             table: header.table,
             source_read_facts: None,
+            derived_view: None,
             _source_storage: creation.storage(),
         })
     }

@@ -35,3 +35,9 @@ pub(crate) mod system_relation;
 pub(crate) mod table;
 pub mod vocabulary;
 pub(crate) use logical::build::{plan_output_columns, plan_query};
+
+/// Proof of a new binding authored after SQL analysis.
+pub(crate) struct BindingAuthority(());
+
+const BINDING_AUTHORITY: crate::binding::PlanBindingAuthority =
+    crate::binding::PlanBindingAuthority::Planner(crate::planner::BindingAuthority(()));

@@ -646,13 +646,19 @@ impl ChannelValidation<'_> {
                             return Err(ProgramChannelTypeError::WrongKind);
                         };
                         let contract = kernel.contract();
-                        let expected = contract
-                            .logical_argument_types()
-                            .chain(contract.order_argument_types());
-                        if source.args.len() != contract.call().selected().argument_types.len() {
+                        let arguments = contract.logical_argument_types();
+                        let ordering = contract.order_argument_types();
+                        if source.args.len() != arguments.len()
+                            || source.function_order_by.len() != ordering.len()
+                        {
                             return Err(ProgramChannelTypeError::WrongShape);
                         }
-                        for (id, expected) in source.args.iter().zip(expected) {
+                        for (id, expected) in source
+                            .args
+                            .iter()
+                            .chain(&source.function_order_by)
+                            .zip(arguments.chain(ordering))
+                        {
                             same_value(self.definition(*id)?, expected, true, work)?;
                         }
                     }

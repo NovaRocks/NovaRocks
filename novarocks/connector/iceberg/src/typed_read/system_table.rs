@@ -41,8 +41,10 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::iceberg::spec::{
-    ManifestContentType, ManifestFile, PartitionSpec, Schema, TableMetadata,
+    FormatVersion, ManifestContentType, ManifestFile, PartitionSpec, Schema, TableMetadata,
 };
+
+use crate::partition_row::UnifiedPartitionRow;
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::table_handle::MAX_PARTITION_SPECS;
@@ -542,10 +544,6 @@ impl TrinoManifestFile {
         self.first_row_id
     }
 
-    fn retained_size_in_bytes(&self) -> usize {
-        size_of::<Self>() + self.path.len()
-    }
-
     pub fn to_proto(&self) -> dto::TrinoManifestFile {
         dto::TrinoManifestFile {
             path: self.path.to_string(),
@@ -589,65 +587,232 @@ impl TrinoManifestFile {
     }
 }
 
-/// The exact facts one files/entries manifest work unit carries.
-#[derive(Clone, Debug)]
-pub struct SystemManifestSplitParams {
-    pub reference: IcebergSystemTableReference,
-    pub table_has_variant_history: bool,
-    pub manifest: TrinoManifestFile,
-    pub table_schema_json: String,
-    /// The frozen `$files` output schema. It is not an Iceberg schema, so it is
-    /// carried as opaque-to-Iceberg but well-formed JSON.
-    pub metadata_table_schema_json: String,
-    /// Every partition spec the manifests of this snapshot reference.
-    pub partition_spec_jsons: BTreeMap<i32, String>,
-    /// The schema-derived partition ROW type, absent for an unpartitioned
-    /// table.
-    pub partition_column_type_json: Option<String>,
-    pub partition_slot_field_ids: Vec<i32>,
-    /// The schema-derived lower/upper bounds ROW type, absent when the frozen
-    /// projection needs no bounds.
-    pub bounds_column_type_json: Option<String>,
-    /// Typed extension point only. This stack implements no manifest
-    /// encryption, so a present value is rejected by producer and consumer.
-    pub encryption_key_id: Option<String>,
+pub(crate) fn require_supported_manifests_format(
+    format_version: FormatVersion,
+) -> Result<(), ConnectorError> {
+    if format_version == FormatVersion::V1 {
+        return Err(unsupported(
+            "Iceberg $manifests is unsupported for format-version 1 tables because iceberg-rust 0.11 cannot read v1 manifest list file counts written by Iceberg Java. Support resumes in B6c-2 with the upstream field-ID-based manifest list reader.",
+        ));
+    }
+    Ok(())
 }
 
-/// One manifest of the pinned snapshot's files or entries relation.
-///
-/// One manifest produces exactly one split. A manifest is a single Avro file
-/// read start to finish; cutting it into byte ranges would make every range
-/// re-read the header, and merging manifests would make one split's failure
-/// retry another manifest's work.
+/// One immutable metadata relation and its scan-wide declaration inputs.
+#[derive(Clone, Debug)]
+pub struct SystemTableScan {
+    reference: IcebergSystemTableReference,
+    facts: Arc<SystemTableScanFacts>,
+}
+
+#[derive(Debug)]
+struct SystemTableScanFacts {
+    format_version: FormatVersion,
+    table_schema: Schema,
+    specs: BTreeMap<i32, PartitionSpec>,
+    partitions: UnifiedPartitionRow,
+    columns: Vec<IcebergColumnHandle>,
+    source_schema: arrow::datatypes::SchemaRef,
+    metric_fields: Box<[super::system_page_source::StatisticsField]>,
+    metric_shape_bytes: u128,
+    table_has_variant_history: bool,
+}
+
+impl SystemTableScan {
+    pub(crate) fn from_metadata(
+        reference: IcebergSystemTableReference,
+        metadata: &TableMetadata,
+    ) -> Result<Self, ConnectorError> {
+        reference.verify_loaded_metadata(metadata)?;
+        Self::from_facts(
+            reference,
+            metadata.format_version(),
+            metadata.current_schema().as_ref().clone(),
+            metadata
+                .partition_specs_iter()
+                .map(|spec| spec.as_ref().clone()),
+            crate::manifest::table_has_variant_history(metadata),
+        )
+    }
+
+    pub(crate) fn from_facts(
+        reference: IcebergSystemTableReference,
+        format_version: FormatVersion,
+        table_schema: Schema,
+        specs: impl IntoIterator<Item = PartitionSpec>,
+        table_has_variant_history: bool,
+    ) -> Result<Self, ConnectorError> {
+        let mut by_id = BTreeMap::new();
+        for spec in specs {
+            if by_id.insert(spec.spec_id(), spec).is_some() {
+                return Err(invalid(
+                    "iceberg system scan has a duplicate partition spec",
+                ));
+            }
+            if by_id.len() > MAX_PARTITION_SPECS {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "iceberg partition spec count exceeds the hard limit",
+                ));
+            }
+        }
+        let partitions =
+            if reference.system_table_type().unit_hint() == SystemTableUnitHint::ManyUnits {
+                let specs: Vec<_> = by_id.values().collect();
+                UnifiedPartitionRow::of_checked(&table_schema, &specs, || {
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .map_err(|error| match error {
+                    crate::partition_row::PartitionRowError::Semantic(error) => error,
+                    crate::partition_row::PartitionRowError::Original(never) => match never {},
+                })?
+            } else {
+                UnifiedPartitionRow {
+                    fields: Vec::new(),
+                    slots_by_spec: BTreeMap::new(),
+                }
+            };
+        let (columns, source_schema) = super::system_page_source::freeze_system_scan_declaration(
+            reference.system_table_type(),
+            &table_schema,
+            &partitions,
+        )?;
+        let metric_fields =
+            if reference.system_table_type().unit_hint() == SystemTableUnitHint::ManyUnits {
+                super::system_page_source::freeze_metric_fields(&table_schema)?
+            } else {
+                Box::new([])
+            };
+        let metric_shape_bytes = metric_fields
+            .iter()
+            .map(|field| 512 + field.name.len() as u128 * 4)
+            .sum();
+        Ok(Self {
+            reference,
+            facts: Arc::new(SystemTableScanFacts {
+                format_version,
+                table_schema,
+                specs: by_id,
+                partitions,
+                columns,
+                source_schema,
+                metric_fields,
+                metric_shape_bytes,
+                table_has_variant_history,
+            }),
+        })
+    }
+
+    pub const fn reference(&self) -> &IcebergSystemTableReference {
+        &self.reference
+    }
+
+    pub const fn system_table_type(&self) -> IcebergSystemTableType {
+        self.reference.system_table_type()
+    }
+
+    pub fn format_version(&self) -> FormatVersion {
+        self.facts.format_version
+    }
+
+    pub fn table_schema(&self) -> &Schema {
+        &self.facts.table_schema
+    }
+
+    pub fn partition_spec(&self, spec_id: i32) -> Option<&PartitionSpec> {
+        self.facts.specs.get(&spec_id)
+    }
+
+    pub(crate) fn partition_specs(&self) -> &BTreeMap<i32, PartitionSpec> {
+        &self.facts.specs
+    }
+
+    pub(crate) fn partitions(&self) -> &UnifiedPartitionRow {
+        &self.facts.partitions
+    }
+
+    pub(crate) fn columns(&self) -> &[IcebergColumnHandle] {
+        &self.facts.columns
+    }
+
+    pub(crate) fn source_schema(&self) -> &arrow::datatypes::SchemaRef {
+        &self.facts.source_schema
+    }
+
+    pub(crate) fn project_columns(
+        &self,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<Vec<usize>, ConnectorError> {
+        columns
+            .iter()
+            .map(|column| {
+                self.facts
+                    .columns
+                    .iter()
+                    .position(|expected| expected == column)
+                    .ok_or_else(|| {
+                        invalid(
+                            "iceberg system projection differs from its frozen column declaration",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn metric_fields(&self) -> &[super::system_page_source::StatisticsField] {
+        &self.facts.metric_fields
+    }
+
+    pub(super) fn metric_shape_bytes(&self) -> u128 {
+        self.facts.metric_shape_bytes
+    }
+
+    pub fn table_has_variant_history(&self) -> bool {
+        self.facts.table_has_variant_history
+    }
+
+    pub(crate) fn validate_manifest(
+        &self,
+        split: &SystemManifestSplit,
+    ) -> Result<&PartitionSpec, ConnectorError> {
+        if split.reference() != self.reference() {
+            return Err(invalid(
+                "iceberg manifest work unit differs from its frozen scan reference",
+            ));
+        }
+        let spec_id = split.manifest().partition_spec_id();
+        self.partition_spec(spec_id).ok_or_else(|| {
+            invalid(format!(
+                "iceberg manifest work unit names unknown frozen partition spec {spec_id}"
+            ))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(reference: IcebergSystemTableReference) -> Self {
+        Self::from_facts(
+            reference,
+            FormatVersion::V2,
+            Schema::builder().build().unwrap(),
+            [],
+            false,
+        )
+        .expect("empty system scan")
+    }
+}
+
+/// A manifest is one unit of work in a frozen files or entries relation.
 #[derive(Clone, Debug)]
 pub struct SystemManifestSplit {
     reference: IcebergSystemTableReference,
-    table_has_variant_history: bool,
     manifest: TrinoManifestFile,
-    table_schema_json: Arc<str>,
-    metadata_table_schema_json: Arc<str>,
-    partition_spec_jsons: Arc<BTreeMap<i32, String>>,
-    partition_column_type_json: Option<Arc<str>>,
-    partition_slot_field_ids: Arc<[i32]>,
-    bounds_column_type_json: Option<Arc<str>>,
-    retained_size_in_bytes: u64,
 }
 
 impl SystemManifestSplit {
-    pub fn try_new(params: SystemManifestSplitParams) -> Result<Self, ConnectorError> {
-        let SystemManifestSplitParams {
-            reference,
-            table_has_variant_history,
-            manifest,
-            table_schema_json,
-            metadata_table_schema_json,
-            partition_spec_jsons,
-            partition_column_type_json,
-            partition_slot_field_ids,
-            bounds_column_type_json,
-            encryption_key_id,
-        } = params;
-
+    pub fn try_new(
+        reference: IcebergSystemTableReference,
+        manifest: TrinoManifestFile,
+    ) -> Result<Self, ConnectorError> {
         if !matches!(
             reference.system_table_type(),
             IcebergSystemTableType::Files | IcebergSystemTableType::Entries
@@ -657,71 +822,10 @@ impl SystemManifestSplit {
                 "iceberg manifest split requires a files or entries reference with a snapshot",
             ));
         }
-        validate_shared_files_table_facts(
-            &table_schema_json,
-            &metadata_table_schema_json,
-            &partition_spec_jsons,
-            partition_column_type_json.as_deref(),
-            bounds_column_type_json.as_deref(),
-            encryption_key_id.as_deref(),
-        )?;
-        // The manifest names the spec that decodes its partition values; a
-        // split that cannot decode them would produce a wrong `$files.partition`
-        // column rather than fail.
-        if !partition_spec_jsons.contains_key(&manifest.partition_spec_id()) {
-            return Err(invalid(format!(
-                "iceberg $files split has no partition spec json for spec id {}",
-                manifest.partition_spec_id()
-            )));
-        }
-
-        let mut split = Self {
+        Ok(Self {
             reference,
-            table_has_variant_history,
             manifest,
-            table_schema_json: Arc::from(table_schema_json.as_str()),
-            metadata_table_schema_json: Arc::from(metadata_table_schema_json.as_str()),
-            partition_spec_jsons: Arc::new(partition_spec_jsons),
-            partition_column_type_json: partition_column_type_json
-                .map(|json| Arc::from(json.as_str())),
-            partition_slot_field_ids: Arc::from(partition_slot_field_ids),
-            bounds_column_type_json: bounds_column_type_json.map(|json| Arc::from(json.as_str())),
-            retained_size_in_bytes: 0,
-        };
-        split.retained_size_in_bytes = split.compute_retained_size_in_bytes();
-        Ok(split)
-    }
-
-    /// A sibling split of the same relation that differs only in its manifest.
-    ///
-    /// Every split of one `$files` scan shares the same frozen schemas; sharing
-    /// them by reference keeps a thousand-manifest snapshot from copying the
-    /// table schema a thousand times, and re-validating them per manifest would
-    /// only re-prove the same fact.
-    pub fn with_manifest(&self, manifest: TrinoManifestFile) -> Result<Self, ConnectorError> {
-        if !self
-            .partition_spec_jsons
-            .contains_key(&manifest.partition_spec_id())
-        {
-            return Err(invalid(format!(
-                "iceberg $files split has no partition spec json for spec id {}",
-                manifest.partition_spec_id()
-            )));
-        }
-        let mut split = Self {
-            reference: self.reference.clone(),
-            table_has_variant_history: self.table_has_variant_history,
-            manifest,
-            table_schema_json: Arc::clone(&self.table_schema_json),
-            metadata_table_schema_json: Arc::clone(&self.metadata_table_schema_json),
-            partition_spec_jsons: Arc::clone(&self.partition_spec_jsons),
-            partition_column_type_json: self.partition_column_type_json.clone(),
-            partition_slot_field_ids: Arc::clone(&self.partition_slot_field_ids),
-            bounds_column_type_json: self.bounds_column_type_json.clone(),
-            retained_size_in_bytes: 0,
-        };
-        split.retained_size_in_bytes = split.compute_retained_size_in_bytes();
-        Ok(split)
+        })
     }
 
     pub const fn reference(&self) -> &IcebergSystemTableReference {
@@ -732,113 +836,28 @@ impl SystemManifestSplit {
         &self.manifest
     }
 
-    pub const fn table_has_variant_history(&self) -> bool {
-        self.table_has_variant_history
-    }
-
-    pub fn table_schema_json(&self) -> &str {
-        &self.table_schema_json
-    }
-
-    pub fn metadata_table_schema_json(&self) -> &str {
-        &self.metadata_table_schema_json
-    }
-
-    pub fn partition_spec_jsons(&self) -> &BTreeMap<i32, String> {
-        &self.partition_spec_jsons
-    }
-
-    pub fn partition_column_type_json(&self) -> Option<&str> {
-        self.partition_column_type_json.as_deref()
-    }
-
-    pub fn partition_slot_field_ids(&self) -> &[i32] {
-        &self.partition_slot_field_ids
-    }
-
-    pub fn bounds_column_type_json(&self) -> Option<&str> {
-        self.bounds_column_type_json.as_deref()
-    }
-
-    /// Always absent: manifest encryption is rejected at construction.
-    pub const fn encryption_key_id(&self) -> Option<&str> {
-        None
-    }
-
-    pub fn parse_partition_spec(&self, spec_id: i32) -> Result<PartitionSpec, ConnectorError> {
-        let spec_json = self.partition_spec_jsons.get(&spec_id).ok_or_else(|| {
-            invalid(format!(
-                "iceberg partition spec id {spec_id} is not carried by this $files split"
-            ))
-        })?;
-        parse_partition_spec(spec_json)
-    }
-
-    fn compute_retained_size_in_bytes(&self) -> u64 {
-        let mut retained = size_of::<Self>()
-            + self.reference.metadata_file_location().len()
-            + self.reference.schema_table_name().schema_name().len()
-            + self.reference.schema_table_name().table_name().len()
-            + self.manifest.retained_size_in_bytes()
-            + std::mem::size_of_val(self.partition_slot_field_ids.as_ref())
-            + self.table_schema_json.len()
-            + self.metadata_table_schema_json.len()
-            + self
-                .partition_column_type_json
-                .as_ref()
-                .map_or(0, |json| json.len())
-            + self
-                .bounds_column_type_json
-                .as_ref()
-                .map_or(0, |json| json.len());
-        for spec_json in self.partition_spec_jsons.values() {
-            retained += size_of::<i32>() + spec_json.len();
-        }
-        retained as u64
-    }
-
+    #[cfg(test)]
     pub fn to_proto(&self) -> dto::SystemManifestSplit {
         dto::SystemManifestSplit {
             reference: Some(self.reference.to_proto()),
-            table_has_variant_history: self.table_has_variant_history,
             manifest: Some(self.manifest.to_proto()),
-            table_schema_json: self.table_schema_json.to_string(),
-            metadata_table_schema_json: self.metadata_table_schema_json.to_string(),
-            partition_spec_jsons: (*self.partition_spec_jsons).clone(),
-            partition_column_type_json: self
-                .partition_column_type_json
-                .as_ref()
-                .map(|json| json.to_string()),
-            bounds_column_type_json: self
-                .bounds_column_type_json
-                .as_ref()
-                .map(|json| json.to_string()),
-            encryption_key_id: None,
-            partition_slot_field_ids: self.partition_slot_field_ids.to_vec(),
         }
     }
 
+    #[cfg(test)]
     pub fn from_proto(raw: &dto::SystemManifestSplit) -> Result<Self, ConnectorError> {
-        let manifest = raw
-            .manifest
-            .as_ref()
-            .ok_or_else(|| invalid("iceberg $files split requires a manifest"))?;
-        Self::try_new(SystemManifestSplitParams {
-            reference: IcebergSystemTableReference::from_proto(
+        Self::try_new(
+            IcebergSystemTableReference::from_proto(
                 raw.reference
                     .as_ref()
                     .ok_or_else(|| invalid("iceberg manifest split requires a frozen reference"))?,
             )?,
-            table_has_variant_history: raw.table_has_variant_history,
-            manifest: TrinoManifestFile::from_proto(manifest)?,
-            table_schema_json: raw.table_schema_json.clone(),
-            metadata_table_schema_json: raw.metadata_table_schema_json.clone(),
-            partition_spec_jsons: raw.partition_spec_jsons.clone(),
-            partition_column_type_json: raw.partition_column_type_json.clone(),
-            partition_slot_field_ids: raw.partition_slot_field_ids.clone(),
-            bounds_column_type_json: raw.bounds_column_type_json.clone(),
-            encryption_key_id: raw.encryption_key_id.clone(),
-        })
+            TrinoManifestFile::from_proto(
+                raw.manifest
+                    .as_ref()
+                    .ok_or_else(|| invalid("iceberg manifest split requires a manifest"))?,
+            )?,
+        )
     }
 }
 
@@ -862,7 +881,12 @@ impl ConnectorSplit for SystemManifestSplit {
     }
 
     fn retained_size_in_bytes(&self) -> u64 {
-        self.retained_size_in_bytes
+        (size_of::<Self>()
+            + self.reference.metadata_file_location().len()
+            + self.reference.schema_table_name().schema_name().len()
+            + self.reference.schema_table_name().table_name().len()
+            + self.reference.table_uuid().len()
+            + self.manifest.path().len()) as u64
     }
 }
 
@@ -911,54 +935,22 @@ impl ConnectorSplit for SystemRelationSplit {
     }
 }
 
-/// The exact facts one files/entries manifest source is built from.
-#[derive(Clone, Debug)]
-pub struct SystemManifestSplitSourceParams {
-    pub table_has_variant_history: bool,
-    pub reference: IcebergSystemTableReference,
-    /// Every manifest of the pinned snapshot's manifest list, in list order.
-    pub manifests: Vec<TrinoManifestFile>,
-    pub table_schema_json: String,
-    pub metadata_table_schema_json: String,
-    pub partition_spec_jsons: BTreeMap<i32, String>,
-    pub partition_column_type_json: Option<String>,
-    pub partition_slot_field_ids: Vec<i32>,
-    pub bounds_column_type_json: Option<String>,
-    pub encryption_key_id: Option<String>,
-}
-
 /// A lazily advancing enumerator over one pinned snapshot's manifests.
 #[derive(Debug)]
 pub struct SystemManifestSplitSource {
-    /// The fully validated first split. Every later split is this one with
-    /// another manifest. `None` only when the pinned snapshot lists no
-    /// manifests at all, which is a legal empty relation.
-    template: Option<SystemManifestSplit>,
-    template_emitted: bool,
+    scan: SystemTableScan,
     manifests: VecDeque<TrinoManifestFile>,
     closed: bool,
     exhausted: bool,
 }
 
 impl SystemManifestSplitSource {
-    pub fn try_new(params: SystemManifestSplitSourceParams) -> Result<Self, ConnectorError> {
-        let SystemManifestSplitSourceParams {
-            table_has_variant_history,
-            reference,
-            manifests,
-            table_schema_json,
-            metadata_table_schema_json,
-            partition_spec_jsons,
-            partition_column_type_json,
-            partition_slot_field_ids,
-            bounds_column_type_json,
-            encryption_key_id,
-        } = params;
-
-        if !matches!(
-            reference.system_table_type(),
-            IcebergSystemTableType::Files | IcebergSystemTableType::Entries
-        ) {
+    pub fn try_new(
+        scan: &SystemTableScan,
+        manifests: Vec<TrinoManifestFile>,
+    ) -> Result<Self, ConnectorError> {
+        let reference = scan.reference();
+        if reference.system_table_type().unit_hint() != SystemTableUnitHint::ManyUnits {
             return Err(invalid(
                 "iceberg manifest source requires a files or entries reference",
             ));
@@ -974,45 +966,26 @@ impl SystemManifestSplitSource {
                 "iceberg $files manifest count exceeds the hard limit",
             ));
         }
-
-        let mut manifests = VecDeque::from(manifests);
-        let template = match manifests.pop_front() {
-            Some(manifest) => Some(SystemManifestSplit::try_new(SystemManifestSplitParams {
-                reference,
-                table_has_variant_history,
-                manifest,
-                table_schema_json,
-                metadata_table_schema_json,
-                partition_spec_jsons,
-                partition_column_type_json,
-                partition_slot_field_ids,
-                bounds_column_type_json,
-                encryption_key_id,
-            })?),
-            None => {
-                // Validate the shared facts even with nothing to enumerate: a
-                // malformed frozen schema is a planning bug, and letting an
-                // empty snapshot hide it would only surface it on the next
-                // commit, under a different query.
-                validate_shared_files_table_facts(
-                    &table_schema_json,
-                    &metadata_table_schema_json,
-                    &partition_spec_jsons,
-                    partition_column_type_json.as_deref(),
-                    bounds_column_type_json.as_deref(),
-                    encryption_key_id.as_deref(),
-                )?;
-                None
-            }
-        };
-        let exhausted = template.is_none();
-        Ok(Self {
-            template,
-            template_emitted: false,
-            manifests,
+        let source = Self {
+            scan: scan.clone(),
+            exhausted: manifests.is_empty(),
+            manifests: manifests.into(),
             closed: false,
-            exhausted,
-        })
+        };
+        if let Some(first) = source.manifests.front() {
+            source.validate_spec(first)?;
+        }
+        Ok(source)
+    }
+
+    fn validate_spec(&self, manifest: &TrinoManifestFile) -> Result<(), ConnectorError> {
+        let spec_id = manifest.partition_spec_id();
+        if self.scan.partition_spec(spec_id).is_none() {
+            return Err(invalid(format!(
+                "iceberg manifest work unit names unknown frozen partition spec {spec_id}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1039,21 +1012,17 @@ impl ConnectorSplitSource for SystemManifestSplitSource {
             return Ok(ConnectorSplitBatch::finished());
         }
 
-        let Some(template) = self.template.as_ref() else {
-            self.exhausted = true;
-            return Ok(ConnectorSplitBatch::finished());
-        };
         let max_size = max_size.min(MAX_SPLITS_PER_ASSIGNMENT);
-        let mut produced = Vec::with_capacity(max_size);
-        if !self.template_emitted {
-            produced.push(template.clone());
-            self.template_emitted = true;
-        }
+        let mut produced = Vec::with_capacity(max_size.min(self.manifests.len()));
         while produced.len() < max_size {
             let Some(manifest) = self.manifests.pop_front() else {
                 break;
             };
-            produced.push(template.with_manifest(manifest)?);
+            self.validate_spec(&manifest)?;
+            produced.push(SystemManifestSplit::try_new(
+                self.scan.reference().clone(),
+                manifest,
+            )?);
         }
 
         let no_more_splits = self.manifests.is_empty();
@@ -1061,7 +1030,7 @@ impl ConnectorSplitSource for SystemManifestSplitSource {
     }
 
     fn is_finished(&self) -> bool {
-        self.closed || self.exhausted || (self.template_emitted && self.manifests.is_empty())
+        self.closed || self.exhausted || self.manifests.is_empty()
     }
 
     /// Idempotent. A batch already returned by value cannot be retracted.
@@ -1072,70 +1041,23 @@ impl ConnectorSplitSource for SystemManifestSplitSource {
     }
 }
 
-/// Validate the facts every split of one `$files` scan shares.
-fn validate_shared_files_table_facts(
-    table_schema_json: &str,
-    metadata_table_schema_json: &str,
-    partition_spec_jsons: &BTreeMap<i32, String>,
-    partition_column_type_json: Option<&str>,
-    bounds_column_type_json: Option<&str>,
-    encryption_key_id: Option<&str>,
-) -> Result<(), ConnectorError> {
-    if encryption_key_id.is_some() {
-        return Err(unsupported(
-            "iceberg manifest encryption is not supported by the connector read stack",
-        ));
-    }
-    if table_schema_json.is_empty() || table_schema_json.len() > MAX_JSON_BYTES {
+pub(crate) fn parse_table_schema(schema_json: &str) -> Result<Schema, ConnectorError> {
+    if schema_json.is_empty() || schema_json.len() > MAX_JSON_BYTES {
         return Err(invalid(
             "iceberg table schema json must be non-empty and bounded",
         ));
     }
-    crate::metadata_json::from_str::<Schema>(table_schema_json)
-        .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
-    parse_json_value("iceberg metadata table schema", metadata_table_schema_json)?;
-    if partition_spec_jsons.len() > MAX_PARTITION_SPECS {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "iceberg partition spec count exceeds the hard limit",
-        ));
-    }
-    for (declared_spec_id, spec_json) in partition_spec_jsons {
-        let spec = parse_partition_spec(spec_json)?;
-        if spec.spec_id() != *declared_spec_id {
-            return Err(invalid(format!(
-                "iceberg partition spec json declares spec id {} under key {declared_spec_id}",
-                spec.spec_id()
-            )));
-        }
-    }
-    if let Some(json) = partition_column_type_json {
-        parse_json_value("iceberg partition column type", json)?;
-    }
-    if let Some(json) = bounds_column_type_json {
-        parse_json_value("iceberg bounds column type", json)?;
-    }
-    Ok(())
+    crate::metadata_json::from_str(schema_json)
+        .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
 }
 
-fn parse_json_value(what: &'static str, json: &str) -> Result<(), ConnectorError> {
-    if json.is_empty() || json.len() > MAX_JSON_BYTES {
-        return Err(invalid(format!(
-            "{what} json must be non-empty and bounded"
-        )));
-    }
-    crate::metadata_json::from_str::<serde_json::Value>(json)
-        .map_err(|error| invalid(format!("{what} json is invalid: {error}")))?;
-    Ok(())
-}
-
-fn parse_partition_spec(spec_json: &str) -> Result<PartitionSpec, ConnectorError> {
+pub(crate) fn parse_partition_spec(spec_json: &str) -> Result<PartitionSpec, ConnectorError> {
     if spec_json.is_empty() || spec_json.len() > MAX_JSON_BYTES {
         return Err(invalid(
             "iceberg partition spec json must be non-empty and bounded",
         ));
     }
-    crate::metadata_json::from_str::<PartitionSpec>(spec_json)
+    crate::metadata_json::from_str(spec_json)
         .map_err(|error| invalid(format!("iceberg partition spec json is invalid: {error}")))
 }
 
@@ -1179,26 +1101,20 @@ mod tests {
         .expect("manifest")
     }
 
-    fn split_source_params(manifests: Vec<TrinoManifestFile>) -> SystemManifestSplitSourceParams {
+    fn scan(reference: IcebergSystemTableReference) -> SystemTableScan {
         let schema = partitioned_schema();
         let spec = identity_partition_spec(&schema);
-        let mut partition_spec_jsons = BTreeMap::new();
-        partition_spec_jsons.insert(
-            spec.spec_id(),
-            serde_json::to_string(&spec).expect("spec json"),
-        );
-        SystemManifestSplitSourceParams {
-            table_has_variant_history: true,
-            reference: reference(IcebergSystemTableType::Files),
+        SystemTableScan::from_facts(reference, FormatVersion::V2, schema, [spec], true)
+            .expect("system scan")
+    }
+
+    fn split_source(
+        manifests: Vec<TrinoManifestFile>,
+    ) -> Result<SystemManifestSplitSource, ConnectorError> {
+        SystemManifestSplitSource::try_new(
+            &scan(reference(IcebergSystemTableType::Files)),
             manifests,
-            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
-            metadata_table_schema_json: r#"{"columns":["content","file_path"]}"#.to_string(),
-            partition_spec_jsons,
-            partition_column_type_json: Some(r#"{"type":"struct"}"#.to_string()),
-            partition_slot_field_ids: spec.fields().iter().map(|field| field.field_id).collect(),
-            bounds_column_type_json: None,
-            encryption_key_id: None,
-        }
+        )
     }
 
     fn drain(source: &mut SystemManifestSplitSource) -> Vec<SystemManifestSplit> {
@@ -1267,9 +1183,11 @@ mod tests {
             IcebergSystemTableType::Entries,
         ] {
             assert_eq!(kind.unit_hint(), SystemTableUnitHint::ManyUnits);
-            let mut params = split_source_params(vec![manifest("m0.avro"), manifest("m1.avro")]);
-            params.reference = reference(kind);
-            let mut source = SystemManifestSplitSource::try_new(params).unwrap();
+            let mut source = SystemManifestSplitSource::try_new(
+                &scan(reference(kind)),
+                vec![manifest("m0.avro"), manifest("m1.avro")],
+            )
+            .unwrap();
             let splits = drain(&mut source);
             assert_eq!(splits.len(), 2);
             assert!(
@@ -1287,9 +1205,13 @@ mod tests {
             assert_eq!(kind.unit_hint(), SystemTableUnitHint::SingleUnit);
             let split = SystemRelationSplit::try_new(reference(kind)).unwrap();
             assert_eq!(split.reference(), &reference(kind));
-            let mut params = split_source_params(vec![manifest("m0.avro")]);
-            params.reference = reference(kind);
-            assert!(SystemManifestSplitSource::try_new(params).is_err());
+            assert!(
+                SystemManifestSplitSource::try_new(
+                    &scan(reference(kind)),
+                    vec![manifest("m0.avro")],
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1300,8 +1222,7 @@ mod tests {
             manifest("m1.avro"),
             manifest("m2.avro"),
         ];
-        let mut source =
-            SystemManifestSplitSource::try_new(split_source_params(manifests)).expect("source");
+        let mut source = split_source(manifests).expect("source");
         let splits = drain(&mut source);
         assert_eq!(splits.len(), 3);
         let paths = splits
@@ -1310,11 +1231,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["m0.avro", "m1.avro", "m2.avro"]);
         assert!(source.is_finished());
-        // Every split repeats the same frozen schemas so a worker needs nothing
-        // but the split itself.
+        let scan = scan(reference(IcebergSystemTableType::Files));
         for split in &splits {
-            assert_eq!(split.table_schema_json(), splits[0].table_schema_json());
-            assert!(split.parse_partition_spec(7).is_ok());
+            assert!(scan.validate_manifest(split).is_ok());
             assert!(ConnectorSplit::retained_size_in_bytes(split) > 0);
             assert_eq!(ConnectorSplit::split_weight(split), SplitWeight::STANDARD);
             assert!(ConnectorSplit::affinity_key(split).is_none());
@@ -1330,9 +1249,8 @@ mod tests {
             let mut raw = reference(kind).to_proto();
             raw.snapshot_id = None;
             let reference = IcebergSystemTableReference::from_proto(&raw).unwrap();
-            let mut params = split_source_params(Vec::new());
-            params.reference = reference;
-            let mut source = SystemManifestSplitSource::try_new(params).unwrap();
+            let mut source =
+                SystemManifestSplitSource::try_new(&scan(reference), Vec::new()).unwrap();
             assert!(source.is_finished());
             assert!(drain(&mut source).is_empty());
         }
@@ -1340,8 +1258,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_with_no_manifests_is_an_empty_relation_not_a_synthetic_split() {
-        let mut source =
-            SystemManifestSplitSource::try_new(split_source_params(Vec::new())).expect("source");
+        let mut source = split_source(Vec::new()).expect("source");
         assert!(source.is_finished());
         assert!(drain(&mut source).is_empty());
     }
@@ -1456,15 +1373,6 @@ mod tests {
         })
         .expect_err("encrypted manifest");
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-
-        let mut params = split_source_params(vec![manifest("m0.avro")]);
-        params.encryption_key_id = Some("key-1".to_string());
-        assert_eq!(
-            SystemManifestSplitSource::try_new(params)
-                .expect_err("encrypted relation")
-                .kind(),
-            ConnectorErrorKind::Unsupported
-        );
     }
 
     #[test]
@@ -1483,40 +1391,24 @@ mod tests {
             assert_eq!(decoded, frozen);
         }
 
-        let mut source = SystemManifestSplitSource::try_new(split_source_params(vec![
-            manifest("m0.avro"),
-            manifest("m1.avro"),
-        ]))
-        .expect("source");
+        let mut source =
+            split_source(vec![manifest("m0.avro"), manifest("m1.avro")]).expect("source");
         for split in drain(&mut source) {
             let decoded =
                 SystemManifestSplit::from_proto(&split.to_proto()).expect("decoded split");
             assert_eq!(decoded.manifest(), split.manifest());
-            assert!(decoded.table_has_variant_history());
-            assert_eq!(decoded.table_schema_json(), split.table_schema_json());
+
+            assert_eq!(decoded.reference(), split.reference());
             assert_eq!(
-                decoded.metadata_table_schema_json(),
-                split.metadata_table_schema_json()
+                decoded.retained_size_in_bytes(),
+                split.retained_size_in_bytes()
             );
-            assert_eq!(decoded.partition_spec_jsons(), split.partition_spec_jsons());
-            assert_eq!(
-                decoded.partition_column_type_json(),
-                split.partition_column_type_json()
-            );
-            assert!(decoded.encryption_key_id().is_none());
         }
     }
 
     #[test]
     fn a_manifest_naming_an_unknown_partition_spec_fails_closed() {
-        let mut params = split_source_params(vec![manifest("m0.avro")]);
-        params.partition_spec_jsons.clear();
-        assert!(SystemManifestSplitSource::try_new(params).is_err());
-
-        let mut source =
-            SystemManifestSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
-                .expect("source");
-        let split = drain(&mut source).remove(0);
+        let scan = scan(reference(IcebergSystemTableType::Files));
         let mut foreign = manifest("m1.avro");
         foreign = TrinoManifestFile::try_new(TrinoManifestFileParams {
             path: foreign.path().to_string(),
@@ -1536,14 +1428,17 @@ mod tests {
             key_metadata: Vec::new(),
         })
         .expect("manifest");
-        assert!(split.with_manifest(foreign).is_err());
+        assert!(SystemManifestSplitSource::try_new(&scan, vec![foreign.clone()]).is_err());
+        let split = SystemManifestSplit::try_new(scan.reference().clone(), foreign).unwrap();
+        assert_eq!(
+            scan.validate_manifest(&split).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     #[test]
     fn an_unsatisfiable_dynamic_filter_finishes_without_a_split() {
-        let mut source =
-            SystemManifestSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
-                .expect("source");
+        let mut source = split_source(vec![manifest("m0.avro")]).expect("source");
         let snapshot = DynamicFilterSnapshot::<IcebergColumnHandle>::new(TupleDomain::none(), true);
         let batch = source.next_batch(16, &snapshot).expect("batch");
         assert!(batch.is_empty());

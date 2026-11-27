@@ -321,12 +321,12 @@ impl PreparedAggregateKernel for ArrayKernel {
         self.output(states, false, control)
     }
 }
-fn supported(
+pub(super) fn supported<E>(
     ty: &DataType,
     json_payload: Option<&ValueTypeRef>,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<bool, KernelFailure> {
-    work.step().map_err(compile_failure)?;
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    observe()?;
     let child = |index| json_payload.and_then(|value| value.child_type_at(index));
     Ok(match ty {
         DataType::Null
@@ -345,19 +345,19 @@ fn supported(
             json_payload.and_then(ValueTypeRef::domain) == Some(ValueLogicalType::Json)
         }
         DataType::FixedSizeBinary(16) => true,
-        DataType::List(item) => supported(item.data_type(), child(0), work)?,
+        DataType::List(item) => supported(item.data_type(), child(0), observe)?,
         DataType::Struct(fields) => {
             let mut all = !fields.is_empty();
             for (index, field) in fields.iter().enumerate() {
-                all &= supported(field.data_type(), child(index), work)?;
+                all &= supported(field.data_type(), child(index), observe)?;
             }
             all
         }
         DataType::Map(entries, _) => {
             if let DataType::Struct(fields) = entries.data_type() {
                 fields.len() == 2
-                    && supported(fields[0].data_type(), child(0), work)?
-                    && supported(fields[1].data_type(), child(1), work)?
+                    && supported(fields[0].data_type(), child(0), observe)?
+                    && supported(fields[1].data_type(), child(1), observe)?
             } else {
                 false
             }
@@ -398,7 +398,9 @@ pub(super) fn validate_contract(
         let json_payload =
             (index == 0 && matches!(operation, Operation::Array) && !receipt.distinct)
                 .then_some(value.value_type());
-        if !supported(value.data_type(), json_payload, work)? {
+        if !supported(value.data_type(), json_payload, &mut || {
+            work.step().map_err(compile_failure)
+        })? {
             return Err(invalid(&format!(
                 "{} has no installed ARRAY input profile for {:?}",
                 contract.call().function_id().as_str(),

@@ -89,104 +89,82 @@ struct SqlFunctionCallFacts {
     aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
 
+/// Capabilities minted by the stages that may author additional plan calls.
+pub(crate) enum PlanBindingAuthority {
+    Optimizer(crate::optimizer::BindingAuthority),
+    Planner(crate::planner::BindingAuthority),
+    Planning(crate::planning::BindingAuthority),
+    #[cfg(test)]
+    Test,
+}
+
 impl SqlFunctionBinding {
-    pub(crate) fn new(
+    pub(crate) fn from_analyzed(call: crate::analyzer::FinalizedAnalysisCall) -> Self {
+        let (resolved, policy, origin, target) = call.into_parts();
+        Self::with_constraint(resolved, policy, origin, target)
+    }
+
+    fn with_constraint(
         resolved: novarocks_functions::ResolvedFunctionBinding,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint_origin: SqlResultConstraintOrigin,
+        result_constraint: Option<novarocks_functions::FunctionValueType>,
     ) -> Self {
         Self(Arc::new(SqlFunctionCallFacts {
             resolved,
             decimal_overflow_policy,
-            result_constraint: None,
-            result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
-
+            result_constraint,
+            result_constraint_origin,
             statement_start: None,
             time_zone: None,
             aggregate_state_source: None,
         }))
     }
 
-    /// The actual conversion constructors retain both original targets. The
-    /// captured request still borrows the original intermediate constraint.
-    /// A later computed target requires its own same-emission derivation.
-    pub(crate) fn new_with_conversion_constraint(
+    pub(crate) fn from_plan(
+        authority: PlanBindingAuthority,
         resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
-        final_target: novarocks_functions::FunctionValueType,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
+        Self::from_plan_with_constraint(
+            authority,
             resolved,
-            decimal_overflow_policy,
-            result_constraint: Some(result_constraint),
-            result_constraint_origin: SqlResultConstraintOrigin::ValueDomainConversion {
-                final_target,
-            },
-
-            statement_start: None,
-            time_zone: None,
-            aggregate_state_source: None,
-        }))
+            policy,
+            SqlResultConstraintOrigin::Unconstrained,
+            None,
+        )
     }
 
-    pub(crate) fn new_with_temporal_constraint(
+    pub(crate) fn from_plan_with_constraint(
+        _authority: PlanBindingAuthority,
         resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
-        own_nullable: bool,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+        origin: SqlResultConstraintOrigin,
+        target: Option<novarocks_functions::FunctionValueType>,
     ) -> Self {
-        let mut binding = Self::new(resolved, decimal_overflow_policy);
-        let facts = Arc::make_mut(&mut binding.0);
-        facts.result_constraint = Some(result_constraint);
-        facts.result_constraint_origin =
-            SqlResultConstraintOrigin::TemporalSelected { own_nullable };
-        binding
+        Self::with_constraint(resolved, policy, origin, target)
     }
 
-    pub(crate) fn new_with_row_constructor_constraint(
-        resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
-    ) -> Self {
-        let mut binding = Self::new(resolved, decimal_overflow_policy);
-        let facts = Arc::make_mut(&mut binding.0);
-        facts.result_constraint = Some(result_constraint);
-        facts.result_constraint_origin = SqlResultConstraintOrigin::RowConstructor;
-        binding
+    pub(crate) fn resolve_for_plan(
+        authority: PlanBindingAuthority,
+        catalog: &dyn crate::compiler::SqlFunctionCatalog,
+        name: &str,
+        args: &[crate::analysis::TypedExpr],
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+        constant_policy: novarocks_functions::ConstantValidation,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, novarocks_functions::FunctionBindingError> {
+        let resolved =
+            crate::analysis::select_scalar_function(catalog, name, args, constant_policy, control)?;
+        Ok(Self::from_plan(authority, resolved, policy))
     }
 
-    pub(crate) fn new_with_array_common_constraint(
+    #[cfg(test)]
+    pub(crate) fn from_test(
         resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
-            resolved,
-            decimal_overflow_policy,
-            result_constraint: Some(result_constraint),
-            result_constraint_origin: SqlResultConstraintOrigin::ArrayCommonCoercion,
-
-            statement_start: None,
-            time_zone: None,
-            aggregate_state_source: None,
-        }))
-    }
-
-    pub(crate) fn new_with_operator_decimal_float_constraint(
-        resolved: novarocks_functions::ResolvedFunctionBinding,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-        result_constraint: novarocks_functions::FunctionValueType,
-    ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
-            resolved,
-            decimal_overflow_policy,
-            result_constraint: Some(result_constraint),
-            result_constraint_origin: SqlResultConstraintOrigin::OperatorDecimalFloatCoercion,
-
-            statement_start: None,
-            time_zone: None,
-            aggregate_state_source: None,
-        }))
+        Self::from_plan(PlanBindingAuthority::Test, resolved, policy)
     }
 
     /// Retain the actual lexical aggregate producer's DISTINCT and ORDER facts.

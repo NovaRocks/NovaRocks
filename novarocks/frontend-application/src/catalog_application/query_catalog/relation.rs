@@ -572,6 +572,40 @@ pub(crate) fn project_view(
     })
 }
 
+pub(crate) fn project_derived_view(
+    table: novarocks_sql::planning::catalog::ResolvedAnalyzerTable,
+    binding: novarocks_sql::binding::SqlTableBindingId,
+    view: &ConnectorDerivedView,
+) -> CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable> {
+    view.definition
+        .validate_output_declaration()
+        .map_err(CatalogResolutionError::failed)?;
+    let identity = novarocks_sql::planning::catalog::materialization_identity_facts(&table);
+    let ConnectorViewDialect::Trino = view.definition.dialect;
+    if view.definition.default_catalog.as_deref() != Some(identity.catalog())
+        || view.definition.default_namespace.as_ref() != identity.namespace()
+    {
+        return Err(CatalogResolutionError::failed(
+            "connector derived view context differs from its source binding",
+        ));
+    }
+    novarocks_sql::planning::catalog::bind_derived_metadata_view(
+        table,
+        binding,
+        &view.name,
+        view.definition.raw_sql.clone(),
+        view.definition
+            .columns
+            .iter()
+            .map(|column| SqlViewColumn {
+                name: column.name.clone(),
+                value_type: column.value_type.clone(),
+            })
+            .collect(),
+    )
+    .map_err(CatalogResolutionError::failed)
+}
+
 pub(crate) fn no_view_capability() -> CatalogResolutionError {
     CatalogResolutionError::from_connector(ConnectorError::new(
         ConnectorErrorKind::Unsupported,

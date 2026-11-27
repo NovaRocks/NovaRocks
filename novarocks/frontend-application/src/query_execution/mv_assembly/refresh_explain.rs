@@ -170,7 +170,7 @@ async fn explain_original_inner(
         context,
     )
     .await?;
-    let query = candidate.query;
+    let query = candidate.canonical_query();
     let decision =
         crate::mv::domain::iceberg_refresh::async_preparation::captured_refresh_decision_original(
             io,
@@ -178,7 +178,7 @@ async fn explain_original_inner(
             &projection,
             &runtime_bindings,
             &baseline,
-            &query,
+            query,
             input.statement.full,
             context,
         )
@@ -191,7 +191,7 @@ async fn explain_original_inner(
         io,
         ports,
         &projection,
-        &query,
+        query,
         context,
     )
     .await?;
@@ -209,7 +209,7 @@ async fn explain_original_inner(
                 target_binding: &binding,
                 target_observation: &schema,
                 runtime_bindings: &runtime_bindings,
-                join_analysis: novarocks_sql::planning::mv::extract_refresh_join_analysis(&query)?,
+                join_analysis: novarocks_sql::planning::mv::extract_refresh_join_analysis(query)?,
                 aggregate,
             },
         )

@@ -254,10 +254,6 @@ mod apply_key_facts_tests {
     }
 }
 
-mod resolved_mv_refresh_input_private {
-    pub trait Sealed {}
-}
-
 #[cfg(test)]
 mod refresh_property_facade_tests {
     use super::*;
@@ -348,7 +344,7 @@ mod refresh_property_facade_tests {
         let query = parse_query(sql);
         let (resolved, _, _) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")
+        SqlResolvedMvRefreshInput::checked_for_test(resolved).expect("named MV output declaration")
     }
 
     #[test]
@@ -409,7 +405,7 @@ mod refresh_property_facade_tests {
             let query = parse_query(sql);
             let (resolved, _, _) =
                 crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
-            let error = SqlResolvedMvRefreshInput::from_analysis(resolved).unwrap_err();
+            let error = SqlResolvedMvRefreshInput::checked_for_test(resolved).unwrap_err();
             assert_eq!(error.kind(), expected, "{sql}");
             assert!(
                 error.span().is_none(),
@@ -1135,16 +1131,6 @@ mod refresh_property_facade_tests {
     }
 }
 
-/// Sealed conversion hook for SQL's analyzed MV query carrier. External
-/// callers can pass the carrier through planning APIs but cannot implement a
-/// second raw-query representation.
-pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Sealed {
-    #[doc(hidden)]
-    fn into_sql_resolved_mv_refresh_input(
-        self,
-    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError>;
-}
-
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
@@ -1155,32 +1141,32 @@ pub struct SqlResolvedMvRefreshInput(
 );
 
 impl SqlResolvedMvRefreshInput {
-    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(
-        source: T,
-    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
-        source.into_sql_resolved_mv_refresh_input()
-    }
-
-    pub(crate) fn from_validated_analysis(
-        resolved: crate::analysis::ResolvedQuery,
-        names: Vec<String>,
-        view_dependencies: Vec<SqlMvViewDependency>,
-    ) -> Self {
-        Self(
+    pub(crate) fn from_admitted_definition(
+        definition: crate::analyzer::AdmittedMvDefinition,
+        span: novarocks_parser::Span,
+    ) -> Result<Self, SqlCompileError> {
+        let (resolved, _, factory, view_dependencies) = definition.into_parts();
+        let names = crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            span,
+        )?;
+        validate_persistable_output(&resolved, &factory).map_err(SqlCompileError::Compilation)?;
+        Ok(Self(
             resolved,
             names.into_boxed_slice(),
             view_dependencies.into_boxed_slice(),
-        )
+        ))
     }
 
-    fn checked(
+    #[cfg(test)]
+    pub(crate) fn checked_for_test(
         resolved: crate::analysis::ResolvedQuery,
     ) -> Result<Self, crate::analyze_error::AnalyzeError> {
         let names = crate::analysis::schema::validate_definition_column_names(
             &resolved.output_columns,
             None,
         )?;
-        Ok(Self::from_validated_analysis(resolved, names, Vec::new()))
+        Ok(Self(resolved, names.into_boxed_slice(), Box::new([])))
     }
 
     pub fn refresh_property(
@@ -1396,26 +1382,6 @@ impl SqlResolvedMvRefreshInput {
             &aliases.left_table,
             &aliases.right_table,
         ))
-    }
-}
-
-impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
-
-impl SqlResolvedMvRefreshInputSource for crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(
-        self,
-    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
-        SqlResolvedMvRefreshInput::checked(self)
-    }
-}
-
-impl resolved_mv_refresh_input_private::Sealed for &crate::analysis::ResolvedQuery {}
-
-impl SqlResolvedMvRefreshInputSource for &crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(
-        self,
-    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
-        SqlResolvedMvRefreshInput::checked(self.clone())
     }
 }
 
@@ -6078,11 +6044,6 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
-                ));
-            }
             args.iter()
                 .try_for_each(validate_non_contract_aggregate_projection_expr)
         }
@@ -6241,11 +6202,6 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
                     "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
                 ));
             }
-            if is_unsupported_contract_scalar_function(name) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
-                ));
-            }
             for arg in args {
                 validate_projection_filter_expr(arg)?;
             }
@@ -6291,27 +6247,6 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-fn is_unsupported_contract_scalar_function(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "now"
-            | "current_timestamp"
-            | "localtime"
-            | "localtimestamp"
-            | "current_date"
-            | "current_time"
-            | "random"
-            | "rand"
-            | "uuid"
-            | "sleep"
-            | "version"
-            | "database"
-            | "current_user"
-            | "user"
-            | "grouping"
-    )
 }
 
 fn relation_qualifiers(relation: &Relation) -> Result<Vec<String>, String> {

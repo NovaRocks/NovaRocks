@@ -757,7 +757,10 @@ mod tests {
         count.source = crate::binding::AggregateArgumentSource::uncertified(
             count.source.arguments().to_vec(),
             count.source.order_by().to_vec(),
-            crate::binding::SqlFunctionBinding::new(
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 count.source.binding().resolved().clone(),
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             ),

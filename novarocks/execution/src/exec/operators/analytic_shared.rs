@@ -120,21 +120,30 @@ pub(crate) fn validate_analytic_output_columns_typed<'a>(
         });
     }
     for (idx, (col, slot)) in columns.iter().zip(output_chunk_schema.slots()).enumerate() {
-        if col.len() != total_rows {
-            return Err(AnalyticOutputValidationFailure::Length {
-                column: idx,
-                expected_rows: total_rows,
-                actual: col.len(),
-            });
-        }
-        let expected = slot.field();
-        if col.data_type() != expected.data_type() {
-            return Err(AnalyticOutputValidationFailure::Type {
-                column: idx,
-                expected: expected.data_type(),
-                actual: col.data_type(),
-            });
-        }
+        validate_analytic_output_column_typed(idx, col, slot.field().data_type(), total_rows)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_analytic_output_column_typed<'a>(
+    column: usize,
+    array: &'a arrow::array::ArrayRef,
+    expected: &'a arrow::datatypes::DataType,
+    total_rows: usize,
+) -> Result<(), AnalyticOutputValidationFailure<'a>> {
+    if array.len() != total_rows {
+        return Err(AnalyticOutputValidationFailure::Length {
+            column,
+            expected_rows: total_rows,
+            actual: array.len(),
+        });
+    }
+    if array.data_type() != expected {
+        return Err(AnalyticOutputValidationFailure::Type {
+            column,
+            expected,
+            actual: array.data_type(),
+        });
     }
     Ok(())
 }

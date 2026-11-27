@@ -18,16 +18,21 @@
 //! LEAD/LAG selected values from one complete original partition.
 //! Offsets come from the exact BIGINT argument or the default of one.
 
-use super::window_default::{DefaultValueRecipe, PartitionDefault};
+use crate::control_values::{
+    AssemblyPlan, assemble_indexed_values_in, assemble_values, normalize_indexed_value_in,
+    visit_indexed_value_offsets,
+};
 use crate::kernel_control::{
     KernelControlObservation, internal, invalid, invalid_function_argument,
 };
 use crate::kernel_input::EvaluationCheckpoints;
+use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use crate::{
-    KernelEvaluationControl, KernelFailure, PreparedWindowKernel, SelectedValues, Selection,
-    WindowCallContract, WindowKernelPartition, WindowPartitionInput,
+    AggregateStateAllocator, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
+    PreparedWindowKernel, SelectedValues, Selection, WindowCallContract, WindowEvaluationFailure,
+    WindowInvocationContext, WindowKernelPartition, WindowPartitionInput, WindowPartitionRetention,
 };
-use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, Int64Array, UInt64Array};
 use std::{alloc::Layout, ops::Range, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,14 +46,39 @@ pub(super) struct PreparedOffset {
     pub(super) contract: Arc<WindowCallContract>,
     pub(super) operation: OffsetOperation,
     pub(super) offset: Option<i64>,
-    pub(super) default: Option<DefaultValueRecipe>,
 }
 
-struct OffsetPartition<'a> {
+struct OffsetDefault {
+    array: ArrayRef,
+    broadcast_row: Option<usize>,
+}
+
+impl OffsetDefault {
+    fn new(argument: EvaluatedArgument<'_>) -> Self {
+        let broadcast_row = match argument {
+            EvaluatedArgument::Column(_) | EvaluatedArgument::SelectedColumn(_) => None,
+            EvaluatedArgument::Scalar(_)
+            | EvaluatedArgument::Constant(_)
+            | EvaluatedArgument::ConstantView(_) => Some(argument.value_row(0, 0)),
+        };
+        Self {
+            array: Arc::clone(argument.array()),
+            broadcast_row,
+        }
+    }
+
+    fn value_row(&self, row: usize) -> usize {
+        self.broadcast_row.unwrap_or(row)
+    }
+}
+
+struct OffsetPartition {
     prepared: Arc<PreparedOffset>,
-    input: WindowPartitionInput<'a>,
+    source: ArrayRef,
+    default: Option<OffsetDefault>,
     addresses: Box<[Option<u64>]>,
-    defaults: Option<PartitionDefault<'a>>,
+    allocator: Option<Arc<dyn AggregateStateAllocator>>,
+    _address_reservation: Option<OpaqueReservation>,
     retained: usize,
     closed: bool,
 }
@@ -65,7 +95,7 @@ fn reserve<T>(rows: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T
 }
 
 fn copy_plan(
-    input: crate::EvaluatedArgument<'_>,
+    input: &ArrayRef,
     indices: &[Option<u64>],
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
@@ -80,7 +110,7 @@ fn copy_plan(
         / 8;
     Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
     work.flush()?;
-    match crate::selected_copy::preflight_take(input.array().as_ref(), indices, |opaque| {
+    match crate::selected_copy::preflight_take(input.as_ref(), indices, |opaque| {
         if opaque { work.flush() } else { work.step() }
     }) {
         Ok(()) => work.flush(),
@@ -96,20 +126,63 @@ impl PreparedWindowKernel for PreparedOffset {
         let heap = Layout::array::<Option<u64>>(rows)
             .map_err(|_| KernelFailure::ResourceExhausted)?
             .size();
-        let defaults = match &self.default {
-            Some(recipe) => recipe.retained_upper_bound(rows)?,
-            None => 0,
-        };
-        size_of::<OffsetPartition<'_>>()
+        size_of::<OffsetPartition>()
             .checked_add(heap)
-            .and_then(|bytes| bytes.checked_add(defaults))
             .ok_or(KernelFailure::ResourceExhausted)
+    }
+    fn partition_retention(&self, rows: usize) -> Result<WindowPartitionRetention, KernelFailure> {
+        if self.supports_owned_partition() {
+            Ok(WindowPartitionRetention::AllocationTracked)
+        } else {
+            self.partition_retained_upper_bound(rows)
+                .map(|bytes| WindowPartitionRetention::RowBounded { bytes })
+        }
+    }
+    fn supports_owned_partition(&self) -> bool {
+        self.contract.logical_argument_types().len() == 3
+    }
+    fn begin_owned_partition_evaluated(
+        self: Arc<Self>,
+        input: WindowPartitionInput<'_>,
+        _context: WindowInvocationContext,
+        allocator: Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn WindowKernelPartition>, WindowEvaluationFailure> {
+        Ok(self.begin_offset_partition(input, Some(allocator), control)?)
+    }
+    fn begin_partition_evaluated<'input>(
+        self: Arc<Self>,
+        input: WindowPartitionInput<'input>,
+        _context: WindowInvocationContext,
+        allocator: Option<Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn WindowKernelPartition + 'input>, WindowEvaluationFailure> {
+        let allocator = if self.supports_owned_partition() {
+            Some(allocator.ok_or_else(|| {
+                invalid("three-argument LEAD/LAG requires its original host allocator")
+            })?)
+        } else {
+            None
+        };
+        Ok(self.begin_offset_partition(input, allocator, control)?)
     }
     fn begin_partition<'a>(
         self: Arc<Self>,
         input: WindowPartitionInput<'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Box<dyn WindowKernelPartition + 'a>, KernelFailure> {
+        self.begin_offset_partition(input, None, control)
+    }
+}
+
+impl PreparedOffset {
+    fn begin_offset_partition(
+        self: Arc<Self>,
+        input: WindowPartitionInput<'_>,
+        allocator: Option<Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn WindowKernelPartition>, KernelFailure> {
+        let three_arguments = self.supports_owned_partition();
         let observation = KernelControlObservation::new(control);
         let control: &dyn KernelEvaluationControl = &observation;
         control.checkpoint(0)?;
@@ -123,26 +196,37 @@ impl PreparedWindowKernel for PreparedOffset {
                 ));
             }
             let rows = input.full_input().partition_rows();
-            self.partition_retained_upper_bound(rows)?;
-            // Preserve the original complete D conversion before target setup.
-            // Only later output copying follows Selection; unrelated CV pool
-            // rows are not logical default inputs.
-            let defaults = match &self.default {
-                Some(recipe) => {
-                    work.flush()?;
-                    let defaults = recipe.prepare_partition(
-                        input.full_input().logical_arguments()[2],
-                        rows,
-                        control,
-                    )?;
-                    work.flush()?;
-                    defaults
-                }
-                None => None,
-            };
-            let source = input.full_input().logical_arguments()[0];
+            let retained = self.partition_retained_upper_bound(rows)?;
+            let charge = allocator
+                .as_ref()
+                .map(|host| OpaqueRetainedCharge::try_new(Arc::clone(host)))
+                .transpose()?;
+            let address_reservation = charge
+                .as_ref()
+                .map(|charge| charge.reserve_operation(retained))
+                .transpose()?;
+            // Full input validation already evaluated and checked both value
+            // channels. Only their row coordinates differ during selection.
+            let arguments = input.full_input().logical_arguments();
+            let source = arguments[0];
+            let mut default = arguments.get(2).copied().map(OffsetDefault::new);
             let mut addresses = reserve::<Option<u64>>(rows, &mut work)?;
             let ignore = self.contract.options().ignore_nulls();
+            let ignore_scratch = if ignore {
+                let slots = rows
+                    .checked_mul(2)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                let bytes = Layout::array::<usize>(slots)
+                    .map_err(|_| KernelFailure::ResourceExhausted)?
+                    .size();
+                charge
+                    .as_ref()
+                    .map(|charge| charge.reserve_operation(bytes))
+                    .transpose()?
+            } else {
+                None
+            };
             let mut positions = if ignore {
                 reserve::<usize>(rows, &mut work)?
             } else {
@@ -234,50 +318,91 @@ impl PreparedWindowKernel for PreparedOffset {
                 addresses.push(address);
                 work.step()?;
             }
-            // Full required setup and format refusal precede output demand.
-            // Source output is copied only on demand. The prepared default
-            // either keeps the input loan or owns the converted partition.
-            copy_plan(source, &addresses, &mut work)?;
+            if default.is_none() {
+                // Preserve the existing complete take preflight.
+                copy_plan(source.array(), &addresses, &mut work)?;
+            }
             drop(positions);
             drop(prefix);
+            drop(ignore_scratch);
             work.flush()?;
             let addresses = addresses.into_boxed_slice();
             work.flush()?;
-            let retained = size_of::<OffsetPartition<'_>>()
-                .checked_add(
-                    addresses
-                        .len()
-                        .checked_mul(size_of::<Option<u64>>())
-                        .ok_or(KernelFailure::ResourceExhausted)?,
-                )
-                .and_then(|bytes| {
-                    bytes.checked_add(
-                        defaults
-                            .as_ref()
-                            .map_or(0, PartitionDefault::retained_bytes),
-                    )
-                })
-                .ok_or(KernelFailure::ResourceExhausted)?;
+            let source = if let (Some(default), Some(allocator)) = (&mut default, &allocator) {
+                let result = self.contract.result_type().data_type();
+                let normalized = normalize_indexed_value_in(
+                    source.array(),
+                    result,
+                    Arc::clone(allocator),
+                    control,
+                )?;
+                default.array = normalize_indexed_value_in(
+                    &default.array,
+                    result,
+                    Arc::clone(allocator),
+                    control,
+                )?;
+                normalized
+            } else {
+                Arc::clone(source.array())
+            };
             let partition = Box::new(OffsetPartition {
                 prepared: self,
-                input,
+                source,
+                default,
                 addresses,
-                defaults,
+                allocator,
+                _address_reservation: address_reservation,
                 retained,
                 closed: false,
             }) as Box<dyn WindowKernelPartition>;
             work.flush()?;
             Ok(partition)
         })();
-        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
-            return result;
+        if three_arguments {
+            observation.finish(work.finish_result(result))
+        } else {
+            if result.as_ref().is_err_and(KernelFailure::is_interruption) {
+                return result;
+            }
+            work.finish()?;
+            observation.finish(result)
         }
-        work.finish()?;
-        observation.finish(result)
     }
 }
 
-impl WindowKernelPartition for OffsetPartition<'_> {
+impl OffsetPartition {
+    fn result_source(
+        &self,
+        row: usize,
+    ) -> Result<Option<(usize, &ArrayRef, usize)>, KernelFailure> {
+        let address = self
+            .addresses
+            .get(row)
+            .ok_or_else(|| invalid("window offset result row differs from its partition"))?;
+        if let Some(index) = address {
+            let index = usize::try_from(*index).map_err(|_| KernelFailure::ResourceExhausted)?;
+            return Ok(Some((0, &self.source, index)));
+        }
+        Ok(self
+            .default
+            .as_ref()
+            .map(|default| (1, &default.array, default.value_row(row))))
+    }
+}
+
+impl WindowKernelPartition for OffsetPartition {
+    fn visit_output_row_offsets(
+        &self,
+        row: usize,
+        visit: &mut dyn FnMut(usize, usize) -> Result<(), KernelFailure>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
+        if let Some((_, source, index)) = self.result_source(row)? {
+            visit_indexed_value_offsets(source.as_ref(), index, 0, visit, control)?;
+        }
+        Ok(())
+    }
     fn evaluate<'s>(
         &mut self,
         selection: Selection<'s>,
@@ -301,93 +426,82 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                         "window offset output differs from its partition or host row grant",
                     ));
                 }
-                let mut indices = reserve::<Option<u64>>(selection.len(), &mut work)?;
-                for row in selection.iter() {
-                    indices.push(self.addresses[row]);
-                    work.step()?;
-                }
-                let source = self.input.full_input().logical_arguments()[0];
-                copy_plan(source, &indices, &mut work)?;
-                work.flush()?;
-                let indices = UInt64Array::from(indices);
-                work.flush()?;
-                let copied = arrow_select::take::take(source.array().as_ref(), &indices, None);
-                work.flush()?;
-                let copied: ArrayRef =
-                    copied.map_err(|_| internal("window offset Arrow take failed"))?;
-                let copied = if let Some(defaults) = &self.defaults {
-                    let borrowed = matches!(defaults, PartitionDefault::Borrowed(_));
-                    let defaults = defaults.argument();
-                    let mut default_indices = reserve::<Option<u64>>(selection.len(), &mut work)?;
-                    let mut use_default = reserve::<bool>(selection.len(), &mut work)?;
+                let result_type = self.prepared.contract.result_type().data_type();
+                let copied = if let Some(default) = &self.default {
+                    let choice_bytes = Layout::array::<Option<(usize, usize)>>(selection.len())
+                        .map_err(|_| KernelFailure::ResourceExhausted)?
+                        .size();
+                    let _choice_reservation = self
+                        .allocator
+                        .as_ref()
+                        .map(|host| {
+                            OpaqueRetainedCharge::try_new(Arc::clone(host))?
+                                .reserve_operation(choice_bytes)
+                        })
+                        .transpose()?;
+                    let mut choices =
+                        reserve::<Option<(usize, usize)>>(selection.len(), &mut work)?;
                     for row in selection.iter() {
-                        // A NULL source at an existing target remains NULL.
-                        let missing = self.addresses[row].is_none();
-                        let address = if !borrowed || missing {
-                            Some(
-                                u64::try_from(defaults.value_row(row, row))
-                                    .map_err(|_| KernelFailure::ResourceExhausted)?,
-                            )
-                        } else {
-                            None
-                        };
-                        default_indices.push(address);
-                        use_default.push(missing);
+                        choices.push(
+                            self.result_source(row)?
+                                .map(|(source, _, index)| (source, index)),
+                        );
                         work.step()?;
                     }
-                    copy_plan(defaults, &default_indices, &mut work)?;
                     work.flush()?;
-                    let default_indices = UInt64Array::from(default_indices);
+                    let sources = [Some(&self.source), Some(&default.array)];
+                    let copied = if let Some(allocator) = &self.allocator {
+                        assemble_indexed_values_in(
+                            result_type,
+                            &sources,
+                            &choices,
+                            Arc::clone(allocator),
+                            control,
+                        )?
+                    } else {
+                        assemble_values(
+                            AssemblyPlan::Indexed {
+                                result_type,
+                                sources: &sources,
+                                choices: &choices,
+                            },
+                            control,
+                        )
+                        .map_err(|error| error.into_kernel())?
+                    };
                     work.flush()?;
-                    let selected_defaults =
-                        arrow_select::take::take(defaults.array().as_ref(), &default_indices, None);
-                    work.flush()?;
-                    let selected_defaults = selected_defaults
-                        .map_err(|_| internal("window offset default Arrow take failed"))?;
-                    let bitmap = selection
-                        .len()
-                        .checked_add(7)
-                        .ok_or(KernelFailure::ResourceExhausted)?
-                        / 8;
-                    Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
-                    work.flush()?;
-                    let mask = BooleanArray::from(use_default);
-                    work.flush()?;
-                    match crate::selected_copy::preflight_zip(
-                        &mask,
-                        selected_defaults.as_ref(),
-                        copied.as_ref(),
-                        |opaque| {
-                            if opaque { work.flush() } else { work.step() }
-                        },
-                    ) {
-                        Ok(()) => {}
-                        Err(source) => return Err(source.into_kernel()),
-                    }
-                    work.flush()?;
-                    let zipped = arrow_select::zip::zip(
-                        &mask,
-                        &selected_defaults.as_ref(),
-                        &copied.as_ref(),
-                    );
-                    work.flush()?;
-                    zipped.map_err(|_| internal("window offset default Arrow zip failed"))?
-                } else {
                     copied
+                } else {
+                    let mut indices = reserve::<Option<u64>>(selection.len(), &mut work)?;
+                    for row in selection.iter() {
+                        indices.push(self.addresses[row]);
+                        work.step()?;
+                    }
+                    copy_plan(&self.source, &indices, &mut work)?;
+                    work.flush()?;
+                    let indices = UInt64Array::from(indices);
+                    work.flush()?;
+                    let copied = arrow_select::take::take(self.source.as_ref(), &indices, None);
+                    work.flush()?;
+                    copied.map_err(|_| internal("window offset Arrow take failed"))?
                 };
                 SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
-                    self.prepared.contract.result_type().data_type(),
+                    result_type,
                     copied,
                     Box::default(),
                     || work.step(),
                 )
             })();
-            if result.as_ref().is_err_and(KernelFailure::is_interruption) {
-                return result;
+            if self.default.is_some() {
+                work.finish_result(result)
+            } else {
+                if result.as_ref().is_err_and(KernelFailure::is_interruption) {
+                    return result;
+                }
+                work.finish()?;
+                result
             }
-            work.finish()?;
-            result
         })();
         let result = observation.finish(result);
         if result.is_err() {

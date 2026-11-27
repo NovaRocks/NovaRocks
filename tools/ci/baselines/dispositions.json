@@ -12,16 +12,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_approx_top_k",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.aggregate/approx_top_k/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_array_agg",
       "failure": {
         "class": "error_code",
@@ -49,16 +39,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_array_agg_over_window",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.aggregate/array_agg/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -852,16 +832,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:decimal/test_decimal256_window_functions",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 5, substatement 1/1, sha256=f9d290e625ddc02f178d965206a16f5a206b0391499d79cec554f0a7de5677c7: builtin.window/lag/(any<T>,i64,any<D>)->any<T>;strict;legacy: three-argument Decimal result/default outside installed nullable numeric/Utf8 default profile. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B9 implements builtin.window/lag/(any<T>,i64,any<D>)->any<T>;strict;legacy: three-argument Decimal result/default outside installed nullable numeric/Utf8 default profile; the original entire decimal/test_decimal256_window_functions native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
-      "owner": "B9 aggregate/window/table-function remainder capability",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:mv-rewrite/mv_rewrite_count_rollup_empty",
       "failure": {
         "class": "error_code",
@@ -959,46 +929,6 @@
       },
       "reason": "The original case reaches statement 8 and the frozen selected overload builtin.aggregate/sum_state/derived-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
       "owner": "UEA-5E B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_lead_lag_col_default",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 8 and the frozen selected overload builtin.window/lag/(any<T>,i64,any<D>)->any<T>;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B9",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_lead_lag_multi_type",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 11 and the frozen selected overload builtin.window/lead/(any<T>,i64,any<D>)->any<T>;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B9",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_leadlag_window_function",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.window/lead/(any<T>,i64,any<D>)->any<T>;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B9",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_removable_cumulative_process",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 33 and the frozen selected overload builtin.aggregate/min/derived-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B9",
       "expires": "2026-12-15"
     },
     {

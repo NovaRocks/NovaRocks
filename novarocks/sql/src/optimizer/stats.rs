@@ -4394,7 +4394,13 @@ mod tests {
             .expect("installed comparison for exact fixture arguments");
         crate::common::binary_operator::typed_call(
             operator,
-            crate::binding::SqlFunctionBinding::new(binding, DecimalOverflowPolicy::OutputNull),
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
+                binding,
+                DecimalOverflowPolicy::OutputNull,
+            ),
             vec![left, right],
         )
     }

@@ -3039,7 +3039,7 @@ _col0	_col1	_col2	_col3
 25308.00000	4.10844155844	1.00000	2222.00000
 
 -- query 610
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 25303.00000	4.10429845904	-1.00000	2222.00000
 
@@ -3054,7 +3054,7 @@ _col0	_col1	_col2	_col3
 40475.00000	3.28610863035	1.00000	2222.00000
 
 -- query 613
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 40048.00000	3.25064935065	-1.00000	2222.00000
 
@@ -3069,7 +3069,7 @@ _col0	_col1	_col2	_col3
 25308.00000	4.10844155844	1.00000	2222.00000
 
 -- query 616
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 25079.00000	4.05612162381	-1.00000	2222.00000
 
@@ -3084,7 +3084,7 @@ _col0	_col1	_col2	_col3
 39849.00000	3.23843965868	1.00000	2222.00000
 
 -- query 619
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 38774.00000	3.14724025974	-1.00000	2222.00000
 
@@ -3099,7 +3099,7 @@ _col0	_col1	_col2	_col3
 196239.00000	15.93236989527	1.00000	8888.00000
 
 -- query 622
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 196196.00000	15.92500000000	-1.00000	8888.00000
 
@@ -3114,7 +3114,7 @@ _col0	_col1	_col2	_col3
 196239.00000	15.93236989527	1.00000	8888.00000
 
 -- query 625
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 196196.00000	15.92500000000	-1.00000	8888.00000
 
@@ -3129,7 +3129,7 @@ _col0	_col1	_col2	_col3
 195545.00000	15.89150751727	1.00000	8888.00000
 
 -- query 628
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 195020.00000	15.82954545455	-1.00000	8888.00000
 
@@ -3144,7 +3144,7 @@ _col0	_col1	_col2	_col3
 195545.00000	15.89150751727	1.00000	8888.00000
 
 -- query 631
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 195020.00000	15.82954545455	-1.00000	8888.00000
 
@@ -3159,7 +3159,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 634
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -5.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3174,7 +3174,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 637
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -12320.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3189,7 +3189,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 640
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -25.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3204,7 +3204,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 643
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -12320.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3219,7 +3219,7 @@ _col0	_col1	_col2	_col3
 24997.00000	4.05993178496	1.00000	2222.00000
 
 -- query 646
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 24889.00000	4.03976627171	-1.00000	2222.00000
 
@@ -3234,7 +3234,7 @@ _col0	_col1	_col2	_col3
 2512101.00000	244.72489040429	1.00000	2222.00000
 
 -- query 649
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 35071.00000	2.84667207792	-1.00000	2222.00000
 
@@ -3249,7 +3249,7 @@ _col0	_col1	_col2	_col3
 18814.00000	3.06167615948	1.00000	1111.00000
 
 -- query 652
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 17357.00000	2.81678026615	-1.00000	4.00000
 
@@ -3264,7 +3264,7 @@ _col0	_col1	_col2	_col3
 18814.00000	3.06167615948	1.00000	1111.00000
 
 -- query 655
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 11199.00000	0.90900974026	-1.00000	4.00000
 
@@ -3279,7 +3279,7 @@ _col0	_col1	_col2	_col3
 195959.00000	15.90963708695	1.00000	8888.00000
 
 -- query 658
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 195729.00000	15.88709415584	-1.00000	8888.00000
 
@@ -3294,7 +3294,7 @@ _col0	_col1	_col2	_col3
 195959.00000	15.90963708695	1.00000	8888.00000
 
 -- query 661
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 195729.00000	15.88709415584	-1.00000	8888.00000
 
@@ -3309,7 +3309,7 @@ _col0	_col1	_col2	_col3
 180800.00000	14.69321414059	1.00000	8888.00000
 
 -- query 664
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 179057.00000	14.53384740260	-1.00000	8888.00000
 
@@ -3324,7 +3324,7 @@ _col0	_col1	_col2	_col3
 180800.00000	14.69321414059	1.00000	8888.00000
 
 -- query 667
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 179057.00000	14.53384740260	-1.00000	8888.00000
 
@@ -3339,7 +3339,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 670
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -5.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3354,7 +3354,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 673
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -12320.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3369,7 +3369,7 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 676
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -25.00000	-1.00000000000	-1.00000	-1.00000
 
@@ -3384,6 +3384,6 @@ _col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 679
--- legacy
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 _col0	_col1	_col2	_col3
 -12320.00000	-1.00000000000	-1.00000	-1.00000

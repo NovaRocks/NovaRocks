@@ -75,6 +75,7 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- @result_contains=SCAN ${case_db}.filter_two_phase
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -82,6 +83,7 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- query 8
 -- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -89,8 +91,9 @@ FROM ${case_db}.filter_two_phase GROUP BY g;
 -- query 9
 -- @explain_contains=HASH AGGREGATE (SINGLE,
 -- @explain_not_contains=HASH AGGREGATE (LOCAL,
-WITH SESSION disable_optimizer_rules = 'SplitAggregateRule'
+WITH SESSION disable_optimizer_rules = 'SplitAggregateRule', pipeline_dop = 1
 SELECT g, approx_distinct(x) FILTER (WHERE keep_row) AS kept,
+       approx_distinct(x, 2.3E-2) FILTER (WHERE keep_row) AS explicit_kept,
        approx_distinct(x % 2 = 0) FILTER (WHERE keep_row) AS kept_boolean,
        approx_distinct(x) FILTER (WHERE false) AS empty_count
 FROM ${case_db}.filter_two_phase GROUP BY g;
@@ -102,6 +105,55 @@ SELECT g, count(DISTINCT x) FILTER (WHERE keep_row) AS kept,
 FROM ${case_db}.filter_two_phase GROUP BY g;
 
 -- query 11
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (LOCAL,
+SELECT g, approx_distinct(x, IF(keep_row, DOUBLE '0.023', DOUBLE '-1'))
+           FILTER (WHERE keep_row) AS dynamic_kept
+FROM ${case_db}.filter_two_phase GROUP BY g;
+
+-- query 12
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.filter_two_phase;
+
+-- query 13
+-- @skip_result_check=true
+CREATE TABLE ${case_db}.approx_distinct_vectors (
+    part_id INTEGER, g INTEGER, x BIGINT
+) WITH (format_version = 3, partitioning = ARRAY['part_id']);
+INSERT INTO ${case_db}.approx_distinct_vectors
+SELECT CAST((x - 1) % 6 AS INTEGER), 7, x
+FROM TABLE(sequence(1, 8192)) AS vector(x);
+
+-- query 14
+-- @explain_contains=HASH AGGREGATE (LOCAL,
+-- @explain_contains=HASH AGGREGATE (GLOBAL,
+-- @be_log_be_count_at_least=NOVAROCKS_CONNECTOR_SCAN_FIRST_CHUNK,2
+SELECT g, approx_distinct(IF(x <= 4, x), 2.6E-1) AS crossing_low,
+       approx_distinct(IF(x <= 251, x)) AS sparse_default,
+       approx_distinct(IF(x <= 252, x)) AS crossing_default,
+       approx_distinct(IF(x <= 252, x), 2.3E-2) AS crossing_explicit,
+       approx_distinct(IF(x <= 8191, x), 4.0625E-3) AS sparse_high,
+       approx_distinct(x, 2.6E-1) AS dense_low,
+       approx_distinct(x) AS dense_default,
+       approx_distinct(x, 4.0625E-3) AS crossing_high
+FROM ${case_db}.approx_distinct_vectors GROUP BY g;
+
+-- query 15
+-- @explain_contains=HASH AGGREGATE (SINGLE,
+-- @explain_not_contains=HASH AGGREGATE (LOCAL,
+WITH SESSION disable_optimizer_rules = 'SplitAggregateRule', pipeline_dop = 1
+SELECT g, approx_distinct(IF(x <= 4, x), 2.6E-1) AS crossing_low,
+       approx_distinct(IF(x <= 251, x)) AS sparse_default,
+       approx_distinct(IF(x <= 252, x)) AS crossing_default,
+       approx_distinct(IF(x <= 252, x), 2.3E-2) AS crossing_explicit,
+       approx_distinct(IF(x <= 8191, x), 4.0625E-3) AS sparse_high,
+       approx_distinct(x, 2.6E-1) AS dense_low,
+       approx_distinct(x) AS dense_default,
+       approx_distinct(x, 4.0625E-3) AS crossing_high
+FROM ${case_db}.approx_distinct_vectors GROUP BY g;
+
+-- query 16
+-- @cleanup=true
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.approx_distinct_vectors;

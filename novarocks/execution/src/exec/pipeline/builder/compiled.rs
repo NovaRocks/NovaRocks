@@ -1095,10 +1095,11 @@ fn build_node(
         ProgramNodeKind::Analytic { input, .. } => {
             // M1 evaluates every partition on one driver: the instance input
             // is gathered, in the order its sorted source emits it.
-            let factory = CompiledWindowProcessorFactory::try_new(
+            let factory = CompiledWindowProcessorFactory::try_new_with_output_batch_rows(
                 Arc::clone(program),
                 id,
                 Arc::clone(error),
+                ctx.output_batch_rows,
             )?;
             let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);

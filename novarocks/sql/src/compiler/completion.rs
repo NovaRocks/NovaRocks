@@ -3907,6 +3907,14 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
                 table_identity_bytes(&table.catalog.identity),
                 Ok(catalog_columns),
                 Ok(planner),
+                table.derived_view.as_deref().map_or(Ok(0), |view| {
+                    checked_sum([
+                        arc_slice_bytes::<crate::catalog::SqlDerivedView>(1),
+                        table_identity_bytes(&view.identity),
+                        arc_slice_bytes::<u8>(view.raw_sql.len()),
+                        view_columns_bytes(&view.columns),
+                    ])
+                }),
             ])?
         }
     };
@@ -4002,8 +4010,16 @@ fn view_fact_bytes(view: &SqlViewDefinition) -> Result<u64, CompletionProtocolEr
         arc_slice_bytes::<u8>(view.raw_sql.len()),
         arc_slice_bytes::<u8>(view.default_catalog.len()),
         arc_slice_bytes::<u8>(view.default_database.len()),
-        arc_slice_bytes::<crate::catalog::SqlViewColumn>(view.columns.len()),
-        checked_sum(view.columns.iter().map(|column| {
+        view_columns_bytes(&view.columns),
+    ])
+}
+
+fn view_columns_bytes(
+    columns: &[crate::catalog::SqlViewColumn],
+) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        arc_slice_bytes::<crate::catalog::SqlViewColumn>(columns.len()),
+        checked_sum(columns.iter().map(|column| {
             checked_sum([
                 arc_slice_bytes::<u8>(column.name.len()),
                 function_value_type_bytes(&column.value_type),
@@ -4673,6 +4689,38 @@ mod tests {
                 )),
             },
         )
+    }
+
+    #[test]
+    fn iceberg_metadata_derived_view_retention_is_charged_to_its_resolved_fact() {
+        let kind = MetadataTableKind::Files;
+        let need = catalog_need(1, CatalogLookupTarget::IcebergMetadata { kind });
+        let table = resolved_catalog_table(SqlScanKind::Metadata {
+            kind,
+            version: SqlTableVersionSelector::Current,
+        });
+        let bare = CatalogRelationFact::resolved(&need, table.clone()).unwrap();
+        let raw: Arc<str> =
+            r#"SELECT count(*) AS file_count FROM "iceberg"."db"."orders$files""#.into();
+        let projected = crate::planning::catalog::bind_derived_metadata_view(
+            table,
+            SqlTableBindingId::new_for_test(1),
+            "orders$partitions",
+            raw.clone(),
+            Arc::from([crate::catalog::SqlViewColumn {
+                name: "file_count".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            }]),
+        )
+        .unwrap();
+        let projected = CatalogRelationFact::resolved(&need, projected).unwrap();
+        assert!(
+            catalog_fact_bytes(&projected).unwrap()
+                >= catalog_fact_bytes(&bare).unwrap() + raw.len() as u64
+        );
     }
 
     fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {

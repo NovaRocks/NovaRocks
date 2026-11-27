@@ -732,14 +732,6 @@ fn refusal(result: Result<Arc<dyn PreparedWindowKernel>, FunctionSpecializationF
 #[test]
 fn unsupported_aggregate_over_shapes_are_refused_by_name() {
     let control = CompileControl::default();
-    let text: ArrayRef = Arc::new(StringArray::from(vec![Some("b"), None]));
-    for name in ["min", "max"] {
-        let fixture = Fixture::new(name, nullable(&text), DecimalOverflowPolicy::ReportError);
-        assert_eq!(
-            refusal(fixture.try_window(None, false, false, &control)),
-            "MIN/MAX OVER a UTF-8 value has no inline window state"
-        );
-    }
     let values = int64s(&[Some(1)]);
     let sum = Fixture::new("sum", nullable(&values), DecimalOverflowPolicy::ReportError);
     assert_eq!(
@@ -852,13 +844,22 @@ fn every_window_lifecycle_callback_keeps_the_original_cause_and_poisons_the_part
                     partition.evaluate(selected, 2, &baseline).unwrap();
                 }
                 2 => {
-                    assert!(partition.evaluate(selected, 1, &baseline).is_err());
+                    assert_eq!(
+                        partition.evaluate(selected, 1, &baseline).unwrap_err(),
+                        invalid("window output Selection exceeds host row grant")
+                    );
                 }
                 _ => partition.finish(&baseline).unwrap(),
             }
         }
         let trace = baseline.trace.lock().unwrap().clone();
-        assert!(trace.len() >= 2);
+        if stage == 2 {
+            // The invalid row grant is decided at entry before the leaf or
+            // any optional completion checks run.
+            assert_eq!(trace, [0]);
+        } else {
+            assert!(trace.len() >= 2);
+        }
         for at in 0..trace.len() {
             for cause in causes() {
                 let control = Control {
@@ -916,7 +917,7 @@ fn admit_extrema_profile(
 }
 
 #[test]
-fn extrema_static_utf8_refusal_is_only_for_the_aggregate_window_lifecycle() {
+fn extrema_static_utf8_supports_plain_window_without_modifiers() {
     for name in ["min", "max"] {
         let text = Fixture::new(
             name,
@@ -930,11 +931,25 @@ fn extrema_static_utf8_refusal_is_only_for_the_aggregate_window_lifecycle() {
         )
         .unwrap();
         let _original_group_aggregate = text.aggregate();
-        assert!(
-            matches!(admit_extrema_profile(&text,PureCallLifecycle::AggregateWindow,
-            &CompileControl::default()),Err(FunctionBindingError::UnavailableImplementation(overload))
-            if overload==text.selected.overload)
-        );
+        admit_extrema_profile(
+            &text,
+            PureCallLifecycle::AggregateWindow {
+                distinct: false,
+                ordered: false,
+            },
+            &CompileControl::default(),
+        )
+        .unwrap();
+        assert!(text.window().supports_owned_partition());
+        assert!(matches!(
+            admit_extrema_profile(
+                &text,
+                PureCallLifecycle::AggregateWindow { distinct: true, ordered: false },
+                &CompileControl::default(),
+            ),
+            Err(FunctionBindingError::UnavailableImplementation(overload))
+                if overload == text.selected.overload
+        ));
         let fixed = Fixture::new(
             name,
             FunctionValueType::new(DataType::Int64, true),
@@ -942,7 +957,10 @@ fn extrema_static_utf8_refusal_is_only_for_the_aggregate_window_lifecycle() {
         );
         admit_extrema_profile(
             &fixed,
-            PureCallLifecycle::AggregateWindow,
+            PureCallLifecycle::AggregateWindow {
+                distinct: false,
+                ordered: false,
+            },
             &CompileControl::default(),
         )
         .unwrap();
@@ -953,17 +971,22 @@ fn extrema_static_utf8_refusal_is_only_for_the_aggregate_window_lifecycle() {
 }
 
 #[test]
-fn extrema_static_window_refusal_preserves_all_original_control_causes() {
+fn extrema_static_window_admission_preserves_all_original_control_causes() {
     let fixture = Fixture::new(
         "min",
         FunctionValueType::new(DataType::Utf8, true),
         DecimalOverflowPolicy::ReportError,
     );
     let baseline = CompileControl::default();
-    assert!(matches!(
-        admit_extrema_profile(&fixture, PureCallLifecycle::AggregateWindow, &baseline),
-        Err(FunctionBindingError::UnavailableImplementation(_))
-    ));
+    admit_extrema_profile(
+        &fixture,
+        PureCallLifecycle::AggregateWindow {
+            distinct: false,
+            ordered: false,
+        },
+        &baseline,
+    )
+    .unwrap();
     let trace = baseline.trace.lock().unwrap().clone();
     for stop in 0..trace.len() {
         for cause in [
@@ -976,10 +999,425 @@ fn extrema_static_window_refusal_preserves_all_original_control_causes() {
                 refusal: Some((stop, cause.clone())),
             };
             assert!(
-                matches!(admit_extrema_profile(&fixture,PureCallLifecycle::AggregateWindow,&control),
+                matches!(admit_extrema_profile(&fixture,PureCallLifecycle::AggregateWindow { distinct: false, ordered: false },&control),
                 Err(FunctionBindingError::Control(actual)) if actual==cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
         }
     }
+}
+
+#[derive(Default)]
+struct TrackedHost {
+    typed: std::sync::atomic::AtomicUsize,
+    opaque: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+impl TrackedHost {
+    fn live(&self) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.typed.load(SeqCst) + self.opaque.load(SeqCst)
+    }
+    fn admit(&self) -> Result<(), KernelFailure> {
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(KernelFailure::ResourceExhausted)
+        } else {
+            Ok(())
+        }
+    }
+}
+impl AggregateStateAllocator for TrackedHost {
+    fn allocate(&self, layout: Layout) -> Result<std::ptr::NonNull<u8>, KernelFailure> {
+        self.admit()?;
+        let block = UnaccountedAggregateStateAllocator.allocate(layout)?;
+        self.typed
+            .fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst);
+        Ok(block)
+    }
+    unsafe fn release(&self, block: std::ptr::NonNull<u8>, layout: Layout) {
+        // SAFETY: this is the original exact block and layout from allocate.
+        unsafe { UnaccountedAggregateStateAllocator.release(block, layout) };
+        assert!(
+            self.typed
+                .fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst)
+                >= layout.size()
+        );
+    }
+    fn opaque_allocation_host(&self) -> Option<&dyn crate::opaque_memory::OpaqueAllocationHost> {
+        Some(self)
+    }
+}
+impl crate::opaque_memory::OpaqueAllocationHost for TrackedHost {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        self.admit()?;
+        self.opaque
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn release_opaque(&self, bytes: usize) {
+        assert!(
+            self.opaque
+                .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst)
+                >= bytes
+        );
+    }
+}
+
+fn tracked_window(
+    name: &str,
+    logical: &[EvaluatedArgument<'_>],
+    order: &[EvaluatedArgument<'_>],
+    distinct: bool,
+) -> Arc<dyn PreparedWindowKernel> {
+    let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let control = CompileControl::default();
+    let arguments: Vec<_> = logical
+        .iter()
+        .chain(order)
+        .map(|arg| FunctionArgument::Value {
+            value_type: nullable(arg.array()),
+            constant: None,
+        })
+        .collect();
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: logical.len(),
+        expected_result_type: None,
+    };
+    let bound = catalog
+        .resolve_bound_user(name, FunctionKind::Aggregate, request, &control)
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let uses = (0..arguments.len())
+        .map(|ordinal| Some(ExpressionUseId::new(11 + ordinal as u32)))
+        .collect::<Vec<_>>();
+    let keys = vec![
+        AggregateOrderKey {
+            ascending: true,
+            nulls_first: true
+        };
+        order.len()
+    ];
+    let receipt = novarocks_type_contract::AggregateStateInterpretation {
+        distinct,
+        order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+            keys.iter()
+                .map(|key| novarocks_type_contract::AggregateStateOrderKey {
+                    ascending: key.ascending,
+                    nulls_first: key.nulls_first,
+                })
+                .collect(),
+        ),
+    };
+    let options = AggregatePreparationOptions {
+        distinct,
+        phase: AggregateKernelPhase::Single,
+        order_keys: keys.into(),
+        state_input_type: None,
+        state_interpretation: Some(Arc::new(receipt)),
+    };
+    let context = context();
+    let prepared = catalog
+        .prepare_fresh_selected(
+            CallEffectInput {
+                function_id: &bound.function_id,
+                kind: FunctionKind::Aggregate,
+                selected: &selected,
+                request,
+                argument_uses: CallArgumentUses::SelectedChannels(&uses),
+                context: context.into(),
+                parameters: &SemanticParameters::try_new([]).unwrap(),
+                environment: &[],
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                proof_scope: CallProofScope::Relation(context.identity),
+            },
+            Arc::clone(&selected),
+            PureCallPreparation::AggregateWindow {
+                arguments: ScopedRelationalEffects::pure_value(context),
+                options: AggregateWindowPreparationOptions {
+                    aggregate: options,
+                    window: WindowCallOptions::try_new(None, false, &control).unwrap(),
+                },
+            },
+            &control,
+        )
+        .unwrap();
+    let PreparedPureKernel::Window(kernel) = prepared.into_prepared() else {
+        panic!("prepared aggregate window");
+    };
+    kernel
+}
+
+fn begin_tracked(
+    kernel: Arc<dyn PreparedWindowKernel>,
+    logical: &[EvaluatedArgument<'_>],
+    order: &[EvaluatedArgument<'_>],
+    frames: &[WindowRowRange],
+    host: Arc<TrackedHost>,
+) -> Result<Box<dyn WindowKernelPartition>, WindowEvaluationFailure> {
+    let contract = Arc::clone(kernel.contract());
+    let control = Control::default();
+    let full =
+        FullPartitionWindowInput::try_new(&contract, frames.len(), logical, order, &control)?;
+    let peers = whole(frames.len());
+    let input = WindowPartitionInput::try_new(full, &peers, frames, &control)?;
+    kernel.begin_owned_partition_evaluated(
+        input,
+        WindowInvocationContext::partition(0, 0),
+        host,
+        &control,
+    )
+}
+
+#[test]
+fn tracked_array_distinct_keeps_original_float_representatives_across_frames() {
+    use arrow_array::ListArray;
+    use std::sync::atomic::Ordering::SeqCst;
+    let nan_a = 0x7ff8_0000_0000_0001;
+    let nan_b = 0xfff8_0000_0000_0010;
+    let source: ArrayRef = Arc::new(Float64Array::from(vec![
+        0.0,
+        -0.0,
+        f64::from_bits(nan_a),
+        f64::from_bits(nan_b),
+    ]));
+    let logical = [EvaluatedArgument::Column(&source)];
+    let frames = ranges(&[(0, 2), (0, 4), (0, 4), (1, 4)]);
+    let kernel = tracked_window("array_agg", &logical, &[], true);
+    let host = Arc::new(TrackedHost::default());
+    let mut partition = begin_tracked(kernel, &logical, &[], &frames, Arc::clone(&host)).unwrap();
+    let control = Control::default();
+    let first = partition
+        .evaluate(Selection::try_sparse(4, &[0, 1]).unwrap(), 2, &control)
+        .unwrap();
+    let next = partition
+        .evaluate(Selection::try_sparse(4, &[2, 3]).unwrap(), 2, &control)
+        .unwrap();
+    let bits = |values: &ArrayRef, row| {
+        let array = values.as_any().downcast_ref::<ListArray>().unwrap();
+        array
+            .value(row)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bits(first.values(), 0), [0]);
+    assert_eq!(bits(first.values(), 1), [0, nan_a]);
+    assert_eq!(bits(next.values(), 0), [0, nan_a]);
+    assert_eq!(bits(next.values(), 1), [(-0.0f64).to_bits(), nan_a]);
+    host.refuse.store(true, SeqCst);
+    assert_eq!(
+        partition
+            .evaluate(Selection::all(4), 4, &control)
+            .unwrap_err(),
+        KernelFailure::ResourceExhausted
+    );
+    drop(partition);
+    let alias = Arc::clone(first.values());
+    drop(first);
+    drop(next);
+    assert!(host.live() > 0);
+    drop(alias);
+    assert_eq!(host.live(), 0);
+}
+
+#[test]
+fn tracked_listagg_late_required_errors_precede_all_output_demand() {
+    let value: ArrayRef = Arc::new(StringArray::from(vec![
+        "early".to_owned(),
+        "a".repeat(1_048_577),
+    ]));
+    let separator: ArrayRef = Arc::new(StringArray::from(vec!["|"]));
+    let overflow: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+    let filler: ArrayRef = Arc::new(StringArray::from(vec!["..."]));
+    let show_count: ArrayRef = Arc::new(BooleanArray::from(vec![false]));
+    let logical = [
+        EvaluatedArgument::Column(&value),
+        EvaluatedArgument::Scalar(&separator),
+        EvaluatedArgument::Scalar(&overflow),
+        EvaluatedArgument::Scalar(&filler),
+        EvaluatedArgument::Scalar(&show_count),
+    ];
+    let frames = ranges(&[(0, 1), (0, 2)]);
+    let host = Arc::new(TrackedHost::default());
+    let result = begin_tracked(
+        tracked_window("listagg", &logical, &[], false),
+        &logical,
+        &[],
+        &frames,
+        Arc::clone(&host),
+    );
+    let error = result.err().expect("late frame must fail at begin");
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert!(matches!(
+        error,
+        WindowEvaluationFailure::Kernel(ref failure)
+            if failure.failure_fact().class() == FailureClass::Data
+    ));
+    assert_eq!(host.live(), 0);
+}
+
+#[test]
+fn tracked_array_distinct_retains_map_entry_order_until_first_representation_leaves() {
+    use arrow_array::{
+        ListArray, MapArray,
+        builder::{Int64Builder, MapBuilder, StringBuilder},
+    };
+    let mut values = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+    for row in [
+        [("a", 1), ("b", 2)],
+        [("b", 2), ("a", 1)],
+        [("a", 1), ("b", 2)],
+    ] {
+        for (key, value) in row {
+            values.keys().append_value(key);
+            values.values().append_value(value);
+        }
+        values.append(true).unwrap();
+    }
+    let source: ArrayRef = Arc::new(values.finish());
+    let logical = [EvaluatedArgument::Column(&source)];
+    let frames = ranges(&[(0, 0), (0, 2), (1, 3)]);
+    let kernel = tracked_window("array_agg", &logical, &[], true);
+    let host = Arc::new(TrackedHost::default());
+    let mut partition = begin_tracked(kernel, &logical, &[], &frames, Arc::clone(&host)).unwrap();
+    let control = Control::default();
+    let array = partition.evaluate(Selection::all(3), 3, &control).unwrap();
+    let result = array.values().as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(result.is_null(0));
+    for (row, expected) in [(1, ["a", "b"]), (2, ["b", "a"])] {
+        let child = result.value(row);
+        let map = child.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.len(), 1);
+        let entries = map.value(0);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!([keys.value(0), keys.value(1)], expected);
+    }
+    partition.finish(&control).unwrap();
+    drop(partition);
+    assert!(host.live() > 0);
+    drop(array);
+    assert_eq!(host.live(), 0);
+}
+
+#[test]
+fn tracked_array_real_keeps_original_quiet_nan_bits() {
+    use arrow_array::{Float32Array, ListArray};
+    let first = 0x7fc0_005a;
+    let second = 0xffc0_0123;
+    let values: ArrayRef = Arc::new(Float32Array::from(vec![
+        f32::from_bits(first),
+        f32::from_bits(second),
+    ]));
+    let logical = [EvaluatedArgument::Column(&values)];
+    let frames = ranges(&[(0, 2), (1, 2)]);
+    let kernel = tracked_window("array_agg", &logical, &[], true);
+    let host = Arc::new(TrackedHost::default());
+    let mut partition = begin_tracked(kernel, &logical, &[], &frames, host).unwrap();
+    let control = Control::default();
+    let output = partition.evaluate(Selection::all(2), 2, &control).unwrap();
+    let result = output
+        .values()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for (index, expected) in [first, second].into_iter().enumerate() {
+        let child = result.value(index);
+        let actual = child.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual.value(0).to_bits(), expected);
+    }
+    partition.finish(&control).unwrap();
+}
+
+#[test]
+fn tracked_listagg_uses_original_order_and_measures_utf8_truncation() {
+    let value: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("über".to_owned()),
+        Some("b".repeat(1_048_576)),
+        None,
+    ]));
+    let key: ArrayRef = Arc::new(Int64Array::from(vec![0, 1, 2]));
+    let separator: ArrayRef = Arc::new(StringArray::from(vec!["|"]));
+    let overflow: ArrayRef = Arc::new(BooleanArray::from(vec![false]));
+    let filler: ArrayRef = Arc::new(StringArray::from(vec!["…"]));
+    let show_count: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+    let logical = [
+        EvaluatedArgument::Column(&value),
+        EvaluatedArgument::Scalar(&separator),
+        EvaluatedArgument::Scalar(&overflow),
+        EvaluatedArgument::Scalar(&filler),
+        EvaluatedArgument::Scalar(&show_count),
+    ];
+    let order = [EvaluatedArgument::Column(&key)];
+    let frames = ranges(&[(0, 0), (0, 1), (0, 3)]);
+    let kernel = tracked_window("listagg", &logical, &order, false);
+    let host = Arc::new(TrackedHost::default());
+    let mut partition =
+        begin_tracked(kernel, &logical, &order, &frames, Arc::clone(&host)).unwrap();
+    let control = Control::default();
+    let output = partition.evaluate(Selection::all(3), 3, &control).unwrap();
+    let result = output
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        result.iter().collect::<Vec<_>>(),
+        [None, Some("über"), Some("über|…(1)")]
+    );
+    partition.finish(&control).unwrap();
+    drop(partition);
+    assert!(host.live() > 0);
+    drop(output);
+    assert_eq!(host.live(), 0);
+}
+
+#[test]
+fn tracked_array_rejects_one_unrepresentable_nested_list_during_setup() {
+    use arrow_array::{ListArray, NullArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+
+    // One physical nullable-child list is valid and small. Broadcasting that
+    // same original row makes one frame's nested List32 child span too large.
+    let width = 32_768usize;
+    let count = i32::MAX as usize / width + 1;
+    let value: ArrayRef = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Null, true)),
+            OffsetBuffer::new(vec![0, width as i32].into()),
+            Arc::new(NullArray::new(width)),
+            None,
+        )
+        .unwrap(),
+    );
+    let arguments = [EvaluatedArgument::Scalar(&value)];
+    let mut frames = vec![WindowRowRange { start: 0, end: 1 }; count];
+    frames[count - 1].end = count;
+    let kernel = tracked_window("array_agg", &arguments, &[], false);
+    let expected = crate::control_values::window_i32_offset_failure(
+        kernel.contract().result_type().data_type(),
+        1,
+        width * count,
+    );
+    let host = Arc::new(TrackedHost::default());
+    let failure = begin_tracked(kernel, &arguments, &[], &frames, Arc::clone(&host))
+        .err()
+        .expect("setup must reject the late unsplittable result before selection exists");
+    let WindowEvaluationFailure::Kernel(actual) = failure else {
+        panic!("original typed copy-layout failure")
+    };
+    assert_eq!(actual.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(actual.failure_fact(), expected.failure_fact());
+    assert_eq!(host.live(), 0);
 }

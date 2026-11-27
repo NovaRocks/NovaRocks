@@ -440,7 +440,7 @@ impl ScalarArena {
     }
 }
 
-pub(crate) fn resolve_function_binding(
+pub(in crate::optimizer) fn resolve_function_binding(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &ScalarArena,
     name: &str,
@@ -455,7 +455,15 @@ pub(crate) fn resolve_function_binding(
         .collect::<Result<Vec<_>, _>>()?;
     catalog
         .resolve_scalar_binding(name, &arguments, control)
-        .map(|resolved| crate::binding::SqlFunctionBinding::new(resolved, policy))
+        .map(|resolved| {
+            crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
+                resolved,
+                policy,
+            )
+        })
         .map_err(crate::compiler::SqlCompileError::from)
 }
 
@@ -500,7 +508,7 @@ pub(crate) fn function_argument(
     })
 }
 
-pub(crate) fn resolve_aggregate_binding(
+pub(in crate::optimizer) fn resolve_aggregate_binding(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &ScalarArena,
     name: &str,
@@ -523,7 +531,11 @@ pub(crate) fn resolve_aggregate_binding(
         catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
     }
     .map_err(crate::compiler::SqlCompileError::from)?;
-    Ok(crate::binding::SqlFunctionBinding::new(exact, policy))
+    Ok(crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
+        exact,
+        policy,
+    ))
 }
 
 #[cfg(test)]
@@ -563,7 +575,8 @@ pub(crate) fn test_function_binding(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     );
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
         ResolvedFunctionBinding {
             declared_scalar_invocation_data: false,
             admitted_execution_abi: None,
@@ -620,7 +633,8 @@ pub(crate) fn test_window_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
         binding,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )
@@ -655,7 +669,8 @@ pub(crate) fn test_table_binding(
         FunctionResultType::Relation(novarocks_type_contract::TypedFactSlice::from_pure_boxed(
             result_columns.to_vec().into_boxed_slice(),
         ));
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_plan(
+        crate::optimizer::BINDING_AUTHORITY,
         binding,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )

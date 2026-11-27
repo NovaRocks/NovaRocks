@@ -1211,6 +1211,7 @@ pub enum SqlExpressionCallKind {
 }
 #[derive(Debug)]
 pub(super) struct LoweredWindowSourceEntry {
+    pub(super) lifecycle: novarocks_functions::PureCallLifecycle,
     pub(super) canonical_operational: Arc<CanonicalCallOperationalRequest>,
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) arguments: Box<[ExprId]>,

@@ -29,7 +29,7 @@ use novarocks_value_arrays::decode::PreparedTemporalArray;
 
 use super::{
     binding_control,
-    date_field::Field,
+    date_field::{Field, IntervalExtraction},
     date_pattern,
     date_shift::{ShiftError, Unit, add, difference, last_day, truncate},
     temporal_output::TemporalOutputBuilder,
@@ -58,6 +58,8 @@ const FAMILIES: [&str; 5] = [
     "timestamp",
     "timestamp_with_time_zone",
 ];
+const INTERVAL_YEAR_MONTH: &str = "interval_year_month";
+const INTERVAL_DAY_TIME: &str = "interval_day_time";
 const INVALID_SELECTION: &str = "Calendar call differs from its selected argument or result type";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,8 +115,8 @@ impl CalendarFunction {
         }
     }
 
-    fn overloads(self) -> &'static [&'static str] {
-        match self {
+    fn overloads(self) -> impl Iterator<Item = &'static str> {
+        let families: &'static [&'static str] = match self {
             Self::Field(_, Field::Hour | Field::Minute | Field::Second) => &FAMILIES[1..],
             Self::Field(_, Field::TimeZoneHour | Field::TimeZoneMinute) => {
                 &["time_with_time_zone", "timestamp_with_time_zone"]
@@ -124,14 +126,15 @@ impl CalendarFunction {
             Self::Format => &["timestamp", "timestamp_with_time_zone"],
             Self::Parse => &["varchar"],
             _ => &FAMILIES,
-        }
+        };
+        families.iter().copied().chain(self.interval_family())
     }
 
-    fn declared_only(self) -> Option<&'static str> {
+    fn interval_family(self) -> Option<&'static str> {
         match self {
-            Self::Field(_, Field::Year | Field::Month) => Some("interval_year_month"),
+            Self::Field(_, Field::Year | Field::Month) => Some(INTERVAL_YEAR_MONTH),
             Self::Field(_, Field::Day | Field::Hour | Field::Minute | Field::Second) => {
-                Some("interval_day_time")
+                Some(INTERVAL_DAY_TIME)
             }
             _ => None,
         }
@@ -140,16 +143,11 @@ impl CalendarFunction {
     fn family(self, value: &ValueKind) -> Result<&'static str, FunctionBindingError> {
         match value {
             ValueKind::Temporal(TemporalType::Interval(qualifier)) => {
-                let family = if qualifier.is_year_month() {
-                    "interval_year_month"
+                Ok(if qualifier.is_year_month() {
+                    INTERVAL_YEAR_MONTH
                 } else {
-                    "interval_day_time"
-                };
-                if self.declared_only() == Some(family) {
-                    Ok(family)
-                } else {
-                    Err(FunctionBindingError::NoMatchingOverload)
-                }
+                    INTERVAL_DAY_TIME
+                })
             }
             ValueKind::String | ValueKind::BoundedCharacter(_)
                 if matches!(self, Self::DateProjection | Self::Parse) =>
@@ -181,7 +179,6 @@ impl CalendarFunction {
 pub(crate) struct DateShiftResolver {
     operation: CalendarFunction,
     overloads: Vec<FunctionOverloadId>,
-    unavailable: Vec<FunctionOverloadId>,
 }
 
 fn family(kind: &ValueKind) -> Result<&'static str, FunctionBindingError> {
@@ -413,18 +410,10 @@ impl DateShiftResolver {
         let index = self
             .operation
             .overloads()
-            .iter()
-            .copied()
-            .chain(self.operation.declared_only())
             .position(|candidate| candidate == family)
             .ok_or(FunctionBindingError::NoMatchingOverload)?;
-        let overload = if index < self.overloads.len() {
-            &self.overloads[index]
-        } else {
-            &self.unavailable[index - self.overloads.len()]
-        };
         Ok(FunctionBindingSelection {
-            overload: overload.clone(),
+            overload: self.overloads[index].clone(),
             argument_types: arguments
                 .into_iter()
                 .map(FunctionArgumentType::Value)
@@ -446,11 +435,6 @@ impl DateShiftResolver {
             let selection = self.selection(request)?;
             if expected.is_some_and(|expected| *expected != selection.overload) {
                 return Err(FunctionBindingError::NoMatchingOverload);
-            }
-            if self.unavailable.contains(&selection.overload) {
-                return Err(FunctionBindingError::UnavailableImplementation(
-                    selection.overload,
-                ));
             }
             Ok(selection)
         })
@@ -484,11 +468,6 @@ impl FunctionBindingResolver for DateShiftResolver {
         binding_control::scope(control, |work| {
             binding_control::request_types(request, work)?;
             let exact = self.selection(request)?;
-            if self.unavailable.contains(&exact.overload) {
-                return Err(FunctionBindingError::UnavailableImplementation(
-                    exact.overload,
-                ));
-            }
             if selected != &exact
                 || !request
                     .arguments
@@ -516,15 +495,19 @@ pub(super) fn definition(
     let mut overloads = Vec::new();
     let mut declarations = Vec::new();
     let mut implementations = Vec::new();
+    let public = !name.starts_with("__extract_");
+    let mut display = Vec::new();
     for family in operation.overloads() {
         let id = FunctionOverloadId::try_new(format!("builtin.scalar/{name}/{family}/v1"))
             .map_err(|error| owner_error("calendar overload", &error))?;
-        let temporal = match *family {
+        let temporal = match family {
             "date" => "date",
             "varchar" => "varchar(x)",
             "time" => "time(p)",
             "time_with_time_zone" => "time(p) with time zone",
             "timestamp" => "timestamp(p)",
+            INTERVAL_YEAR_MONTH => "interval year-month(Q)",
+            INTERVAL_DAY_TIME => "interval day-time(Q)",
             _ => "timestamp(p) with time zone",
         };
         let (arguments, result) = match operation {
@@ -538,6 +521,21 @@ pub(super) fn definition(
             CalendarFunction::Format => (format!("{temporal},varchar(x)"), "varchar"),
             CalendarFunction::Parse => ("varchar(x),varchar(y)".to_owned(), "timestamp(3)"),
         };
+        if public {
+            let public_arguments = match family {
+                INTERVAL_YEAR_MONTH => "interval year to month".to_owned(),
+                INTERVAL_DAY_TIME => "interval day to second".to_owned(),
+                _ => arguments.replace(',', ", "),
+            };
+            display.push((
+                id.clone(),
+                vec![crate::FunctionPublicSignature::new(
+                    public_arguments,
+                    result,
+                    "",
+                )],
+            ));
+        }
         declarations.push(FunctionOverloadDeclaration::from_effects(
             id.clone(),
             arguments,
@@ -552,56 +550,19 @@ pub(super) fn definition(
         });
         overloads.push(id);
     }
-    let unavailable = operation
-        .declared_only()
-        .map(|family| {
-            let id = FunctionOverloadId::try_new(format!("builtin.scalar/{name}/{family}/v1"))
-                .map_err(|error| owner_error("calendar overload", &error))?;
-            declarations.push(FunctionOverloadDeclaration::from_effects(
-                id.clone(),
-                if family == "interval_year_month" {
-                    "interval year-month(Q)"
-                } else {
-                    "interval day-time(Q)"
-                },
-                "bigint",
-                None,
-                effects(),
-            ));
-            Ok(id)
-        })
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
     let function = FunctionId::try_new(format!("builtin.scalar/{name}/v1"))
         .map_err(|error| owner_error("calendar function", &error))?;
-    let public = !name.starts_with("__extract_");
-    let display = public.then(|| {
-        declarations
-            .iter()
-            .map(|overload| {
-                (
-                    overload.identity.clone(),
-                    vec![crate::FunctionPublicSignature::new(
-                        overload.argument_pattern.replace(',', ", "),
-                        overload.result_pattern.clone(),
-                        "",
-                    )],
-                )
-            })
-            .collect::<Vec<_>>()
-    });
     let declaration =
         FunctionBindingDeclaration::try_new_complete(function, FunctionKind::Scalar, declarations)
             .map_err(|error| owner_error("calendar declaration", &error))?;
-    let declaration = if let Some(display) = display {
+    let declaration = if public {
         declaration
             .with_public_signatures(display)
             .map_err(super::catalogue::public_signature_error)?
     } else {
         declaration
     };
-    FunctionDefinition::try_new_pure_scalar_with_declared_only(
+    FunctionDefinition::try_new_pure_scalar(
         name,
         if public {
             FunctionVisibility::Public
@@ -612,12 +573,10 @@ pub(super) fn definition(
             resolver: Arc::new(DateShiftResolver {
                 operation,
                 overloads,
-                unavailable: unavailable.clone(),
             }),
             declaration,
             implementations: implementations.into_boxed_slice(),
         }),
-        &unavailable,
     )
     .map_err(|error| owner_error("calendar implementation", &error))
 }
@@ -751,13 +710,28 @@ impl Owner {
                 "Calendar preparation differs from its selected call",
             ));
         }
+        let operation = self.resolver.operation;
+        let interval = match (operation, input.selected.argument_types.as_ref()) {
+            (CalendarFunction::Field(_, field), [FunctionArgumentType::Value(argument)]) => {
+                match argument.value_type().temporal() {
+                    Some(TemporalType::Interval(qualifier)) => {
+                        Some(IntervalExtraction::new(field, qualifier).map_err(|_| {
+                            invalid("Calendar field differs from its frozen interval")
+                        })?)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         Ok(Arc::new(Prepared {
-            operation: self.resolver.operation,
-            unit: if self.resolver.operation.uses_unit() {
+            operation,
+            unit: if operation.uses_unit() {
                 PreparedUnit::new(input.request, control)?
             } else {
                 PreparedUnit::Dynamic
             },
+            interval,
             contract,
         }))
     }
@@ -840,6 +814,7 @@ impl PureScalarImplementation for Owner {
 struct Prepared {
     operation: CalendarFunction,
     unit: PreparedUnit,
+    interval: Option<IntervalExtraction>,
     contract: Arc<ScalarCallContract>,
 }
 
@@ -856,6 +831,7 @@ impl PreparedScalarKernel for Prepared {
         Ok(Box::new(Instance {
             operation: self.operation,
             unit: self.unit,
+            interval: self.interval,
         }))
     }
 }
@@ -903,6 +879,7 @@ impl PreparedUnit {
 struct Instance {
     operation: CalendarFunction,
     unit: PreparedUnit,
+    interval: Option<IntervalExtraction>,
 }
 
 enum Source<'a> {
@@ -1116,7 +1093,7 @@ impl ScalarKernelInstance for Instance {
                 };
                 value
             } else {
-                let Some(stamp_value) = stamp.at(stamp_arg.value_row(ordinal, row))? else {
+                let Some(stamp_value) = stamp.at(source_row)? else {
                     output.null();
                     continue;
                 };
@@ -1157,9 +1134,13 @@ impl ScalarKernelInstance for Instance {
                         .and_then(|unit| truncate(unit, temporal, stamp_value)),
                     (None, None, None) => match self.operation {
                         CalendarFunction::LastDay => last_day(stamp_value).map(Value::Date),
-                        CalendarFunction::Field(_, field) => {
-                            field.evaluate(stamp_value).map(Value::Bigint)
-                        }
+                        CalendarFunction::Field(_, field) => self
+                            .interval
+                            .map_or_else(
+                                || field.evaluate(stamp_value),
+                                |interval| interval.evaluate(stamp_value),
+                            )
+                            .map(Value::Bigint),
                         _ => return Err(invalid("Calendar call expected its unit argument")),
                     },
                     _ => return Err(invalid("Unexpected calendar call operands")),

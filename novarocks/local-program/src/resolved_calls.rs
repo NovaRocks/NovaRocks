@@ -816,24 +816,59 @@ fn validate_window(
         return Err(ProgramResolvedCallsError::WrongWindow);
     }
     if let Some(aggregate) = contract.aggregate() {
+        let same_interpretation = match (
+            &source.state_interpretation,
+            aggregate.state_interpretation(),
+        ) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.matches_observed(right, || work.step())?,
+            _ => false,
+        };
+        if !same_interpretation {
+            return Err(ProgramResolvedCallsError::WrongOrder);
+        }
         match &source.kind {
             WindowFunctionKind::ArrayAgg {
                 is_distinct,
                 is_asc_order,
                 nulls_first,
             } => check_order(aggregate, is_asc_order, nulls_first, *is_distinct, work)?,
+            WindowFunctionKind::Prepared if source.state_interpretation.is_some() => {
+                let facts = source
+                    .state_interpretation
+                    .as_ref()
+                    .expect("checked state facts");
+                if aggregate.distinct() != facts.distinct
+                    || aggregate.order_keys().len() != facts.order_keys.len()
+                {
+                    return Err(ProgramResolvedCallsError::WrongOrder);
+                }
+                for (actual, expected) in aggregate.order_keys().iter().zip(facts.order_keys.iter())
+                {
+                    work.step()?;
+                    if (actual.ascending, actual.nulls_first)
+                        != (expected.ascending, expected.nulls_first)
+                    {
+                        return Err(ProgramResolvedCallsError::WrongOrder);
+                    }
+                }
+            }
             _ => check_order(aggregate, &[], &[], false, work)?,
         }
+    } else if source.state_interpretation.is_some() {
+        return Err(ProgramResolvedCallsError::WrongOrder);
     }
-    if source.args.len() != contract.call().selected().argument_types.len() {
+    if source.args.len() != contract.logical_argument_types().len()
+        || source.function_order_by.len() != contract.order_argument_types().len()
+    {
         return Err(ProgramResolvedCallsError::WrongArguments);
     }
-    for (argument, ty) in contract
-        .logical_argument_types()
-        .chain(contract.order_argument_types())
-        .enumerate()
-    {
-        check_argument_root(units, source.args[argument], ty, work)?;
+    for (reference, ty) in source.args.iter().chain(&source.function_order_by).zip(
+        contract
+            .logical_argument_types()
+            .chain(contract.order_argument_types()),
+    ) {
+        check_argument_root(units, *reference, ty, work)?;
     }
     check_arrow(
         &source.return_type,

@@ -1,0 +1,19 @@
+-- query 4
+-- types	bigint
+rejected_in_system
+0
+
+-- query 5
+-- types	bigint
+rejected_in_catalog
+0
+
+-- query 6
+-- types	bigint	double
+id	v
+1	0.0
+
+-- query 8
+-- types	bigint	double
+id	v
+1	0.0

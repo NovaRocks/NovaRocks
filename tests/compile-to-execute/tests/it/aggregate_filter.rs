@@ -412,7 +412,16 @@ fn single_only_aggregate_keeps_original_update_channels_with_a_mergeable_peer() 
 
 #[test]
 fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
-    use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+    assert_approx_distinct_multiple_filtered_partials(false);
+}
+
+#[test]
+fn approx_distinct_fixed_accuracy_consumes_multiple_nonempty_filtered_partial_states() {
+    assert_approx_distinct_multiple_filtered_partials(true);
+}
+
+fn assert_approx_distinct_multiple_filtered_partials(explicit_accuracy: bool) {
+    use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Int64Array};
     use novarocks_functions::{
         AggregateStateColumn, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
         SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
@@ -431,8 +440,9 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
         }
     }
 
+    let arguments = if explicit_accuracy { "k, 2.3E-2" } else { "k" };
     let source = sql_source(
-        "SELECT approx_distinct(k) FILTER (WHERE k > 0) FROM fixture.source",
+        &format!("SELECT approx_distinct({arguments}) FILTER (WHERE k > 0) FROM fixture.source"),
         DataType::Int64,
     );
     let plan = source.plan();
@@ -460,7 +470,7 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
     );
     assert_eq!(
         partial.binding.state_format.as_str(),
-        "novarocks/approx_distinct/hll-xxhash64-p11-v1"
+        "novarocks/approx_distinct/hll-xxhash64-parameterized-v2"
     );
     assert_eq!(
         final_call.binding.state_format,
@@ -495,12 +505,17 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
         .unwrap();
         states.push(&Control).unwrap();
         let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
-        let arguments = [EvaluatedArgument::Column(&values)];
+        let accuracy: ArrayRef = Arc::new(Float64Array::from(vec![0.023; 3]));
+        let sources = [
+            EvaluatedArgument::Column(&values),
+            EvaluatedArgument::Column(&accuracy),
+        ];
+        let arguments = &sources[..1 + usize::from(explicit_accuracy)];
         let selected = Selection::try_sparse(3, &[0, 2]).unwrap();
         let input = SelectedAggregateUpdateInput::try_new(
             update.contract(),
             selected,
-            &arguments,
+            arguments,
             &[],
             &Control,
         )
@@ -551,4 +566,72 @@ fn approx_distinct_final_consumes_multiple_nonempty_filtered_partial_states() {
             .value(0),
         4
     );
+}
+
+#[test]
+fn approx_distinct_explicit_precision_requires_the_original_fixed_value_for_both_splits() {
+    use novarocks_local_program::{ProgramCallSite, ProgramStateTemplate};
+
+    for (expression, distributed) in [
+        ("2.3E-2", true),
+        ("DOUBLE '0.023'", false),
+        ("CAST(k AS DOUBLE)", false),
+        ("DOUBLE '-1'", false),
+        ("CAST(NULL AS DOUBLE)", false),
+    ] {
+        let sql = format!(
+            "SELECT approx_distinct(k, {expression}) FILTER (WHERE k > 0) FROM fixture.source"
+        );
+        let source = sql_source(&sql, DataType::Int64);
+        let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+        let nodes = aggregates(source.plan()).collect::<Vec<_>>();
+        if distributed {
+            assert_eq!(nodes.len(), 2, "{sql}");
+            assert!(
+                nodes.iter().any(|(_, _, calls)| {
+                    matches!(calls[0].binding.phase, AggregatePhase::Partial { .. })
+                }),
+                "{sql}"
+            );
+            assert!(
+                nodes.iter().any(|(_, _, calls)| {
+                    matches!(calls[0].binding.phase, AggregatePhase::Final { .. })
+                }),
+                "{sql}"
+            );
+        } else {
+            let [(fragment, node, [call])] = nodes.as_slice() else {
+                panic!("expected one Single aggregate for {sql}");
+            };
+            assert_eq!(call.binding.phase, AggregatePhase::Single, "{sql}");
+            let program = &programs[&fragment.id()];
+            let node = local_aggregate(program, node).local_id().unwrap();
+            let Some(ProgramStateTemplate::Aggregate { kernel, .. }) =
+                program.state_template(ProgramCallSite::Aggregate { node, call: 0 })
+            else {
+                panic!("expected prepared Single aggregate for {sql}");
+            };
+            assert!(kernel.local_stages().is_none(), "{sql}");
+        }
+    }
+}
+
+#[test]
+fn dynamic_approx_distinct_keeps_a_distinct_peer_in_single_execution() {
+    for (group_column, group_by) in [("", ""), ("k % 2, ", " GROUP BY k % 2")] {
+        let sql = format!(
+            "SELECT {group_column}count(DISTINCT k), approx_distinct(k, CAST(k AS DOUBLE)) FROM fixture.source{group_by}"
+        );
+        let source = sql_source(&sql, DataType::Int64);
+        let programs = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
+        let nodes = aggregates(source.plan()).collect::<Vec<_>>();
+        let [(fragment, node, [_, approximate])] = nodes.as_slice() else {
+            panic!("expected one Single aggregate with two calls for {sql}");
+        };
+        assert_eq!(approximate.binding.phase, AggregatePhase::Single, "{sql}");
+        assert!(matches!(
+            local_aggregate(&programs[&fragment.id()], node).kind(),
+            ProgramNodeKind::Aggregate { .. }
+        ));
+    }
 }

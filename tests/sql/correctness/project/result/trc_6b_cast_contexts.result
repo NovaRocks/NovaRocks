@@ -65,3 +65,8 @@ total	mean	any_true	counted	week
 k	any_true
 1	true
 2	true
+
+-- query 32
+-- types	bigint
+years
+2

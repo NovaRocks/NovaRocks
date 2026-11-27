@@ -417,3 +417,44 @@ fn control_values_frozen_result_type_governs_null_and_numeric_inputs() {
     let output = ifnull_legacy(nulls.clone(), nulls, &DataType::Null).unwrap();
     assert_eq!(output.data_type(), &DataType::Null);
 }
+
+#[test]
+fn control_values_window_offsets_keep_narrow_children_of_a_large_container() {
+    use arrow_array::{LargeListArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Fields;
+
+    let item = Arc::new(Field::new("item", DataType::Utf8, true));
+    let children: ArrayRef = Arc::new(StringArray::from(vec!["a", "bb", "ccc"]));
+    let large: ArrayRef = Arc::new(LargeListArray::new(
+        item,
+        OffsetBuffer::new(vec![0i64, 2, 3].into()),
+        children,
+        None,
+    ));
+    let field_values: ArrayRef = Arc::new(StringArray::from(vec!["left", "right"]));
+    let fields: Fields = vec![
+        Arc::new(Field::new("large", large.data_type().clone(), true)),
+        Arc::new(Field::new("label", DataType::Utf8, true)),
+    ]
+    .into();
+    let values = StructArray::new(fields, vec![large, field_values], None);
+    assert_eq!(indexed_value_offset_count(values.data_type()).unwrap(), 2);
+    let visit = |row| {
+        let mut offsets = Vec::new();
+        visit_indexed_value_offsets(
+            &values,
+            row,
+            0,
+            &mut |node, length| {
+                offsets.push((node, length));
+                Ok(())
+            },
+            &LegacyControl,
+        )
+        .unwrap();
+        offsets
+    };
+    assert_eq!(visit(0), [(0, 3), (1, 4)]);
+    assert_eq!(visit(1), [(0, 3), (1, 5)]);
+}

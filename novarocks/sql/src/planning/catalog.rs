@@ -701,6 +701,32 @@ pub fn resolved_metadata_table(
     crate::catalog::ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner)
 }
 
+/// Attach a generated SQL definition to the request-local scan that authored it.
+pub fn bind_derived_metadata_view(
+    mut source: ResolvedAnalyzerTable,
+    binding: crate::binding::SqlTableBindingId,
+    name: &str,
+    raw_sql: std::sync::Arc<str>,
+    columns: std::sync::Arc<[SqlViewColumn]>,
+) -> Result<ResolvedAnalyzerTable, String> {
+    validate_materialization_binding(&source, binding)?;
+    if name.is_empty() || raw_sql.is_empty() || columns.is_empty() || source.derived_view.is_some()
+    {
+        return Err("connector derived view definition is invalid".into());
+    }
+    let identity = &source.catalog.identity;
+    source.derived_view = Some(std::sync::Arc::new(crate::catalog::SqlDerivedView {
+        identity: novarocks_types::naming::TableIdentity::new(
+            &identity.catalog,
+            &identity.namespace,
+            name,
+        ),
+        binding,
+        raw_sql,
+        columns,
+    }));
+    Ok(source)
+}
 /// Resolve one local-catalog entry into SQL's opaque analyzer materialization.
 /// The application may hold the catalog service, but only SQL may inspect its
 /// table definition or create an analyzer relation from it.

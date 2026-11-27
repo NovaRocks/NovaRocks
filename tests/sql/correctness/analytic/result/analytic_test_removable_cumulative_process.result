@@ -839,7 +839,7 @@ v3	CNT
 24	24.0
 
 -- query 33
--- legacy
+-- types	integer	varchar	varchar
 v1	v2	_min
 13	20	20
 12	10	10

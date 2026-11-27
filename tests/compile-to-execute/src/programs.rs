@@ -299,12 +299,33 @@ pub fn programs_with_catalogue_and_nullable_source(
     programs_with_original_frozen_reads(source, functions, false, true)
 }
 
-fn programs_with_original_frozen_reads(
+fn fixture_package_admission() -> FragmentPackageAdmission {
+    FragmentPackageAdmission {
+        plan_limits: PlanLimits::FROZEN,
+        source_retained_bytes: 64 << 20,
+        property_projection_limits: PropertyProofProjectionLimits {
+            max_request_bytes: 16 << 20,
+            max_coexisting_bytes: 256 << 20,
+            max_projection_work: 16 << 20,
+        },
+    }
+}
+
+fn fixture_local_options() -> LocalCompileOptions {
+    LocalCompileOptions {
+        pipeline_dop: NonZeroUsize::new(1).unwrap(),
+        root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
+        kernel_abi: KernelAbiVersion::CURRENT,
+        // The host supplies these fixture admission limits.
+        constants: policy().into(),
+    }
+}
+
+fn fragment_packages_with_original_frozen_reads(
     source: &SqlAuthoredPhysicalPlan,
-    functions: &PureEngineFunctionCatalog,
     admit_original_scan_residuals: bool,
     admit_extended_source_shape: bool,
-) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
+) -> BTreeMap<FragmentId, FragmentPackage> {
     let pruning = source
         .plan()
         .fragments()
@@ -320,22 +341,9 @@ fn programs_with_original_frozen_reads(
         .plan()
         .fragments()
         .keys()
-        .map(|&id| {
-            (
-                id,
-                FragmentPackageAdmission {
-                    plan_limits: PlanLimits::FROZEN,
-                    source_retained_bytes: 64 << 20,
-                    property_projection_limits: PropertyProofProjectionLimits {
-                        max_request_bytes: 16 << 20,
-                        max_coexisting_bytes: 256 << 20,
-                        max_projection_work: 16 << 20,
-                    },
-                },
-            )
-        })
+        .map(|&id| (id, fixture_package_admission()))
         .collect();
-    let packages = extract_fragment_packages(
+    extract_fragment_packages(
         source.plan(),
         &if admit_extended_source_shape {
             frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, true)
@@ -349,28 +357,33 @@ fn programs_with_original_frozen_reads(
         &admissions,
         &Control,
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn programs_with_original_frozen_reads(
+    source: &SqlAuthoredPhysicalPlan,
+    functions: &PureEngineFunctionCatalog,
+    admit_original_scan_residuals: bool,
+    admit_extended_source_shape: bool,
+) -> BTreeMap<FragmentId, Arc<LocalProgram>> {
     let providers = providers();
-    packages
-        .into_iter()
-        .map(|(id, package)| {
-            let compiled = compile_fragment(
-                validate_fragment_providers(Arc::new(package), &providers, &Control).unwrap(),
-                functions,
-                LocalCompileOptions {
-                    pipeline_dop: NonZeroUsize::new(1).unwrap(),
-                    root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
-                    kernel_abi: KernelAbiVersion::CURRENT,
-                    // The package carries the statement's source policy. These
-                    // are the host's fixture admission limits.
-                    constants: policy().into(),
-                },
-                &Control,
-            )
-            .unwrap();
-            (id, Arc::new(compiled))
-        })
-        .collect()
+    fragment_packages_with_original_frozen_reads(
+        source,
+        admit_original_scan_residuals,
+        admit_extended_source_shape,
+    )
+    .into_iter()
+    .map(|(id, package)| {
+        let compiled = compile_fragment(
+            validate_fragment_providers(Arc::new(package), &providers, &Control).unwrap(),
+            functions,
+            fixture_local_options(),
+            &Control,
+        )
+        .unwrap();
+        (id, Arc::new(compiled))
+    })
+    .collect()
 }
 pub fn producer_root(
     programs: &BTreeMap<FragmentId, Arc<LocalProgram>>,
@@ -502,4 +515,100 @@ pub fn project_input_slot_for_use(
     program.graph().nodes()[input.index()]
         .output_layout()
         .slots()[binding.ordinal as usize]
+}
+
+#[test]
+fn approx_distinct_final_local_compiler_refuses_a_nonconstant_frozen_accuracy() {
+    use novarocks_sql_testkit::{installed_builtin_owner_catalogue, sql_source};
+    use std::error::Error;
+
+    let source = sql_source(
+        "SELECT approx_distinct(k, 2.3E-2) FROM fixture.source",
+        DataType::Int64,
+    );
+    let (package, site) = fragment_packages_with_original_frozen_reads(&source, false, false)
+        .into_values()
+        .find_map(|package| {
+            let site = package.fragment().nodes().values().find_map(|node| {
+                let NodeKind::Aggregate { calls, .. } = &node.kind else {
+                    return None;
+                };
+                let [call] = calls.as_ref() else {
+                    return None;
+                };
+                matches!(call.binding.phase, AggregatePhase::Final { .. }).then_some(
+                    PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: 0,
+                    },
+                )
+            })?;
+            Some((package, site))
+        })
+        .expect("fixed DOUBLE selection yields a Final package");
+    let providers = providers();
+    let functions = installed_builtin_owner_catalogue();
+    let compile = |package| {
+        compile_fragment(
+            validate_fragment_providers(Arc::new(package), &providers, &Control).unwrap(),
+            &functions,
+            fixture_local_options(),
+            &Control,
+        )
+    };
+    compile(package.clone()).expect("the genuine Final package prepares");
+
+    let mut input = package.into_input();
+    let mut requests = input
+        .fragment
+        .call_requests()
+        .entries()
+        .iter()
+        .map(|(&site, request)| (site, request.clone()))
+        .collect::<Vec<_>>();
+    let request = &mut requests
+        .iter_mut()
+        .find(|(actual, _)| *actual == site)
+        .expect("exact Final original request")
+        .1;
+    let [
+        _,
+        StaticFunctionArgument::Value {
+            value_type,
+            constant,
+        },
+    ] = request.arguments.as_mut()
+    else {
+        panic!("the Final request retains both original logical arguments");
+    };
+    assert_eq!(value_type.data_type(), &DataType::Float64);
+    assert!(
+        constant.take().is_some(),
+        "positive fixture had a proven constant"
+    );
+    assert_eq!(
+        input.constants.entries().len(),
+        1,
+        "accuracy is the Final package's only constant"
+    );
+    input.constants = ConstantPools::empty();
+    input.fragment = input
+        .fragment
+        .with_call_requests_observed(requests, &Control)
+        .unwrap();
+    let package = FragmentPackage::try_new(input, fixture_package_admission(), &Control)
+        .expect("the neutral package retains the genuine Final state input and signature");
+    let error = compile(package).expect_err("LocalCompiler cannot prepare this Final");
+    let cause: &(dyn Error + 'static) = &error;
+    let owner_failure = std::iter::successors(Some(cause), |&cause| cause.source())
+        .find_map(|cause| cause.downcast_ref::<FunctionSpecializationFailure>());
+    let Some(FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(detail))) =
+        owner_failure
+    else {
+        panic!("expected the original phase-qualification failure, got {error:?}");
+    };
+    assert_eq!(
+        detail.message(),
+        "approx_distinct stages require fixed legal accuracy"
+    );
 }

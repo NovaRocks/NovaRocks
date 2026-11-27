@@ -75,7 +75,7 @@ pub(super) fn is_trino_orderable<E>(
     is_orderable_type(item, &mut observe)
 }
 
-fn is_orderable_type<E>(
+pub(super) fn is_orderable_type<E>(
     ty: &ValueTypeRef,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -274,7 +274,7 @@ fn sort(
     )
 }
 
-fn stable_positions(
+pub(super) fn stable_positions(
     positions: &mut [usize],
     temporary: &mut [usize],
     work: &mut EvaluationCheckpoints<'_>,

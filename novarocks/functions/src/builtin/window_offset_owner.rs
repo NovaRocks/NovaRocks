@@ -26,7 +26,7 @@ use novarocks_type_contract::{
 };
 
 use super::catalogue::BuiltinScalarResolver;
-use super::window_default::DefaultValueRecipe;
+use super::window_default::supports_common_offset_type;
 use super::window_offset::{OffsetOperation, PreparedOffset};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
@@ -200,8 +200,8 @@ impl PureFunctionMetadataOwner for WindowOffsetOwner {
                 "LEAD/LAG admission differs from its canonical value channel count".into(),
             ));
         }
-        // Only the third channel installs a DefaultValueRecipe. One/two-argument
-        // nested and encoded sources keep their existing selected-copy boundary.
+        // The third channel is an independently addressed value of the common
+        // type. One/two-argument calls keep their established take profile.
         let supported = if logical_argument_count == 3 {
             let (FunctionArgumentType::Value(source), FunctionResultType::Scalar(target)) =
                 (&selected.argument_types[2], &selected.result_type)
@@ -210,7 +210,9 @@ impl PureFunctionMetadataOwner for WindowOffsetOwner {
                     "LEAD/LAG default admission requires exact scalar value channels".into(),
                 ));
             };
-            DefaultValueRecipe::supports_profile(source, target)
+            supports_common_offset_type(source, target, || {
+                work.step().map_err(FunctionBindingError::from)
+            })?
         } else {
             true
         };
@@ -465,19 +467,20 @@ impl WindowOffsetOwner {
                 _ => invalid("window_offset preparation has a stale selected binding"),
             })?;
             let offset = canonical_call(input, *contract.options(), &mut work)?;
-            let default = if input.request.arguments.len() == 3 {
-                let FunctionArgumentType::Value(source) = &input.selected.argument_types[2] else {
+            if input.request.arguments.len() == 3 {
+                let FunctionArgumentType::Value(default) = &input.selected.argument_types[2] else {
                     return Err(invalid(
                         "LEAD/LAG default requires its complete selected value domain",
                     ));
                 };
-                work.flush().map_err(compile_failure)?;
-                let recipe = DefaultValueRecipe::try_new(source, contract.result_type(), control)?;
-                work.flush().map_err(compile_failure)?;
-                Some(recipe)
-            } else {
-                None
-            };
+                if !supports_common_offset_type(default, contract.result_type(), || {
+                    work.step().map_err(compile_failure)
+                })? {
+                    return Err(invalid(
+                        "LEAD/LAG default requires the common selected type and an indexed result",
+                    ));
+                }
+            }
             work.flush().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
@@ -485,7 +488,6 @@ impl WindowOffsetOwner {
                 contract,
                 operation: self.operation,
                 offset,
-                default,
             }) as Arc<dyn PreparedWindowKernel>;
             work.flush().map_err(compile_failure)?;
             Ok(prepared)

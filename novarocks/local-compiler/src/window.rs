@@ -39,10 +39,10 @@ use crate::{
 };
 use novarocks_expression_contract::{BoundFunction, RootOrdinal};
 use novarocks_functions::{
-    AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
+    AggregateBindingSelection, AggregateKernelPhase, AggregateOrderKey, AggregateOverloadIdentity,
     AggregatePreparationOptions, AggregateWindowPreparationOptions, CallEffectInput,
     EngineFunctionCatalog, FunctionBindingSelection, FunctionResultType,
-    FunctionSpecializationFailure, PureCallPreparation, PureCallSpecialization,
+    FunctionSpecializationFailure, PureCallLifecycle, PureCallPreparation, PureCallSpecialization,
     PureEngineFunctionCatalog, PureKernelAbi, ResolvedAggregateSignature, ScopedRelationalEffects,
     WindowCallOptions,
 };
@@ -52,8 +52,8 @@ use novarocks_local_program::{
     WindowType,
 };
 use novarocks_physical_plan::{
-    AggregatePhase, FragmentPackage, FunctionArgumentType, NodeId, NodeKind, PhysicalCallSite,
-    PhysicalNode,
+    AggregatePhase, FragmentPackage, FunctionArgumentType, NodeId, NodeKind, NullOrdering,
+    PhysicalCallSite, PhysicalNode, SortDirection,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, ExpressionEffects,
@@ -89,16 +89,8 @@ pub(crate) fn admit_window(
     };
     for item in spec.calls.iter() {
         let function = &item.binding;
-        let distinct = &item.distinct;
-        let function_order_by = &item.order_by;
         let frame = &item.frame;
         let aggregate_binding = &item.aggregate_binding;
-        if *distinct {
-            return Err(unsupported("DISTINCT window call"));
-        }
-        if !function_order_by.is_empty() {
-            return Err(unsupported("window function ORDER BY"));
-        }
         if let Some(frame) = frame {
             if frame.units == WindowFrameUnits::Groups {
                 return Err(unsupported("GROUPS window frame"));
@@ -111,7 +103,7 @@ pub(crate) fn admit_window(
             }
         }
         let (abi, missing) = match (function.kind, aggregate_binding.as_deref()) {
-            (FunctionKind::Window, None) => (
+            (FunctionKind::Window, None) if !item.distinct && item.order_by.is_empty() => (
                 PureKernelAbi::WindowV1,
                 "window function without an installed pure window kernel",
             ),
@@ -135,10 +127,35 @@ pub(crate) fn admit_window(
             }
         }
         work.flush()?;
-        let installed = window_function_abi(function, functions.metadata(), work.control());
+        let owner = window_function_owner(function, functions.metadata(), work.control())?;
         work.flush()?;
-        if installed? != abi {
+        if owner.implementation().abi != abi {
             return Err(unsupported(missing));
+        }
+        if let Some(binding) = aggregate_binding.as_deref()
+            && (item.distinct || !item.order_by.is_empty())
+        {
+            let selected = window_selection(function, Some(binding));
+            let lifecycle = PureCallLifecycle::AggregateWindow {
+                distinct: item.distinct,
+                ordered: !item.order_by.is_empty(),
+            };
+            match owner.admit_selected_lifecycle_observed(
+                &selected,
+                item.arguments.len(),
+                lifecycle,
+                work.control(),
+            ) {
+                Ok(()) => {}
+                Err(novarocks_functions::FunctionBindingError::UnavailableImplementation(_)) => {
+                    return Err(unsupported(if item.distinct {
+                        "DISTINCT window call"
+                    } else {
+                        "window function ORDER BY"
+                    }));
+                }
+                Err(error) => return Err(ExpressionLoweringError::from(error).into()),
+            }
         }
         work.step()?;
     }
@@ -147,18 +164,27 @@ pub(crate) fn admit_window(
 
 /// Preserve metadata lookup failures separately from a missing ABI capability.
 /// The production caller supplies metadata from its sealed pure catalog.
+#[cfg(test)]
 pub(super) fn window_function_abi(
     function: &BoundFunction,
     functions: &EngineFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<PureKernelAbi, FragmentCompileError> {
+    window_function_owner(function, functions, control).map(|owner| owner.implementation().abi)
+}
+
+fn window_function_owner<'a>(
+    function: &BoundFunction,
+    functions: &'a EngineFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PureOverloadDeclaration<'a>, FragmentCompileError> {
     match functions.pure_overload_declaration_observed(
         &function.function_id,
         function.kind,
         &function.overload,
         control,
     ) {
-        Ok(declaration) => Ok(declaration.implementation().abi),
+        Ok(declaration) => Ok(declaration),
         Err(FunctionSpecializationFailure::Control(cause)) => Err(cause.into()),
         Err(error) => Err(ExpressionLoweringError::Specialization(error).into()),
     }
@@ -381,7 +407,18 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
             inputs.push(lowered(argument, "missing lowered window argument")?);
             work.step()?;
         }
+        let mut function_order_by = Vec::new();
+        reserve_vec(&mut function_order_by, item.order_by.len(), work)?;
+        for key in &item.order_by {
+            function_order_by.push(lowered(&key.expr, "missing lowered function sort key")?);
+            work.step()?;
+        }
         let frozen = frozen_frame(package, frame.as_ref(), work)?;
+        let state_interpretation = aggregate_binding
+            .as_ref()
+            .and_then(|binding| binding.state_interpretation.as_ref())
+            .map(|facts| facts.clone_observed(work))
+            .transpose()?;
         let frozen_aggregate = aggregate_binding
             .as_deref()
             .map(|binding| crate::aggregate::freeze_binding_with_creation(binding, work, creation))
@@ -395,6 +432,8 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
             frozen_aggregate,
             kind: WindowFunctionKind::Prepared,
             args: inputs,
+            function_order_by,
+            state_interpretation,
             return_type: item.binding.result_type.data_type().clone(),
             aggregate_binding,
             frame: Some(effective_frame(frozen.as_ref(), ordered)?),
@@ -607,6 +646,22 @@ pub(crate) fn prepare_window_calls<H, F: novarocks_type_contract::ValueSchemaCre
     Ok(())
 }
 
+fn window_selection(
+    function: &BoundFunction,
+    binding: Option<&novarocks_physical_plan::AggregateBinding>,
+) -> FunctionBindingSelection {
+    FunctionBindingSelection {
+        overload: function.overload.clone(),
+        argument_types: function.argument_types.clone(),
+        result_type: FunctionResultType::Scalar(function.result_type.clone()),
+        aggregate: binding.map(|binding| AggregateBindingSelection {
+            state_argument_contract: binding.state_argument_contract,
+            intermediate_type: binding.intermediate_type.clone(),
+            state_format: binding.state_format.clone(),
+        }),
+    }
+}
+
 fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
@@ -628,9 +683,6 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         node: node.id,
         call: ordinal,
     };
-    if !function_order_by.is_empty() {
-        return Err(ExpressionLoweringError::UnsupportedCall(site).into());
-    }
     let frozen = package
         .calls()
         .entries()
@@ -649,20 +701,44 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         work,
         creation,
     )?;
+    let argument_count = args
+        .len()
+        .checked_add(function_order_by.len())
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    if request.request().logical_argument_count != args.len()
+        || request.request().arguments.len() != argument_count
+    {
+        return Err(ExpressionLoweringError::Invalid(
+            "window request differs from the logical and function sort channels",
+        )
+        .into());
+    }
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
-    let selection = Arc::new(FunctionBindingSelection {
-        overload: function.overload.clone(),
-        argument_types: function.argument_types.clone(),
-        result_type: FunctionResultType::Scalar(function.result_type.clone()),
-        aggregate: aggregate_binding
-            .as_deref()
-            .map(|binding| AggregateBindingSelection {
-                state_argument_contract: binding.state_argument_contract,
-                intermediate_type: binding.intermediate_type.clone(),
-                state_format: binding.state_format.clone(),
-            }),
-    });
+    let selection = Arc::new(window_selection(function, aggregate_binding.as_deref()));
+    work.flush()?;
+    let lifecycle = match function.kind {
+        FunctionKind::Window => PureCallLifecycle::Window,
+        FunctionKind::Aggregate => PureCallLifecycle::AggregateWindow {
+            distinct,
+            ordered: !function_order_by.is_empty(),
+        },
+        _ => return Err(ExpressionLoweringError::UnsupportedCall(site).into()),
+    };
+    if !distinct && function_order_by.is_empty() {
+        let owner = functions.metadata().pure_overload_declaration_observed(
+            &function.function_id,
+            function.kind,
+            &function.overload,
+            work.control(),
+        )?;
+        owner.admit_selected_lifecycle_observed(
+            &selection,
+            args.len(),
+            lifecycle,
+            work.control(),
+        )?;
+    }
     work.flush()?;
     crate::expressions::validate_call_created(
         functions.metadata(),
@@ -675,9 +751,9 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     )?;
     work.flush()?;
     let mut argument_uses = Vec::new();
-    reserve_vec(&mut argument_uses, args.len(), work)?;
+    reserve_vec(&mut argument_uses, argument_count, work)?;
     let mut children = ExpressionEffects::PURE_VALUE;
-    if !args.is_empty() {
+    if argument_count != 0 {
         let unit = node
             .expressions
             .as_ref()
@@ -685,7 +761,11 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 "window node has no expression unit",
             ))?;
         let compiled = effects.unit(node.id)?;
-        for &argument in args.iter() {
+        for argument in args
+            .iter()
+            .copied()
+            .chain(function_order_by.iter().map(|key| key.expr))
+        {
             let root = unit.root(argument).ok_or(ExpressionLoweringError::Invalid(
                 "window argument root is absent",
             ))?;
@@ -736,19 +816,35 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     work.flush()?;
     let arguments = ScopedRelationalEffects::primitive(frozen.context, children);
     let options = match (function.kind, aggregate_binding.as_deref()) {
-        (FunctionKind::Window, None) if !distinct => PureCallPreparation::Window {
-            arguments,
-            options: window,
-        },
+        (FunctionKind::Window, None) if !distinct && function_order_by.is_empty() => {
+            PureCallPreparation::Window {
+                arguments,
+                options: window,
+            }
+        }
         (FunctionKind::Aggregate, Some(binding)) if binding.phase == AggregatePhase::Single => {
+            let state_interpretation = binding
+                .state_interpretation
+                .as_ref()
+                .map(|facts| facts.clone_observed(work).map(Arc::new))
+                .transpose()?;
+            let mut order_keys = Vec::new();
+            reserve_vec(&mut order_keys, function_order_by.len(), work)?;
+            for key in function_order_by {
+                order_keys.push(AggregateOrderKey {
+                    ascending: key.direction == SortDirection::Ascending,
+                    nulls_first: key.null_ordering == NullOrdering::First,
+                });
+                work.step()?;
+            }
             PureCallPreparation::AggregateWindow {
                 arguments,
                 options: AggregateWindowPreparationOptions {
                     aggregate: AggregatePreparationOptions {
-                        state_interpretation: None,
+                        state_interpretation,
                         phase: AggregateKernelPhase::Single,
                         distinct,
-                        order_keys: Arc::from([]),
+                        order_keys: order_keys.into(),
                         state_input_type: None,
                     },
                     window,

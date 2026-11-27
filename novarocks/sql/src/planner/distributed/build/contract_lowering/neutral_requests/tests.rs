@@ -403,6 +403,10 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
                             );
                             assert_eq!(actual.logical_argument_count, 1);
                             assert_eq!(actual.arguments.len(), 2);
+                            assert_eq!(
+                                call.binding.overload.as_str(),
+                                "builtin.aggregate/array_agg/derived-v1"
+                            );
                             windows += 1;
                         }
                     }
@@ -430,17 +434,9 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
         nulls_first: true,
     };
     let (window_source, _) = relational::window_fixture(vec![relational::integer(7)], vec![order]);
-    for (source, window, overload) in [
-        (
-            plan(scalar::lower_lambda_fixture()),
-            false,
-            scalar::LAMBDA_FIXTURE_OVERLOAD,
-        ),
-        (
-            window_source,
-            true,
-            "builtin.aggregate/array_agg/derived-v1",
-        ),
+    for (source, window) in [
+        (plan(scalar::lower_lambda_fixture()), false),
+        (window_source, true),
     ] {
         let control = Control::default();
         let mut observer = ObserveTransfer { calls: 0, window };
@@ -460,9 +456,13 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
             &mut observer,
         );
         assert_eq!(observer.calls, 1);
-        assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
-            novarocks_functions::FunctionBindingError::UnavailableImplementation(ref actual)
-        )) if actual.as_str() == overload));
+        if window {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(ref actual)
+            )) if actual.as_str() == scalar::LAMBDA_FIXTURE_OVERLOAD));
+        }
     }
     let (source, binding) = relational::table_fixture(vec![relational::list_value(1)], true);
     let owner = relational::finish(&source);

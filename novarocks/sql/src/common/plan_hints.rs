@@ -175,7 +175,7 @@ impl ScanVariantColumn {
             true,
             novarocks_functions::FunctionVolatility::Immutable,
         );
-        let binding = crate::binding::SqlFunctionBinding::new(
+        let binding = crate::binding::SqlFunctionBinding::from_test(
             original.resolved().clone(),
             DecimalOverflowPolicy::ReportError,
         );

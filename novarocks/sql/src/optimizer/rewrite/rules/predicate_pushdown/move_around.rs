@@ -515,8 +515,11 @@ mod tests {
             )
             .unwrap();
         catalog.validate_bound(&bound, request, control).unwrap();
-        let binding =
-            crate::binding::SqlFunctionBinding::new(bound, DecimalOverflowPolicy::OutputNull);
+        let binding = crate::binding::SqlFunctionBinding::from_plan(
+            crate::optimizer::BINDING_AUTHORITY,
+            bound,
+            DecimalOverflowPolicy::OutputNull,
+        );
         let predicate =
             crate::common::binary_operator::typed_call(operator, binding, vec![column, literal]);
         let left = make_filter(&mut arena, predicate, make_scan("l", &[("a", 1)]));

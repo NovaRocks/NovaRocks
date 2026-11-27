@@ -48,12 +48,10 @@ impl Rule for SplitAggregateRule {
         memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
-        let _ = control;
-
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Ok(Vec::new());
         };
-        if !is_eligible(agg) {
+        if !is_eligible(agg, &memo.scalars, control)? {
             return Ok(Vec::new());
         }
 
@@ -128,17 +126,26 @@ fn remember_group_key_output_displays(
     }
 }
 
-fn is_eligible(agg: &LogicalAggregateOp) -> bool {
-    agg.stage == AggStage::Single
-        && !agg.is_split
-        && agg.is_merge.iter().all(|flag| !*flag)
-        && (!agg.aggregates.is_empty() || !agg.group_by.is_empty())
-        && agg.aggregates.iter().all(is_splittable_aggregate)
-}
-
-fn is_splittable_aggregate(call: &ScalarAggregateSpec) -> bool {
+fn is_eligible(
+    agg: &LogicalAggregateOp,
+    arena: &ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
     use crate::agg_mergeability::{AggMergeability, scalar_aggregate_mergeability};
-    scalar_aggregate_mergeability(call) == AggMergeability::TwoPhase
+
+    if agg.stage != AggStage::Single
+        || agg.is_split
+        || agg.is_merge.iter().any(|flag| *flag)
+        || (agg.aggregates.is_empty() && agg.group_by.is_empty())
+    {
+        return Ok(false);
+    }
+    for call in &agg.aggregates {
+        if scalar_aggregate_mergeability(call, arena, control)? != AggMergeability::TwoPhase {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<OutputColumn> {
@@ -767,7 +774,10 @@ mod tests {
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
-            let resolved = crate::binding::SqlFunctionBinding::new(
+            let resolved = crate::binding::SqlFunctionBinding::from_plan(
+                crate::binding::PlanBindingAuthority::Optimizer(
+                    crate::optimizer::BindingAuthority(()),
+                ),
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );

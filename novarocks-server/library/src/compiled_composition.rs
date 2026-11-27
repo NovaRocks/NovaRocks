@@ -291,6 +291,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_window_inventory_uses_the_production_seal_and_selected_types() {
+        use arrow::datatypes::DataType;
+        use novarocks_functions::{
+            FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType,
+            PureCallLifecycle, PureKernelAbi,
+        };
+
+        let function_set = compose_process_function_set().unwrap();
+        let seal = seal_pure_catalog(function_set.catalog()).unwrap();
+        let catalog = seal.catalog.metadata();
+
+        for row in seal.catalog.public_function_overloads() {
+            if !matches!(row.kind, FunctionKind::Aggregate | FunctionKind::Window) {
+                continue;
+            }
+            let installed = catalog
+                .pure_overload_declaration_observed(
+                    row.function_id,
+                    row.kind,
+                    row.overload_id,
+                    &CompositionControl,
+                )
+                .unwrap();
+            println!(
+                "window-public-overload\t{}\t{}\t{}\t{}\t{}\t{:?}",
+                row.name,
+                row.function_id.as_str(),
+                row.overload_id.as_str(),
+                row.argument_types,
+                row.return_type,
+                installed.implementation().abi,
+            );
+        }
+        for definition in catalog.definitions() {
+            let Some(binding) = definition.binding_declaration() else {
+                continue;
+            };
+            for overload in binding.overloads() {
+                if binding.kind() == FunctionKind::Aggregate
+                    && definition.is_declared_only_pure_overload(&overload.identity)
+                {
+                    println!(
+                        "window-declared-only\t{}\t{}\t{}\t{}\t{}",
+                        definition.canonical_name(),
+                        binding.function_id().as_str(),
+                        overload.identity.as_str(),
+                        overload.argument_pattern,
+                        overload.result_pattern,
+                    );
+                }
+            }
+        }
+
+        let samples: &[(&str, &[DataType], usize, bool, bool)] = &[
+            ("count_if", &[DataType::Boolean], 1, false, true),
+            ("count_if", &[DataType::Boolean], 1, true, false),
+            ("bool_and", &[DataType::Boolean], 1, false, true),
+            ("var_pop", &[DataType::Float64], 1, false, true),
+            ("stddev_pop", &[DataType::Float64], 1, false, true),
+            ("min", &[DataType::Utf8], 1, false, true),
+            ("max", &[DataType::Utf8], 1, false, true),
+            ("min", &[DataType::Int64, DataType::Int64], 2, false, false),
+            (
+                "map_agg",
+                &[DataType::Int64, DataType::Utf8],
+                2,
+                false,
+                false,
+            ),
+            (
+                "array_agg",
+                &[DataType::Utf8, DataType::Int64],
+                1,
+                false,
+                true,
+            ),
+            (
+                "array_agg",
+                &[DataType::Utf8, DataType::Utf8],
+                1,
+                true,
+                true,
+            ),
+            (
+                "listagg",
+                &[
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Boolean,
+                    DataType::Utf8,
+                    DataType::Boolean,
+                    DataType::Utf8,
+                ],
+                5,
+                true,
+                true,
+            ),
+        ];
+        for &(name, types, logical_count, distinct, available) in samples {
+            let arguments = types
+                .iter()
+                .map(|ty| FunctionArgument::Value {
+                    value_type: FunctionValueType::new(ty.clone(), true),
+                    constant: None,
+                })
+                .collect::<Vec<_>>();
+            let binding = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Aggregate,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: logical_count,
+                        expected_result_type: None,
+                    },
+                    &CompositionControl,
+                )
+                .unwrap();
+            let installed = catalog
+                .pure_overload_declaration_observed(
+                    &binding.function_id,
+                    binding.kind,
+                    &binding.selected.overload,
+                    &CompositionControl,
+                )
+                .unwrap();
+            let ordered = arguments.len() > logical_count;
+            let admission = installed.admit_selected_lifecycle_observed(
+                &binding.selected,
+                logical_count,
+                PureCallLifecycle::AggregateWindow { distinct, ordered },
+                &CompositionControl,
+            );
+            if available {
+                assert_eq!(
+                    installed.implementation().abi,
+                    PureKernelAbi::AggregateWindowV1
+                );
+                assert!(admission.is_ok(), "{name} {types:?}: {admission:?}");
+            } else {
+                assert!(
+                    matches!(&admission, Err(FunctionBindingError::UnavailableImplementation(id))
+                        if *id == binding.selected.overload),
+                    "{name} {types:?}: {admission:?}"
+                );
+            }
+            println!(
+                "window-selected-profile\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{:?}",
+                name,
+                binding.function_id.as_str(),
+                binding.selected.overload.as_str(),
+                types,
+                logical_count,
+                distinct,
+                ordered,
+                admission,
+            );
+        }
+    }
+
     /// The production seal holds exactly the definitions with installed pure
     /// owners: RAND is one, so it is sealed with its owner's own records, and
     /// the seal is a strict subset whose digest is not the metadata digest.

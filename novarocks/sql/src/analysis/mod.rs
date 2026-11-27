@@ -491,21 +491,19 @@ pub(crate) fn normalize_window_for_execution(
     (name, order_by, window_frame)
 }
 
-pub(crate) fn resolve_function_binding(
+pub(crate) fn select_scalar_function(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     constant_policy: novarocks_functions::ConstantValidation,
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<crate::binding::SqlFunctionBinding, novarocks_functions::FunctionBindingError> {
+) -> Result<novarocks_functions::ResolvedFunctionBinding, novarocks_functions::FunctionBindingError>
+{
     let arguments = args
         .iter()
         .map(|arg| function_argument(arg, constant_policy, control))
         .collect::<Result<Vec<_>, _>>()?;
-    catalog
-        .resolve_scalar_binding(name, &arguments, control)
-        .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
+    catalog.resolve_scalar_binding(name, &arguments, control)
 }
 
 /// Builds an explicit, fully typed function contract for structural IR tests
@@ -525,7 +523,7 @@ pub(crate) fn test_function_binding(
         ResolvedFunctionBinding,
     };
 
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_test(
         ResolvedFunctionBinding {
             declared_scalar_invocation_data: false,
             admitted_execution_abi: None,
@@ -601,7 +599,7 @@ pub(crate) fn test_window_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
-    crate::binding::SqlFunctionBinding::new(
+    crate::binding::SqlFunctionBinding::from_test(
         binding,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )

@@ -49,7 +49,7 @@ use crate::exec::fragment::error::{
     FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
 };
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::concat;
@@ -68,9 +68,15 @@ use novarocks_local_program::{
 #[path = "compiled_window_invocation_input.rs"]
 mod invocation_input;
 use invocation_input::InvocationInputBuffer;
+#[path = "compiled_window_batch.rs"]
+mod output_batch;
+use output_batch::{
+    BatchedCall, PreparedPartitionCall, PreparedWindowOutput, WindowBatchCursor, invalid_batch,
+};
 
 use super::analytic_shared::{
-    AnalyticKeyType, AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
+    AnalyticKeyType, AnalyticOutputValidationFailure, validate_analytic_output_column_typed,
+    validate_analytic_output_columns_typed,
 };
 use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, instances, root_value_type_ref,
@@ -141,7 +147,14 @@ struct CallPlan {
     frame: WindowFrame,
     /// Offset of this call's argument roots in the processor's root list.
     first_root: usize,
-    roots: usize,
+    logical_roots: usize,
+    order_roots: usize,
+}
+
+impl CallPlan {
+    fn roots(&self) -> usize {
+        self.logical_roots + self.order_roots
+    }
 }
 
 /// Where one output column comes from.
@@ -163,13 +176,30 @@ pub struct CompiledWindowProcessorFactory {
     error: Arc<RuntimeErrorState>,
     original_function_major: bool,
     original_key_types: Arc<[AnalyticKeyType]>,
+    owned_partition: bool,
+    output_batch_rows: NonZeroU32,
 }
 
 impl CompiledWindowProcessorFactory {
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_with_output_batch_rows(
+            program,
+            node,
+            error,
+            novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
+        )
+    }
+
+    pub(crate) fn try_new_with_output_batch_rows(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        output_batch_rows: NonZeroU32,
     ) -> ExecutionResult<Self> {
         let at = node.index();
         let nodes = program.graph().nodes();
@@ -227,31 +257,27 @@ impl CompiledWindowProcessorFactory {
             };
             let kernel = Arc::clone(kernel);
             let contract = kernel.contract();
-            if contract.order_argument_types().len() != 0 {
+            let logical_roots = contract.logical_argument_types().len();
+            let order_roots = contract.order_argument_types().len();
+            if function.args.len() != logical_roots
+                || function.function_order_by.len() != order_roots
+            {
                 return Err(program_binding_failure(
                     PlanBindingKind::InvalidAssignment,
                     format!(
-                        "compiled Analytic call {call} at local node {at} with function ORDER BY is not executable"
-                    ),
-                ));
-            }
-            let roots = contract.logical_argument_types().len();
-            if function.args.len() != roots {
-                return Err(program_binding_failure(
-                    PlanBindingKind::InvalidAssignment,
-                    format!(
-                        "compiled Analytic call {call} at local node {at} has {} roots for {roots} channels",
-                        function.args.len()
+                        "compiled Analytic call {call} at local node {at} differs from its {logical_roots} logical and {order_roots} sort channels"
                     ),
                 ));
             }
             let first_root = sites.len();
             sites.extend_from_slice(&function.args);
+            sites.extend_from_slice(&function.function_order_by);
             calls.push(CallPlan {
                 kernel,
                 frame,
                 first_root,
-                roots,
+                logical_roots,
+                order_roots,
             });
         }
         let input_slots = nodes
@@ -302,6 +328,10 @@ impl CompiledWindowProcessorFactory {
             .iter()
             .any(|call| call.kernel.has_original_invocation_handoff());
 
+        let owned_partition = calls
+            .iter()
+            .any(|call| call.kernel.supports_owned_partition());
+
         let original_key_types =
             if original_function_major {
                 sites[..partition_keys + order_keys]
@@ -332,6 +362,8 @@ impl CompiledWindowProcessorFactory {
             error,
             original_function_major,
             original_key_types,
+            owned_partition,
+            output_batch_rows,
         })
     }
 }
@@ -368,6 +400,9 @@ impl CompiledWindowProcessorFactory {
             last_partition: None,
             open: Vec::new(),
             emission: None,
+            batched: None,
+            owned_partition: self.owned_partition,
+            output_batch_rows: self.output_batch_rows,
             failed: None,
             original_function_major: self.original_function_major,
             original_key_types: Arc::clone(&self.original_key_types),
@@ -418,11 +453,23 @@ struct CompiledWindowProcessor {
     last_partition: Option<CreatedPartitionKey>,
     open: Vec<Piece>,
     emission: Option<WindowOutputCursor>,
+    batched: Option<WindowBatchCursor>,
+    owned_partition: bool,
+    output_batch_rows: NonZeroU32,
     failed: Option<ExecutionFailure>,
     original_function_major: bool,
     original_key_types: Arc<[AnalyticKeyType]>,
     invocation_input: Option<InvocationInputBuffer>,
     partition_ordinal: usize,
+}
+
+struct PartitionSource {
+    batch: Chunk,
+    /// Includes separate logical and function sort root arrays in call order.
+    arguments: Vec<ArrayRef>,
+    peers: Vec<WindowRowRange>,
+    retained: Box<dyn InputConstructionOwner>,
+    pieces: Vec<Piece>,
 }
 
 /// The complete relation is computed in the original function-major order.
@@ -556,6 +603,7 @@ fn original_peer_groups(
 impl CompiledWindowProcessor {
     fn release_owned(&mut self) {
         self.emission = None;
+        self.batched = None;
         self.instances = None;
         self.invocation_input = None;
         self.partition_rows = None;
@@ -724,16 +772,33 @@ impl CompiledWindowProcessor {
                 peers.try_push(*peer, &self.control)?;
             }
         }
-        let mut results = WindowInvocationScratch::try_with_capacity(
-            self.calls.len(),
-            host.clone(),
-            &self.control,
-        )?;
+        let mixed_owner = if self.owned_partition {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            Some(factory.begin_input_construction(&ordered)?)
+        } else {
+            None
+        };
+        let mut results = if mixed_owner.is_some() {
+            InvocationOutputs::Mixed(WindowInvocationScratch::try_with_capacity(
+                self.calls.len(),
+                host.clone(),
+                &self.control,
+            )?)
+        } else {
+            InvocationOutputs::Complete(WindowInvocationScratch::try_with_capacity(
+                self.calls.len(),
+                host.clone(),
+                &self.control,
+            )?)
+        };
         for (call_ordinal, call) in self.calls.iter().enumerate() {
             // Original function-major order: this call's full-input argument
             // uses precede THIS call's all-partition work, not later call roots.
             let mut arguments = WindowInvocationScratch::try_with_capacity(
-                call.roots,
+                call.roots(),
                 host.clone(),
                 &self.control,
             )?;
@@ -741,7 +806,7 @@ impl CompiledWindowProcessor {
                 .iter_mut()
                 .enumerate()
                 .skip(call.first_root)
-                .take(call.roots)
+                .take(call.roots())
             {
                 arguments.try_push(
                     evaluate_all(
@@ -801,8 +866,8 @@ impl CompiledWindowProcessor {
                 let full = FullWindowInvocationInput::try_new(
                     call.kernel.contract().as_ref(),
                     rows,
-                    &logical,
-                    &[],
+                    &logical[..call.logical_roots],
+                    &logical[call.logical_roots..],
                     &self.control,
                 )?;
                 let source = WindowInvocationInput::try_new(
@@ -822,13 +887,80 @@ impl CompiledWindowProcessor {
                 let carrier = invocation.complete_carrier(&self.control)?;
                 let values = Arc::clone(carrier.values());
                 invocation.finish(&self.control)?;
-                results.try_push(
+                results.push_complete(
                     CallOutput {
                         values,
                         carrier: Some(carrier),
                     },
                     &self.control,
                 )?;
+            } else if call.kernel.supports_owned_partition() {
+                let owner = mixed_owner
+                    .as_ref()
+                    .expect("owned window input scope installed");
+                let mut calls = WindowInvocationScratch::try_with_capacity(
+                    partitions.len(),
+                    Arc::clone(&host),
+                    &self.control,
+                )?;
+                for (ordinal, part) in partitions.iter().enumerate() {
+                    let len = part.end - part.start;
+                    let arrays = slice_observed(&arguments, part.start, len, owner.as_ref())?;
+                    let mut inputs = WindowInvocationScratch::try_with_capacity(
+                        arrays.len(),
+                        Arc::clone(&host),
+                        &self.control,
+                    )?;
+                    for argument in &arrays {
+                        inputs.try_push(EvaluatedArgument::Column(argument), &self.control)?;
+                    }
+                    let (logical, order) = inputs.split_at(call.logical_roots);
+                    let mut local_peers = WindowInvocationScratch::try_with_capacity(
+                        len,
+                        Arc::clone(&host),
+                        &self.control,
+                    )?;
+                    for peer in peers
+                        .iter()
+                        .filter(|peer| peer.start >= part.start && peer.end <= part.end)
+                    {
+                        local_peers.try_push(
+                            WindowRowRange {
+                                start: peer.start - part.start,
+                                end: peer.end - part.start,
+                            },
+                            &self.control,
+                        )?;
+                    }
+                    let frames = frame_table_tracked(
+                        &call.frame,
+                        &local_peers,
+                        Arc::clone(&host),
+                        &self.control,
+                    )?;
+                    calls.try_push(
+                        prepare_owned_call(
+                            &call.kernel,
+                            call_ordinal,
+                            ordinal,
+                            *part,
+                            logical,
+                            order,
+                            &local_peers,
+                            &frames,
+                            Arc::clone(&host),
+                            &self.control,
+                        )?,
+                        &self.control,
+                    )?;
+                }
+                let InvocationOutputs::Mixed(results) = &mut results else {
+                    return Err(invalid_batch(
+                        "owned window partition has no invocation output carrier",
+                    )
+                    .into());
+                };
+                results.try_push(BatchedCall::Owned(calls), &self.control)?;
             } else {
                 // Mixed nodes retain the existing FixedZero partition owner
                 // and its errors, while preserving original call priority.
@@ -864,7 +996,8 @@ impl CompiledWindowProcessor {
                             call_ordinal,
                             part_ordinal,
                             part.end - part.start,
-                            &logical,
+                            &logical[..call.logical_roots],
+                            &logical[call.logical_roots..],
                             &local_peers,
                             &local_frames,
                             &self.control,
@@ -883,7 +1016,7 @@ impl CompiledWindowProcessor {
                         arrow_failure(WindowArrowOperation::ConcatenatePartitions, error)
                     })?
                 };
-                results.try_push(
+                results.push_complete(
                     CallOutput {
                         values,
                         carrier: None,
@@ -892,6 +1025,59 @@ impl CompiledWindowProcessor {
                 )?;
             }
         }
+        let results = match results {
+            InvocationOutputs::Complete(results) => results,
+            InvocationOutputs::Mixed(results) => {
+                let owner = mixed_owner.expect("owned window input scope installed");
+                validate_mixed_complete_output(
+                    batch,
+                    &self.columns,
+                    &results,
+                    self.prepared_output()?,
+                    rows,
+                    &self.control,
+                )?;
+                let mut arrival_ends = WindowInvocationScratch::try_with_capacity(
+                    input.len(),
+                    Arc::clone(&host),
+                    &self.control,
+                )?;
+                let mut boundary = 0usize;
+                for chunk in input.iter().filter(|chunk| !chunk.is_empty()) {
+                    boundary = boundary
+                        .checked_add(chunk.len())
+                        .ok_or(KernelFailure::ResourceExhausted)?;
+                    arrival_ends.try_push(boundary, &self.control)?;
+                }
+                if boundary != rows {
+                    return Err(invalid_batch(
+                        "window continuation differs from original arrival rows",
+                    )
+                    .into());
+                }
+                let mut groups = WindowInvocationScratch::try_with_capacity(
+                    1,
+                    Arc::clone(&host),
+                    &self.control,
+                )?;
+                groups.try_push(
+                    Some(PreparedWindowOutput {
+                        calls: results,
+                        source: ordered,
+                        argument_storage: owner.storage_lifetime(),
+                    }),
+                    &self.control,
+                )?;
+                self.batched = Some(WindowBatchCursor::new(
+                    groups,
+                    arrival_ends,
+                    Some(input_owner),
+                    true,
+                ));
+                return Ok(());
+            }
+        };
+
         let mut columns = WindowInvocationScratch::try_with_capacity(
             self.columns.len(),
             host.clone(),
@@ -909,7 +1095,7 @@ impl CompiledWindowProcessor {
         validate_complete_output(
             &columns,
             &self.columns,
-            &results,
+            |call| results.get(call).and_then(|output| output.carrier.as_ref()),
             self.prepared_output()?,
             rows,
             &self.control,
@@ -1053,6 +1239,14 @@ impl CompiledWindowProcessor {
             });
         }
         let mut closed = Vec::new();
+        let mut prepared = if self.owned_partition {
+            Some(WindowInvocationScratch::try_new(
+                self.batch_host()?,
+                &self.control,
+            )?)
+        } else {
+            None
+        };
         let mut cursor = 0;
         for &start in starts.iter().chain(std::iter::once(&rows)) {
             if start > cursor {
@@ -1075,14 +1269,24 @@ impl CompiledWindowProcessor {
                 cursor = start;
             }
             if start < rows && !self.open.is_empty() {
-                closed.push(self.close()?);
+                if let Some(groups) = &mut prepared {
+                    groups.try_push(Some(self.prepare_batched_partition()?), &self.control)?;
+                } else {
+                    closed.push(self.close()?);
+                }
             }
         }
-        self.publish(closed)
+        if let Some(groups) = prepared {
+            if !groups.is_empty() {
+                self.install_batches(groups, false)?;
+            }
+            Ok(None)
+        } else {
+            self.publish(closed)
+        }
     }
 
-    /// Evaluate the complete open partition and return its output rows.
-    fn close(&mut self) -> ExecutionResult<Chunk> {
+    fn collect_partition(&mut self) -> ExecutionResult<PartitionSource> {
         let pieces = std::mem::take(&mut self.open);
         let factory = self
             .construction
@@ -1141,12 +1345,37 @@ impl CompiledWindowProcessor {
             )?;
             peer_groups(rows, |row| encoded.row(row) == encoded.row(row - 1))
         };
+        Ok(PartitionSource {
+            batch,
+            arguments,
+            peers,
+            retained,
+            pieces,
+        })
+    }
+
+    /// Legacy fixed-window output retains its complete partition boundary.
+    fn close(&mut self) -> ExecutionResult<Chunk> {
+        let PartitionSource {
+            batch,
+            arguments,
+            peers,
+            retained,
+            pieces: _pieces,
+        } = self.collect_partition()?;
+        let rows = batch.len();
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let input_schema = batch.chunk_schema_ref();
+        let input_creation = SortCreation::new(factory.as_ref(), &input_schema);
         let first_argument = self.partition_keys + self.order_keys;
         let mut results = Vec::with_capacity(self.calls.len());
         for (call_ordinal, call) in self.calls.iter().enumerate() {
             let frames = frame_table(&call.frame, &peers).map_err(ExecutionFailure::from)?;
             let start = call.first_root - first_argument;
-            let logical = arguments[start..start + call.roots]
+            let logical = arguments[start..start + call.roots()]
                 .iter()
                 .map(EvaluatedArgument::Column)
                 .collect::<Vec<_>>();
@@ -1155,7 +1384,8 @@ impl CompiledWindowProcessor {
                 call_ordinal,
                 self.partition_ordinal,
                 rows,
-                &logical,
+                &logical[..call.logical_roots],
+                &logical[call.logical_roots..],
                 &peers,
                 &frames,
                 &self.control,
@@ -1173,7 +1403,7 @@ impl CompiledWindowProcessor {
             validate_complete_output(
                 &columns,
                 &self.columns,
-                &results,
+                |call| results.get(call).and_then(|output| output.carrier.as_ref()),
                 self.prepared_output()?,
                 rows,
                 &self.control,
@@ -1195,6 +1425,125 @@ impl CompiledWindowProcessor {
             .checked_add(1)
             .ok_or(KernelFailure::ResourceExhausted)?;
         Ok(result)
+    }
+
+    fn batch_host(&self) -> ExecutionResult<Arc<dyn AggregateStateAllocator>> {
+        self.control.allocator().ok_or_else(|| {
+            invalid_batch("window continuation requires its actual allocator").into()
+        })
+    }
+
+    fn prepare_batched_partition(&mut self) -> ExecutionResult<PreparedWindowOutput> {
+        let PartitionSource {
+            batch,
+            arguments,
+            peers,
+            retained,
+            pieces,
+        } = self.collect_partition()?;
+        let host = self.batch_host()?;
+        let mut output_calls = WindowInvocationScratch::try_with_capacity(
+            self.calls.len(),
+            Arc::clone(&host),
+            &self.control,
+        )?;
+        let rows = batch.len();
+        let first_argument = self.partition_keys + self.order_keys;
+        for (call_ordinal, call) in self.calls.iter().enumerate() {
+            let frames =
+                frame_table_tracked(&call.frame, &peers, Arc::clone(&host), &self.control)?;
+            let start = call.first_root - first_argument;
+            let mut args = WindowInvocationScratch::try_with_capacity(
+                call.roots(),
+                Arc::clone(&host),
+                &self.control,
+            )?;
+            for argument in &arguments[start..start + call.roots()] {
+                args.try_push(EvaluatedArgument::Column(argument), &self.control)?;
+            }
+            let (logical, order) = args.split_at(call.logical_roots);
+            let output = if call.kernel.supports_owned_partition() {
+                let mut partitions = WindowInvocationScratch::try_with_capacity(
+                    1,
+                    Arc::clone(&host),
+                    &self.control,
+                )?;
+                let range = WindowRowRange {
+                    start: 0,
+                    end: rows,
+                };
+                partitions.try_push(
+                    prepare_owned_call(
+                        &call.kernel,
+                        call_ordinal,
+                        self.partition_ordinal,
+                        range,
+                        logical,
+                        order,
+                        &peers,
+                        &frames,
+                        Arc::clone(&host),
+                        &self.control,
+                    )?,
+                    &self.control,
+                )?;
+                BatchedCall::Owned(partitions)
+            } else {
+                BatchedCall::Complete(evaluate_call(
+                    &call.kernel,
+                    call_ordinal,
+                    self.partition_ordinal,
+                    rows,
+                    logical,
+                    order,
+                    &peers,
+                    &frames,
+                    &self.control,
+                )?)
+            };
+            output_calls.try_push(output, &self.control)?;
+        }
+        self.partition_ordinal = self
+            .partition_ordinal
+            .checked_add(1)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        let mut inputs = WindowInvocationScratch::try_with_capacity(
+            pieces.len(),
+            Arc::clone(&host),
+            &self.control,
+        )?;
+        for piece in pieces {
+            let source = piece
+                .batch
+                .retaining_array_type_storage_observed::<ConstructionFailure>(
+                    &piece._key_storage,
+                    |layout| retained.request(layout),
+                )?;
+            inputs.try_push(source, &self.control)?;
+        }
+        let argument_storage = Chunk::source_set_storage_lifetime_observed::<ConstructionFailure>(
+            &inputs,
+            retained.storage_lifetime(),
+            |layout| retained.request(layout),
+        )?;
+        Ok(PreparedWindowOutput {
+            calls: output_calls,
+            source: batch,
+            argument_storage,
+        })
+    }
+
+    fn install_batches(
+        &mut self,
+        groups: WindowInvocationScratch<Option<PreparedWindowOutput>>,
+        eos: bool,
+    ) -> ExecutionResult<()> {
+        if self.batched.is_some() || self.emission.is_some() {
+            return Err(invalid_batch("window output continuation is already active").into());
+        }
+        let arrival_ends = WindowInvocationScratch::try_new(self.batch_host()?, &self.control)?;
+        self.batched = Some(WindowBatchCursor::new(groups, arrival_ends, None, eos));
+        Ok(())
     }
 
     /// Emit the partitions one arrival closed as one chunk, in partition order.
@@ -1266,18 +1615,40 @@ struct CallOutput {
     values: ArrayRef,
     carrier: Option<WindowResultCarrier>,
 }
+// Old whole-invocation-only windows preserve the original exact scratch
+// element. The mixed continuation allocates its separate layout only when
+// an exact installed call requires it.
+enum InvocationOutputs {
+    Complete(WindowInvocationScratch<CallOutput>),
+    Mixed(WindowInvocationScratch<BatchedCall>),
+}
+
+impl InvocationOutputs {
+    fn push_complete(
+        &mut self,
+        output: CallOutput,
+        control: &RuntimeKernelControl,
+    ) -> Result<(), KernelFailure> {
+        match self {
+            Self::Complete(results) => results.try_push(output, control),
+            Self::Mixed(results) => results.try_push(BatchedCall::Complete(output), control),
+        }
+    }
+}
+
 fn evaluate_call(
     kernel: &Arc<dyn PreparedWindowKernel>,
     call_ordinal: usize,
     partition_ordinal: usize,
     rows: usize,
     logical: &[EvaluatedArgument<'_>],
+    order: &[EvaluatedArgument<'_>],
     peers: &[WindowRowRange],
     frames: &[WindowRowRange],
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<CallOutput> {
     let contract = Arc::clone(kernel.contract());
-    let full = FullPartitionWindowInput::try_new(contract.as_ref(), rows, logical, &[], control)?;
+    let full = FullPartitionWindowInput::try_new(contract.as_ref(), rows, logical, order, control)?;
     let input = WindowPartitionInput::try_new(full, peers, frames, control)?;
     let mut partition = WindowEvaluationPartition::begin_evaluated(
         Arc::clone(kernel),
@@ -1312,6 +1683,35 @@ fn evaluate_call(
     })
 }
 
+fn prepare_owned_call(
+    kernel: &Arc<dyn PreparedWindowKernel>,
+    call: usize,
+    ordinal: usize,
+    range: WindowRowRange,
+    logical: &[EvaluatedArgument<'_>],
+    order: &[EvaluatedArgument<'_>],
+    peers: &[WindowRowRange],
+    frames: &[WindowRowRange],
+    host: Arc<dyn AggregateStateAllocator>,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<PreparedPartitionCall> {
+    let rows = range.end - range.start;
+    let full = FullPartitionWindowInput::try_new(kernel.contract(), rows, logical, order, control)?;
+    let input = WindowPartitionInput::try_new(full, peers, frames, control)?;
+    let continuation = WindowEvaluationPartition::begin_owned_evaluated(
+        Arc::clone(kernel),
+        input,
+        WindowInvocationContext::partition(call, ordinal),
+        host,
+        control,
+    )?;
+    Ok(PreparedPartitionCall {
+        range,
+        ordinal,
+        continuation: Some(continuation),
+    })
+}
+
 // Count the ONE original Display without allocating or rendering a second
 // diagnostic. The caller requests real host capacity before invoking the
 // validator or constructing its full original String.
@@ -1330,10 +1730,10 @@ fn validation_message_bytes(
     write!(&mut count, "{error}").map_err(|_| KernelFailure::ResourceExhausted)?;
     Ok(count.0)
 }
-fn validate_complete_output(
+fn validate_complete_output<'a>(
     columns: &[ArrayRef],
     sources: &[OutputSource],
-    results: &[CallOutput],
+    carrier_for_call: impl Fn(usize) -> Option<&'a WindowResultCarrier>,
     schema: &ChunkSchemaRef,
     rows: usize,
     control: &RuntimeKernelControl,
@@ -1390,9 +1790,7 @@ fn validate_complete_output(
             ))
         })?;
         let carrier = match source {
-            OutputSource::Call(call) => results
-                .get(*call)
-                .and_then(|result| result.carrier.as_ref()),
+            OutputSource::Call(call) => carrier_for_call(*call),
             OutputSource::Input(_) => None,
         }
         .ok_or_else(|| {
@@ -1406,6 +1804,59 @@ fn validate_complete_output(
         return Err(novarocks_functions::WindowEvaluationFailure::InvocationData(cause).into());
     }
     drop(reservation);
+    control.checkpoint(0)?;
+    Ok(())
+}
+
+fn validate_mixed_complete_output(
+    batch: &arrow::record_batch::RecordBatch,
+    sources: &[OutputSource],
+    calls: &[BatchedCall],
+    schema: &ChunkSchemaRef,
+    rows: usize,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<()> {
+    use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
+    use std::fmt::Write;
+    if sources.len() != schema.slots().len() {
+        return Err(
+            invalid_batch("window continuation output count differs from its schema").into(),
+        );
+    }
+    for (column, (source, slot)) in sources.iter().zip(schema.slots()).enumerate() {
+        control.checkpoint(1)?;
+        let (array, carrier) = match *source {
+            OutputSource::Input(input) => (batch.column(input), None),
+            OutputSource::Call(call) => {
+                let Some(complete) = calls[call].complete() else {
+                    continue;
+                };
+                (&complete.values, complete.carrier.as_ref())
+            }
+        };
+        let Err(error) =
+            validate_analytic_output_column_typed(column, array, slot.field().data_type(), rows)
+        else {
+            continue;
+        };
+        let carrier = carrier.ok_or_else(|| {
+            invalid_batch("exact window input or fixed result violated its immutable layout")
+        })?;
+        let host = control.allocator().ok_or_else(|| {
+            invalid_batch("original window output validation requires its actual allocator")
+        })?;
+        let charge = OpaqueRetainedCharge::try_new(host)?;
+        let bytes = validation_message_bytes(&error)?;
+        let reservation = charge.reserve_operation(bytes)?;
+        let mut message = String::new();
+        message
+            .try_reserve_exact(bytes)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        write!(&mut message, "{error}")
+            .expect("original analytic Display writes the measured exact text");
+        let cause = carrier.original_output_validation_data(column, message, reservation);
+        return Err(novarocks_functions::WindowEvaluationFailure::InvocationData(cause).into());
+    }
     control.checkpoint(0)?;
     Ok(())
 }
@@ -1510,12 +1961,57 @@ impl TransformKernel for CompiledWindowProcessor {
             ctx.report_failure(error.clone());
         }
         let output = self.failure_result(result)?;
-        Ok(StepResult::new(output, NextStep::NeedInput, rows))
+        let next = if self.batched.is_some() {
+            NextStep::Runnable
+        } else {
+            NextStep::NeedInput
+        };
+        Ok(StepResult::new(output, next, rows))
     }
 
     fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
+        }
+        if self.batched.is_some() {
+            if !ctx.work().try_consume(1) {
+                return Ok(StepResult::new(None, NextStep::Yield, 0));
+            }
+            let result = (|| {
+                let schema = self.prepared_output()?.clone();
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?;
+                self.batched
+                    .as_mut()
+                    .expect("active window continuation")
+                    .next(
+                        self.output_batch_rows.get() as usize,
+                        &self.columns,
+                        &schema,
+                        factory.as_ref(),
+                        &self.control,
+                    )
+            })();
+            if let Err(error) = &result {
+                ctx.report_failure(error.clone());
+            }
+            let output = self.failure_result(result)?;
+            let cursor = self.batched.as_ref().expect("active window continuation");
+            let next = if cursor.drained() {
+                let eos = cursor.eos;
+                self.batched = None;
+                if eos {
+                    self.release_owned();
+                    NextStep::Finished
+                } else {
+                    NextStep::NeedInput
+                }
+            } else {
+                NextStep::Runnable
+            };
+            return Ok(StepResult::new(Some(output), next, 0));
         }
         let Some(cursor) = &self.emission else {
             return Ok(StepResult::new(None, NextStep::NeedInput, 0));
@@ -1560,12 +2056,23 @@ impl TransformKernel for CompiledWindowProcessor {
             if self.original_function_major {
                 self.finish_invocation()?;
                 self.instances = None;
-                if self.emission.is_some() {
+                if self.emission.is_some() || self.batched.is_some() {
                     return Ok(StepResult::new(None, NextStep::Runnable, 0));
                 }
                 self.release_owned();
                 Ok(StepResult::new(None, NextStep::Finished, 0))
             } else {
+                if self.owned_partition && !self.open.is_empty() {
+                    let mut groups = WindowInvocationScratch::try_with_capacity(
+                        1,
+                        self.batch_host()?,
+                        &self.control,
+                    )?;
+                    groups.try_push(Some(self.prepare_batched_partition()?), &self.control)?;
+                    self.install_batches(groups, true)?;
+                    self.instances = None;
+                    return Ok(StepResult::new(None, NextStep::Runnable, 0));
+                }
                 let output = if self.open.is_empty() {
                     None
                 } else {

@@ -44,7 +44,7 @@ fn upper_call(argument: TypedExpr) -> TypedExpr {
             name: "upper".into(),
             args: (vec![argument]).into(),
             distinct: false,
-            binding: SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError),
+            binding: SqlFunctionBinding::from_test(resolved, DecimalOverflowPolicy::ReportError),
             volatility,
         },
         value_type,

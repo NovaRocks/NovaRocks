@@ -40,6 +40,7 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
             let source = FunctionValueType::new(carrier, nullable);
             let target = FunctionValueType::new(target.clone(), nullable);
             let conversion = plan_conversion(
+                crate::binding::PlanBindingAuthority::Test,
                 functions,
                 &source,
                 &target,
@@ -80,6 +81,7 @@ fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
     );
     assert!(matches!(
         plan_conversion(
+            crate::binding::PlanBindingAuthority::Test,
             catalog,
             &ty,
             &ty,
@@ -92,6 +94,7 @@ fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
     ));
     for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
         let PlannedConversion::Carrier(step) = plan_conversion(
+            crate::binding::PlanBindingAuthority::Test,
             catalog,
             &ty,
             &ty,

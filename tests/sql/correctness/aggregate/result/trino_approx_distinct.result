@@ -13,7 +13,32 @@ distinct_boolean	distinct_true
 cardinality
 2
 
+-- query 4
+-- types	bigint
+cardinality
+1
+
+-- query 5
+-- types	bigint
+cardinality
+1
+
+-- query 6
+-- types	bigint
+cardinality
+0
+
 -- query 7
 -- types	bigint	bigint	bigint	boolean
 groups	smallest_exact	largest_exact	within_rmse
 32	8192	8192	true
+
+-- query 8
+-- types	bigint	bigint
+default_precision	explicit_precision
+3	3
+
+-- query 9
+-- types	bigint
+cardinality
+1

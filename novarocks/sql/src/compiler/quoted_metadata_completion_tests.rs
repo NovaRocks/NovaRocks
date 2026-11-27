@@ -282,9 +282,7 @@ fn a_complete_quoted_cte_name_uses_no_catalog_qualification_or_relation_need() {
 #[test]
 fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
     use crate::analysis::{QueryBody, Relation};
-    use crate::analyzer::iceberg_metadata::{
-        IcebergMetadataDerivedTypes, metadata_table_schema_with,
-    };
+    use crate::planning::catalog::{bind_derived_metadata_view, resolved_metadata_table};
 
     for partitioned in [false, true] {
         for name in [
@@ -305,50 +303,80 @@ fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
             let identity = TableIdentity::new("caller", "caller_db", "orders");
             assert_metadata_need(need, identity.clone(), SqlMetadataTableKind::Files, binding);
 
-            let partition_type = partitioned.then(|| {
-                DataType::Struct(
-                    vec![arrow::datatypes::Field::new(
-                        "region",
-                        DataType::Int32,
-                        true,
-                    )]
-                    .into(),
-                )
-            });
-            let derivatives = IcebergMetadataDerivedTypes::try_new(partition_type, None).unwrap();
-            let columns = metadata_table_schema_with(SqlMetadataTableKind::Files, &derivatives)
-                .into_iter()
-                .map(|column| ColumnDef {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                    write_default: None,
-                    logical_type: column.logical_type,
-                })
-                .collect();
-            let slot = crate::binding::SqlTableBindingId::new_for_test(73);
-            let table = ResolvedAnalyzerTable::from_planner(
-                Some(&identity.catalog),
-                &identity.namespace,
-                TableDef {
-                    name: identity.table.clone(),
-                    columns,
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::Sql(SqlScanSource::new(
-                        slot,
-                        SqlTableIdentity::try_new(
-                            identity.catalog.clone(),
-                            identity.namespace.clone(),
-                            identity.table.clone(),
-                        )
-                        .unwrap(),
-                        SqlScanKind::Metadata {
-                            kind: SqlMetadataTableKind::Files,
-                            version: SqlTableVersionSelector::Current,
-                        },
-                    )),
-                },
+            let mut columns = vec![
+                ("content", FunctionValueType::new(DataType::Int32, false)),
+                (
+                    "record_count",
+                    FunctionValueType::new(DataType::Int64, false),
+                ),
+                (
+                    "file_size_in_bytes",
+                    FunctionValueType::new(DataType::Int64, false),
+                ),
+            ];
+            let mut expected = Vec::new();
+            if partitioned {
+                let partition = FunctionValueType::new(
+                    DataType::Struct(
+                        vec![arrow::datatypes::Field::new(
+                            "region",
+                            DataType::Int32,
+                            true,
+                        )]
+                        .into(),
+                    ),
+                    true,
+                );
+                columns.push(("partition", partition.clone()));
+                expected.push(SqlViewColumn {
+                    name: "partition".into(),
+                    value_type: partition,
+                });
+            }
+            expected.extend(
+                [
+                    ("record_count", true),
+                    ("file_count", false),
+                    ("total_size", true),
+                ]
+                .map(|(name, nullable)| SqlViewColumn {
+                    name: name.into(),
+                    value_type: FunctionValueType::new(DataType::Int64, nullable),
+                }),
             );
+            let slot = crate::binding::SqlTableBindingId::new_for_test(73);
+            let table = resolved_metadata_table(
+                &identity.catalog,
+                &identity.namespace,
+                &identity.table,
+                SqlMetadataTableKind::Files,
+                columns
+                    .into_iter()
+                    .map(|(name, value)| {
+                        ColumnDef::from_value_type(name.into(), value, None).unwrap()
+                    })
+                    .collect(),
+                vec![],
+                slot,
+            );
+            let (partition, grouping) = if partitioned {
+                ("partition, ", "GROUP BY partition")
+            } else {
+                ("", "HAVING count(*) > 0")
+            };
+            let view_sql = format!(
+                r#"SELECT {partition}sum(record_count) AS record_count,
+                   count(*) AS file_count, sum(file_size_in_bytes) AS total_size
+                   FROM "caller"."caller_db"."orders$files" WHERE content = 0 {grouping}"#
+            );
+            let table = bind_derived_metadata_view(
+                table,
+                slot,
+                "orders$partitions",
+                view_sql.into(),
+                expected.clone().into(),
+            )
+            .unwrap();
             let fact = CatalogRelationFact::resolved(need, table).unwrap();
             state
                 .accept_facts(vec![fact].into(), &SqlCompileControl::unbounded())
@@ -357,13 +385,10 @@ fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
             let catalog = state.completed_catalog().unwrap();
             let (resolved, _, _) =
                 crate::analyzer::analyze(state.query(), &catalog, "caller_db").unwrap();
-            let expected =
-                metadata_table_schema_with(SqlMetadataTableKind::Partitions, &derivatives);
             assert_eq!(resolved.output_columns.len(), expected.len());
             for (column, shape) in resolved.output_columns.iter().zip(expected) {
-                assert_eq!(column.name, shape.name, "{source}");
-                assert_eq!(column.value_type.data_type(), &shape.data_type, "{source}");
-                assert_eq!(column.value_type.nullable(), shape.nullable, "{source}");
+                assert_eq!(column.name, shape.name.as_ref(), "{source}");
+                assert_eq!(column.value_type, shape.value_type, "{source}");
             }
 
             let QueryBody::Select(outer) = &resolved.body else {
@@ -375,7 +400,7 @@ fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
                 ..
             } = outer.from.as_ref().unwrap()
             else {
-                panic!("partitions must keep SQL-owned aggregation");
+                panic!("partitions must expand its provider-authored aggregation");
             };
             assert_eq!(alias, "p");
             let QueryBody::Select(inner) = &partitions.body else {

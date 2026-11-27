@@ -267,19 +267,13 @@ impl ContractLoweringVisitor<'_> {
             )?;
         }
         for (&(fragment, site), entry) in &self.call_sources.window_entries {
-            let kind = entry.captured.binding().resolved().kind;
-            let lifecycle = if kind == novarocks_type_contract::FunctionKind::Aggregate {
-                PureCallLifecycle::AggregateWindow
-            } else {
-                PureCallLifecycle::Window
-            };
             insert_relation_binding(
                 &mut source_groups,
                 fragment,
                 site,
                 &entry.canonical_operational.binding,
                 entry.captured.binding(),
-                lifecycle,
+                entry.lifecycle,
                 &mut self.work,
             )?;
         }

@@ -46,6 +46,8 @@ struct OccurrenceSnapshotWindow<'a> {
 
 pub(crate) struct PlannedRequestedRefresh {
     pub(crate) plan: RefreshPlan,
+    /// Original canonical syntax admitted against the retained source views.
+    pub(crate) canonical_query: Arc<ast::Query>,
     pub(crate) target_binding: ConnectorProviderBindingKey,
     pub(crate) full_overwrite: bool,
     pub(crate) rebuild: Option<RefreshRebuildBinding>,
@@ -57,10 +59,16 @@ pub(crate) struct RefreshRebuildBinding {
 }
 
 pub(crate) struct RefreshBindingCandidate {
-    pub(crate) query: ast::Query,
+    query: Arc<ast::Query>,
     pub(crate) observed: crate::mv::domain::persistence::source_bindings::MvObservedBinding,
     pub(crate) versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
     pub(crate) interpretation: novarocks_mv_application::persistence::codec::InterpretationDocument,
+}
+
+impl RefreshBindingCandidate {
+    pub(crate) fn canonical_query(&self) -> &ast::Query {
+        &self.query
+    }
 }
 
 pub(crate) enum RefreshBindingObservation {
@@ -118,6 +126,7 @@ pub(crate) fn definition_analysis_failure(
                 | AnalyzeErrorKind::TypeMismatch
                 | AnalyzeErrorKind::InvalidFunctionArgument
                 | AnalyzeErrorKind::UnsupportedQueryShape
+                | AnalyzeErrorKind::MvDefinitionEffect
                 | AnalyzeErrorKind::InvalidView
                 | AnalyzeErrorKind::ViewIsStale
                 | AnalyzeErrorKind::ViewIsRecursive
@@ -272,7 +281,7 @@ pub(crate) async fn prepare_refresh_binding_candidate(
         .capture_views(bindings.freeze_statement_views().await?)?;
     Ok(RefreshBindingObservation::Complete(Box::new(
         RefreshBindingCandidate {
-            query,
+            query: Arc::new(query),
             observed,
             versions,
             interpretation,
@@ -384,12 +393,6 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         full
     });
     let stmt = full_statement.as_ref().unwrap_or(stmt);
-    let finish = |plan| PlannedRequestedRefresh {
-        plan,
-        target_binding: target_binding_key.clone(),
-        full_overwrite,
-        rebuild: None,
-    };
     let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)?;
     let target_schema_observation =
         crate::mv::domain::storage_observation::observe_schema_validation(
@@ -557,6 +560,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                     "MV binding rebuild",
                 ),
             ),
+            canonical_query: Arc::clone(&candidate.query),
             target_binding: target_binding_key,
             full_overwrite: true,
             rebuild: Some(RefreshRebuildBinding {
@@ -575,6 +579,13 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     .await?;
     let base_refs = definition_base_refs(&mv_definition)?;
     let canonical_select_query = candidate.query;
+    let finish = |plan| PlannedRequestedRefresh {
+        plan,
+        canonical_query: Arc::clone(&canonical_select_query),
+        target_binding: target_binding_key.clone(),
+        full_overwrite,
+        rebuild: None,
+    };
     // Driver dispatch: plan-side dispatch is capability-driven, matching the
     // execute path. The capabilities come from L plus the exact target
     // observation L was validated against, never from a persisted contract.
@@ -1976,6 +1987,9 @@ pub(crate) async fn validate_target_snapshot_original(
     )
     .map_err(Into::into)
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod partition_planning_tests {
