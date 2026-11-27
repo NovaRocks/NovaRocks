@@ -339,7 +339,26 @@ mod tests {
     }
     #[test]
     fn non_aggregate_sources_require_v2_or_v3_without_row_lineage() {
-        let projection = projection();
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        fixture.interpretation.aggregates.clear();
+        fixture.interpretation.state_slots.clear();
+        fixture.interpretation.branches.clear();
+        fixture.interpretation.apply_key = None;
+        fixture.interpretation.target.fields.retain(|field| {
+            matches!(
+                field.logical_identity,
+                PhysicalFieldLogicalIdentity::Output(_)
+            )
+        });
+        fixture.mapping = novarocks_mv_application::persistence::test_support::fixture_mapping(
+            &fixture.binding,
+            &fixture.interpretation,
+        );
+        let projection = StoredKeyedMvProjection {
+            mv_id: 1,
+            facts: fixture.build().unwrap(),
+        };
         assert!(!projection.facts.interpretation().is_aggregate());
         let occurrence = &projection.facts.binding().occurrences[0];
         let target = target_observation(&projection);

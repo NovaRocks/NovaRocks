@@ -3648,8 +3648,8 @@ fn installed_keyed_drop_fixture() -> (
 }
 
 #[test]
-fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
-    use crate::persistence::keyed_documents::decode_current_keyed_documents;
+fn keyed_drop_of_external_data_snapshot_preserves_unattributed_current() {
+    use crate::persistence::resolution::ApplicablePublication;
     let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
     let original = caps.reply.lock().unwrap().as_ref().unwrap().clone();
     let mut external = original.clone();
@@ -3658,16 +3658,21 @@ fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
         ConnectorCommittedVersion::try_new(Bytes::from_static(b"external"), Some(3)).unwrap();
     external.current_records.clear();
     *caps.reply.lock().unwrap() = Ok(external.clone());
-    assert!(decode_current_keyed_documents(external, target.catalog().clone()).is_err());
-    assert!(
-        entrance
-            .observe_keyed_admission(&lease, request.clone())
-            .is_err()
+    let (observed, admission, _) = entrance
+        .observe_keyed_admission(&lease, request.clone())
+        .unwrap();
+    assert_eq!(observed.view, external);
+    assert!(admission.matches_keyed(&observed));
+    assert_eq!(
+        observed.applicable_publication(),
+        &ApplicablePublication::Unattributed
     );
+    assert!(observed.servable_publication().is_none());
     let (first, _) = entrance
         .observe_keyed_drop(&lease, request.clone())
         .unwrap();
     assert_eq!(first.target(), &target);
+    assert_eq!(first.metadata_version(), &external.metadata_version);
     let mut management = entrance.acquire(first.request(), || false).unwrap();
     let (second, _) = entrance.observe_keyed_drop(&lease, request).unwrap();
     assert!(first.matches(&second));
@@ -3687,10 +3692,9 @@ fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
         entrance.management_phase(target.table()),
         MvManagementPhase::NotObserved
     );
-    // This management-only operation did not change the provider's data facts.
+    // DROP admission and settlement leave the provider's data facts intact.
     let retained = caps.reply.lock().unwrap().as_ref().unwrap().clone();
-    assert!(retained.current_records.is_empty());
-    assert!(decode_current_keyed_documents(retained, target.catalog().clone()).is_err());
+    assert_eq!(retained, external);
     assert!(!original.current_records.is_empty());
 }
 
@@ -4139,8 +4143,13 @@ fn keyed_drop_foreign_scope_does_not_revoke_another_targets_authority() {
 
 #[test]
 fn shared_current_reader_revokes_foreign_authority_before_publication_decoding() {
-    use crate::persistence::keyed_documents::{
-        management_slot, management_slot_name, observe_current_keyed_documents_with_management,
+    use crate::persistence::{
+        codec::PersistenceCodecError,
+        documents::MvDocumentError,
+        keyed_documents::{
+            management_slot, management_slot_name, observe_current_keyed_documents_with_management,
+        },
+        resolution::ApplicablePublication,
     };
     for publication in ["valid", "missing", "malformed"] {
         let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
@@ -4166,13 +4175,30 @@ fn shared_current_reader_revokes_foreign_authority_before_publication_decoding()
             caps.calls.load(std::sync::atomic::Ordering::SeqCst),
             before + 1
         );
-        if publication == "valid" {
+        if publication == "malformed" {
+            assert!(matches!(
+                result,
+                Err(MvDocumentError::Codec(
+                    PersistenceCodecError::MalformedWire(_)
+                ))
+            ));
+        } else {
             let (foreign, _) = result.unwrap();
             assert_eq!(foreign.deployment_owner, owner("deployment-b"));
             assert_eq!(foreign.process_incarnation, incarnation("inc-b"));
-            assert!(foreign.publication.is_some());
-        } else {
-            assert!(result.is_err());
+            if publication == "valid" {
+                assert!(matches!(
+                    foreign.applicable_publication(),
+                    ApplicablePublication::Bound(_)
+                ));
+                assert!(foreign.servable_publication().is_some());
+            } else {
+                assert_eq!(
+                    foreign.applicable_publication(),
+                    &ApplicablePublication::Unattributed
+                );
+                assert!(foreign.servable_publication().is_none());
+            }
         }
         assert!(!prior.is_open());
         assert_eq!(

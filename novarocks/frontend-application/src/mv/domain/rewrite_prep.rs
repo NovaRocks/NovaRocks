@@ -530,7 +530,10 @@ mod tests {
 
     #[test]
     fn rewrite_requires_the_exact_original_view_declaration() {
-        use super::{freeze_mv_rewrite_selection, verify_rewrite_publication};
+        use super::{
+            freeze_mv_rewrite_selection, resolve_current_keyed_documents,
+            verify_rewrite_publication,
+        };
         use crate::mv::domain::persistence::source_bindings::view_binding_dependency;
         use novarocks_mv_application::{
             persistence::{
@@ -575,7 +578,7 @@ mod tests {
             ConnectorInstanceId::parse("ice").unwrap(),
             CatalogVersion::from_bytes([1; 32]),
         );
-        let mut frozen = observed_current_keyed(&projection, catalog);
+        let frozen = observed_current_keyed(&projection, catalog.clone());
         assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored.clone())], &[]).is_ok());
         let output = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
             ConnectorProviderId::parse("iceberg").unwrap(),
@@ -610,8 +613,10 @@ mod tests {
         }
         .encode()
         .unwrap();
-        frozen.view.markers.insert(key, marker);
-        assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored)], &[]).is_err());
+        let mut marked_view = frozen.view;
+        marked_view.markers.insert(key, marker);
+        let marked = resolve_current_keyed_documents(marked_view, catalog).unwrap();
+        assert!(verify_rewrite_publication(&marked, &[Arc::new(stored)], &[]).is_err());
     }
 
     struct CapturedEvent {

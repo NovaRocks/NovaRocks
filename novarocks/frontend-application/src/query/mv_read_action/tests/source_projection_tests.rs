@@ -22,7 +22,7 @@ use super::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
-    codec::{ApplyKeyKind, PhysicalFieldLogicalIdentity},
+    codec::PhysicalFieldLogicalIdentity,
     identity::FieldIdentity,
     keyed_documents::{MvKeyedObservedCurrentDocuments, StoredKeyedMvProjection},
     test_support::{KeyedProjectionFixture, fixture_mapping, fixture_type, observed_current_keyed},
@@ -65,14 +65,12 @@ pub(super) struct SourceFixture {
     background_composition: bool,
     initial_schema: InitialSourceSchema,
 }
-/// Use only the existing row-level projection capability. The pure keyed
-/// fixture supplies durable identities; SQL owns internal target labels/types.
+/// Build the visible-only target for a non-aggregate MV. Source occurrences
+/// retain their own identities, including for UNION ALL and self joins.
 fn row_projection(
     fixture: &mut KeyedProjectionFixture,
     self_join: bool,
 ) -> BTreeMap<FieldIdentity, String> {
-    use novarocks_sql::planning::mv::{SqlMvInternalTargetColumn, mv_internal_target_column};
-    use novarocks_types::schema::SqlType;
     let field = |id| FieldIdentity::try_new(vec![id]).unwrap();
     fixture.definition.query.effective_sql = if self_join {
         "SELECT o.amount AS amount FROM ice.sales.orders o JOIN ice.sales.orders o2 ON o.order_id=o2.order_id".into()
@@ -93,58 +91,25 @@ fn row_projection(
         output
             .source_fields
             .retain(|value| value.occurrence_id == 7);
-        fixture.interpretation.branches.clear();
     }
     fixture.interpretation.outputs[0].source_type = fixture_type("double");
+    fixture.interpretation.branches.clear();
     fixture.interpretation.aggregates.clear();
     fixture.interpretation.state_slots.clear();
-    fixture.interpretation.apply_key.as_mut().unwrap().kind = if self_join {
-        ApplyKeyKind::JoinRowKey
-    } else {
-        ApplyKeyKind::BaseRowId
-    };
-    let apply = mv_internal_target_column(if self_join {
-        SqlMvInternalTargetColumn::JoinApplyKey
-    } else {
-        SqlMvInternalTargetColumn::ApplyKey
+    fixture.interpretation.apply_key = None;
+    fixture.interpretation.target.fields.retain_mut(|binding| {
+        if matches!(
+            binding.logical_identity,
+            PhysicalFieldLogicalIdentity::Output(_)
+        ) {
+            binding.source_type = fixture_type("double");
+            true
+        } else {
+            false
+        }
     });
-    assert!(!apply.nullable);
-    let apply_type = match apply.data_type {
-        SqlType::BigInt => "bigint",
-        SqlType::String => "string",
-        other => panic!("unexpected projection apply-key type {other:?}"),
-    };
-    fixture
-        .interpretation
-        .target
-        .fields
-        .retain_mut(|binding| match &binding.logical_identity {
-            PhysicalFieldLogicalIdentity::Output(_) => {
-                binding.source_type = fixture_type("double");
-                true
-            }
-            PhysicalFieldLogicalIdentity::ApplyKey(_) => {
-                binding.source_type = fixture_type(apply_type);
-                binding.nullable = apply.nullable;
-                true
-            }
-            PhysicalFieldLogicalIdentity::Branch(_) => !self_join,
-            PhysicalFieldLogicalIdentity::State(_) => false,
-        });
     fixture.mapping = fixture_mapping(&fixture.binding, &fixture.interpretation);
-    let mut names = BTreeMap::from([(field(31), "amount".into()), (field(34), apply.name)]);
-    if !self_join {
-        let branch = mv_internal_target_column(SqlMvInternalTargetColumn::BranchId);
-        assert_eq!(branch.data_type, SqlType::Int);
-        assert!(!branch.nullable);
-        names.insert(field(35), branch.name);
-    }
-    for binding in &fixture.interpretation.target.fields {
-        assert!(names.contains_key(&binding.target_field_id));
-    }
-    assert!(fixture.interpretation.aggregates.is_empty());
-    assert!(fixture.interpretation.state_slots.is_empty());
-    names
+    BTreeMap::from([(field(31), "amount".into())])
 }
 
 impl SourceFixture {
@@ -201,7 +166,7 @@ impl SourceFixture {
             query_materializer::connector_query_binding_from_materialization,
         };
         use crate::mv::domain::{
-            analysis::refresh_property::{derive_fragment_property, derive_imv_refresh_contract},
+            analysis::refresh_property::derive_fragment_property,
             analysis_adapter::analyze_mv_select_with_captured_catalog,
             persistence::source_bindings::observe_mv_binding,
             refresh::definition::{read_stored_mv_query, stored_mv_identity},
@@ -283,7 +248,6 @@ impl SourceFixture {
         let observed =
             observe_mv_binding(self.as_ref(), &sql, &bindings, &[], context.clone()).unwrap();
         let property = derive_fragment_property(&analysis, &control).unwrap();
-        let contract = derive_imv_refresh_contract(&analysis, &control).unwrap();
         let storage = metadata(false);
         let schema = crate::mv::domain::storage_observation::observe_schema_validation(
             self.as_ref(),
@@ -299,9 +263,8 @@ impl SourceFixture {
                 source_observations: &observed.relations,
                 runtime_layout: &crate::mv::domain::iceberg_refresh::stateless_mv_runtime_layout(),
                 target_identity: &property.identity,
-                apply_key_column_name: Some(contract.apply_key.column_name),
-                branch_column_name: (!sql.union_branches().is_empty())
-                    .then_some(novarocks_sql::planning::mv::MV_BRANCH_ID_COLUMN_NAME),
+                apply_key_column_name: None,
+                branch_column_name: None,
             },
             schema.exact_schema(),
         )
@@ -1391,7 +1354,7 @@ async fn original_explain_union_occurrences_prepare_once_across_a_and_b_without_
     explain_counted(false, false).await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn original_explain_self_join_binds_one_window_before_existing_join_key_refusal() {
+async fn original_explain_self_join_binds_one_window_for_both_occurrences() {
     explain_counted(true, false).await;
 }
 #[tokio::test(flavor = "current_thread")]
@@ -1598,7 +1561,6 @@ async fn explain_counted_with_initial_schema(
             "B must validate the actual frozen To exact revision"
         );
     }
-    assert_eq!(result.is_ok(), !self_join);
     drop(result);
     fixture.close(false).await;
 }
