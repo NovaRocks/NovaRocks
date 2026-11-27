@@ -38,39 +38,6 @@ pub(super) fn is_window_only_function(name: &str) -> bool {
     )
 }
 
-/// Ordinary aggregates with a concrete implementation in the native analytic
-/// operator. Catalog membership alone is not enough to admit `OVER`: the BE
-/// intentionally supports a smaller, explicit set of aggregate window shapes.
-pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
-    matches!(
-        name,
-        "count"
-            | "sum"
-            | "avg"
-            | "min"
-            | "max"
-            | "max_by"
-            | "min_by"
-            | "variance"
-            | "var_samp"
-            | "stddev"
-            | "stddev_samp"
-            | "bool_or"
-            | "covar_pop"
-            | "covar_samp"
-            | "corr"
-            | "array_agg"
-    )
-}
-
-pub(super) fn aggregate_window_supports_distinct(name: &str) -> bool {
-    name == "array_agg"
-}
-
-pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
-    name == "array_agg"
-}
-
 fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {
     match data_type {
         DataType::Null => "null_type".to_string(),

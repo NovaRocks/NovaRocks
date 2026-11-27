@@ -29,16 +29,13 @@ SELECT approx_distinct(DISTINCT x) AS cardinality
 FROM (VALUES BIGINT '1', BIGINT '2', BIGINT '2', CAST(NULL AS BIGINT)) t(x);
 
 -- query 4
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT approx_distinct(BIGINT '1', DOUBLE '0.023');
+SELECT approx_distinct(BIGINT '1', DOUBLE '0.023') AS cardinality;
 
 -- query 5
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT approx_distinct(true, DOUBLE '0.023');
+SELECT approx_distinct(true, DOUBLE '0.023') AS cardinality;
 
 -- query 6
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT approx_distinct(NULL, DOUBLE '0.023');
+SELECT approx_distinct(NULL, DOUBLE '0.023') AS cardinality;
 
 -- query 7
 WITH domain AS (
@@ -57,3 +54,20 @@ SELECT count(*) AS groups,
        max(exact) AS largest_exact,
        sqrt(avg(relative_error * relative_error)) <= DOUBLE '0.046' AS within_rmse
 FROM errors;
+
+-- query 8
+SELECT approx_distinct(x) AS default_precision,
+       approx_distinct(x, DOUBLE '0.023') AS explicit_precision
+FROM (VALUES ARRAY[BIGINT '1', NULL], ARRAY[BIGINT '1', NULL],
+             ARRAY[NULL, BIGINT '1'], ARRAY[BIGINT '2', NULL]) t(x);
+
+-- query 9
+SELECT approx_distinct(x, e) FILTER (WHERE accepted) AS cardinality
+FROM (VALUES (BIGINT '1', DOUBLE 'NaN', false),
+             (NULL, DOUBLE 'NaN', true),
+             (BIGINT '2', NULL, true),
+             (BIGINT '3', DOUBLE '0.023', true)) t(x, e, accepted);
+
+-- query 10
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT approx_distinct(BIGINT '1', DOUBLE '0.26000000000000006');

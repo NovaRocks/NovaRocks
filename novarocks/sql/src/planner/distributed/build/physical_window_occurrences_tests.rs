@@ -673,12 +673,12 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
         .unwrap();
     for name in ["lead", "lag"] {
         let (mut builder, leaf, owner) = empty();
-        let text = ty(DataType::Utf8, true);
+        let nullable_integer = ty(DataType::Int64, true);
         let value = literal(
             &mut builder,
             owner,
-            text.clone(),
-            checked::utf8("value".into()),
+            nullable_integer.clone(),
+            checked::i64(11),
         );
         let offset = literal(&mut builder, owner, integer.clone(), checked::i64(1));
         let default = builder
@@ -695,7 +695,11 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
             &mut builder,
             leaf,
             owner,
-            window_binding(&catalog, name, &[text, integer.clone(), integer.clone()]),
+            window_binding(
+                &catalog,
+                name,
+                &[nullable_integer, integer.clone(), integer.clone()],
+            ),
             &[value, offset, default],
             None,
             false,
@@ -735,7 +739,7 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
         );
         assert_eq!(
             window_contract(&result).result_type().data_type().clone(),
-            DataType::Utf8
+            DataType::Int64
         );
         assert!(window_contract(&result).result_type().nullable());
     }
@@ -1515,9 +1519,9 @@ fn analyze_window_admission_sql(sql: &str) -> Result<(), crate::analyze_error::A
 #[test]
 fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emission() {
     for sql in [
-        "SELECT lead(TRUE, 1, FALSE) OVER (ORDER BY 1)",
-        "SELECT min('x') OVER ()",
-        "SELECT max('x') OVER ()",
+        "SELECT map_agg(1, 'x') OVER ()",
+        "SELECT min(7, 2) OVER ()",
+        "SELECT max(7, 2) OVER ()",
     ] {
         let error = analyze_window_admission_sql(sql).expect_err("static capability refusal");
         assert_eq!(
@@ -1538,6 +1542,9 @@ fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emissi
     for sql in [
         "SELECT min('x')",
         "SELECT max('x')",
+        "SELECT min('x') OVER ()",
+        "SELECT max('x') OVER ()",
+        "SELECT lead(TRUE, 1, FALSE) OVER (ORDER BY 1)",
         "SELECT min(7) OVER ()",
         "SELECT max(7) OVER ()",
         "SELECT lead('x') OVER (ORDER BY 1)",

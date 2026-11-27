@@ -18,6 +18,8 @@
 use crate::aggregate_scalar::{ScalarStateAllocator, ScalarWork, TrackedAggScalarValue};
 use crate::{KernelFailure, kernel_control::invalid};
 use allocator_api2::vec::Vec as ScalarVec;
+use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
+use arrow_schema::DataType;
 use hashbrown::{HashSet, hash_map::DefaultHashBuilder};
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, OuterFailureProjection, kernel_reason,
@@ -65,6 +67,41 @@ impl<'a> Arguments<'a> {
             show_count: *show_count,
         })
     }
+    fn from_columns(columns: [(&'a ArrayRef, usize); 5]) -> Result<Option<Self>, KernelFailure> {
+        for (source, row) in &columns {
+            if *row >= source.len() {
+                return Err(invalid(
+                    "LISTAGG selected row is outside its original input",
+                ));
+            }
+            if source.data_type() == &DataType::Null || source.is_null(*row) {
+                return Ok(None);
+            }
+        }
+        let strings = |index: usize| {
+            let (source, row) = columns[index];
+            source
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|value| value.value(row))
+                .ok_or_else(|| invalid("LISTAGG text has a foreign value carrier"))
+        };
+        let flags = |index: usize| {
+            let (source, row) = columns[index];
+            source
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .map(|value| value.value(row))
+                .ok_or_else(|| invalid("LISTAGG flag has a foreign value carrier"))
+        };
+        Ok(Some(Self {
+            value: strings(0)?,
+            separator: strings(1)?,
+            overflow_error: flags(2)?,
+            filler: strings(3)?,
+            show_count: flags(4)?,
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -108,24 +145,58 @@ pub(super) fn emit<'a, A: ScalarStateAllocator + 'a>(
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Option<ScalarVec<u8, A>>, KernelFailure> {
-    let mut rows = rows.into_iter();
-    let Some(first) = rows.next() else {
+    let mut output = ScalarVec::new_in(allocator.clone());
+    let length = emit_arguments(
+        rows.into_iter().map(Arguments::from_row),
+        distinct,
+        allocator,
+        work,
+        |piece, work| append(&mut output, piece, work),
+    )?;
+    Ok(length.map(|_| output))
+}
+
+/// The window's shared frame selector already applied its exact modifiers.
+/// A borrowed row's original SQL NULLs and bytes enter the same emission.
+pub(in crate::builtin) fn emit_window<'a, A: ScalarStateAllocator + 'a>(
+    rows: impl Iterator<Item = [(&'a ArrayRef, usize); 5]>,
+    allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+    write: impl FnMut(&str, &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure>,
+) -> Result<Option<usize>, KernelFailure> {
+    emit_arguments(
+        rows.map(Arguments::from_columns)
+            .filter_map(Result::transpose),
+        false,
+        allocator,
+        work,
+        write,
+    )
+}
+
+fn emit_arguments<'a, A: ScalarStateAllocator>(
+    mut rows: impl Iterator<Item = Result<Arguments<'a>, KernelFailure>>,
+    distinct: bool,
+    allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+    mut write: impl FnMut(&str, &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure>,
+) -> Result<Option<usize>, KernelFailure> {
+    let Some(options) = rows.next().transpose()? else {
         return Ok(None);
     };
     work.step()?;
-    let options = Arguments::from_row(first)?;
     if options.filler.len() > MAX_FILLER_BYTES {
         return Err(KernelFailure::from_domain(ListaggDataFailure::Filler(
             options.filler.len(),
         )));
     }
     let mut seen = HashSet::with_hasher_in(DefaultHashBuilder::default(), allocator.clone());
-    let mut output = ScalarVec::new_in(allocator.clone());
+    let mut output_bytes = 0usize;
     let mut emitted = 0usize;
     let mut omitted = 0usize;
-    for row in std::iter::once(first).chain(rows) {
+    for row in std::iter::once(Ok(options)).chain(rows) {
         work.step()?;
-        let args = Arguments::from_row(row)?;
+        let args = row?;
         if distinct {
             work.flush()?;
             if seen.contains(&args) {
@@ -140,7 +211,7 @@ pub(super) fn emit<'a, A: ScalarStateAllocator + 'a>(
         }
         let separator = if emitted == 0 { "" } else { options.separator };
         let needed = separator.len().saturating_add(args.value.len());
-        if omitted > 0 || needed > MAX_OUTPUT_BYTES - output.len() {
+        if omitted > 0 || needed > MAX_OUTPUT_BYTES - output_bytes {
             if options.overflow_error {
                 return Err(KernelFailure::from_domain(ListaggDataFailure::Overflow));
             }
@@ -150,24 +221,36 @@ pub(super) fn emit<'a, A: ScalarStateAllocator + 'a>(
             }
             continue;
         }
-        append(&mut output, separator, work)?;
-        append(&mut output, args.value, work)?;
+        write(separator, work)?;
+        write(args.value, work)?;
+        output_bytes += needed;
         emitted += 1;
     }
 
     if omitted > 0 {
         if emitted > 0 {
-            append(&mut output, options.separator, work)?;
+            write(options.separator, work)?;
+            output_bytes += options.separator.len();
         }
-        append(&mut output, options.filler, work)?;
+        write(options.filler, work)?;
+        output_bytes += options.filler.len();
         if options.show_count {
-            let count = omitted.to_string();
-            append(&mut output, "(", work)?;
-            append(&mut output, &count, work)?;
-            append(&mut output, ")", work)?;
+            use std::io::Write;
+            let mut number = [0u8; 3 * std::mem::size_of::<usize>()];
+            let mut output = &mut number[..];
+            write!(output, "{omitted}").map_err(|_| {
+                invalid("LISTAGG omitted row count exceeds its decimal representation")
+            })?;
+            let used = 3 * std::mem::size_of::<usize>() - output.len();
+            let count = std::str::from_utf8(&number[..used])
+                .map_err(|_| invalid("LISTAGG omitted row count has invalid UTF-8"))?;
+            write("(", work)?;
+            write(count, work)?;
+            write(")", work)?;
+            output_bytes += used + 2;
         }
     }
-    Ok(Some(output))
+    Ok(Some(output_bytes))
 }
 
 fn append<A: ScalarStateAllocator>(

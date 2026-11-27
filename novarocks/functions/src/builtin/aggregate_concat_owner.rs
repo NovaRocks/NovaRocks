@@ -18,7 +18,11 @@
 //! One real immutable owner for the installed LISTAGG aggregate identity.
 //! Raw ordered state interpretation and aggregate OVER retain separate obligations.
 
-use super::{aggregate_concat::ListaggKernel, catalogue::BuiltinAggregateResolver};
+use super::{
+    aggregate_concat::ListaggKernel,
+    aggregate_window_adapter::{TrackedWindowOwner, admit_frame_modifiers},
+    catalogue::BuiltinAggregateResolver,
+};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::*;
 use arrow_schema::DataType;
@@ -47,12 +51,11 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ConcatOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin LISTAGG aggregate pure owner",
             value: error.to_string().into(),
-        },
-    )
+        })
 }
 struct ConcatOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -91,7 +94,7 @@ impl ConcatOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: PureKernelAbi::AggregateWindowV1,
             })
             .collect();
         Ok(Self {
@@ -189,6 +192,25 @@ impl PureFunctionMetadataOwner for ConcatOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_lifecycle_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        lifecycle: PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.admit_selected_profile_observed(selected, logical_argument_count, control)?;
+        let PureCallLifecycle::AggregateWindow { distinct, ordered } = lifecycle else {
+            return Ok(());
+        };
+        self.declaration.effect_declaration(&selected.overload)?;
+        if logical_argument_count != 5 {
+            return Err(FunctionBindingError::InvalidBinding(
+                "LISTAGG window requires five exact value channels".into(),
+            ));
+        }
+        admit_frame_modifiers(selected, logical_argument_count, distinct, ordered, control)
+    }
 }
 impl FunctionEffectOwner for ConcatOwner {
     type Error = FunctionBindingError;
@@ -247,6 +269,17 @@ impl PureAggregateImplementation for ConcatOwner {
             checked.require_binding_author(self.resolver.as_ref(), input)
         })
         .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PureAggregateWindowImplementation for ConcatOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<ListaggKernel>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        TrackedWindowOwner::Listagg(aggregate).prepare(contract, control)
     }
 }
 

@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact MIN/MAX fixed-width and UTF-8 owners. MIN/MAX OVER folds each frame
-//! through the same fixed-width kernel; a UTF-8 state retains heap and has no
-//! inline window state, so its OVER form is refused by name.
+//! Exact MIN/MAX for fixed-width and byte values, with tracked UTF-8 windows.
 
 use super::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
 use super::aggregate_extrema_utf8::BytesExtremaKernel;
-use super::aggregate_window_adapter::InlineAggregateWindowKernel;
+use super::aggregate_window_adapter::{InlineAggregateWindowKernel, TrackedWindowOwner};
 use super::{
     aggregate_extrema::{ExtremaKernel, ExtremaOperation, supported_type},
     catalogue::BuiltinAggregateResolver,
@@ -164,7 +162,6 @@ fn unsupported_window_input(selected: &FunctionBindingSelection) -> Option<&'sta
         return None;
     };
     match (source.data_type(), source.logical_type()) {
-        (DataType::Utf8, _) => Some("MIN/MAX OVER a UTF-8 value has no inline window state"),
         (DataType::Binary, _) => Some("MIN/MAX OVER a VARBINARY value has no inline window state"),
         (_, ValueLogicalType::Uuid) => Some("MIN/MAX OVER a UUID value is unsupported"),
         _ => None,
@@ -195,7 +192,11 @@ impl PureAggregateWindowImplementation for ExtremaOwner {
                 .map_err(compile_failure)?;
             return Err(invalid(message));
         }
-        super::aggregate_window_adapter::prepare(aggregate, contract, control)
+        if matches!(aggregate.as_ref(), PreparedExtrema::Bytes(_)) {
+            TrackedWindowOwner::Utf8Extrema(aggregate).prepare(contract, control)
+        } else {
+            super::aggregate_window_adapter::prepare(aggregate, contract, control)
+        }
     }
 }
 
@@ -280,8 +281,13 @@ impl PureFunctionMetadataOwner for ExtremaOwner {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         self.admit_selected_profile_observed(selected, logical_argument_count, control)?;
-        if lifecycle != PureCallLifecycle::AggregateWindow {
+        let PureCallLifecycle::AggregateWindow { distinct, ordered } = lifecycle else {
             return Ok(());
+        };
+        if distinct || ordered {
+            return Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ));
         }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         work.step()?;

@@ -490,7 +490,11 @@ fn aggregate_options_observed(
             }
             work.flush()?;
             Some(AggregatePreparationOptions {
-                state_interpretation: None,
+                state_interpretation: binding
+                    .state_interpretation
+                    .as_ref()
+                    .map(|facts| facts.clone_observed(work).map(Arc::new))
+                    .transpose()?,
                 phase: AggregateKernelPhase::Single,
                 distinct,
                 order_keys: keys.into(),

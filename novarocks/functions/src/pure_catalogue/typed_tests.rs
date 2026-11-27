@@ -1695,7 +1695,10 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
         );
         for lifecycle in [
             PureCallLifecycle::Aggregate,
-            PureCallLifecycle::AggregateWindow,
+            PureCallLifecycle::AggregateWindow {
+                distinct: false,
+                ordered: false,
+            },
         ] {
             profile
                 .admit_selected_lifecycle_observed(&bound.selected, 2, lifecycle, &COMPILE)

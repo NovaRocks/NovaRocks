@@ -100,7 +100,7 @@ use std::ops::Range;
 #[path = "selected_copy/extent_failure.rs"]
 mod extent_failure;
 pub use extent_failure::CopyExtentFailure;
-use extent_failure::CopyLayout;
+pub(crate) use extent_failure::CopyLayout;
 
 #[derive(Debug)]
 pub enum CopyError {

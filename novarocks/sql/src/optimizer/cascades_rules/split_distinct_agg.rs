@@ -59,8 +59,6 @@ impl Rule for SplitDistinctAgg {
         memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
-        let _ = control;
-
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Ok(vec![]);
         };
@@ -91,6 +89,16 @@ impl Rule for SplitDistinctAgg {
             .enumerate()
             .filter_map(|(idx, call)| (!call.distinct).then_some(idx))
             .collect();
+        for &index in &non_distinct_indices {
+            if crate::agg_mergeability::approx_distinct_split_eligibility(
+                &agg.aggregates[index],
+                &memo.scalars,
+                control,
+            )? == Some(false)
+            {
+                return Ok(vec![]);
+            }
+        }
         let non_distinct: Vec<ScalarAggregateSpec> = non_distinct_indices
             .iter()
             .map(|idx| agg.aggregates[*idx].clone())

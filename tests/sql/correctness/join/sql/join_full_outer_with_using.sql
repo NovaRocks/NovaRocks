@@ -496,7 +496,7 @@ ORDER BY k1;
 SELECT k1, k2, v1, v2,
        ROW_NUMBER() OVER (
          PARTITION BY k1
-         ORDER BY k2,
+         ORDER BY k2 NULLS FIRST,
                   CASE
                     WHEN v1 IS NOT NULL AND v2 IS NOT NULL THEN 'BOTH'
                     WHEN v1 IS NOT NULL THEN 'T1_ONLY'

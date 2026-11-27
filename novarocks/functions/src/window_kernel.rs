@@ -25,7 +25,7 @@ use crate::{
     FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionCallContract,
     FunctionEffectOwner, FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure,
     PreparedAggregateKernel, PureAggregateImplementation, ScopedRelationalEffects, SelectedValues,
-    Selection, WindowCallContract, WindowCallOptions, WindowOutputProjection,
+    Selection, WindowCallContract, WindowCallOptions,
 };
 use novarocks_type_contract::{
     CallEffects, CompilePhase, PureCompileControl, WindowFrameExclusion,
@@ -129,6 +129,9 @@ pub enum WindowPartitionRetention {
     /// chooses the retention validator. Actual host grants precede every
     /// output operation; the observed carrier fact grants no allocation.
     InputBackedFrozen,
+    /// An owned continuation whose evolving state and output are admitted by
+    /// the original allocator before each allocation.
+    AllocationTracked,
 }
 
 pub trait PreparedWindowKernel: Send + Sync + fmt::Debug + 'static {
@@ -156,6 +159,20 @@ pub trait PreparedWindowKernel: Send + Sync + fmt::Debug + 'static {
     fn partition_retention(&self, rows: usize) -> Result<WindowPartitionRetention, KernelFailure> {
         self.partition_retained_upper_bound(rows)
             .map(|bytes| WindowPartitionRetention::RowBounded { bytes })
+    }
+    /// Positive owner capability for a checked partition that outlives the
+    /// setup loan. The operator continues to own the original input sources.
+    fn supports_owned_partition(&self) -> bool {
+        false
+    }
+    fn begin_owned_partition_evaluated(
+        self: Arc<Self>,
+        _input: WindowPartitionInput<'_>,
+        _context: crate::WindowInvocationContext,
+        _allocator: Arc<dyn crate::AggregateStateAllocator>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<Box<dyn WindowKernelPartition>, crate::WindowEvaluationFailure> {
+        Err(invalid("prepared window owner has no owned partition continuation").into())
     }
     /// Explicit whole-invocation source. This does not reinterpret a partition
     /// loan, infer an invocation mode, or supply a missing host capability.
@@ -236,6 +253,19 @@ pub trait WindowKernelPartition: Send {
     > {
         Ok(None)
     }
+    /// Visit the exact i32 offset spans contributed by one output row. Callers
+    /// combine spans only within the same output column and depth-first node.
+    fn visit_output_row_offsets(
+        &self,
+        _row: usize,
+        _visit: &mut dyn FnMut(usize, usize) -> Result<(), KernelFailure>,
+        _control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
+        Err(invalid(
+            "owned window partition has no result offset author",
+        ))
+    }
+
     /// Exact O(1) owned body/heap fact, including failure exits.
     fn retained_bytes(&self) -> usize;
 }
@@ -604,12 +634,53 @@ pub struct WindowEvaluationPartition<'input> {
     instance: Box<dyn WindowKernelPartition + 'input>,
     prepared: Arc<dyn PreparedWindowKernel>,
     contract: Arc<WindowCallContract>,
-    input: WindowPartitionInput<'input>,
+    rows: usize,
     retained_upper_bound: usize,
     retention: WindowPartitionRetention,
     complete_carrier_handoff: bool,
     first_evaluated_failure: Option<crate::window_invocation_data::WindowEvaluationFailure>,
     status: PartitionStatus,
+}
+impl WindowEvaluationPartition<'static> {
+    pub fn begin_owned_evaluated(
+        prepared: Arc<dyn PreparedWindowKernel>,
+        input: WindowPartitionInput<'_>,
+        context: crate::WindowInvocationContext,
+        allocator: Arc<dyn crate::AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, crate::WindowEvaluationFailure> {
+        control.checkpoint(0)?;
+        let contract = Arc::clone(prepared.contract());
+        let rows = input.full_input().partition_rows();
+        let retention = prepared.partition_retention(rows)?;
+        if !Arc::ptr_eq(prepared.contract(), &contract)
+            || !std::ptr::eq(contract.as_ref(), input.full_input().contract())
+            || !prepared.supports_owned_partition()
+            || prepared.has_complete_carrier_handoff()
+            || retention != WindowPartitionRetention::AllocationTracked
+        {
+            return Err(invalid(
+                "window owned partition differs from the allocator-backed contract",
+            )
+            .into());
+        }
+        let instance = Arc::clone(&prepared)
+            .begin_owned_partition_evaluated(input, context, allocator, control)?;
+        let partition = Self {
+            rows,
+            retained_upper_bound: 0,
+            retention,
+            first_evaluated_failure: None,
+            complete_carrier_handoff: false,
+            instance,
+            prepared,
+            contract,
+            status: PartitionStatus::Open,
+        };
+        partition.validate_metadata()?;
+        control.checkpoint(0)?;
+        Ok(partition)
+    }
 }
 impl<'input> WindowEvaluationPartition<'input> {
     pub fn begin(
@@ -634,7 +705,7 @@ impl<'input> WindowEvaluationPartition<'input> {
         let partition = Self {
             prepared,
             contract,
-            input,
+            rows: input.full_input().partition_rows(),
             retained_upper_bound,
             retention: WindowPartitionRetention::RowBounded {
                 bytes: retained_upper_bound,
@@ -682,6 +753,7 @@ impl<'input> WindowEvaluationPartition<'input> {
             // This freeze occurs after actual admitted construction; it is a
             // retaining-owner envelope, never authority for the work just done.
             WindowPartitionRetention::InputBackedFrozen => instance.retained_bytes(),
+            WindowPartitionRetention::AllocationTracked => 0,
         };
         size_of::<Self>()
             .checked_add(retained_upper_bound)
@@ -691,7 +763,7 @@ impl<'input> WindowEvaluationPartition<'input> {
             instance,
             prepared,
             contract,
-            input,
+            rows: input.full_input().partition_rows(),
             retained_upper_bound,
             retention,
             complete_carrier_handoff,
@@ -703,19 +775,55 @@ impl<'input> WindowEvaluationPartition<'input> {
         control.checkpoint(0)?;
         Ok(partition)
     }
+    fn validate_selection(&self, selection: Selection<'_>) -> Result<(), KernelFailure> {
+        if selection.batch_rows() != self.rows {
+            return Err(invalid(
+                "window output Selection addresses another partition",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn visit_output_row_offsets(
+        &self,
+        row: usize,
+        visit: &mut dyn FnMut(usize, usize) -> Result<(), KernelFailure>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
+        if self.status != PartitionStatus::Open
+            || row >= self.rows
+            || !self.prepared.supports_owned_partition()
+        {
+            return Err(invalid(
+                "window result geometry differs from the checked continuation",
+            ));
+        }
+        control.checkpoint(0)?;
+        self.instance
+            .visit_output_row_offsets(row, visit, control)?;
+        control.checkpoint(0)
+    }
+
     pub const fn retention_policy(&self) -> WindowPartitionRetention {
         self.retention
     }
 
     pub fn retained_upper_bound(&self) -> usize {
-        size_of::<Self>() + self.retained_upper_bound
+        match self.retention {
+            // Dynamic state has no finite row-derived budget. Only the actual
+            // allocator can grant bytes as the continuation advances.
+            WindowPartitionRetention::AllocationTracked => usize::MAX,
+            _ => size_of::<Self>() + self.retained_upper_bound,
+        }
     }
     pub fn retained_bytes(&self) -> Result<usize, KernelFailure> {
         self.validate_retained()?;
         Ok(size_of::<Self>() + self.instance.retained_bytes())
     }
     fn validate_retained(&self) -> Result<(), KernelFailure> {
-        if self.instance.retained_bytes() > self.retained_upper_bound {
+        if self.retention != WindowPartitionRetention::AllocationTracked
+            && self.instance.retained_bytes() > self.retained_upper_bound
+        {
             Err(internal(
                 "window partition exceeded its frozen retained bound",
             ))
@@ -726,14 +834,12 @@ impl<'input> WindowEvaluationPartition<'input> {
     fn validate_metadata(&self) -> Result<(), KernelFailure> {
         let immutable_retention = match self.retention {
             WindowPartitionRetention::RowBounded { .. } => {
-                self.prepared
-                    .partition_retained_upper_bound(self.input.full_input().partition_rows())?
+                self.prepared.partition_retained_upper_bound(self.rows)?
                     == self.retained_upper_bound
             }
-            WindowPartitionRetention::InputBackedFrozen => {
-                self.prepared
-                    .partition_retention(self.input.full_input().partition_rows())?
-                    == WindowPartitionRetention::InputBackedFrozen
+            WindowPartitionRetention::InputBackedFrozen
+            | WindowPartitionRetention::AllocationTracked => {
+                self.prepared.partition_retention(self.rows)? == self.retention
             }
         };
         if !Arc::ptr_eq(self.prepared.contract(), &self.contract)
@@ -760,8 +866,7 @@ impl<'input> WindowEvaluationPartition<'input> {
             control.checkpoint(0)?;
             self.validate_metadata()?;
             self.validate_retained()?;
-            let input = self.input.full_input();
-            let projection = WindowOutputProjection::try_new(&input, selection, control)?;
+            self.validate_selection(selection)?;
             if selection.len() > row_capacity {
                 return Err(invalid("window output Selection exceeds host row grant"));
             }
@@ -778,7 +883,13 @@ impl<'input> WindowEvaluationPartition<'input> {
             } else {
                 self.instance.evaluate(selection, row_capacity, control)?
             };
-            projection.validate_result(&output, row_capacity, control)?;
+            crate::window_call::validate_window_result(
+                &self.contract,
+                selection,
+                &output,
+                row_capacity,
+                control,
+            )?;
             control.checkpoint(0)?;
             Ok(output)
         })();
@@ -841,8 +952,7 @@ impl<'input> WindowEvaluationPartition<'input> {
             control.checkpoint(0)?;
             self.validate_metadata()?;
             self.validate_retained()?;
-            let input = self.input.full_input();
-            let projection = WindowOutputProjection::try_new(&input, selection, control)?;
+            self.validate_selection(selection)?;
             if selection.len() > row_capacity {
                 return Err(invalid("window output Selection exceeds host row grant").into());
             }
@@ -851,7 +961,13 @@ impl<'input> WindowEvaluationPartition<'input> {
             let output = self
                 .instance
                 .evaluate_evaluated(selection, row_capacity, control)?;
-            projection.validate_result(&output, row_capacity, control)?;
+            crate::window_call::validate_window_result(
+                &self.contract,
+                selection,
+                &output,
+                row_capacity,
+                control,
+            )?;
             control.checkpoint(0)?;
             Ok(output)
         })();
@@ -918,8 +1034,7 @@ impl<'input> WindowEvaluationPartition<'input> {
             let carrier = self.instance.complete_carrier_evaluated(control)?;
             let carrier = carrier
                 .ok_or_else(|| invalid("complete window handoff owner returned no carrier"))?;
-            carrier
-                .validate_call_metadata(&self.contract, self.input.full_input().partition_rows())?;
+            carrier.validate_call_metadata(&self.contract, self.rows)?;
             control.checkpoint(0)?;
             Ok(Some(carrier))
         })();

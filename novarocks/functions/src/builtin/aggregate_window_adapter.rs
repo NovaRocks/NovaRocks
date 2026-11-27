@@ -53,6 +53,10 @@ use novarocks_type_contract::{
 };
 use std::{alloc::Layout, fmt, sync::Arc};
 
+#[path = "aggregate_window_adapter_tracked.rs"]
+mod tracked;
+pub(super) use tracked::{TrackedWindowOwner, admit_frame_modifiers};
+
 /// States whose final values one partition begin builds per emitter call.
 /// The values are checked and dropped; output emission builds its own.
 const RESULT_CHECK_BLOCK: usize = 4096;

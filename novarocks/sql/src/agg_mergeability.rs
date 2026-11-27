@@ -76,12 +76,52 @@ pub(crate) fn aggregate_mergeability(call: &AggregateCall) -> AggMergeability {
     )
 }
 
-pub(crate) fn scalar_aggregate_mergeability(call: &ScalarAggregateSpec) -> AggMergeability {
-    aggregate_mergeability_from_parts(
-        call.source.binding(),
-        call.distinct,
-        call.source.order_by().is_empty(),
-    )
+pub(crate) fn scalar_aggregate_mergeability(
+    call: &ScalarAggregateSpec,
+    arena: &crate::optimizer::scalar::ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<AggMergeability, crate::compiler::SqlCompileError> {
+    let binding = call.source.binding();
+    if call.distinct || !call.source.order_by().is_empty() {
+        return Ok(AggMergeability::SinglePhaseOnly);
+    }
+    if let Some(eligible) = approx_distinct_split_eligibility(call, arena, control)? {
+        return Ok(if eligible {
+            AggMergeability::TwoPhase
+        } else {
+            AggMergeability::SinglePhaseOnly
+        });
+    }
+    Ok(aggregate_mergeability_from_parts(binding, false, true))
+}
+
+/// The ordinary aggregate split and the DISTINCT partitioning rule both
+/// create exchange states. Approximate distinct accepts such a phase only
+/// when its original selected accuracy proves a fixed precision.
+pub(crate) fn approx_distinct_split_eligibility(
+    call: &ScalarAggregateSpec,
+    arena: &crate::optimizer::scalar::ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<bool>, crate::compiler::SqlCompileError> {
+    let binding = call.source.binding();
+    if binding.function_id.as_str() != "builtin.aggregate/approx_distinct/v1" {
+        return Ok(None);
+    }
+    let arguments = call.source.arguments();
+    if arguments.len() != binding.logical_argument_count {
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "approx_distinct staged candidate differs from its original arity".into(),
+        ));
+    }
+    let accuracy = arguments
+        .get(1)
+        .map(|arg| crate::optimizer::scalar::function_argument(arena, *arg, control))
+        .transpose()?;
+    let fixed = novarocks_functions::builtin::approx_distinct_fixed_precision(
+        arguments.len(),
+        accuracy.as_ref(),
+    )?;
+    Ok(Some(fixed.is_some()))
 }
 
 fn aggregate_mergeability_from_parts(

@@ -117,8 +117,8 @@ mod(v6, 32) as v8,
 1 as v9
 FROM (
     SELECT v1, v2, v3, v4,
-    row_number() OVER (ORDER BY v1, v2, v3, v4) as v5,
-    row_number() OVER (PARTITION BY v1 ORDER BY v2, v3, v4) as v6
+    row_number() OVER (ORDER BY v1 NULLS FIRST, v2 NULLS FIRST, v3, v4) as v5,
+    row_number() OVER (PARTITION BY v1 ORDER BY v2 NULLS FIRST, v3, v4) as v6
     FROM ${case_db}.t0
 ) tmp;
 

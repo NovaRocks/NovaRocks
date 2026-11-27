@@ -1,9 +1,9 @@
--- query 10
+-- query 11
 -- types	varchar
 table_name
 trc_l7_count_control
 
--- query 11
+-- query 12
 -- types	varchar
 name
 trc_l7_count_control

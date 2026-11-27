@@ -618,9 +618,9 @@ impl<'a> AnalyzerContext<'a> {
             false,
             std::slice::from_ref(&marker_argument),
             &[],
-            novarocks_parser::SYNTHETIC,
             self.constant_policy,
             self.purpose,
+            super::resolve_expr::AggregateCallSite::Group(novarocks_parser::SYNTHETIC),
         )?;
         let marker_query = match null_source_col {
             Some(source_col) => value_form_null_marker_query(

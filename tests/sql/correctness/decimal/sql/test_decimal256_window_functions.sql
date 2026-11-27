@@ -123,7 +123,8 @@ FROM ${case_db}.decimal_window_test
 ORDER BY category, d76_0;
 
 -- query 7
--- Test 6: Complex window expressions
+-- The DECIMAL(38,15) * DECIMAL(38,20) product overflows the Trino result.
+-- @expect_trino_error=NUMERIC_VALUE_OUT_OF_RANGE,USER_ERROR
 SELECT
     'Test6_COMPLEX_WINDOW' as test_name,
     id,

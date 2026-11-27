@@ -24,7 +24,7 @@ use arrow_array::{ArrayRef, builder::StringBuilder};
 use std::{cmp::Ordering, sync::Arc};
 
 #[path = "listagg_emission.rs"]
-mod listagg_emission;
+pub(super) mod listagg_emission;
 
 #[derive(Debug)]
 pub struct ListaggState<A: ScalarStateAllocator> {

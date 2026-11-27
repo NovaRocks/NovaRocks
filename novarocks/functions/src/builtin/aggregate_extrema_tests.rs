@@ -1173,7 +1173,10 @@ fn aggregate_extrema_uuid_and_varbinary_do_not_expand_window_or_top_n() {
                 declaration.admit_selected_lifecycle_observed(
                     &fixture.selected,
                     1,
-                    PureCallLifecycle::AggregateWindow,
+                    PureCallLifecycle::AggregateWindow {
+                        distinct: false,
+                        ordered: false,
+                    },
                     &control,
                 ),
                 Err(FunctionBindingError::UnavailableImplementation(overload))
