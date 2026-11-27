@@ -50,13 +50,21 @@ use std::{
 /// Function bindings include complete identity, type and semantic metadata.
 /// Sharing keeps expression nodes compact while preserving one exact binding
 /// from analysis through optimization and physical lowering.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqlFunctionBinding(
     Arc<SqlFunctionCallFacts>,
     Option<novarocks_functions::StaticScalarCallEffects>,
 );
 
 // Derived proof availability is independent of the bound expression's identity.
+impl std::fmt::Debug for SqlFunctionBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SqlFunctionBinding")
+            .field(&self.0)
+            .finish()
+    }
+}
 impl PartialEq for SqlFunctionBinding {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0

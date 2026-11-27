@@ -24,7 +24,7 @@ use crate::compiler::{SqlCompileError, SqlFunctionCatalog};
 use novarocks_type_contract::{FunctionValueType, PureCompileControl};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct EffectEnvironment {
     functions: Arc<dyn SqlFunctionCatalog>,
     allow_throw_exception: bool,

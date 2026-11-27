@@ -214,7 +214,7 @@ struct StoredColumnDisplay {
 }
 
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ScalarArena {
     constant_policy: novarocks_functions::ConstantValidation,
     nodes: Vec<ScalarNode>,
@@ -223,6 +223,21 @@ pub(crate) struct ScalarArena {
     effect_environment: Option<effects::EffectEnvironment>,
     intern: HashMap<u64, Vec<ScalarId>>,
     column_displays: HashMap<ColumnId, StoredColumnDisplay>,
+}
+
+impl std::fmt::Debug for ScalarArena {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // CTAS captures the optimized artifact through its Debug representation.
+        // Derived effects and the catalogue used to compute them are not plan facts.
+        formatter
+            .debug_struct("ScalarArena")
+            .field("constant_policy", &self.constant_policy)
+            .field("nodes", &self.nodes)
+            .field("value_types", &self.value_types)
+            .field("intern", &self.intern)
+            .field("column_displays", &self.column_displays)
+            .finish()
+    }
 }
 
 impl ScalarArena {
@@ -785,52 +800,50 @@ mod tests {
 
     #[test]
     fn sqlx1_function_scalar_arena_carries_catalog_volatility() {
+        use novarocks_functions::{FunctionArgument, FunctionResultType};
+
         let mut arena = ScalarArena::new();
-        let volatile_binding = test_function_binding(
-            &arena,
-            "curdate",
-            &[],
-            DataType::Date32,
-            false,
-            FunctionVolatility::Volatile,
-        );
-        let volatile = arena.intern(
-            ScalarNode::FunctionCall {
-                binding: volatile_binding,
-                volatility: FunctionVolatility::Volatile,
-                name: "curdate".to_string(),
-                args: vec![],
-                distinct: false,
-            },
-            FunctionValueType::new(DataType::Date32, false),
-        );
-        let immutable_binding = test_function_binding(
-            &arena,
-            "lower",
-            &[],
-            DataType::Utf8,
-            false,
-            FunctionVolatility::Immutable,
-        );
-        let immutable = arena.intern(
-            ScalarNode::FunctionCall {
-                binding: immutable_binding,
-                volatility: FunctionVolatility::Immutable,
-                name: "lower".to_string(),
-                args: vec![],
-                distinct: false,
-            },
+        let argument = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
             FunctionValueType::new(DataType::Utf8, false),
         );
-
-        assert_eq!(
-            arena.effects(volatile).expression.value_stability,
-            FunctionVolatility::Volatile
-        );
-        assert_eq!(
-            arena.effects(immutable).expression.value_stability,
-            FunctionVolatility::Immutable
-        );
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let control = crate::optimizer::test_optimizer_control();
+        for (name, args, expected) in [
+            ("rand", Vec::new(), FunctionVolatility::Volatile),
+            ("lower", vec![argument], FunctionVolatility::Immutable),
+        ] {
+            let arguments = args
+                .iter()
+                .map(|&id| FunctionArgument::Value {
+                    value_type: arena.value_type(id).clone(),
+                    constant: None,
+                })
+                .collect::<Vec<_>>();
+            let resolved = catalog
+                .resolve_scalar_binding(name, &arguments, control)
+                .unwrap();
+            let FunctionResultType::Scalar(value_type) = &resolved.selected.result_type else {
+                panic!("expected a scalar overload");
+            };
+            let value_type = value_type.clone();
+            let volatility = resolved.semantics.volatility;
+            let binding = crate::binding::SqlFunctionBinding::from_test(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            );
+            let scalar = arena.intern(
+                ScalarNode::FunctionCall {
+                    binding,
+                    volatility,
+                    name: name.into(),
+                    args,
+                    distinct: false,
+                },
+                value_type,
+            );
+            assert_eq!(arena.effects(scalar).expression.value_stability, expected);
+        }
     }
 
     #[test]

@@ -33,16 +33,19 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Control {
-    trace: Mutex<Vec<u32>>,
+    trace: Mutex<Vec<(CompilePhase, u32)>>,
     refuse: Option<(usize, CompileControlError)>,
 }
 
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-        assert_eq!(phase, CompilePhase::Validate);
+        assert!(matches!(
+            phase,
+            CompilePhase::Validate | CompilePhase::FunctionSpecialization
+        ));
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
-        trace.push(units);
+        trace.push((phase, units));
         match self.refuse.clone() {
             Some((at, cause)) if trace.len() == at + 1 => Err(cause),
             _ => Ok(()),
@@ -488,10 +491,14 @@ fn selected_cv_every_original_callback_refusal_keeps_group_publication_unchanged
     derive_group_statistics_for(&mut baseline_memo, root, &input(), &baseline).unwrap();
     let trace = baseline.trace.into_inner().unwrap();
     assert!(
-        trace.contains(&256),
+        trace.contains(&(CompilePhase::Validate, 256)),
         "no real bounded scalar traversal occurred"
     );
-    assert!(trace.iter().any(|units| *units > 0 && *units < 256));
+    assert!(
+        trace
+            .iter()
+            .any(|&(phase, units)| phase == CompilePhase::Validate && units > 0 && units < 256)
+    );
     assert_ne!(
         baseline_memo.groups[root]
             .logical_props
@@ -559,7 +566,11 @@ fn selected_cv_ordinary_source_refusal_observes_tail_and_preserves_typed_primary
         Err(SqlCompileError::InvalidRequest(_))
     ));
     let trace = baseline.trace.into_inner().unwrap();
-    assert!(trace.iter().any(|units| *units > 0));
+    assert!(
+        trace
+            .iter()
+            .any(|&(phase, units)| phase == CompilePhase::Validate && units > 0)
+    );
     for at in 0..trace.len() {
         for (cause, expected) in [
             (CompileControlError::Cancelled, SqlCompileError::Cancelled),

@@ -270,16 +270,29 @@ fn full_types_metadata_and_nullability_are_exact_even_in_the_same_bucket() {
 fn ordered_children_and_display_and_frame_facts_participate_in_exact_interning() {
     let control = Control::good();
     let mut arena = ScalarArena::new();
-    let a = ScalarId(0);
-    let b = ScalarId(1);
+    let a = forced(
+        &mut arena,
+        ScalarNode::ColumnRef(crate::column_id::ColumnId::new_for_test(1)),
+        ty(),
+        &control,
+    )
+    .unwrap();
+    let b = forced(
+        &mut arena,
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+        ty(),
+        &control,
+    )
+    .unwrap();
     let list = |list| ScalarNode::InList {
         child: a,
         list,
         negated: false,
     };
-    let first = forced(&mut arena, list(vec![a, b]), ty(), &control).unwrap();
+    let bool_type = FunctionValueType::new(DataType::Boolean, false);
+    let first = forced(&mut arena, list(vec![a, b]), bool_type.clone(), &control).unwrap();
     assert_ne!(
-        forced(&mut arena, list(vec![b, a]), ty(), &control).unwrap(),
+        forced(&mut arena, list(vec![b, a]), bool_type, &control).unwrap(),
         first
     );
     let binding = super::super::test_function_binding(

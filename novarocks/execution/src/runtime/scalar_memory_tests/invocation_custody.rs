@@ -357,7 +357,9 @@ fn runtime_json_object_rolls_back_capacity_failure_before_publication() {
 
 #[test]
 fn runtime_json_object_ordered_filter_suppresses_and_maps_selected_errors() {
-    let sql = r#"SELECT n FROM t WHERE flag AND JSON_OBJECT(k VALUE n) = '{"b":3}'"#;
+    // A LIMIT preserves one ordered Filter above the original row selection.
+    let sql = r#"SELECT n FROM (SELECT n, k, flag FROM t LIMIT 3) s
+                 WHERE flag AND JSON_OBJECT(k VALUE n) = '{"b":3}'"#;
     let mut selected = None;
     for program in programs(sql) {
         for node in program.graph().nodes() {
