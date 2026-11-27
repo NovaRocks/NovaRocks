@@ -183,11 +183,7 @@ impl PreparedAggregateKernel for ListaggKernel {
     {
         observed(control, |work| {
             let states = checked_states(states, work)?;
-            let distinct = self
-                .contract
-                .state_interpretation()
-                .expect("checked concatenation state interpretation")
-                .distinct;
+            let distinct = self.contract.distinct();
             let mut work = ScalarWork::new(Some(work));
             core::build_listagg_array(
                 states.iter().copied(),

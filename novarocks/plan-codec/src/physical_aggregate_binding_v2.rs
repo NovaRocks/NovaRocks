@@ -171,7 +171,7 @@ pub struct AggregateBindingInput<'source> {
     pub id: u32,
     pub source: &'source AggregateBinding,
     pub function_binding_id: u32,
-    pub intermediate_value_type_id: u32,
+    pub intermediate_value_type_id: Option<u32>,
 }
 
 /// Retains immutable loans to all original sources and their same emissions.
@@ -391,7 +391,7 @@ fn preflight(
     if policy.0 {
         let mut initial = BindingProjectionFacts {
             definition_count: inputs.len(),
-            type_reference_count: inputs.len(),
+            type_reference_count: 0,
             allocation_requests_upper_bound: 0,
             request_bytes_upper_bound: 0,
             coexisting_source_and_request_bytes_upper_bound: 0,
@@ -463,7 +463,7 @@ fn preflight(
     let mul = product;
     let mut facts = BindingProjectionFacts {
         definition_count: inputs.len(),
-        type_reference_count: inputs.len(),
+        type_reference_count: 0,
         allocation_requests_upper_bound: 0,
         request_bytes_upper_bound: 0,
         coexisting_source_and_request_bytes_upper_bound: 0,
@@ -485,8 +485,9 @@ fn preflight(
     let mut previous = None;
     let mut chunks = 0;
     for input in inputs {
-        let state = input.source.state_format.as_str();
-        if let Some(receipt) = &input.source.state_interpretation {
+        let merge = input.source.merge_state.as_ref();
+        let state = merge.map_or("", |merge| merge.state_format.as_str());
+        if let Some(receipt) = merge.and_then(|merge| merge.state_interpretation.as_ref()) {
             request::<wire::AggregateStateOrderKey>(receipt.order_keys.len(), &mut facts, policy)?;
             chunks = add(chunks, receipt.order_keys.len())?;
             if limits.is_some()
@@ -525,6 +526,16 @@ fn preflight(
         }
         if !is_aggregate {
             return Err(invalid("aggregate source has non-aggregate function kind"));
+        }
+        if !input.source.has_valid_phase_contract()
+            || merge.is_some() != input.intermediate_value_type_id.is_some()
+        {
+            return Err(invalid(
+                "aggregate source phase or type reference differs from its state capability",
+            ));
+        }
+        if merge.is_some() {
+            facts.type_reference_count = add(facts.type_reference_count, 1)?;
         }
         // Aliased aggregate owners are not summed as independent backing.
         if limits.is_some() && source < add(size_of::<AggregateBinding>(), state.len())? {
@@ -643,41 +654,46 @@ fn validate(
                     "aggregate function binding ID is absent or relation-valued",
                 ));
             }
-            let found = types.value_type_captured::<BindingCodecError>(
+            if let (Some(intermediate_id), Some(source_type)) = (
                 input.intermediate_value_type_id,
-                &mut |intermediate, work| {
-                    let base = facts.cumulative_work_upper_bound;
-                    let compared = crate::borrowed_type_resources::verify_type_binding_admitted(
-                        &input.source.intermediate_type,
-                        intermediate,
-                        source,
-                        remaining(limits, base)?,
-                        &mut |prefix| {
-                            facts.cumulative_work_upper_bound = policy.add(
-                                base,
-                                prefix.work_upper_bound(),
-                                "aggregate projection arithmetic overflow",
-                            )?;
-                            policy.gate(facts, limits, admit)
-                        },
-                        work,
-                    )?;
-                    facts.cumulative_work_upper_bound = policy.add(
-                        base,
-                        compared.work_upper_bound(),
-                        "aggregate projection arithmetic overflow",
-                    )?;
-                    if !compared.matches() {
-                        return Err(invalid(
-                            "aggregate intermediate value type differs from its original source",
-                        ));
-                    }
-                    Ok(())
-                },
-                work,
-            )?;
-            if found.is_none() {
-                return Err(invalid("aggregate intermediate value type ID is absent"));
+                input.source.intermediate_type(),
+            ) {
+                let found = types.value_type_captured::<BindingCodecError>(
+                    intermediate_id,
+                    &mut |intermediate, work| {
+                        let base = facts.cumulative_work_upper_bound;
+                        let compared = crate::borrowed_type_resources::verify_type_binding_admitted(
+                            source_type,
+                            intermediate,
+                            source,
+                            remaining(limits, base)?,
+                            &mut |prefix| {
+                                facts.cumulative_work_upper_bound = policy.add(
+                                    base,
+                                    prefix.work_upper_bound(),
+                                    "aggregate projection arithmetic overflow",
+                                )?;
+                                policy.gate(facts, limits, admit)
+                            },
+                            work,
+                        )?;
+                        facts.cumulative_work_upper_bound = policy.add(
+                            base,
+                            compared.work_upper_bound(),
+                            "aggregate projection arithmetic overflow",
+                        )?;
+                        if !compared.matches() {
+                            return Err(invalid(
+                                "aggregate intermediate value type differs from its original source",
+                            ));
+                        }
+                        Ok(())
+                    },
+                    work,
+                )?;
+                if found.is_none() {
+                    return Err(invalid("aggregate intermediate value type ID is absent"));
+                }
             }
         } else {
             let function: &BoundFunction = functions
@@ -701,24 +717,29 @@ fn validate(
                     "aggregate function differs from its original source",
                 ));
             }
-            let intermediate = types
-                .value_type_observed(input.intermediate_value_type_id, work)?
-                .ok_or_else(|| invalid("aggregate intermediate value type ID is absent"))?;
-            let compared = verify_type_binding(
-                &input.source.intermediate_type,
-                intermediate,
-                source,
-                remaining(limits, facts.cumulative_work_upper_bound)?,
-                work,
-            )?;
-            facts.cumulative_work_upper_bound = add(
-                facts.cumulative_work_upper_bound,
-                compared.work_upper_bound(),
-            )?;
-            if !compared.matches() {
-                return Err(invalid(
-                    "aggregate intermediate value type differs from its original source",
-                ));
+            if let (Some(intermediate_id), Some(source_type)) = (
+                input.intermediate_value_type_id,
+                input.source.intermediate_type(),
+            ) {
+                let intermediate = types
+                    .value_type_observed(intermediate_id, work)?
+                    .ok_or_else(|| invalid("aggregate intermediate value type ID is absent"))?;
+                let compared = verify_type_binding(
+                    source_type,
+                    intermediate,
+                    source,
+                    remaining(limits, facts.cumulative_work_upper_bound)?,
+                    work,
+                )?;
+                facts.cumulative_work_upper_bound = add(
+                    facts.cumulative_work_upper_bound,
+                    compared.work_upper_bound(),
+                )?;
+                if !compared.matches() {
+                    return Err(invalid(
+                        "aggregate intermediate value type differs from its original source",
+                    ));
+                }
             }
         }
         work.step()?;
@@ -756,32 +777,37 @@ fn encode(
     crate::allocation_exit_v2::reserve_exit::<BindingCodecError>(reserved, work)?;
     for input in inputs {
         work.flush()?;
-        let mut state_format = String::new();
-        let reserved = state_format.try_reserve_exact(input.source.state_format.as_str().len());
-        crate::allocation_exit_v2::reserve_exit::<BindingCodecError>(reserved, work)?;
-        // This identity's sole constructor admits at most 1024 ASCII bytes.
-        state_format.push_str(input.source.state_format.as_str());
-        work.step()?;
-        work.flush()?;
-        definitions.push(wire::AggregateBindingDefinition {
+        let mut definition = wire::AggregateBindingDefinition {
             id: input.id,
             function_binding_id: Some(input.function_binding_id),
             phase: Some(crate::physical_value_origin_v2::encode_phase(
                 input.source.phase,
             )),
             logical_argument_count: input.source.logical_argument_count,
-            intermediate_value_type_id: Some(input.intermediate_value_type_id),
-            state_format,
-            state_interpretation: input
-                .source
+            state_capability: wire::AggregateStateCapability::SingleOnly as i32,
+            ..Default::default()
+        };
+        if let Some(state) = &input.source.merge_state {
+            definition.state_capability = wire::AggregateStateCapability::Mergeable as i32;
+            definition.intermediate_value_type_id = input.intermediate_value_type_id;
+            let reserved = definition
+                .state_format
+                .try_reserve_exact(state.state_format.as_str().len());
+            crate::allocation_exit_v2::reserve_exit::<BindingCodecError>(reserved, work)?;
+            definition
+                .state_format
+                .push_str(state.state_format.as_str());
+            work.step()?;
+            work.flush()?;
+            definition.state_interpretation = state
                 .state_interpretation
                 .as_ref()
                 .map(|value| encode_state_interpretation(value, work))
-                .transpose()?,
-            state_argument_contract: encode_state_argument_contract(
-                input.source.state_argument_contract,
-            ),
-        });
+                .transpose()?;
+            definition.state_argument_contract =
+                encode_state_argument_contract(state.state_argument_contract);
+        }
+        definitions.push(definition);
         work.step()?;
     }
     Ok((definitions, facts))

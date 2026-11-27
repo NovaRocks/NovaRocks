@@ -3173,9 +3173,6 @@ fn grouped_writer_fragment_with_sources(
             shared_state_input
         },
         binding: AggregateBinding {
-            state_interpretation: None,
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     semantic_parameters: Box::default(),
@@ -3209,8 +3206,13 @@ fn grouped_writer_fragment_with_sources(
             } else {
                 1
             },
-            intermediate_type: ty(DataType::Binary, true),
-            state_format: AggregateStateFormatId::try_new("test_statistics/state-v1").unwrap(),
+            merge_state: Some(crate::AggregateMergeBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                intermediate_type: ty(DataType::Binary, true),
+                state_format: AggregateStateFormatId::try_new("test_statistics/state-v1").unwrap(),
+            }),
         },
         output: shared_final_output,
     };

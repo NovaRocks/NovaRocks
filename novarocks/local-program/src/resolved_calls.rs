@@ -441,7 +441,7 @@ impl ProgramResolvedCalls {
                                 }
                                 check_aggregate_source(
                                     function.frozen.as_deref(),
-                                    &function.resolved,
+                                    Some(&function.resolved),
                                     aggregate,
                                     work,
                                 )?;
@@ -489,7 +489,7 @@ impl ProgramResolvedCalls {
                                 }
                                 check_aggregate_source(
                                     function.frozen.as_deref(),
-                                    &function.resolved,
+                                    Some(&function.resolved),
                                     aggregate,
                                     work,
                                 )?;
@@ -618,7 +618,12 @@ fn validate_aggregate(
         return Err(ProgramResolvedCallsError::InvalidSite);
     }
     let contract = aggregate_contract(token)?;
-    check_aggregate_source(source.frozen.as_deref(), &source.resolved, contract, work)?;
+    check_aggregate_source(
+        source.frozen.as_deref(),
+        source.resolved.as_ref(),
+        contract,
+        work,
+    )?;
     let same_interpretation = match (
         &source.state_interpretation,
         contract.state_interpretation(),
@@ -677,7 +682,7 @@ fn validate_aggregate(
 /// legacy carrier-only representation remains an explicit expansion adapter.
 fn check_aggregate_source(
     frozen: Option<&crate::FrozenAggregateSelection>,
-    source: &novarocks_functions::ResolvedAggregateSignature,
+    source: Option<&novarocks_functions::ResolvedAggregateSignature>,
     contract: &AggregateCallContract,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
@@ -695,7 +700,11 @@ fn check_aggregate_source(
     }
     // Expansion-only carrier representation. Strong lowered calls retain the
     // original complete selection above; this adapter is retired with P07.
-    if &source.state_format != contract.state_format() {
+    let source = source.ok_or(ProgramResolvedCallsError::WrongLifecycle)?;
+    let state = contract
+        .merge_state()
+        .ok_or(ProgramResolvedCallsError::WrongLifecycle)?;
+    if source.state_format != state.state_format {
         return Err(ProgramResolvedCallsError::WrongStateFormat);
     }
     if source.argument_types.len() != contract.call().selected().argument_types.len() {
@@ -710,7 +719,7 @@ fn check_aggregate_source(
     }
     check_arrow(
         &source.intermediate_type,
-        contract.intermediate_type().data_type(),
+        state.intermediate_type.data_type(),
         work,
     )?;
     check_arrow(&source.output_type, contract.final_type().data_type(), work)
@@ -789,12 +798,18 @@ fn validate_window(
         return Err(ProgramResolvedCallsError::WrongLifecycle);
     };
     let contract = kernel.contract();
-    if contract.aggregate().is_some() != source.aggregate_binding.is_some() {
+    if contract.aggregate().is_some()
+        != (source.frozen_aggregate.is_some() || source.aggregate_binding.is_some())
+    {
         return Err(ProgramResolvedCallsError::WrongLifecycle);
     }
-    if let (Some(aggregate), Some((_, legacy))) = (contract.aggregate(), &source.aggregate_binding)
-    {
-        check_aggregate_source(source.frozen_aggregate.as_deref(), legacy, aggregate, work)?;
+    if let Some(aggregate) = contract.aggregate() {
+        check_aggregate_source(
+            source.frozen_aggregate.as_deref(),
+            source.aggregate_binding.as_ref().map(|(_, legacy)| legacy),
+            aggregate,
+            work,
+        )?;
     }
     if source.ignore_nulls != contract.options().ignore_nulls() {
         return Err(ProgramResolvedCallsError::WrongWindow);

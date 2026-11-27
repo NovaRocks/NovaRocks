@@ -46,6 +46,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(TypedLayout),
         Box::new(SingleStatementEffects),
         Box::new(DeepWideTypes::default()),
+        Box::new(OrderedAggregateDepth::default()),
     ]
 }
 
@@ -53,6 +54,12 @@ struct TypedLayout;
 struct SingleStatementEffects;
 #[derive(Default)]
 struct DeepWideTypes {
+    observe: AtomicBool,
+    intent: SqlIntentOwner,
+}
+
+#[derive(Default)]
+struct OrderedAggregateDepth {
     observe: AtomicBool,
     intent: SqlIntentOwner,
 }
@@ -407,6 +414,402 @@ impl Scenario for DeepWideTypes {
     }
 }
 
+impl Scenario for OrderedAggregateDepth {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module("query_output", self.name(), true, false)
+    }
+
+    fn name(&self) -> &'static str {
+        "query-output/ordered-aggregate-depth64"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(&self, profile: LaunchProfile) -> Result<()> {
+        ensure!(
+            matches!(
+                profile,
+                LaunchProfile::FaultScenario | LaunchProfile::Performance
+            ),
+            "ordered aggregates require the fault-scenario or performance launch profile"
+        );
+        self.observe
+            .store(profile == LaunchProfile::FaultScenario, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &crate::scenario::ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        if !self.observe.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let observations = (0..cluster_size)
+            .map(|index| (index, ObservationAction::ExchangeSnapshot.as_str(), None))
+            .collect();
+        Ok(Some(self.intent.freeze(
+            vec![StatementSpec {
+                sql: ordered_aggregate_query("ordered_aggregate.fixture.numbers"),
+                faults: vec![],
+                observations,
+            }],
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = context
+            .handle()
+            .query_execution_resource_snapshot()?
+            .context("ordered aggregate resource baseline missing")?;
+        let mut session =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        let selected = if context.launch_profile() == LaunchProfile::FaultScenario {
+            Some(self.intent.take(0)?)
+        } else {
+            None
+        };
+        let result = with_number_files(
+            context,
+            &mut session,
+            "ordered_aggregate",
+            "ordered-aggregate-output",
+            |context, session, table| {
+                ordered_aggregate_pages(context, session, table, selected.as_ref())
+            },
+        );
+        let deadline = context.deadline();
+        let convergence = context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, deadline);
+        with_cleanup(result, convergence)
+    }
+}
+
+fn ordered_aggregate_query(table: &str) -> String {
+    let depth = TYPE_DEPTH - 2;
+    let value = format!("{}n{}", "[".repeat(depth), "]".repeat(depth));
+    let leaf = "[1]".repeat(depth);
+    let items = (1..=8)
+        .map(|i| format!("items[{i}]{leaf}"))
+        .collect::<Vec<_>>();
+    format!(
+        "WITH input AS (
+             SELECT n, IF(n IN (2,8), CAST(NULL AS BIGINT), n%4) AS k, {value} AS v
+             FROM {table}
+         ), grouped AS (
+             SELECT IF(n<10, 17, 23) AS g,
+                    array_agg(v ORDER BY k DESC NULLS FIRST, n ASC) FILTER (WHERE n<>3) AS items,
+                    count(*) AS total, sum(n) AS combined,
+                    listagg(CAST(n AS VARCHAR), ',') WITHIN GROUP (ORDER BY k ASC NULLS LAST, n DESC)
+                        FILTER (WHERE n<>3) AS listed
+             FROM input GROUP BY IF(n<10, 17, 23)
+         )
+         SELECT g, total, combined, cardinality(items), {}, listed FROM grouped",
+        items.join(", "),
+    )
+}
+
+fn ordered_aggregate_pages(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    table: &str,
+    selected: Option<&SelectedStatement>,
+) -> Result<()> {
+    let query = ordered_aggregate_query(table);
+    let root = context.scenario_root().join("ordered-aggregate-http");
+    let client = TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
+        context.deadline(),
+        &root,
+    )?
+    .with_session(&[("x-trino-session", "pipeline_dop=4")]);
+    let explain = session.execute(format!(
+        "EXPLAIN WITH SESSION explain_detail = 'CONTRACT', pipeline_dop = 4 {query}"
+    ))?;
+    let mut plan = String::new();
+    for row in &explain.rows {
+        let [TrinoValue::Text(line)] = row.as_slice() else {
+            anyhow::bail!("unexpected ordered aggregate EXPLAIN row: {row:?}");
+        };
+        plan.push_str(line);
+        plan.push('\n');
+    }
+    std::fs::write(root.join("source.sql"), &query)?;
+    std::fs::write(root.join("source-plan.txt"), &plan)?;
+    let mut fragment = 0;
+    let mut fragments = BTreeSet::new();
+    let mut routes = Vec::new();
+    for line in plan.lines() {
+        if let Some(header) = line.strip_prefix("PLAN FRAGMENT ") {
+            fragment = header.parse::<u32>()?;
+            fragments.insert(fragment);
+        }
+        if line.trim_start().starts_with("inbound edge")
+            && line.contains("destination-distribution=hash")
+            && line.matches("List(").count() == TYPE_DEPTH - 2
+        {
+            let source = marker_field(line, "source")
+                .and_then(|s| s.strip_prefix('f'))
+                .context("raw group route has no source fragment")?
+                .parse::<u32>()?;
+            let node = marker_field(line, "destination")
+                .and_then(|n| n.strip_prefix('n'))
+                .context("raw group route has no receiving node")?;
+            routes.push((source, fragment, node));
+        }
+    }
+    let [(source, destination, node)] = routes.as_slice() else {
+        anyhow::bail!("expected one hash exchange of full raw ordered rows: {routes:?}");
+    };
+    let stage = |f| (fragments.range(..f).count() + 1).to_string();
+    let pages = if let Some(selected) = selected {
+        observe_statement(context, &client, selected, &query)?
+    } else {
+        client.execute(&query)?
+    };
+    let (_, rows) = read_typed_pages(&pages, "ordered aggregate at the depth limit")?;
+    ensure!(
+        rows == [json!([
+            17,
+            9,
+            45,
+            8,
+            2,
+            8,
+            7,
+            6,
+            1,
+            5,
+            9,
+            4,
+            "4,9,5,1,6,7,8,2"
+        ])],
+        "ordered raw-row aggregate changed its group, FILTER, or order: {rows:?}"
+    );
+    if let Some(selected) = selected {
+        verify_ordered_input_routes(
+            context,
+            selected,
+            (&stage(*source), &stage(*destination), node),
+            &root,
+        )?;
+    }
+
+    verify_additional_ordered_groups(context, session, table, &root, selected.is_none())?;
+
+    let type_name = format!(
+        "{}BIGINT{}",
+        "ARRAY(".repeat(TYPE_DEPTH - 1),
+        ")".repeat(TYPE_DEPTH - 1)
+    );
+    let tasks = |context: &mut ScenarioContext| {
+        let owner = context.handle();
+        (0..owner.be_count())
+            .map(|i| owner.backend_task_execution_tasks_created(i))
+            .collect::<Result<Vec<_>>>()
+    };
+    let before = tasks(context)?;
+    let pages = client.execute(&format!(
+        "SELECT cardinality(array_agg(CAST(NULL AS {type_name}) ORDER BY n)) FROM {table}"
+    ))?;
+    let terminal = pages.last().context("missing ordered D+1 rejection")?;
+    let error = &terminal.json()?["error"];
+    ensure!(
+        terminal.next_uri()?.is_none()
+            && error["errorName"] == "NOT_SUPPORTED"
+            && error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&format!("depth limit of {TYPE_DEPTH}"))),
+        "unexpected ordered D+1 SQL verdict: {error}"
+    );
+    ensure!(
+        tasks(context)? == before,
+        "ordered D+1 SQL created a BE Task"
+    );
+    context
+        .action("verified complete ordered aggregation of raw rows at D and SQL rejection at D+1");
+    Ok(())
+}
+
+fn verify_additional_ordered_groups(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    table: &str,
+    root: &Path,
+    verify_single_edge: bool,
+) -> Result<()> {
+    let grouped = session.execute(format!(
+        "SELECT n%2 AS g, array_agg(DISTINCT n%3 ORDER BY n%3 DESC) AS items
+         FROM {table} GROUP BY n%2 ORDER BY g"
+    ))?;
+    for (g, expected) in [0, 1].into_iter().zip(&grouped.rows) {
+        ensure!(
+            matches!(expected.as_slice(), [TrinoValue::Integer(actual), TrinoValue::Array(items)]
+                if *actual == g && items == &[TrinoValue::Integer(2), TrinoValue::Integer(1), TrinoValue::Integer(0)]),
+            "grouped ordered DISTINCT produced {expected:?}"
+        );
+    }
+    ensure!(
+        grouped.rows.len() == 2,
+        "expected two complete DISTINCT groups"
+    );
+
+    let depth = TYPE_DEPTH - 3;
+    let value = format!("{}n{}", "[".repeat(depth), "]".repeat(depth));
+    let key = format!(
+        "{}n{}",
+        "[".repeat(TYPE_DEPTH - 1),
+        "]".repeat(TYPE_DEPTH - 1)
+    );
+    let leaf = "[1]".repeat(depth);
+    let scalar = format!(
+        "SELECT cardinality(items) AS items_count, items[1]{leaf} AS first, items[9]{leaf} AS last
+         FROM (SELECT array_agg({value} ORDER BY {key} DESC) AS items FROM {table}) grouped"
+    );
+    let before = if verify_single_edge {
+        let explain = session.execute(format!(
+            "EXPLAIN WITH SESSION explain_detail = 'CONTRACT' {scalar}"
+        ))?;
+        let text = explain
+            .rows
+            .iter()
+            .filter_map(|row| match row.as_slice() {
+                [TrinoValue::Text(line)] => Some(line.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("scalar-release-plan.txt"), &text)?;
+        let edges = text
+            .lines()
+            .filter(|line| line.starts_with("  edge") && line.contains("kind=stream"))
+            .count();
+        ensure!(
+            edges == 1,
+            "release raw scalar aggregate requires one target stream"
+        );
+        Some(deep_exchange_metrics(
+            context,
+            root,
+            "ordered-scalar-before",
+        )?)
+    } else {
+        None
+    };
+    let scalar = session.execute(scalar)?;
+    ensure!(
+        matches!(scalar.rows.as_slice(), [row]
+            if matches!(row.as_slice(), [TrinoValue::Integer(9), TrinoValue::Integer(9), TrinoValue::Integer(1)])),
+        "no-key aggregate with a depth-64 order key returned {:?}",
+        scalar.rows
+    );
+    if let Some(before) = before {
+        let after = deep_exchange_metrics(context, root, "ordered-scalar-after")?;
+        let root_owners = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(index, (old, new))| {
+                (new.0.checked_sub(old.0) == Some(1)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            root_owners.len() == 1,
+            "expected one BE to finish the scalar root"
+        );
+        ensure!(
+            before
+                .iter()
+                .zip(&after)
+                .enumerate()
+                .any(|(index, (old, new))| index != root_owners[0] && new.1 > old.1),
+            "no other BE acknowledged nonempty data on the one ordered scalar raw input edge"
+        );
+    }
+    Ok(())
+}
+
+fn verify_ordered_input_routes(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    route: (&str, &str, &str),
+    root: &Path,
+) -> Result<()> {
+    let (source_stage, destination_stage, node_id) = route;
+    let deadline = context.deadline();
+    loop {
+        let mut receivers = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+        for index in 0..context.handle().be_count() {
+            let handle = context.handle();
+            let Some(binding) = handle.selected_native_observation_binding(
+                index,
+                ObservationAction::ExchangeSnapshot.as_str(),
+                &selected.token,
+                None,
+            )?
+            else {
+                continue;
+            };
+            let execution = format!(
+                "{}:{}:{}",
+                binding.query_id_hi, binding.query_id_lo, binding.attempt_id
+            );
+            let log = handle.be_current_log_contents(index)?;
+            let mut records = Vec::new();
+            for line in log.lines() {
+                if !line.contains(EXCHANGE_SNAPSHOT)
+                    || marker_field(line, "event") != Some("receiver_consumed")
+                    || marker_field(line, "execution_id") != Some(execution.as_str())
+                    || marker_field(line, "source_stage") != Some(source_stage)
+                    || marker_field(line, "destination_stage") != Some(destination_stage)
+                    || marker_field(line, "node_id") != Some(node_id)
+                    || marker_field(line, "destination")
+                        != Some(binding.backend_process_id.as_str())
+                    || !marker_field(line, "sequence")
+                        .and_then(|sequence| sequence.parse::<u64>().ok())
+                        .is_some_and(|sequence| sequence > 1)
+                {
+                    continue;
+                }
+                let source = marker_field(line, "source").context("raw input has no source BE")?;
+                let task = marker_field(line, "destination_task")
+                    .context("raw input has no owning Task")?;
+                receivers
+                    .entry((binding.backend_process_id.clone(), task.to_owned()))
+                    .or_default()
+                    .insert(source.to_owned());
+                records.push(line);
+            }
+            std::fs::write(
+                root.join(format!("be-{index}-ordered-input.log")),
+                records.join("\n"),
+            )?;
+        }
+        if receivers.values().any(|sources| sources.len() >= 2) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "expected raw rows from multiple source BEs for one group: {receivers:?}"
+        );
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+    }
+}
+
 const TYPE_DEPTH: usize = 64;
 const ROW_WIDTH: usize = 64;
 
@@ -561,22 +964,7 @@ fn deep_wide_pages(
     let before_roles = context.handle().launched_backend_topology()?;
     let before = deep_exchange_metrics(context, &root, "before")?;
     let pages = if let Some(selected) = selected {
-        let initial = client.submit(&query)?;
-        let next = initial
-            .next_uri()?
-            .context("missing original native continuation")?;
-        let first = initial.json()?;
-        let query_id = first["id"]
-            .as_str()
-            .context("missing original statement ID")?;
-        if let Err(error) = selected.arm_client_query(context, query_id, &query) {
-            return with_cleanup(Err(error), client.delete(&next).map(|_| ()));
-        }
-        let mut pages = vec![initial, client.get(&next)?];
-        while let Some(uri) = pages.last().unwrap().next_uri()? {
-            pages.push(client.get(&uri)?);
-        }
-        pages
+        observe_statement(context, &client, selected, &query)?
     } else {
         client.execute(&query)?
     };
@@ -653,6 +1041,30 @@ fn deep_wide_pages(
         "no different BE acknowledged bytes on the single target stream"
     );
     Ok(())
+}
+
+fn observe_statement(
+    context: &mut ScenarioContext,
+    client: &TrinoClient,
+    selected: &SelectedStatement,
+    query: &str,
+) -> Result<Vec<RawResponse>> {
+    let initial = client.submit(query)?;
+    let next = initial
+        .next_uri()?
+        .context("missing original native continuation")?;
+    let first = initial.json()?;
+    let query_id = first["id"]
+        .as_str()
+        .context("missing original statement ID")?;
+    if let Err(error) = selected.arm_client_query(context, query_id, query) {
+        return with_cleanup(Err(error), client.delete(&next).map(|_| ()));
+    }
+    let mut pages = vec![initial, client.get(&next)?];
+    while let Some(uri) = pages.last().unwrap().next_uri()? {
+        pages.push(client.get(&uri)?);
+    }
+    Ok(pages)
 }
 
 fn marker_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {

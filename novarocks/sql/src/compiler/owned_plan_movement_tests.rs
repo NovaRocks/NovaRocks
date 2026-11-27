@@ -167,7 +167,7 @@ fn completed_query_parts_move_original_plan_and_logical_journal_together() {
                                 .root_expression(node.id, call.arguments[0])
                                 .unwrap()
                                 .ty,
-                            call.binding.intermediate_type
+                            call.binding.merge_state.as_ref().unwrap().intermediate_type
                         );
                     }
                 }

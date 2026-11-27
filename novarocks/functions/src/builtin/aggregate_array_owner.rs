@@ -429,21 +429,23 @@ impl ArrayOwner {
             }
             validate_contract(self.operation, &contract, &mut work)?;
             work.flush().map_err(compile_failure)?;
+            let (ascending, nulls_first): (Vec<_>, Vec<_>) =
+                if let Some(state) = contract.state_interpretation() {
+                    state
+                        .order_keys
+                        .iter()
+                        .map(|key| (key.ascending, key.nulls_first))
+                        .unzip()
+                } else {
+                    contract
+                        .order_keys()
+                        .iter()
+                        .map(|key| (key.ascending, key.nulls_first))
+                        .unzip()
+                };
             let prepared = Arc::new(ArrayKernel {
-                ascending: contract
-                    .state_interpretation()
-                    .expect("validated ARRAY receipt")
-                    .order_keys
-                    .iter()
-                    .map(|key| key.ascending)
-                    .collect(),
-                nulls_first: contract
-                    .state_interpretation()
-                    .expect("validated ARRAY receipt")
-                    .order_keys
-                    .iter()
-                    .map(|key| key.nulls_first)
-                    .collect(),
+                ascending: ascending.into_boxed_slice(),
+                nulls_first: nulls_first.into_boxed_slice(),
                 contract,
                 operation: self.operation,
             });

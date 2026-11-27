@@ -239,7 +239,6 @@ fn nominal() -> FunctionValueType {
 }
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
-        state_interpretation: None,
         function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
@@ -251,9 +250,13 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
         ),
         phase,
         logical_argument_count: 1,
-        intermediate_type: dictionary(),
-        state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: dictionary(),
+            state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
+            state_argument_contract:
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        }),
     }
 }
 
@@ -886,7 +889,7 @@ impl Fixture {
                     id,
                     source: &call.binding,
                     function_binding_id: id,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 }
             })
             .collect::<Vec<_>>();
@@ -899,7 +902,7 @@ impl Fixture {
                     id: 9,
                     source: &calls[0].binding,
                     function_binding_id: 0,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 },
             );
         }
@@ -1275,16 +1278,45 @@ fn table_write_inline_aggregate_copies_preserve_four_phases_lambda_dictionary_an
             assert_eq!(b.phase, phase);
             assert!(b.function.legacy_metadata.is_none());
             let original = &a.definitions().iter().find(|(id, _)| *id == 0).unwrap().1;
-            assert_eq!(b.intermediate_type, original.intermediate_type);
-            assert_eq!(b.intermediate_type.data_type(), &DataType::Utf8);
+            assert_eq!(
+                b.merge_state.as_ref().unwrap().intermediate_type,
+                original.merge_state.as_ref().unwrap().intermediate_type
+            );
+            assert_eq!(
+                b.merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .data_type(),
+                &DataType::Utf8
+            );
             assert!(
-                b.intermediate_type
+                b.merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
                     .value_type()
-                    .shares_storage(original.intermediate_type.value_type())
+                    .shares_storage(
+                        original
+                            .merge_state
+                            .as_ref()
+                            .unwrap()
+                            .intermediate_type
+                            .value_type()
+                    )
             );
             assert!(std::ptr::eq(
-                b.intermediate_type.data_type(),
-                original.intermediate_type.data_type()
+                b.merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .data_type(),
+                original
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .data_type()
             ));
             match (
                 &original.function.result_type.data_type(),
@@ -1795,7 +1827,7 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
         for (i,call) in calls.iter().enumerate(){
             assert_eq!(call.binding.phase,p::AggregatePhase::Partial{sequence:p::AggregateSequenceId::new(i as u32)});
             assert_eq!(call.binding.logical_argument_count,1);
-            assert_eq!(call.binding.intermediate_type,dictionary());
+            assert_eq!(call.binding.merge_state.as_ref().unwrap().intermediate_type,dictionary());
             assert_eq!(call.binding.function.result_type,nested());
             assert!(call.binding.function.legacy_metadata.is_none());
             match &call.binding.function.argument_types[0]{FunctionArgumentType::Value(t)=>assert_eq!(*t,dictionary()),_=>panic!()}

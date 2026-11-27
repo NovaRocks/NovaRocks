@@ -95,7 +95,6 @@ fn fixture(phase: AggregatePhase) -> AggregateBinding {
     let parameter = FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true);
     assert_eq!(field.metadata()["unknown"], "preserved");
     AggregateBinding {
-        state_interpretation: None,
         function: BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
@@ -122,9 +121,13 @@ fn fixture(phase: AggregatePhase) -> AggregateBinding {
         ),
         phase,
         logical_argument_count: 1,
-        intermediate_type: dictionary(),
-        state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: dictionary(),
+            state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
+            state_argument_contract:
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        }),
     }
 }
 fn scope<T>(
@@ -205,15 +208,33 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
             AggregateStateArgumentContract::ValueRootNullabilityIndependent,
         ] {
             let mut source = fixture(phase);
-            source.state_argument_contract = contract;
+            source.merge_state.as_mut().unwrap().state_argument_contract = contract;
             let copied = run(&source, &Control::default()).unwrap();
             assert_eq!(copied.phase, phase);
             assert_eq!(copied.logical_argument_count, 1);
-            assert_eq!(copied.state_argument_contract, contract);
-            assert_eq!(copied.state_format.as_str(), "state/v1");
+            assert_eq!(
+                copied.merge_state.as_ref().unwrap().state_argument_contract,
+                contract
+            );
+            assert_eq!(
+                copied.merge_state.as_ref().unwrap().state_format.as_str(),
+                "state/v1"
+            );
             assert!(std::ptr::eq(
-                source.state_format.as_str().as_ptr(),
-                copied.state_format.as_str().as_ptr()
+                source
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .state_format
+                    .as_str()
+                    .as_ptr(),
+                copied
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .state_format
+                    .as_str()
+                    .as_ptr()
             ));
             assert!(copied.function.legacy_metadata.is_none());
             assert_eq!(copied.function.kind, FunctionKind::Aggregate);
@@ -223,7 +244,10 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
                 copied.function.result_type,
                 FunctionValueType::new(DataType::Int64, true)
             );
-            shared_value_binding(&source.intermediate_type, &copied.intermediate_type);
+            shared_value_binding(
+                &source.merge_state.as_ref().unwrap().intermediate_type,
+                &copied.merge_state.as_ref().unwrap().intermediate_type,
+            );
             let (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) = (
                 &source.function.argument_types[0],
                 &copied.function.argument_types[0],
@@ -316,10 +340,25 @@ fn repeated_aggregate_copies_accumulate_all_six_axes_and_keep_numeric_primary() 
         assert_eq!(model.retained, 2 * once.1);
         let first = copy_aggregate_binding_observed(&source, work)?;
         let second = copy_aggregate_binding_observed(&source, work)?;
-        shared_value_binding(&first.intermediate_type, &second.intermediate_type);
+        shared_value_binding(
+            &first.merge_state.as_ref().unwrap().intermediate_type,
+            &second.merge_state.as_ref().unwrap().intermediate_type,
+        );
         assert!(std::ptr::eq(
-            first.state_format.as_str().as_ptr(),
-            second.state_format.as_str().as_ptr()
+            first
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str()
+                .as_ptr(),
+            second
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str()
+                .as_ptr()
         ));
         Ok(model)
     })

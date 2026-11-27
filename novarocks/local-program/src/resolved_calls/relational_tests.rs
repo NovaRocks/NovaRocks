@@ -1044,7 +1044,7 @@ pub(crate) fn aggregate_node(
                         input_is_intermediate: intermediate,
                         types: None,
                         order,
-                        resolved: resolved_signature(owner),
+                        resolved: Some(resolved_signature(owner)),
                     }],
                     need_finalize: finalize,
                     input_is_intermediate: intermediate,
@@ -1914,7 +1914,7 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
                             input_is_intermediate: false,
                             types: None,
                             order: StaticAggregateOrder::default(),
-                            resolved: resolved_signature(&owner),
+                            resolved: Some(resolved_signature(&owner)),
                         })
                         .collect(),
                     need_finalize: false,

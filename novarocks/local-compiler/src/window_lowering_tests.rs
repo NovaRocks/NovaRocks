@@ -467,13 +467,15 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         let aggregate_binding = (call.kind == FunctionKind::Aggregate).then(|| {
             let aggregate = bound.selected.aggregate.as_ref().unwrap();
             Box::new(AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: aggregate.state_argument_contract,
                 function: function.clone(),
                 phase: AggregatePhase::Single,
                 logical_argument_count: u32::try_from(call.args.len()).unwrap(),
-                intermediate_type: aggregate.intermediate_type.clone(),
-                state_format: aggregate.state_format.clone(),
+                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract: aggregate.state_argument_contract,
+                    intermediate_type: aggregate.intermediate_type.clone(),
+                    state_format: aggregate.state_format.clone(),
+                }),
             })
         });
         let frame = call.frame.map(|(units, start, end)| {
@@ -620,9 +622,18 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             result_type: FunctionResultType::Scalar(function.result_type.clone()),
             aggregate: aggregate_binding.as_deref().map(|binding| {
                 novarocks_functions::AggregateBindingSelection {
-                    state_argument_contract: binding.state_argument_contract,
-                    intermediate_type: binding.intermediate_type.clone(),
-                    state_format: binding.state_format.clone(),
+                    state_argument_contract: binding
+                        .merge_state
+                        .as_ref()
+                        .unwrap()
+                        .state_argument_contract,
+                    intermediate_type: binding
+                        .merge_state
+                        .as_ref()
+                        .unwrap()
+                        .intermediate_type
+                        .clone(),
+                    state_format: binding.merge_state.as_ref().unwrap().state_format.clone(),
                 }
             }),
         });

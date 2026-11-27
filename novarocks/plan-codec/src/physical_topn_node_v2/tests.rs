@@ -220,7 +220,6 @@ fn nominal() -> FunctionValueType {
 }
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
-        state_interpretation: None,
         function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
@@ -232,9 +231,13 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
         ),
         phase,
         logical_argument_count: 1,
-        intermediate_type: dictionary(),
-        state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: dictionary(),
+            state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
+            state_argument_contract:
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        }),
     }
 }
 fn node() -> p::PhysicalNode {
@@ -642,7 +645,7 @@ impl Fixture {
                     id,
                     source: &call.binding,
                     function_binding_id: id,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 }
             })
             .collect::<Vec<_>>();
@@ -655,7 +658,7 @@ impl Fixture {
                     id: 9,
                     source: &calls[0].binding,
                     function_binding_id: 0,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 },
             );
         }
@@ -869,7 +872,16 @@ fn topn_grouped_states_preserve_complete_independent_wire_and_owned_payloads() {
                 .iter()
                 .all(|c| c.binding.function.legacy_metadata.is_none())
         );
-        assert_eq!(calls[0].binding.state_format.as_str(), "state/v1");
+        assert_eq!(
+            calls[0]
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str(),
+            "state/v1"
+        );
         assert_eq!(
             calls[1].binding.phase,
             p::AggregatePhase::Intermediate {
@@ -909,7 +921,10 @@ fn topn_owned_signatures_keep_lambda_nominal_metadata_and_original_aliases() {
             first.function.argument_types[0],
             FunctionArgumentType::Value(dictionary())
         );
-        assert_eq!(first.intermediate_type, dictionary());
+        assert_eq!(
+            first.merge_state.as_ref().unwrap().intermediate_type,
+            dictionary()
+        );
         match &first.function.argument_types[1] {
             FunctionArgumentType::Lambda {
                 parameter_types,

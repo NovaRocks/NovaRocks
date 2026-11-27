@@ -253,10 +253,14 @@ impl ContractLoweringVisitor<'_> {
             }
             let ty = self.value_declared_type(original.output)?;
             self.work.flush()?;
-            if !ty.exactly_equals_observed::<ContractLoweringError>(
-                &original.binding.intermediate_type,
-                || self.work.step().map_err(ContractLoweringError::from),
-            )? {
+            let state = original.binding.intermediate_type().ok_or(
+                ContractLoweringError::InvalidAggregate {
+                    detail: "grouped TopN has no merge state",
+                },
+            )?;
+            if !ty.exactly_equals_observed::<ContractLoweringError>(state, || {
+                self.work.step().map_err(ContractLoweringError::from)
+            })? {
                 return Err(grouped_shape(
                     "GroupedStates TopN state differs from the exact intermediate type",
                 ));
@@ -271,7 +275,7 @@ impl ContractLoweringVisitor<'_> {
             let mut binding = original.binding.clone();
             binding.phase = phase;
             let value = self.fragment_mut().add_value(
-                binding.intermediate_type.clone(),
+                state.clone(),
                 ValueOrigin::AggregateState { call: id, phase },
             )?;
             let site = PhysicalCallSite::TopNState {

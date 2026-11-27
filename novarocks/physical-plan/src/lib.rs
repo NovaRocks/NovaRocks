@@ -125,7 +125,9 @@ pub fn grouped_state_topn_key_supported(
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
 /// Revision 47 retires package and call-request constant quota fields.
-pub const PLAN_CONTRACT_REVISION: u32 = 48;
+/// Revision 48 places one RecordBatch message in every IPC constant pool.
+/// Revision 49 freezes ordered aggregation as a Single call without merge state.
+pub const PLAN_CONTRACT_REVISION: u32 = 49;
 
 #[cfg(test)]
 mod tests;

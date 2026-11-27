@@ -319,11 +319,13 @@ pub(super) fn author_scalar_result_selection_observed(
         overload: function.overload.clone(),
         argument_types: function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(function.result_type.clone()),
-        aggregate: aggregate.map(|binding| novarocks_functions::AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type: binding.intermediate_type.clone(),
-            state_format: binding.state_format.clone(),
-        }),
+        aggregate: aggregate
+            .and_then(|binding| binding.merge_state.as_ref())
+            .map(|binding| novarocks_functions::AggregateBindingSelection {
+                state_argument_contract: binding.state_argument_contract,
+                intermediate_type: binding.intermediate_type.clone(),
+                state_format: binding.state_format.clone(),
+            }),
     });
     work.flush()?;
     Ok(selected)

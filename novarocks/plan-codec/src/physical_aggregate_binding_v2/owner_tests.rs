@@ -102,7 +102,7 @@ fn with_sender<T>(
             id: originals.definitions()[at].0,
             source: &originals.definitions()[at].1,
             function_binding_id: u32::MAX,
-            intermediate_value_type_id: 8,
+            intermediate_value_type_id: Some(8),
         });
         call(&types, &functions, &inputs)
     })

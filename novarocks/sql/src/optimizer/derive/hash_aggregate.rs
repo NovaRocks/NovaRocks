@@ -38,6 +38,14 @@ fn grouping_distribution<'a>(
     DistributionSpec::hash_partitioned(cols, source)
 }
 
+impl PhysicalHashAggregateOp {
+    fn routes_raw_groups(&self) -> bool {
+        self.aggregates
+            .iter()
+            .any(|call| call.source.requires_raw_group_input())
+    }
+}
+
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(
         &self,
@@ -46,8 +54,8 @@ impl DeriveOutput for PhysicalHashAggregateOp {
     ) -> PhysicalPropertySet {
         match self.mode {
             AggMode::Local | AggMode::DistinctLocal => return PhysicalPropertySet::any(),
-            AggMode::Single => return PhysicalPropertySet::gather(),
-            AggMode::Global | AggMode::DistinctGlobal => {}
+            AggMode::Single if !self.routes_raw_groups() => return PhysicalPropertySet::gather(),
+            AggMode::Single | AggMode::Global | AggMode::DistinctGlobal => {}
         }
 
         // For Single / Global the group_by may contain non-ColumnRef
@@ -89,11 +97,9 @@ impl DeriveRequired for PhysicalHashAggregateOp {
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
         match self.mode {
-            AggMode::Single => {
-                vec![PhysicalPropertySet::gather()]
-            }
-            AggMode::Local => vec![PhysicalPropertySet::any()],
-            AggMode::Global => {
+            AggMode::Single if !self.routes_raw_groups() => vec![PhysicalPropertySet::gather()],
+            AggMode::Local | AggMode::DistinctLocal => vec![PhysicalPropertySet::any()],
+            AggMode::Single | AggMode::Global | AggMode::DistinctGlobal => {
                 let cols = scalar_exprs_to_column_ids(scalars, &self.group_by).unwrap_or_default();
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
@@ -109,23 +115,6 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                     }]
                 }
             }
-            AggMode::DistinctGlobal => {
-                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by).unwrap_or_default();
-                if cols.is_empty() {
-                    vec![PhysicalPropertySet::gather()]
-                } else {
-                    vec![PhysicalPropertySet {
-                        distribution: grouping_distribution(
-                            cols,
-                            self.group_by
-                                .iter()
-                                .map(|id| scalars.value_type(*id).data_type()),
-                        ),
-                        ordering: OrderingSpec::Any,
-                    }]
-                }
-            }
-            AggMode::DistinctLocal => vec![PhysicalPropertySet::any()],
         }
     }
 }

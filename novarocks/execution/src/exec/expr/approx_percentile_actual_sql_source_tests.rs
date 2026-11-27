@@ -81,7 +81,7 @@ fn check_actual_approx() {
                         FunctionValueType::new(expected, true)
                     );
                     assert_eq!(
-                        call.binding.intermediate_type,
+                        call.binding.merge_state.as_ref().unwrap().intermediate_type,
                         FunctionValueType::new(DataType::Binary, false)
                     );
                     assert!(
@@ -93,7 +93,7 @@ fn check_actual_approx() {
                         call.binding.phase,
                         request.arguments,
                         call.binding.function.result_type,
-                        call.binding.intermediate_type
+                        call.binding.merge_state.as_ref().unwrap().intermediate_type
                     );
                     seen += 1;
                 }

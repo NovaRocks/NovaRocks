@@ -220,7 +220,6 @@ fn nominal() -> FunctionValueType {
 }
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
-        state_interpretation: None,
         function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
@@ -232,9 +231,13 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
         ),
         phase,
         logical_argument_count: 1,
-        intermediate_type: dictionary(),
-        state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
-        state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: dictionary(),
+            state_format: AggregateStateFormatId::try_new("state/v1").unwrap(),
+            state_argument_contract:
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        }),
     }
 }
 fn node() -> p::PhysicalNode {
@@ -567,7 +570,7 @@ impl Fixture {
                     id,
                     source: &call.binding,
                     function_binding_id: id,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 }
             })
             .collect::<Vec<_>>();
@@ -580,7 +583,7 @@ impl Fixture {
                     id: 9,
                     source: &calls[0].binding,
                     function_binding_id: 0,
-                    intermediate_value_type_id: 1,
+                    intermediate_value_type_id: Some(1),
                 },
             );
         }

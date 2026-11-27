@@ -202,11 +202,15 @@ fn aggregate_filter(
                         ),
                         phase,
                         logical_argument_count: 1,
-                        intermediate_type: state_type,
-                        state_format: AggregateStateFormatId::try_new("fixture/aggregate/state")
+                        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                            intermediate_type: state_type,
+                            state_format: AggregateStateFormatId::try_new(
+                                "fixture/aggregate/state",
+                            )
                             .unwrap(),
-                        state_argument_contract: AggregateStateArgumentContract::ExactSignature,
-                        state_interpretation: None,
+                            state_argument_contract: AggregateStateArgumentContract::ExactSignature,
+                            state_interpretation: None,
+                        }),
                     },
                     arguments: Box::new([argument_root]),
                     distinct: false,

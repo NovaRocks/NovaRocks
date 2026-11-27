@@ -3327,13 +3327,22 @@ mod tests {
                                     .logical_type(),
                                 input.logical_type()
                             );
-                            let DataType::List(item) = &call.binding.intermediate_type.data_type()
+                            let DataType::List(item) = &call
+                                .binding
+                                .merge_state
+                                .as_ref()
+                                .unwrap()
+                                .intermediate_type
+                                .data_type()
                             else {
                                 panic!("expected state List")
                             };
                             assert!(item.metadata().as_arc().is_none());
                             assert_eq!(
                                 call.binding
+                                    .merge_state
+                                    .as_ref()
+                                    .unwrap()
                                     .intermediate_type
                                     .child_at(0)
                                     .unwrap()

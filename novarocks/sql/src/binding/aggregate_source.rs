@@ -180,6 +180,10 @@ impl<A, O> AggregateArgumentSource<A, O> {
     pub(crate) fn order_by(&self) -> &[O] {
         &self.order_by
     }
+    pub(crate) fn requires_raw_group_input(&self) -> bool {
+        !self.order_by.is_empty() && self.binding.selected.aggregate.is_none()
+    }
+
     pub(crate) fn binding(&self) -> &SqlFunctionBinding {
         &self.binding
     }

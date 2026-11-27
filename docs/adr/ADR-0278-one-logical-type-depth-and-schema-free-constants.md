@@ -7,12 +7,14 @@ supersedes: []
 superseded-by: null
 date: 2026-11-27
 provenance:
-  - "7B3F F9 design v3 and approved plan v4"
+  - "7B3F F9 design v4 and approved plan v5"
 code-anchors:
   - "novarocks/type-contract/src/depth_profile.rs (logical and raw Arrow paths)"
   - "novarocks/plan-codec/src/physical_package_v2/decode.rs (compiled package admission)"
   - "novarocks/connector/iceberg/src/wire/read.rs (private column-identity wire grammar)"
   - "novarocks/spi/src/connector/row_mutation (MOR preparation identity)"
+  - "novarocks/sql/src/optimizer/derive/hash_aggregate.rs (raw row placement for ordered aggregates)"
+  - "novarocks/plan-codec/src/physical_aggregate_binding_v2 (explicit aggregate state capability)"
 ---
 
 # ADR-0278 统一逻辑类型深度与常量记录
@@ -41,10 +43,16 @@ SQL 逻辑嵌套、Arrow 物理结构、Iceberg 私有 protobuf 的位置和 Par
 1. **逻辑准入。** `novarocks-type-contract::MAX_VALUE_TYPE_DEPTH` 唯一定义 D=64，根与叶都计入。SQL 在声明和派生结果类型诞生处检查 D，超过 D 返回具名 `NOT_SUPPORTED`，先于创建 Task。Provider 由原作者检查声明，冻结包先检查扁平类型图、引用闭合及环，再物化递归 Arrow 对象。RF 继续沿现有标量准入集合。
 2. **编码形状。** 一个逻辑节点可带一层 Dictionary 或 RunEndEncoded。连续的同节点包装由原生产者归一化，保留值和 NULL。引擎入口在递归物化或比较前检查包装、Map entries 与辅助整数载体。规范 Map 路径至多 `2D−1` 个 DataType 节点，raw 路径至多 `3D−1` 个，独立 Field/Carrier 的包图游标至多 `2(3D−1)` 槽。
 3. **宽度与资源。** 类型遍历每层保留当前节点和下一个子项，定长游标直接随调用持有。宽类型按字段和实际内容推进。共享 backing 的实际分配计一次，重复 occurrence 仍逐次访问。类型遍历的工作区不占用构造配额，值的数组、批、缓冲和真实元数据分配沿原作者及最后别名寿命保管。本条调整 ADR-0176 裁决 4 中的类型结构限额。
-4. **常量线路。** 从计划包修订 48 起，每个 `IpcConstantPool.arrow_ipc` 是一条未压缩的 V5 Arrow RecordBatch。continuation 和有符号 i32 metadata 长度在 FlatBuffer 头之前。body 包含对齐，尾随任意字节或 EOS 都拒绝。包先检查准确修订，再用原 `value_type_id` 和 `source_field_id` 恢复内存中的精确 Schema。旧 revision 46 和 47 的载荷在解释前拒绝。Native 兼容材料包含准确计划修订，生产 epoch 继续为 18。
+4. **常量线路。** 从计划包修订 48 起，每个 `IpcConstantPool.arrow_ipc` 是一条未压缩的 V5 Arrow RecordBatch。continuation 和有符号 i32 metadata 长度在 FlatBuffer 头之前。body 包含对齐，尾随任意字节或 EOS 都拒绝。包先检查准确修订，再用原 `value_type_id` 和 `source_field_id` 恢复内存中的精确 Schema。当前修订 49 保留此固定记录文法，并增加聚合状态能力标签。旧修订 46、47 和 48 的载荷在解释前拒绝。Native 兼容材料包含准确计划修订，生产 epoch 继续为 18。
 5. **Parquet 解释与写入。** FS 的 `FileFormat::Parquet(policy)` 显式指定解释策略，prepared footer 与缓存沿同一策略。Iceberg 依据实际 footer 注解、原字段 ID 和 Provider 绑定读取。iceberg-rust 0.11 的 writer 继续写出 `ARROW:schema`，引擎读路径采用 Skip 或 Derived。允许的 V/W/T、requiredness、FixedSize 位宽和实际 Writer 保留费用沿现有作者。
 6. **私有位置。** Iceberg ColumnIdentity 的逻辑深度以原列身份根计，私有校验以列和递归身份计 D+1 个位置。外层 split、predicate 和 change-window 消息是独立的有限文法。把这些信封计入列身份会让同一个深类型只在某些读路径失败。Provider 私有 codec 按此在 Prost 解码前核对形状。SDK manifest 边界继续按 ADR-0214 的原文档和解码作者检查。
 7. **MOR 身份。** 每次成功签发 preparation 后生成不透明进程内身份。克隆保留同一身份，相同 `operation_id` 的独立签发得到不同身份。读写按原表、快照和签发身份核对，再沿原 Session 及发布校验。源 schema 与重新读取的当前表以及 temporal source 的内容比较继续使用显式字段编码。
+
+8. **有序聚合。** 原调用含函数内 `ORDER BY` 时，函数目录定型实际输入、排序键与最终值，选择显式单阶段。冻结包必须标明单阶段或可合并。单阶段携带原排序、FILTER 和 DISTINCT，禁止登记 state 类型、格式或解释。FE 按原分组键将同组原始行发给同一 Task。BE 在 Task 内按原键落到同一 driver，该 driver 排序并完成组内全部调用。无分组键时汇到一个 Task 和一个 driver。窗口路径沿原窗口分区和帧。普通可分解聚合、受检 writer state 和已合法持久化的 state 保留各自的 merge 合同与格式。
+
+单阶段避免为排序渠道构造额外的中间状态 `Struct<List<…>>`。例如派生结果刚好为 64 层的 `array_agg(v ORDER BY k)` 沿实际输入和最终产物检验 D。取消、组状态预算与释放继续由执行和内核的原 owner 管理。
+
+定位有序聚合拒绝时，先看 `EXPLAIN WITH SESSION explain_detail = 'CONTRACT'` 的原分组键、接收边分布及聚合阶段。接收旧计划包时核对两端的计划修订，当前必须为 49。可合并状态的读者根据原函数重载与 state 格式排查，现有持久化格式与计划修订分别演进。
 
 ## 流水线构造
 

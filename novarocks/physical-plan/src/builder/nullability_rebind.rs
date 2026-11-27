@@ -566,9 +566,15 @@ fn aggregate_equal(
     work.flush()?;
     let same = a.phase == b.phase
         && a.logical_argument_count == b.logical_argument_count
-        && a.state_format == b.state_format
-        && a.state_argument_contract == b.state_argument_contract
-        && a.state_interpretation == b.state_interpretation;
+        && match (&a.merge_state, &b.merge_state) {
+            (Some(a), Some(b)) => {
+                a.state_format == b.state_format
+                    && a.state_argument_contract == b.state_argument_contract
+                    && a.state_interpretation == b.state_interpretation
+            }
+            (None, None) => true,
+            _ => false,
+        };
     work.step()?;
     work.flush()?;
     if !same || !binding_equal(&a.function, &b.function, work)? {
@@ -576,7 +582,10 @@ fn aggregate_equal(
             "aggregate earlier binding differs from its actual definition",
         ));
     }
-    exact_type(&a.intermediate_type, &b.intermediate_type, work)
+    if let (Some(a), Some(b)) = (a.intermediate_type(), b.intermediate_type()) {
+        exact_type(a, b, work)?;
+    }
+    Ok(())
 }
 fn aggregate_admission(
     a: &AggregateBinding,
@@ -586,9 +595,15 @@ fn aggregate_admission(
     work.flush()?;
     let same = a.phase == b.phase
         && a.logical_argument_count == b.logical_argument_count
-        && a.state_format == b.state_format
-        && a.state_argument_contract == b.state_argument_contract
-        && a.state_interpretation == b.state_interpretation;
+        && match (&a.merge_state, &b.merge_state) {
+            (Some(a), Some(b)) => {
+                a.state_format == b.state_format
+                    && a.state_argument_contract == b.state_argument_contract
+                    && a.state_interpretation == b.state_interpretation
+            }
+            (None, None) => true,
+            _ => false,
+        };
     work.step()?;
     work.flush()?;
     if !same {
@@ -598,7 +613,10 @@ fn aggregate_admission(
     }
     signature_identity(&a.function, &b.function, work)?;
     root_admission(&a.function.result_type, &b.function.result_type, work)?;
-    root_admission(&a.intermediate_type, &b.intermediate_type, work)
+    if let (Some(a), Some(b)) = (a.intermediate_type(), b.intermediate_type()) {
+        root_admission(a, b, work)?;
+    }
+    Ok(())
 }
 fn table_identity(
     a: &BoundTableFunction,

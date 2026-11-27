@@ -1192,13 +1192,6 @@ fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    usage.add_bytes(binding.state_format.as_str().len());
-    if let Some(receipt) = &binding.state_interpretation {
-        usage.add_items(receipt.order_keys.len());
-        usage.add_bytes(receipt.order_keys.len().saturating_mul(std::mem::size_of::<
-            novarocks_type_contract::AggregateStateOrderKey,
-        >()));
-    }
     add_function_usage_core(
         &binding.function,
         &format!("{path}.function"),
@@ -1206,13 +1199,22 @@ fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
         errors,
         policy,
     )?;
-    validate_value_type_core(
-        &binding.intermediate_type,
-        &format!("{path}.intermediate_type"),
-        usage,
-        errors,
-        policy,
-    )?;
+    if let Some(state) = &binding.merge_state {
+        usage.add_bytes(state.state_format.as_str().len());
+        if let Some(receipt) = &state.state_interpretation {
+            usage.add_items(receipt.order_keys.len());
+            usage.add_bytes(receipt.order_keys.len().saturating_mul(std::mem::size_of::<
+                novarocks_type_contract::AggregateStateOrderKey,
+            >()));
+        }
+        validate_value_type_core(
+            &state.intermediate_type,
+            &format!("{path}.intermediate_type"),
+            usage,
+            errors,
+            policy,
+        )?;
+    }
     Ok(())
 }
 
@@ -2287,17 +2289,19 @@ mod tests {
             result_type: ValueType::new(DataType::Int64, false),
         };
         let binding = AggregateBinding {
-            state_interpretation: None,
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function,
             phase: crate::AggregatePhase::Single,
             logical_argument_count: 0,
-            intermediate_type: ValueType::new(DataType::Int64, false),
-            state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
-                "s".repeat(1024),
-            )
-            .unwrap(),
+            merge_state: Some(crate::AggregateMergeBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                intermediate_type: ValueType::new(DataType::Int64, false),
+                state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
+                    "s".repeat(1024),
+                )
+                .unwrap(),
+            }),
         };
         let mut usage =
             ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);

@@ -251,11 +251,28 @@ fn verify_update_and_final(owner: &SqlAuthoredPhysicalPlan) {
             .as_ref()
             .unwrap()
             .state_format,
-        partial.source().binding.state_format
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(
-        partial.source().binding.state_format,
-        final_call.binding.state_format
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format,
+        final_call
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(
         partial
@@ -425,11 +442,25 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
         }]
     );
     assert_eq!(
-        partial.source().binding.state_interpretation.as_ref(),
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_interpretation
+            .as_ref(),
         Some(state_source)
     );
     assert_eq!(
-        final_entry.source().binding.state_interpretation.as_ref(),
+        final_entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_interpretation
+            .as_ref(),
         Some(state_source)
     );
     assert_eq!(

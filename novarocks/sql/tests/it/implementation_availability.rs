@@ -657,7 +657,13 @@ fn mixed_window_freezes_one_node_with_independent_function_order_roots() {
     assert_ne!(*value, key.expr);
     let state = array.aggregate_binding.as_ref().unwrap();
     assert_eq!(state.phase, AggregatePhase::Single);
-    let source = state.state_interpretation.as_ref().unwrap();
+    let source = state
+        .merge_state
+        .as_ref()
+        .unwrap()
+        .state_interpretation
+        .as_ref()
+        .unwrap();
     assert_eq!(source.order_keys.len(), 1);
     assert!(!source.order_keys[0].ascending);
     assert!(source.order_keys[0].nulls_first);

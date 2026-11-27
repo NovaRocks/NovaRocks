@@ -158,8 +158,6 @@ fn binding(
         panic!("scalar aggregate result")
     };
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract,
         function: BoundFunction {
             function_id: r.function_id,
             overload: r.selected.overload,
@@ -176,8 +174,12 @@ fn binding(
         },
         phase,
         logical_argument_count: u32::from(t.is_some()),
-        intermediate_type,
-        state_format,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract,
+            intermediate_type,
+            state_format,
+        }),
     }
 }
 #[derive(Clone, Copy)]
@@ -353,7 +355,12 @@ impl Fixture {
                 )
             } else {
                 (
-                    binding.intermediate_type.clone(),
+                    binding
+                        .merge_state
+                        .as_ref()
+                        .unwrap()
+                        .intermediate_type
+                        .clone(),
                     ValueOrigin::AggregateState { call: id, phase },
                 )
             };
@@ -737,10 +744,24 @@ fn aggregate_occurrences_installed_count_min_max_single_partial_keep_complete_se
                         AggregateKernelPhase::Partial
                     }
                 );
-                assert_eq!(c.intermediate_type(), &f.call(0).binding.intermediate_type);
+                assert_eq!(
+                    c.intermediate_type(),
+                    &f.call(0)
+                        .binding
+                        .merge_state
+                        .as_ref()
+                        .unwrap()
+                        .intermediate_type
+                );
                 assert_eq!(
                     c.state_format().as_str(),
-                    f.call(0).binding.state_format.as_str()
+                    f.call(0)
+                        .binding
+                        .merge_state
+                        .as_ref()
+                        .unwrap()
+                        .state_format
+                        .as_str()
                 );
                 assert_eq!(c.final_type(), &f.call(0).binding.function.result_type);
                 assert_eq!(c.call().logical_argument_count(), 1);
@@ -1188,7 +1209,10 @@ fn aggregate_occurrences_state_format_drift_and_nominal_json_keep_selected_owner
         AggregatePhase::Single,
         1,
         0,
-        |b| b.state_format = AggregateStateFormatId::try_new("foreign/state").unwrap(),
+        |b| {
+            b.merge_state.as_mut().unwrap().state_format =
+                AggregateStateFormatId::try_new("foreign/state").unwrap()
+        },
     );
     let o = f.occurrences();
     let e = summaries(&f);
@@ -1301,7 +1325,12 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     let partial_id = AggregateCallId::new(0);
     let state = b
         .add_value(
-            binding.intermediate_type.clone(),
+            binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .clone(),
             ValueOrigin::AggregateState {
                 call: partial_id,
                 phase: partial_phase,
@@ -1337,7 +1366,12 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
     let state_expr = b
         .add_expression(
             owner,
-            binding.intermediate_type.clone(),
+            binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .clone(),
             ExprKind::Value(state),
         )
         .unwrap();
@@ -1351,7 +1385,12 @@ fn merge_fixture(phase: AggregatePhase, topn: bool) -> Fixture {
         )
     } else {
         (
-            binding.intermediate_type.clone(),
+            binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .clone(),
             ValueOrigin::AggregateState {
                 call: call_id,
                 phase,

@@ -338,11 +338,14 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
         binding: &'a p::AggregateBinding,
     ) -> Result<(), E> {
         self.function(occurrence, &binding.function)?;
-        self.value(
-            PackageTypeOwner::Binding(occurrence),
-            PackageTypeChannel::Intermediate,
-            &binding.intermediate_type,
-        )
+        if let Some(intermediate) = binding.intermediate_type() {
+            self.value(
+                PackageTypeOwner::Binding(occurrence),
+                PackageTypeChannel::Intermediate,
+                intermediate,
+            )?;
+        }
+        Ok(())
     }
     fn writer_schema(
         &mut self,

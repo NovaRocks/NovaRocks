@@ -2566,6 +2566,13 @@ pub(crate) fn validate_writer_aggregates(
         }
         require_value(fragment, call.input, path, errors);
         require_value(fragment, call.output, path, errors);
+        if !call.binding.has_valid_phase_contract() {
+            errors.push(ValidationError::new(
+                path,
+                "writer aggregate has no merge contract",
+            ));
+            continue;
+        }
         let expected_input = match call.binding.phase {
             AggregatePhase::Single | AggregatePhase::Partial { .. } => {
                 match call.binding.function.argument_types.first() {
@@ -2580,7 +2587,7 @@ pub(crate) fn validate_writer_aggregates(
                 }
             }
             AggregatePhase::Intermediate { .. } | AggregatePhase::Final { .. } => {
-                Some(&call.binding.intermediate_type)
+                call.binding.intermediate_type()
             }
         };
         // Everything a writer aggregate reads is a column of the write
@@ -2601,13 +2608,8 @@ pub(crate) fn validate_writer_aggregates(
                 ),
             ));
         }
-        let expected_output = match call.binding.phase {
-            AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                &call.binding.function.result_type
-            }
-            AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                &call.binding.intermediate_type
-            }
+        let Some(expected_output) = call.binding.output_type() else {
+            continue;
         };
         // A writer aggregate's output is a column of the write relation, and
         // that relation admits null there because a row which is not an
@@ -3602,15 +3604,7 @@ fn validate_aggregate_contract(
             ));
         }
         if let Some(output) = fragment.values().get(&call.output) {
-            let expected = match call.binding.phase {
-                AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                    &call.binding.function.result_type
-                }
-                AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                    &call.binding.intermediate_type
-                }
-            };
-            if &output.ty != expected {
+            if call.binding.output_type() != Some(&output.ty) {
                 errors.push(ValidationError::new(
                     path,
                     "aggregate output type differs from phase output",

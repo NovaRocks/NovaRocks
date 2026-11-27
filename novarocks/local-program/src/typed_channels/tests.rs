@@ -1202,7 +1202,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         crate::test_support::root(0, 0),
         crate::test_support::root(0, 1),
     ];
-    functions[0].resolved = owner.signature();
+    functions[0].resolved = Some(owner.signature());
     // The adapted call has an independently declared order channel. Publish
     // the actual ordered owner's complete selection, replacing the original
     // one-argument fixture owner together with the revised signature.

@@ -304,14 +304,20 @@ fn resolved_signature(
     // A diagnostic tag only; the frozen preparation owns the call.
     let name: Arc<str> = Arc::from(function.function_id.as_str());
     work.flush()?;
+    let state = binding
+        .merge_state
+        .as_ref()
+        .ok_or(FragmentCompileError::Invalid(
+            "writer aggregate has no merge state",
+        ))?;
     Ok((
         name,
         ResolvedAggregateSignature {
             overload,
             argument_types,
-            intermediate_type: binding.intermediate_type.data_type().clone(),
+            intermediate_type: state.intermediate_type.data_type().clone(),
             output_type: function.result_type.data_type().clone(),
-            state_format: binding.state_format.clone(),
+            state_format: state.state_format.clone(),
         },
     ))
 }
@@ -859,14 +865,17 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     )?;
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
+    let state = binding.merge_state.as_ref().ok_or(
+        crate::expressions::ExpressionLoweringError::Invalid("writer aggregate has no merge state"),
+    )?;
     let selection = Arc::new(FunctionBindingSelection {
         overload: function.overload.clone(),
         argument_types: function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(function.result_type.clone()),
         aggregate: Some(AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type: binding.intermediate_type.clone(),
-            state_format: binding.state_format.clone(),
+            state_argument_contract: state.state_argument_contract,
+            intermediate_type: state.intermediate_type.clone(),
+            state_format: state.state_format.clone(),
         }),
     });
     work.flush()?;

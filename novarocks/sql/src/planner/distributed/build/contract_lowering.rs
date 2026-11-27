@@ -3959,13 +3959,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     phase,
                 )?;
                 let output_type = self.value_declared_type_in(self.current_fragment, output)?;
-                let domain_matches = binding
-                    .intermediate_type
-                    .same_value_domain_observed(&output_type, || {
-                        self.work.step().map_err(ContractLoweringError::from)
-                    })?;
-                let nullable_matches =
-                    !binding.intermediate_type.nullable() || output_type.nullable();
+                let state = binding
+                    .intermediate_type()
+                    .ok_or_else(|| invalid_write("writer aggregate has no state".into()))?;
+                let domain_matches = state.same_value_domain_observed(&output_type, || {
+                    self.work.step().map_err(ContractLoweringError::from)
+                })?;
+                let nullable_matches = !state.nullable() || output_type.nullable();
                 self.work.step()?;
                 if !domain_matches || !nullable_matches {
                     return Err(invalid_write(
@@ -7360,7 +7360,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // an ordinal that lines up against the wrong column is caught
                 // here rather than reaching the backend as a merge of another
                 // aggregate's state.
-                if state_type.data_type() != original_binding.intermediate_type.data_type() {
+                if original_binding
+                    .intermediate_type()
+                    .is_none_or(|state| state_type.data_type() != state.data_type())
+                {
                     return Err(ContractLoweringError::InvalidAggregate {
                         detail: "state-consuming aggregate reads a state of another type",
                     });
@@ -7376,11 +7379,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )?);
             }
             let call_id = self.allocate_aggregate_call()?;
-            let original_output_type = if phase.produces_final_result() {
-                original_binding.function.result_type.clone()
-            } else {
-                original_binding.intermediate_type.clone()
-            };
+            let original_output_type = original_binding
+                .output_type()
+                .ok_or(ContractLoweringError::InvalidAggregate {
+                    detail: "state-producing aggregate has no state contract",
+                })?
+                .clone();
             // The column may admit null this phase's output never produces
             // -- a count standing where the statement types a nullable
             // integer is sound. It may not claim the reverse, and the type
@@ -7416,11 +7420,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )?,
                 None => original_binding,
             };
-            let expected_output_type = if phase.produces_final_result() {
-                binding.function.result_type.clone()
-            } else {
-                binding.intermediate_type.clone()
-            };
+            let expected_output_type = binding
+                .output_type()
+                .ok_or(ContractLoweringError::InvalidAggregate {
+                    detail: "state-producing aggregate has no state contract",
+                })?
+                .clone();
             if canonical.is_some() {
                 let published = published_value_type(&original_output_type, &expected_output_type);
                 self.work.flush()?;
@@ -9973,9 +9978,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .to_string(),
                     });
                 }
-                if aggregate.selected.aggregate.is_none() {
+                if aggregate.selected.aggregate.is_some() != window.function_order_by.is_empty() {
                     return Err(ContractLoweringError::InvalidWindow {
-                        detail: "aggregate window binding lacks state metadata".into(),
+                        detail: "aggregate window ordering and state capability differ".into(),
                     });
                 }
                 Some(aggregate)
@@ -11517,13 +11522,15 @@ fn lower_writer_aggregate_binding_from_selection(
         .as_ref()
         .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
     Ok(AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved, selected, result),
         phase,
         logical_argument_count: 1,
-        intermediate_type: aggregate.intermediate_type.clone(),
-        state_format: aggregate.state_format.clone(),
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract: aggregate.state_argument_contract,
+            intermediate_type: aggregate.intermediate_type.clone(),
+            state_format: aggregate.state_format.clone(),
+        }),
     })
 }
 
@@ -12542,22 +12549,33 @@ fn lower_captured_aggregate_binding(
             detail: "aggregate binding has a relation result",
         });
     };
-    let aggregate = selected
+    if selected.aggregate.is_some() != (order_count == 0)
+        || (order_count != 0 && phase != AggregatePhase::Single)
+    {
+        return Err(ContractLoweringError::InvalidAggregate {
+            detail: "ordered call and aggregate state capability differ",
+        });
+    }
+    let merge_state = selected
         .aggregate
         .as_ref()
-        .ok_or(ContractLoweringError::InvalidAggregate {
-            detail: "aggregate binding has no intermediate state contract",
-        })?;
+        .map(|state| {
+            Ok::<_, ContractLoweringError>(novarocks_physical_plan::AggregateMergeBinding {
+                state_interpretation: resolved
+                    .aggregate_state_source()
+                    .map(|facts| facts.clone_observed(work))
+                    .transpose()?,
+                state_argument_contract: state.state_argument_contract,
+                intermediate_type: full_source_type(&state.intermediate_type),
+                state_format: state.state_format.clone(),
+            })
+        })
+        .transpose()?;
     // A call's own `result_type` is the type its phase's carrier column has,
     // not the aggregate's SQL result -- a partial `avg` carries its state
     // there. The phase carrier is checked against this binding where the
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
-        state_interpretation: resolved
-            .aggregate_state_source()
-            .map(|facts| facts.clone_observed(work))
-            .transpose()?,
-        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved.resolved(), selected, result_type),
         phase,
         logical_argument_count: u32::try_from(resolved.logical_argument_count).map_err(|_| {
@@ -12565,8 +12583,7 @@ fn lower_captured_aggregate_binding(
                 detail: "logical argument count exceeds u32",
             }
         })?,
-        intermediate_type: full_source_type(&aggregate.intermediate_type),
-        state_format: aggregate.state_format.clone(),
+        merge_state,
     })
 }
 

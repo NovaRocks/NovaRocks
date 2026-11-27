@@ -329,7 +329,7 @@ struct BuiltinAggregateDecision<'a> {
     declaration: AggregateDeclaration,
     request: FunctionBindingRequest<'a>,
     output: crate::aggregate_types::AggregateTypeRecipe<'a>,
-    intermediate: crate::aggregate_types::AggregateTypeRecipe<'a>,
+    intermediate: Option<crate::aggregate_types::AggregateTypeRecipe<'a>>,
 }
 
 impl BuiltinAggregateDecision<'_> {
@@ -379,6 +379,9 @@ impl BuiltinAggregateDecision<'_> {
         )? {
             return Ok(false);
         }
+        let Some(intermediate) = &self.intermediate else {
+            return Ok(selected.aggregate.is_none());
+        };
         let Some(state) = &selected.aggregate else {
             return Ok(false);
         };
@@ -396,7 +399,7 @@ impl BuiltinAggregateDecision<'_> {
         )? {
             return Ok(false);
         }
-        self.intermediate.matches_value_observed(
+        intermediate.matches_value_observed(
             state.intermediate_type.typed_binding().borrowed(),
             builtin_aggregate_intermediate_nullable(name),
             ValueLogicalType::Physical,
@@ -415,12 +418,26 @@ impl BuiltinAggregateDecision<'_> {
             ValueLogicalType::Physical,
         )?;
         work.step()?;
-        let intermediate = self.intermediate.materialize_value_pure(
-            builtin_aggregate_intermediate_nullable(name),
-            ValueLogicalType::Physical,
-        )?;
+        let aggregate = if let Some(recipe) = &self.intermediate {
+            let intermediate_type = recipe.materialize_value_pure(
+                builtin_aggregate_intermediate_nullable(name),
+                ValueLogicalType::Physical,
+            )?;
+            binding_control::value_type(&intermediate_type, work)?;
+            Some(crate::AggregateBindingSelection {
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    self.declaration.operation(),
+                ),
+                intermediate_type,
+                state_format: AggregateStateFormatIdentity::try_from_boxed(
+                    self.declaration.state_format().into_boxed_str(),
+                )
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            })
+        } else {
+            None
+        };
         binding_control::value_type(&output, work)?;
-        binding_control::value_type(&intermediate, work)?;
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_from_boxed(
                 self.declaration.overload().into_boxed_str(),
@@ -428,16 +445,7 @@ impl BuiltinAggregateDecision<'_> {
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
             argument_types: binding_control::argument_types(self.request, work)?,
             result_type: FunctionResultType::Scalar(output),
-            aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract: builtin_aggregate_state_argument_contract(
-                    self.declaration.operation(),
-                ),
-                intermediate_type: intermediate,
-                state_format: AggregateStateFormatIdentity::try_from_boxed(
-                    self.declaration.state_format().into_boxed_str(),
-                )
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            }),
+            aggregate,
         })
     }
 }
@@ -597,7 +605,8 @@ impl BuiltinAggregateResolver {
             declaration,
             request,
             output,
-            intermediate,
+            intermediate: (arguments.len() == request.logical_argument_count)
+                .then_some(intermediate),
         })
     }
 

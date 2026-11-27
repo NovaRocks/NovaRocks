@@ -338,34 +338,38 @@ fn author_window_request_from_canonical_observed<'source>(
             "window source result differs from canonical result",
         ));
     }
-    match (&selected.aggregate, aggregate_binding.as_deref()) {
-        (None, None) => {}
-        (Some(state), Some(binding)) => {
-            signature_observed(&binding.function, selected, work)?;
-            work.flush()?;
-            let identity = binding.function.function_id == function.function_id
-                && binding.function.kind == function.kind
-                && state.state_argument_contract == binding.state_argument_contract
-                && state.state_format == binding.state_format;
-            work.step()?;
-            work.flush()?;
-            if !identity
-                || !state
-                    .intermediate_type
-                    .exactly_equals_observed(&binding.intermediate_type, || {
-                        work.step().map_err(PhysicalWindowRequestError::from)
-                    })?
-            {
-                return Err(PhysicalWindowRequestError::InvalidSource(
-                    "window aggregate canonical state metadata differs",
-                ));
-            }
-        }
-        _ => {
+    if let Some(binding) = aggregate_binding.as_deref() {
+        signature_observed(&binding.function, selected, work)?;
+        work.step()?;
+        if binding.function.function_id != function.function_id
+            || binding.function.kind != function.kind
+        {
             return Err(PhysicalWindowRequestError::InvalidSource(
-                "window aggregate canonical header differs",
+                "window aggregate binding identity differs",
             ));
         }
+        let matching = match (&selected.aggregate, &binding.merge_state) {
+            (None, None) => true,
+            (Some(state), Some(merge)) => {
+                state.state_argument_contract == merge.state_argument_contract
+                    && state.state_format == merge.state_format
+                    && state
+                        .intermediate_type
+                        .exactly_equals_observed(&merge.intermediate_type, || {
+                            work.step().map_err(PhysicalWindowRequestError::from)
+                        })?
+            }
+            _ => false,
+        };
+        if !matching {
+            return Err(PhysicalWindowRequestError::InvalidSource(
+                "window aggregate canonical state metadata differs",
+            ));
+        }
+    } else if selected.aggregate.is_some() {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window aggregate canonical header differs",
+        ));
     }
     let aggregate = aggregate_options_observed(
         function,
@@ -492,8 +496,7 @@ fn aggregate_options_observed(
             work.flush()?;
             Some(AggregatePreparationOptions {
                 state_interpretation: binding
-                    .state_interpretation
-                    .as_ref()
+                    .state_interpretation()
                     .map(|facts| facts.clone_observed(work).map(Arc::new))
                     .transpose()?,
                 phase: AggregateKernelPhase::Single,

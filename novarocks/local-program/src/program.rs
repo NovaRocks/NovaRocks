@@ -224,7 +224,7 @@ pub struct StaticAggregateCall {
     pub input_is_intermediate: bool,
     pub types: Option<StaticAggregateTypeSignature>,
     pub order: StaticAggregateOrder,
-    pub resolved: ResolvedAggregateSignature,
+    pub resolved: Option<ResolvedAggregateSignature>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

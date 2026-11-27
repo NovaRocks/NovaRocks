@@ -1226,8 +1226,6 @@ fn theta_binding(
         panic!("Theta returns one scalar")
     };
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract: aggregate.state_argument_contract,
         function: BoundFunction {
             legacy_metadata: None,
             function_id: bound.function_id,
@@ -1238,8 +1236,12 @@ fn theta_binding(
         },
         phase,
         logical_argument_count: 1,
-        intermediate_type: aggregate.intermediate_type,
-        state_format: aggregate.state_format,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract: aggregate.state_argument_contract,
+            intermediate_type: aggregate.intermediate_type,
+            state_format: aggregate.state_format,
+        }),
     }
 }
 
@@ -1249,9 +1251,18 @@ fn selection(binding: &AggregateBinding) -> Arc<FunctionBindingSelection> {
         argument_types: binding.function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(binding.function.result_type.clone()),
         aggregate: Some(AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type: binding.intermediate_type.clone(),
-            state_format: binding.state_format.clone(),
+            state_argument_contract: binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_argument_contract,
+            intermediate_type: binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .clone(),
+            state_format: binding.merge_state.as_ref().unwrap().state_format.clone(),
         }),
     })
 }

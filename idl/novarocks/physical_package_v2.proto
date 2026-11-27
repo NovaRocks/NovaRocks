@@ -156,6 +156,12 @@ message AggregateBindingDefinition {
   string state_format = 6;
   novarocks.common.AggregateStateArgumentContract state_argument_contract = 7;
   AggregateStateInterpretation state_interpretation = 8;
+  AggregateStateCapability state_capability = 9;
+}
+enum AggregateStateCapability {
+  AGGREGATE_STATE_CAPABILITY_UNSPECIFIED = 0;
+  AGGREGATE_STATE_CAPABILITY_SINGLE_ONLY = 1;
+  AGGREGATE_STATE_CAPABILITY_MERGEABLE = 2;
 }
 message AggregateStateInterpretation {
   optional bool distinct = 1;

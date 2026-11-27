@@ -87,7 +87,10 @@ impl ArrayKernel {
         ArrayAggConfig {
             kind: self.kind(),
             output_type: self.contract.final_type().data_type(),
-            intermediate_type: self.contract.intermediate_type().data_type(),
+            intermediate_type: self
+                .contract
+                .merge_state()
+                .map(|state| state.intermediate_type.data_type()),
             input_arg_type: Some(item.data_type()),
         }
     }
@@ -376,15 +379,21 @@ pub(super) fn validate_contract(
             "ARRAY aggregate requires exactly one logical value channel",
         ));
     }
-    let receipt = contract.state_interpretation().ok_or_else(|| {
-        invalid("ARRAY aggregate requires its original state interpretation facts")
-    })?;
-    if receipt.order_keys.len() != arguments.len() - 1 {
+    let (distinct, order_count) = if let Some(receipt) = contract.state_interpretation() {
+        (receipt.distinct, receipt.order_keys.len())
+    } else if contract.merge_state().is_none() {
+        (contract.distinct(), contract.order_keys().len())
+    } else {
+        return Err(invalid(
+            "ARRAY aggregate requires its original state interpretation facts",
+        ));
+    };
+    if order_count != arguments.len() - 1 {
         return Err(invalid(
             "ARRAY aggregate state interpretation has a different channel shape",
         ));
     }
-    if matches!(operation, Operation::Unique) && !receipt.order_keys.is_empty() {
+    if matches!(operation, Operation::Unique) && order_count != 0 {
         return Err(invalid(
             "array_unique_agg has no installed ordered state profile",
         ));
@@ -395,9 +404,8 @@ pub(super) fn validate_contract(
         };
         // The value channel may carry JSON bytes across partial and final
         // aggregation. Order and distinct still require their existing domains.
-        let json_payload =
-            (index == 0 && matches!(operation, Operation::Array) && !receipt.distinct)
-                .then_some(value.value_type());
+        let json_payload = (index == 0 && matches!(operation, Operation::Array) && !distinct)
+            .then_some(value.value_type());
         if !supported(value.data_type(), json_payload, &mut || {
             work.step().map_err(compile_failure)
         })? {
@@ -431,15 +439,24 @@ pub(super) fn validate_contract(
     } else {
         value.data_type()
     };
-    if item.data_type() != expected_item
-        || !contract.final_type().nullable()
-        || !contract.intermediate_type().nullable()
-    {
+    if item.data_type() != expected_item || !contract.final_type().nullable() {
         return Err(invalid(
             "ARRAY aggregate selected result or state differs from its exact nullable profile",
         ));
     }
-    let intermediate = contract.intermediate_type().data_type();
+    let Some(state) = contract.merge_state() else {
+        return validate_full_selected_types(
+            operation,
+            arguments,
+            contract.final_type(),
+            None,
+            work,
+        );
+    };
+    if !state.intermediate_type.nullable() {
+        return Err(invalid("ARRAY aggregate state must be nullable"));
+    }
+    let intermediate = state.intermediate_type.data_type();
     if arguments.len() == 1 {
         let DataType::List(state_item) = intermediate else {
             return Err(invalid("ARRAY aggregate plain state must be List"));
@@ -480,7 +497,7 @@ pub(super) fn validate_contract(
         operation,
         arguments,
         contract.final_type(),
-        contract.intermediate_type(),
+        Some(&state.intermediate_type),
         work,
     )?;
     Ok(())
@@ -489,7 +506,7 @@ fn validate_full_selected_types(
     operation: Operation,
     arguments: &[FunctionArgumentType],
     output: &FunctionValueType,
-    state: &FunctionValueType,
+    state: Option<&FunctionValueType>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     let name = match operation {

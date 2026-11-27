@@ -548,7 +548,7 @@ pub(crate) fn matches_selected_array_types_observed(
     name: &str,
     arguments: &[crate::FunctionArgumentType],
     output: &crate::FunctionValueType,
-    state: &crate::FunctionValueType,
+    state: Option<&crate::FunctionValueType>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, crate::FunctionBindingError> {
     if !matches!(name, "array_agg" | "array_agg_distinct") {
@@ -566,19 +566,25 @@ pub(crate) fn matches_selected_array_types_observed(
         arguments.len(),
     )
     .map_err(|_| crate::FunctionBindingError::NoMatchingOverload)?;
-    Ok(output_recipe.matches_value_from_sources_observed(
+    if !output_recipe.matches_value_from_sources_observed(
         output.typed_binding().borrowed(),
         true,
         novarocks_type_contract::ValueLogicalType::Physical,
         Some(arguments),
         work,
-    )? && state_recipe.matches_value_from_sources_observed(
-        state.typed_binding().borrowed(),
-        true,
-        novarocks_type_contract::ValueLogicalType::Physical,
-        Some(arguments),
-        work,
-    )?)
+    )? {
+        return Ok(false);
+    }
+    match state {
+        Some(state) => state_recipe.matches_value_from_sources_observed(
+            state.typed_binding().borrowed(),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical,
+            Some(arguments),
+            work,
+        ),
+        None => Ok(arguments.len() > 1),
+    }
 }
 
 /// Decide output/state layouts through the sole original aggregate rule.

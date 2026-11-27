@@ -81,17 +81,19 @@ fn function(kind: FunctionKind, lambda: bool) -> BoundFunction {
 }
 fn binding() -> AggregateBinding {
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: function(FunctionKind::Aggregate, false),
         phase: AggregatePhase::Single,
         logical_argument_count: 1,
-        intermediate_type: ty(),
-        state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
-            "test.resource.state",
-        )
-        .unwrap(),
+        merge_state: Some(crate::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            intermediate_type: ty(),
+            state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
+                "test.resource.state",
+            )
+            .unwrap(),
+        }),
     }
 }
 fn properties() -> PhysicalProperties {
@@ -586,7 +588,14 @@ fn function_heap(function: &BoundFunction) -> usize {
             .sum::<usize>()
 }
 fn binding_heap(binding: &AggregateBinding) -> usize {
-    function_heap(&binding.function) + binding.state_format.as_str().len()
+    function_heap(&binding.function)
+        + binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
+            .as_str()
+            .len()
 }
 #[derive(Debug)]
 struct Outcome {

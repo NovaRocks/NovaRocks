@@ -21,7 +21,7 @@
 use super::*;
 
 #[test]
-fn array_state_source_real_ordered_distinct_single_receipt_without_split_capability() {
+fn ordered_array_preserves_original_order_without_merge_state() {
     for (sql, distinct, ascending, nulls_first) in [
         (
             "SELECT ARRAY_AGG(order_key ORDER BY order_key DESC NULLS FIRST) FROM orders",
@@ -84,10 +84,7 @@ fn array_state_source_real_ordered_distinct_single_receipt_without_split_capabil
                 nulls_first
             }]
         );
-        assert_eq!(
-            single_entry.source().binding.state_interpretation.as_ref(),
-            Some(original)
-        );
+        assert!(single_entry.source().binding.merge_state.is_none());
         let update = run(&single_entry, &Control::default()).unwrap();
         let PureCallPreparation::Aggregate { options, .. } =
             update.preparation(effects(&single_entry))
@@ -97,7 +94,7 @@ fn array_state_source_real_ordered_distinct_single_receipt_without_split_capabil
         assert_eq!(options.phase, AggregateKernelPhase::Single);
         assert_eq!(options.distinct, distinct);
         assert_eq!(options.order_keys.len(), 1);
-        assert_eq!(options.state_interpretation.as_deref(), Some(original));
+        assert!(options.state_interpretation.is_none());
         prefixes(|control| run(&single_entry, control).map(|_| ()), true);
     }
 }

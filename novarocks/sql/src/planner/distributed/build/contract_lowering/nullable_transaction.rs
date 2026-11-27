@@ -920,7 +920,7 @@ impl ContractLoweringVisitor<'_> {
                     // retain their own request and original compatibility law.
                     let own_source = producer.identity.same_revision(captured.logical_identity());
                     self.work.step()?;
-                    if binding.state_argument_contract != novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent
+                    if binding.merge_state.as_ref().is_none_or(|state| state.state_argument_contract != novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent)
                         && !own_source
                     {
                         continue;
@@ -1119,7 +1119,13 @@ impl ContractLoweringVisitor<'_> {
                                     ));
                                 }
                                 found = Some(if state {
-                                    actual.binding.intermediate_type.clone()
+                                    actual
+                                        .binding
+                                        .intermediate_type()
+                                        .ok_or_else(|| {
+                                            invalid("aggregate state value has no merge state")
+                                        })?
+                                        .clone()
                                 } else {
                                     actual.binding.function.result_type.clone()
                                 });
@@ -1385,7 +1391,9 @@ impl ContractLoweringVisitor<'_> {
                             if call.output == value.id {
                                 revised = published_value_type(
                                     &value.ty,
-                                    &call.binding.intermediate_type,
+                                    call.binding.intermediate_type().ok_or_else(|| {
+                                        invalid("writer aggregate has no merge state")
+                                    })?,
                                 );
                             }
                         }

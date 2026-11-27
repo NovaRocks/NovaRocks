@@ -72,8 +72,14 @@ fn checked_window<'a>(
                 binding.logical_argument_count as usize,
                 receipt.captured().request().logical_argument_count
             );
-            assert_eq!(binding.intermediate_type, state.intermediate_type);
-            assert_eq!(binding.state_format, state.state_format);
+            assert_eq!(
+                binding.merge_state.as_ref().unwrap().intermediate_type,
+                state.intermediate_type
+            );
+            assert_eq!(
+                binding.merge_state.as_ref().unwrap().state_format,
+                state.state_format
+            );
         }
         (None, None) => assert_eq!(function.kind, FunctionKind::Window),
         _ => panic!("aggregate metadata must come from the same selection"),
@@ -328,10 +334,21 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
             aggregate.logical_argument_count as usize,
             receipt.captured().request().logical_argument_count
         );
-        assert_eq!(aggregate.intermediate_type, state.intermediate_type);
-        assert_eq!(aggregate.state_format, state.state_format);
         assert_eq!(
-            aggregate.state_interpretation.as_ref(),
+            aggregate.merge_state.as_ref().unwrap().intermediate_type,
+            state.intermediate_type
+        );
+        assert_eq!(
+            aggregate.merge_state.as_ref().unwrap().state_format,
+            state.state_format
+        );
+        assert_eq!(
+            aggregate
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_interpretation
+                .as_ref(),
             receipt.captured().binding().aggregate_state_source(),
         );
 

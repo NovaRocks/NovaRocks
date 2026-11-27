@@ -560,6 +560,7 @@ mod extent_failure_tests {
 #[cfg(test)]
 mod actual_depth_geometry_tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn actual_geometry_follows_separate_encoding_occurrences_past_logical_depth() {

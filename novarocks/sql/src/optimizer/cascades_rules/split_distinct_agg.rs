@@ -62,14 +62,11 @@ impl Rule for SplitDistinctAgg {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Ok(vec![]);
         };
-        // Ordered aggregates need all order-by inputs available at the update
-        // phase. The current split-distinct lowering only preserves the
-        // shared DISTINCT column across phase boundaries, so ordered DISTINCT
-        // aggregates like `array_agg(distinct x order by y)` lose `y` in the
-        // GLOBAL phase. Fall back to the single-stage aggregate for semantic
-        // correctness until multi-phase ordered DISTINCT is implemented.
+        // Ordered calls own only a single-stage kernel. They share the
+        // original raw rows with every other call in the aggregate.
         if agg.aggregates.iter().any(|call| {
-            !call.source.order_by().is_empty()
+            call.source.binding().selected.aggregate.is_none()
+                || !call.source.order_by().is_empty()
                 || (call.distinct && call.source.has_projected_inputs())
         }) {
             return Ok(vec![]);

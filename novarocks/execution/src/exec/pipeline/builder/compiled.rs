@@ -1386,29 +1386,43 @@ fn finish_linear_aggregate(
         let partition_slots = factory.local_group_partition_slots();
         let (partial, final_stage) = factory.into_local_update_stages()?;
         build.pipeline.factories.push(Box::new(partial));
-        build = if partition_slots.is_empty() {
-            gather_to_one(build, ctx, node_id)
-        } else {
-            let partitions = build.pipeline.dop as usize;
-            let layout = program.graph().nodes()[id.index()].output_layout();
-            let keys = frozen_routing_keys(layout, &partition_slots)?;
-            use novarocks_type_contract::PartitionHashAlgorithm;
-            let algorithm = PartitionHashAlgorithm::for_grouping_keys(
-                keys.iter().map(|(_, ty)| ty.data_type()),
-            );
-            if algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
-                shuffle_compiled_map_group_keys(build, ctx, node_id, keys, partitions)
-            } else {
-                shuffle_compiled_group_input_slots(build, ctx, node_id, partition_slots, partitions)
-            }
-        };
+        let layout = program.graph().nodes()[id.index()].output_layout();
+        build = place_compiled_aggregate_groups(build, ctx, node_id, layout, partition_slots)?;
         factory = final_stage;
+    } else if complete && factory.requires_raw_group_input() && build.pipeline.dop > 1 {
+        let ProgramNodeKind::Aggregate {
+            input, group_by, ..
+        } = program.graph().nodes()[id.index()].kind()
+        else {
+            unreachable!("a compiled aggregate processor owns an aggregate node");
+        };
+        let layout = program.graph().nodes()[input.index()].output_layout();
+        let slots = group_by
+            .iter()
+            .map(|reference| {
+                let direct_slot = program.unit(reference.unit).and_then(|unit| {
+                    let root = unit.root(reference.root)?;
+                    if root.scope != novarocks_expression_contract::RootScope::Port(0) {
+                        return None;
+                    }
+                    let input = unit.input(root.use_id)?;
+                    layout.slots().get(input.ordinal as usize).copied()
+                });
+                direct_slot.ok_or_else(|| {
+                    program_failure(
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        "single-stage aggregate grouping key has no direct raw input slot",
+                    )
+                })
+            })
+            .collect::<ExecutionResult<Vec<_>>>()?;
+        build = place_compiled_aggregate_groups(build, ctx, node_id, layout, slots)?;
+        // The completed aggregate publishes its own output layout.
+        build.stream = StreamDesc::any(build.pipeline.dop);
+    } else if complete {
+        build = gather_to_one(build, ctx, node_id);
     } else {
-        if complete {
-            build = gather_to_one(build, ctx, node_id);
-        } else {
-            build.stream = StreamDesc::any(build.pipeline.dop);
-        }
+        build.stream = StreamDesc::any(build.pipeline.dop);
     }
     if let Some(ordered) = ordered {
         let session = ctx
@@ -1433,6 +1447,32 @@ fn finish_linear_aggregate(
     }
     build.pipeline.factories.push(Box::new(factory));
     Ok(build)
+}
+
+fn place_compiled_aggregate_groups(
+    build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    node_id: i32,
+    layout: &novarocks_local_program::StaticLayout,
+    slots: Vec<novarocks_types::SlotId>,
+) -> ExecutionResult<PipelineBuildResult> {
+    if slots.is_empty() {
+        return Ok(gather_to_one(build, ctx, node_id));
+    }
+    let partitions = build.pipeline.dop as usize;
+    let keys = frozen_routing_keys(layout, &slots)?;
+    use novarocks_type_contract::PartitionHashAlgorithm;
+    let algorithm =
+        PartitionHashAlgorithm::for_grouping_keys(keys.iter().map(|(_, ty)| ty.data_type()));
+    if algorithm == PartitionHashAlgorithm::NativeExchangeV2 {
+        Ok(shuffle_compiled_map_group_keys(
+            build, ctx, node_id, keys, partitions,
+        ))
+    } else {
+        Ok(shuffle_compiled_group_input_slots(
+            build, ctx, node_id, slots, partitions,
+        ))
+    }
 }
 
 fn profile_created_factories(

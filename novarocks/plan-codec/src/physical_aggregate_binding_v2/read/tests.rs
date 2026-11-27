@@ -144,11 +144,12 @@ fn with_functions<T>(
 }
 fn definition(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBindingDefinition {
     wire::AggregateBindingDefinition {
+        state_capability: wire::AggregateStateCapability::Mergeable as i32,
         state_interpretation: None,
         id,
         function_binding_id: Some(0),
         phase: Some(wire::AggregatePhase { kind: Some(phase) }),
-        logical_argument_count: u32::MAX,
+        logical_argument_count: 0,
         intermediate_value_type_id: Some(0),
         state_format: "aggregate/state-v1".into(),
         state_argument_contract:
@@ -229,7 +230,7 @@ fn receiving_aggregate_headers_borrow_all_phases_sparse_ids_and_exact_type_owner
         for original in &definitions {
             let actual = token.definition(original.id).unwrap().unwrap();
             assert!(std::ptr::eq(actual, original));
-            assert_eq!(actual.logical_argument_count, u32::MAX);
+            assert_eq!(actual.logical_argument_count, 0);
             assert_eq!(actual.phase, original.phase);
             assert_eq!(
                 actual.intermediate_value_type_id,
@@ -710,4 +711,71 @@ fn receiving_aggregate_repeated_lookup_uses_one_caller_scope_and_actual_quantum(
     // Wide selection is sampled; small public/observed lookups above replay
     // every actual callback for all original causes.
     prefixes(call, true, false);
+}
+
+#[test]
+fn single_only_headers_require_an_explicit_tag_and_forbid_merge_fields() {
+    let control = Control::default();
+    let types = types();
+    let mut functions = functions();
+    functions[1].arguments = vec![wire::FunctionArgumentType {
+        kind: Some(wire::function_argument_type::Kind::ValueTypeId(0)),
+    }];
+    let functions =
+        prepare_function_binding_headers(&functions, &types, FUNCTION_SOURCE, limits(), &control)
+            .unwrap();
+    let single = wire::AggregateBindingDefinition {
+        id: 1,
+        function_binding_id: Some(0),
+        phase: Some(wire::AggregatePhase {
+            kind: Some(wire::aggregate_phase::Kind::Single(
+                physical_control_v2::Empty {},
+            )),
+        }),
+        state_capability: wire::AggregateStateCapability::SingleOnly as i32,
+        ..Default::default()
+    };
+    let good = [single.clone()];
+    let token = prepare_aggregate_binding_headers(&good, &functions, SOURCE, limits()).unwrap();
+    assert_eq!(token.facts().type_reference_count, 0);
+
+    for bad in [
+        wire::AggregateBindingDefinition {
+            state_capability: 0,
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            state_capability: 99,
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            intermediate_value_type_id: Some(0),
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            state_format: "state/v1".into(),
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            state_argument_contract: 1,
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            logical_argument_count: 1,
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            phase: Some(wire::AggregatePhase {
+                kind: Some(wire::aggregate_phase::Kind::PartialSequenceId(0)),
+            }),
+            ..single.clone()
+        },
+        wire::AggregateBindingDefinition {
+            state_capability: wire::AggregateStateCapability::Mergeable as i32,
+            logical_argument_count: 1,
+            ..single
+        },
+    ] {
+        assert!(prepare_aggregate_binding_headers(&[bad], &functions, SOURCE, limits()).is_err());
+    }
 }
