@@ -854,7 +854,8 @@ pub(super) fn rewrite_agg_calls_to_refs(
     control: &dyn PureCompileControl,
 ) -> Result<TypedExpr, SqlCompileError> {
     if let ExprKind::AggregateCall { occurrence, .. } = &expr.kind {
-        let can_share = crate::analysis::expr_identity::expression_can_share_evaluation(expr);
+        let can_share =
+            crate::analysis::expr_identity::expression_can_share_evaluation(expr, control)?;
         for call in agg_calls {
             if call.source.contains_occurrence(occurrence)
                 || (can_share && aggregate_call_matches(call, expr, control)?)
@@ -1263,7 +1264,8 @@ pub(super) fn collect_aggregates(
                     "aggregate occurrence differs from its complete declared type".into(),
                 ));
             }
-            let can_share = crate::analysis::expr_identity::expression_can_share_evaluation(expr);
+            let can_share =
+                crate::analysis::expr_identity::expression_can_share_evaluation(expr, control)?;
             for call in out.iter_mut() {
                 if call.source.contains_occurrence(occurrence)
                     || (can_share && aggregate_call_matches(call, expr, control)?)

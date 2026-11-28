@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual ordered Boolean regions. Only row data errors can be pending;
-//! outer failures never enter this state or become a successful NULL.
+//! Actual ordered Boolean regions. TruthOnly preserves the first demanded
+//! row error. Pure Value regions retain their original pending-error domain.
 use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_type_contract::EvaluationDemand;
@@ -135,7 +135,7 @@ impl BooleanRows {
                 let error = errors
                     .next()
                     .ok_or_else(|| internal("missing actual Boolean operand error"))?;
-                if pure {
+                if pure && demand == EvaluationDemand::Value {
                     self.pending
                         .entry(parent)
                         .or_insert_with(|| error.with_selected_ordinal(parent));

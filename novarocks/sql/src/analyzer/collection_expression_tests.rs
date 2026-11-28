@@ -350,7 +350,6 @@ fn null_list_conversion_preserves_each_original_control_refusal() {
 #[test]
 fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
     use crate::compiler::selected_scalar_call::{PlannedConversion, plan_conversion};
-    use novarocks_type_contract::DecimalOverflowPolicy;
     let control = SqlCompileControl::unbounded();
     let ctx = context(&control);
     let source = ctx
@@ -358,11 +357,9 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
         .unwrap();
     let target = json_list_target();
     let conversion = plan_conversion(
-        crate::binding::PlanBindingAuthority::Test,
-        ctx.function_catalog,
+        Some(ctx.function_catalog),
         &source.value_type,
         &target,
-        DecimalOverflowPolicy::OutputNull,
         None,
         &control,
     )
@@ -380,11 +377,9 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
         .unwrap();
     assert!(
         plan_conversion(
-            crate::binding::PlanBindingAuthority::Test,
-            ctx.function_catalog,
+            Some(ctx.function_catalog),
             &text.value_type,
             &target,
-            DecimalOverflowPolicy::OutputNull,
             None,
             &control
         )
@@ -466,9 +461,16 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     let ctx = context(&control);
     let scope = ctx.new_scope();
     let source = ctx
-        .analyze_expr(projection(&query("SELECT [NULL]")), &scope)
+        .analyze_expr(projection(&query("SELECT ['bad']")), &scope)
         .unwrap();
-    let target = source.value_type.clone().with_nullable(true).unwrap();
+    let target = novarocks_type_contract::FunctionValueType::new(
+        DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))),
+        true,
+    );
     let mut arena = ScalarArena::new();
     let mut ids = Vec::new();
     let mut typed = Vec::new();
@@ -511,11 +513,12 @@ fn array_cast_modes_have_distinct_semantic_and_scalar_identity_and_survive_rebui
     };
     let nested_id = intern_typed(&mut arena, &nested_try, &control).unwrap();
     assert!(
-        crate::optimizer::scalar_expr::can_fail(&arena, ids[1]),
+        arena.effects(ids[1]).may_raise_data(),
         "strict conversion retains its own Data failure possibility"
     );
+    assert!(!arena.effects(ids[2]).may_raise_data());
     assert!(
-        crate::optimizer::scalar_expr::can_fail(&arena, nested_id),
+        arena.effects(nested_id).may_raise_data(),
         "outer TRY cannot suppress a source expression's failure"
     );
     for left in 0..ids.len() {

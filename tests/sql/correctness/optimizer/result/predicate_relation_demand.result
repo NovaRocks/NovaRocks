@@ -1,0 +1,48 @@
+-- query 5
+-- types	bigint
+id
+3
+
+-- query 7
+-- types	bigint
+id
+3
+
+-- query 14
+-- types	bigint
+id
+
+-- query 16
+-- types	boolean
+retained
+NULL
+
+-- query 17
+-- types	bigint	bigint
+id	n
+3	7
+
+-- query 22
+-- types	bigint	bigint
+k	total
+1	10
+
+-- query 24
+-- types	bigint	bigint
+k	total
+NULL	35
+
+-- query 25
+-- types	bigint	bigint
+id	caught
+1	NULL
+
+-- query 30
+-- types	bigint
+id
+3
+
+-- query 34
+-- types	bigint	bigint
+k	total
+1	10

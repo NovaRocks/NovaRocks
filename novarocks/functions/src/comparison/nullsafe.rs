@@ -113,7 +113,11 @@ impl PreparedNullSafeComparisonRecipe {
         false
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::primitive(context, ExpressionEffects::PURE_VALUE)
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        ExpressionEffects::PURE_VALUE
     }
     /// Required child errors are not successful input NULLs. Both addresses,
     /// classes and NULL promises are verified before this total predicate runs.

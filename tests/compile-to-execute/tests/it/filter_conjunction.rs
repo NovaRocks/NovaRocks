@@ -259,9 +259,17 @@ fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
     }
 }
 #[test]
-fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latches() {
+fn filter_conjunction_actual_guard_order_preserves_required_site_and_batch_row() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL AND approx_distinct(v) = 0",
+    );
+    let guard_first = fixture(
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING approx_distinct(v) = 0 AND CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NOT NULL",
+    );
+    let guarded_input = batch(
+        &guard_first,
+        &[1, 0, 0],
+        &[Some(f64::NAN), Some(f64::NAN), Some(20200101.)],
     );
     let input = batch(
         &f,
@@ -270,10 +278,10 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
     );
     assert_eq!(
         bits(
-            &group(&f)
+            &group(&guard_first)
                 .evaluate(
                     EvaluationInput::Batch {
-                        batch: &input,
+                        batch: &guarded_input,
                         source: None
                     },
                     Selection::try_sparse(3, &[0, 2]).unwrap(),
@@ -291,7 +299,7 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
                 batch: &input,
                 source: None,
             },
-            Selection::try_sparse(3, &[1, 2]).unwrap(),
+            Selection::try_sparse(3, &[0, 2]).unwrap(),
             &Control,
             &mut PassThroughCallHost,
         )
@@ -306,7 +314,7 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
         panic!("actual Filter");
     };
     assert_eq!(error.root(), sites[0].root);
-    assert_eq!(error.batch_row(), 1);
+    assert_eq!(error.batch_row(), 0);
     let second = instance
         .evaluate(
             EvaluationInput::Batch {
@@ -326,7 +334,7 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
 #[test]
 fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     let f = fixture(
-        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL) AND approx_distinct(v) = 0",
+        "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING approx_distinct(v) = 0 AND NOT (CAST(MAX(CAST(v AS DOUBLE)) AS INTEGER) IS NULL)",
     );
     let input = batch(&f, &[0, 1, 0], &[None, Some(f64::NAN), Some(20200101.)]);
     assert_eq!(

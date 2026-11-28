@@ -21,7 +21,7 @@
 -- the Filter as an internal CSE Project item while visible results stay stable.
 DROP TABLE IF EXISTS ${case_db}.cse_filter_t;
 CREATE TABLE ${case_db}.cse_filter_t (a BIGINT, b BIGINT);
-INSERT INTO ${case_db}.cse_filter_t VALUES ROW(1, 2), ROW(3, 4), ROW(8, 9), ROW(12, 13);
+INSERT INTO ${case_db}.cse_filter_t VALUES ROW(1, 2), ROW(3, 4), ROW(8, 9), ROW(12, 13), ROW(7, NULL);
 
 SET SESSION disable_optimizer_rules = 'PushDownPredicateScan';
 
@@ -43,4 +43,15 @@ WHERE (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) > 6e0
   AND (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) < 20e0
 ORDER BY a;
 
+SET SESSION enable_common_subexpr_reuse = false;
+
+-- @explain_not_contains=__cse_
+-- @result_not_contains=__cse_
+SELECT a, b
+FROM ${case_db}.cse_filter_t
+WHERE (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) > 6e0
+  AND (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) < 20e0
+ORDER BY a;
+
+SET SESSION enable_common_subexpr_reuse = true;
 SET SESSION disable_optimizer_rules = '';

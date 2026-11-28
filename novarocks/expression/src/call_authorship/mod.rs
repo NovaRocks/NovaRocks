@@ -25,7 +25,7 @@ mod error;
 #[cfg(test)]
 mod tests;
 
-pub use controls::author_call_controls;
+pub use controls::{author_call_controls, installed_scalar_control_shape};
 pub use effects::author_unit_calls;
 pub use error::{CallAuthorError, CapabilityRefusal, InvariantRefusal};
 

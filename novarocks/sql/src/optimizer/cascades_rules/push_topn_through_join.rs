@@ -146,10 +146,10 @@ fn rewrite_topn_through_join(
     }
 
     // The pushed limit suppresses join-condition evaluation for removed rows.
-    // Keep an errorful condition above its original complete input domain.
+    // Keep the original pair domain for conditions that require it.
     if join
         .condition
-        .is_some_and(|condition| crate::optimizer::scalar_expr::can_fail(&memo.scalars, condition))
+        .is_some_and(|condition| !memo.scalars.effects(condition).can_share())
     {
         return Vec::new();
     }
@@ -1088,7 +1088,14 @@ mod tests {
         );
         let cast = memo.scalars.intern(
             ScalarNode::Cast {
-                cast_mode: None,
+                cast_mode: Some(match policy {
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull => {
+                        novarocks_type_contract::TrinoCastMode::Try
+                    }
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError => {
+                        novarocks_type_contract::TrinoCastMode::Explicit
+                    }
+                }),
                 child: source,
                 target: DataType::Decimal128(2, 0),
                 decimal_overflow_policy: policy,

@@ -39,16 +39,8 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
         for (carrier, nullable) in [(left, false), (right, true)] {
             let source = FunctionValueType::new(carrier, nullable);
             let target = FunctionValueType::new(target.clone(), nullable);
-            let conversion = plan_conversion(
-                crate::binding::PlanBindingAuthority::Test,
-                functions,
-                &source,
-                &target,
-                DecimalOverflowPolicy::OutputNull,
-                None,
-                &control,
-            )
-            .unwrap();
+            let conversion =
+                plan_conversion(Some(functions), &source, &target, None, &control).unwrap();
             match conversion {
                 PlannedConversion::Identity => assert_eq!(source, target),
                 PlannedConversion::Carrier(step) => {
@@ -80,29 +72,13 @@ fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
         true,
     );
     assert!(matches!(
-        plan_conversion(
-            crate::binding::PlanBindingAuthority::Test,
-            catalog,
-            &ty,
-            &ty,
-            DecimalOverflowPolicy::OutputNull,
-            None,
-            &control
-        )
-        .unwrap(),
+        plan_conversion(Some(catalog), &ty, &ty, None, &control).unwrap(),
         PlannedConversion::Identity
     ));
     for mode in [TrinoCastMode::Explicit, TrinoCastMode::Try] {
-        let PlannedConversion::Carrier(step) = plan_conversion(
-            crate::binding::PlanBindingAuthority::Test,
-            catalog,
-            &ty,
-            &ty,
-            DecimalOverflowPolicy::OutputNull,
-            Some(mode),
-            &control,
-        )
-        .unwrap() else {
+        let PlannedConversion::Carrier(step) =
+            plan_conversion(Some(catalog), &ty, &ty, Some(mode), &control).unwrap()
+        else {
             panic!("explicit boundary must not become identity")
         };
         assert_eq!(step.target(), &ty);

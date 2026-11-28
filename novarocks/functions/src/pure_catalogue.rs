@@ -21,8 +21,9 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CompileCheckpoints, CompilePhase, FunctionEffectDeclaration,
-    FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
+    ArgumentControl, CallEffects, CompileCheckpoints, CompilePhase, ExpressionEffects,
+    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
+    PureCompileControl,
 };
 use sha2::{Digest, Sha256};
 
@@ -210,6 +211,16 @@ pub struct PureImplementationDeclaration {
     pub abi: PureKernelAbi,
 }
 
+/// Scope-independent facts for the exact installed scalar invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticScalarCallEffects {
+    pub own_effects: ExpressionEffects,
+    pub argument_control: ArgumentControl,
+    /// The owner allows invocation over only the rows still needed by an
+    /// ordinary filter. This does not allow reordering on surviving rows.
+    pub permits_filter_row_elimination: bool,
+}
+
 /// Borrowed base metadata from one actually installed pure overload.
 /// This can author invocation control topology, but does not validate a full
 /// selected signature, refine effects/environment or authorize execution.
@@ -276,6 +287,46 @@ impl PureOverloadDeclaration<'_> {
         }
         Ok(actual)
     }
+    /// Read conservative intrinsic facts and the selected argument control
+    /// without creating a prepared kernel or binding an evaluation region.
+    pub fn static_scalar_effects_observed(
+        &self,
+        function: &FunctionId,
+        selected: &FunctionBindingSelection,
+        control: &dyn PureCompileControl,
+    ) -> Result<StaticScalarCallEffects, FunctionBindingError> {
+        let argument_count = selected.argument_types.len();
+        self.admit_selected_lifecycle_observed(
+            selected,
+            argument_count,
+            PureCallLifecycle::Scalar,
+            control,
+        )?;
+        let argument_control =
+            self.selected_argument_control_observed(function, selected, argument_count, control)?;
+        let may_raise_invocation_data = self.implementation().abi.may_raise_invocation_data();
+        let base = self.effects();
+        let own_row_error = self
+            .attachment
+            .metadata_owner
+            .static_scalar_row_error_observed(selected, control)?;
+        Ok(StaticScalarCallEffects {
+            own_effects: ExpressionEffects {
+                value_stability: base.value_stability,
+                may_raise_row_error: own_row_error == FunctionIntrinsicRowError::MayRaise,
+                may_raise_invocation_data,
+                has_instance_state: base.instance_state != FunctionInstanceState::None,
+                observable_effects: base.observable_effects,
+            },
+            argument_control,
+            permits_filter_row_elimination: !may_raise_invocation_data
+                && self
+                    .attachment
+                    .metadata_owner
+                    .permits_filter_row_elimination(),
+        })
+    }
+
     /// Check the actual typed registration adapter, not a manifest copied from
     /// metadata. The original selected profile is borrowed without preparation.
     /// This proves installed lifecycle/static admission only; emitted-source
@@ -384,6 +435,26 @@ pub trait PureFunctionMetadataOwner:
 {
     fn binding_declaration(&self) -> &FunctionBindingDeclaration;
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration];
+
+    /// Conservative intrinsic row-error facts for a previously bound signature.
+    /// The default leaves constant- and environment-sensitive refinements scoped.
+    fn static_scalar_row_error_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionIntrinsicRowError, FunctionBindingError> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        Ok(self
+            .binding_declaration()
+            .effect_declaration(&selected.overload)?
+            .own_row_error)
+    }
+
+    /// Owners opt in when an invocation may process only the rows on which
+    /// an ordinary filter still needs its result.
+    fn permits_filter_row_elimination(&self) -> bool {
+        false
+    }
 
     /// Loan the SAME immutable binding author to its single carrier. Concrete
     /// owners loan their original core here; the default remains explicitly

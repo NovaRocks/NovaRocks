@@ -84,7 +84,32 @@ impl MvColumnMap {
         query_base_names: &HashMap<ColumnId, String>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
-        if let Some(n) = normalize(arena, expr, query_base_names, control)?
+        self.rewrite_expression(arena, expr, query_base_names, false, control)
+    }
+
+    /// Rebind a compensation predicate without using precomputed MV values
+    /// in place of its required kernels. Total subtrees can still use a
+    /// matching dimension with the exact original type.
+    pub(crate) fn rewrite_compensation(
+        &self,
+        arena: &mut ScalarArena,
+        expr: ScalarId,
+        query_base_names: &HashMap<ColumnId, String>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+        self.rewrite_expression(arena, expr, query_base_names, true, control)
+    }
+
+    fn rewrite_expression(
+        &self,
+        arena: &mut ScalarArena,
+        expr: ScalarId,
+        query_base_names: &HashMap<ColumnId, String>,
+        retain_required_evaluation: bool,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<ScalarId>, crate::compiler::SqlCompileError> {
+        if (!retain_required_evaluation || arena.effects(expr).can_skip_for_earlier_filter())
+            && let Some(n) = normalize(arena, expr, query_base_names, control)?
             && let Some(col) = self.by_norm.get(&n, control)?
         {
             let mapped = arena.intern_observed(
@@ -104,7 +129,15 @@ impl MvColumnMap {
                 arena,
                 expr,
                 node,
-                |arena, child| self.rewrite(arena, child, query_base_names, control),
+                |arena, child| {
+                    self.rewrite_expression(
+                        arena,
+                        child,
+                        query_base_names,
+                        retain_required_evaluation,
+                        control,
+                    )
+                },
                 control,
             ),
         }
@@ -395,6 +428,76 @@ mod tests {
             )
             .unwrap()?;
         Some(materialize(&arena, rewritten))
+    }
+
+    #[test]
+    fn compensation_keeps_original_failing_expression_even_when_mv_stores_its_value() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
+
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let names = HashMap::from([(ColumnId(1), "s".into())]);
+        let source = OutputColumn {
+            value_type: FunctionValueType::new(DataType::Utf8, true),
+            ..col(1, "s")
+        };
+        let source_expr = col_ref(&source);
+        let cast = TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Explicit),
+                expr: novarocks_parser::ast::AstBox::new(source_expr.clone()),
+                target: DataType::Int64,
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: FunctionValueType::new(DataType::Int64, true),
+        };
+        let cast = intern_typed(&mut arena, &cast, control).unwrap();
+        let source_expr = intern_typed(&mut arena, &source_expr, control).unwrap();
+        let cast_value = super::normalize(&arena, cast, &names, control)
+            .unwrap()
+            .unwrap();
+        let source_value = super::normalize(&arena, source_expr, &names, control)
+            .unwrap()
+            .unwrap();
+        let stored_cast = col(101, "stored_cast");
+        let stored_source = OutputColumn {
+            column_id: ColumnId(102),
+            ..source
+        };
+
+        let cast_only =
+            MvColumnMap::try_new(vec![(cast_value.clone(), stored_cast.clone())], control)
+                .unwrap()
+                .unwrap();
+        assert!(
+            cast_only
+                .rewrite(&mut arena, cast, &names, control)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cast_only
+                .rewrite_compensation(&mut arena, cast, &names, control)
+                .unwrap()
+                .is_none()
+        );
+
+        let map = MvColumnMap::try_new(
+            vec![(cast_value, stored_cast), (source_value, stored_source)],
+            control,
+        )
+        .unwrap()
+        .unwrap();
+        let rewritten = map
+            .rewrite_compensation(&mut arena, cast, &names, control)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            arena.node(rewritten),
+            ScalarNode::Cast { child, .. }
+                if matches!(arena.node(*child), ScalarNode::ColumnRef(ColumnId(102)))
+        ));
+        assert!(arena.effects(rewritten).expression.may_raise_row_error);
     }
 
     #[test]

@@ -171,33 +171,33 @@ fn json_object_native_sql_metadata_and_error_preservation() {
         }
         assert!(!owners.is_empty(), "throwing JSON projection must remain");
         if *query == 11 {
-            let filters = live
+            let scans = live
                 .iter()
-                .filter(|(f, n)| {
-                    matches!(plan.fragments()[f].nodes()[n].kind, NodeKind::Filter { .. })
+                .copied()
+                .filter(|(fragment, node)| {
+                    let NodeKind::Scan {
+                        relation,
+                        residuals,
+                        ..
+                    } = &plan.fragments()[fragment].nodes()[node].kind
+                    else {
+                        return false;
+                    };
+                    residuals.len() == 1
+                        || matches!(
+                            relation.predicate_guarantees(),
+                            [guarantee] if guarantee.kind == novarocks_physical_plan::PredicateGuaranteeKind::Exact
+                        )
                 })
                 .collect::<Vec<_>>();
-            assert!(!filters.is_empty());
+            let [scan] = scans.as_slice() else {
+                panic!("one Scan applies the necessary id predicate");
+            };
             assert!(
-                filters.iter().any(|site| owners
+                owners
                     .iter()
-                    .all(|owner| ancestors(plan, **site).contains(owner))),
-                "outer filter remains above the throwing project"
+                    .all(|owner| ancestors(plan, *owner).contains(scan))
             );
-            for (f, n) in &live {
-                if let NodeKind::Scan {
-                    relation,
-                    residuals,
-                    ..
-                } = &plan.fragments()[f].nodes()[n].kind
-                {
-                    assert!(residuals.is_empty());
-                    assert!(
-                        relation.predicate_guarantees().is_empty(),
-                        "no provider predicate hides a pushed filter"
-                    );
-                }
-            }
         }
         let headers = result
             .fields

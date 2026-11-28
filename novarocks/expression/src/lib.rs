@@ -26,13 +26,14 @@ pub use compiler::{ExprCompileError, ExprCompileFailure};
 mod call_authorship;
 pub use call_authorship::{
     CallAuthorError, CallAuthorInputs, CapabilityRefusal, InvariantRefusal, UnitCallAuthorship,
-    author_call_controls, author_unit_calls,
+    author_call_controls, author_unit_calls, installed_scalar_control_shape,
 };
 mod original_requests;
 mod primitives;
 pub use primitives::{
-    ComparisonSite, ProgramPrimitiveError as PrimitiveError, prepare_arithmetic_node,
-    prepare_cast_node, prepare_comparison_node, prepare_null_safe_comparison_node,
+    ComparisonSite, ProgramPrimitiveError as PrimitiveError, case_static_own_effects,
+    prepare_arithmetic_node, prepare_cast_node, prepare_comparison_node,
+    prepare_null_safe_comparison_node,
 };
 mod scopes;
 pub mod typing;

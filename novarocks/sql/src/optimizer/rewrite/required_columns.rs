@@ -306,14 +306,6 @@ fn collect_scalar_column_id_refs_inner(
     }
 }
 
-fn scalar_is_assert_true(arena: &ScalarArena, expr: ScalarId) -> bool {
-    matches!(
-        arena.node(expr),
-        ScalarNode::FunctionCall { binding, .. }
-            if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
-    )
-}
-
 fn tag_project(
     mut expr: OptExpr,
     arena: &ScalarArena,
@@ -338,8 +330,8 @@ fn tag_project(
             None => true,
             Some(n) => {
                 let is_needed = n.contains(&item.output_column_id);
-                let must_evaluate = scalar_is_assert_true(arena, item.expr)
-                    || crate::optimizer::scalar_expr::can_fail(arena, item.expr);
+                let must_evaluate =
+                    crate::optimizer::scalar_expr::must_retain_projection(arena, item.expr);
                 is_needed || must_evaluate
             }
         })
@@ -2693,7 +2685,7 @@ mod tests {
             collect_scalar_column_id_refs(&arena, window),
             needed_set(&[11, 12, 13, 14])
         );
-        assert!(crate::optimizer::scalar_expr::can_fail(&arena, window));
+        assert!(arena.effects(window).may_raise_data());
         assert_eq!(
             crate::optimizer::scalar_expr::collect_column_ids_strict(&arena, window),
             Some(needed_set(&[11, 12, 13, 14]))

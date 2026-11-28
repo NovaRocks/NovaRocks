@@ -190,15 +190,20 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         let arena_rc = ctx.scalar_arena();
         {
             let arena = arena_rc.borrow();
-            if scalar_expr::can_fail(&arena, filter_predicate_id)
+            if !arena
+                .effects(filter_predicate_id)
+                .expression
+                .permits_earlier_evaluation()
                 || project_expr_ref.is_some_and(|expr| {
                     let Operator::LogicalProject(project) = &expr.op else {
                         return false;
                     };
-                    project
-                        .items
-                        .iter()
-                        .any(|item| scalar_expr::can_fail(&arena, item.expr))
+                    project.items.iter().any(|item| {
+                        !arena
+                            .effects(item.expr)
+                            .expression
+                            .permits_earlier_evaluation()
+                    })
                 })
             {
                 return Ok(RewriteResult::Unchanged);
@@ -1357,7 +1362,14 @@ mod tests {
         let target = DataType::Decimal128(2, 0);
         TypedExpr {
             kind: ExprKind::Cast {
-                cast_mode: None,
+                cast_mode: Some(match policy {
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull => {
+                        novarocks_type_contract::TrinoCastMode::Try
+                    }
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError => {
+                        novarocks_type_contract::TrinoCastMode::Explicit
+                    }
+                }),
                 expr: novarocks_parser::ast::AstBox::new(value),
                 target: target.clone(),
                 decimal_overflow_policy: policy,

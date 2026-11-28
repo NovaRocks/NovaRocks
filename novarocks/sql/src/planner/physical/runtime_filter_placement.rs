@@ -9,9 +9,11 @@
 //! probe cannot be filtered by missing build membership. New placement policy
 //! belongs in the RF baseline / producer arcs.
 
+use crate::analysis::scalar_effects::ScalarEffectQuery;
 use crate::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::options::SessionOptimizerSettings;
 use crate::planner::physical::runtime_filter::{
     RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
@@ -603,36 +605,45 @@ fn place_probe(node: &mut PhysicalPlanNode, filter_id: i32, members: &[TypedExpr
     true
 }
 
+fn direct_column_id(expr: &TypedExpr) -> Option<ColumnId> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
+        ExprKind::Nested(inner) => direct_column_id(inner),
+        _ => None,
+    }
+}
+
 fn expand_probe_set_across_join(
     join: &PhysicalPlanNode,
     eq_conditions: &[PhysicalHashJoinEqCondition],
     members: &[TypedExpr],
 ) -> Vec<TypedExpr> {
     let mut expanded = members.to_vec();
-    let mut seen: HashSet<Vec<ColumnId>> = members.iter().map(column_id_vec).collect();
+    let mut seen: HashSet<ColumnId> = members.iter().filter_map(direct_column_id).collect();
     let output_cols = child_column_set(join);
 
-    let survives = |expr: &TypedExpr| -> bool {
-        let cols = column_id_vec(expr);
-        !cols.is_empty() && cols.iter().all(|c| output_cols.contains(c))
-    };
-
     for eq in eq_conditions {
-        if eq.null_safe {
+        // A lower equality on a computed key does not relate the input
+        // columns it references. Propagate only one unchanged RF domain.
+        if eq.null_safe || eq.left.value_type != eq.right.value_type {
             continue;
         }
-        let left_cols = column_id_vec(&eq.left);
-        let right_cols = column_id_vec(&eq.right);
-        if left_cols.is_empty() || right_cols.is_empty() {
+        let (Some(left_col), Some(right_col)) =
+            (direct_column_id(&eq.left), direct_column_id(&eq.right))
+        else {
             continue;
-        }
+        };
         for member in members {
-            let member_cols = column_id_vec(member);
-            if member_cols == left_cols && survives(&eq.right) && seen.insert(right_cols.clone()) {
-                expanded.push(eq.right.clone());
+            if member.value_type != eq.left.value_type {
+                continue;
             }
-            if member_cols == right_cols && survives(&eq.left) && seen.insert(left_cols.clone()) {
-                expanded.push(eq.left.clone());
+            let target = match direct_column_id(member) {
+                Some(id) if id == left_col => (right_col, &eq.right),
+                Some(id) if id == right_col => (left_col, &eq.left),
+                _ => continue,
+            };
+            if output_cols.contains(&target.0) && seen.insert(target.0) {
+                expanded.push(target.1.clone());
             }
         }
     }
@@ -667,18 +678,79 @@ fn probe_gate_passes(
     (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ProbePushPolicy {
+#[derive(Clone, Copy)]
+struct ProbePushPolicy<'a> {
     allow_cross_exchange: bool,
     cross_exchange: CrossExchangeMode,
+    effects: &'a ScalarEffectQuery<'a>,
+}
+
+fn skippable_before_probe_filter<'a>(
+    expressions: impl IntoIterator<Item = &'a TypedExpr>,
+    query: &ScalarEffectQuery<'_>,
+) -> Result<bool, SqlCompileError> {
+    for expr in expressions {
+        if !query.typed(expr)?.can_skip_for_earlier_filter() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A filter on a join probe can reach an earlier input only if that input
+/// still denotes the same value and pruning cannot skip earlier required
+/// work. Otherwise place the filter at the producing join.
+fn can_prune_before(
+    node: &PhysicalPlanNode,
+    effects: &ScalarEffectQuery<'_>,
+) -> Result<bool, SqlCompileError> {
+    match &node.kind {
+        PhysicalPlanKind::Filter(filter) => {
+            skippable_before_probe_filter([&filter.predicate], effects)
+        }
+        PhysicalPlanKind::Scan(scan) => skippable_before_probe_filter(&scan.predicates, effects),
+        PhysicalPlanKind::Project(project) => {
+            skippable_before_probe_filter(project.items.iter().map(|item| &item.expr), effects)
+        }
+        PhysicalPlanKind::Sort(sort) if sort.partition_limit.is_none() && sort.offset.is_none() => {
+            skippable_before_probe_filter(
+                sort.items
+                    .iter()
+                    .map(|item| &item.expr)
+                    .chain(&sort.analytic_partition_by),
+                effects,
+            )
+        }
+        PhysicalPlanKind::HashJoin(join) if !join_is_outer_or_anti_boundary(join.join_type) => {
+            for key in join.condition.keys() {
+                for operand in [&key.left, &key.right] {
+                    if !effects.typed(operand)?.can_share() {
+                        return Ok(false);
+                    }
+                }
+            }
+            skippable_before_probe_filter(join.condition.residual().iter(), effects)
+        }
+        PhysicalPlanKind::Redistribute(exchange) => {
+            skippable_before_probe_filter(&exchange.partition_exprs, effects)
+        }
+        // These leaves have no earlier child on which the pass could change
+        // the value domain. The package uses them as join-probe witnesses.
+        PhysicalPlanKind::Values(_)
+        | PhysicalPlanKind::SystemTable(_)
+        | PhysicalPlanKind::GenerateSeries(_) => Ok(true),
+        // Row selection, groups, assertions, correlated/shared sources and
+        // non-proven join implementations keep their original input domain.
+        _ => Ok(false),
+    }
 }
 
 fn push_probe_down(
     node: &mut PhysicalPlanNode,
     filter_id: i32,
     members: &[TypedExpr],
-    policy: ProbePushPolicy,
-) -> bool {
+    policy: ProbePushPolicy<'_>,
+) -> Result<bool, SqlCompileError> {
     if policy.allow_cross_exchange && distribution_is_crossable(node) {
         let crossable: Vec<TypedExpr> = match policy.cross_exchange {
             CrossExchangeMode::Unconditional => members.to_vec(),
@@ -689,45 +761,70 @@ fn push_probe_down(
                 .collect(),
             CrossExchangeMode::Disabled => Vec::new(),
         };
-        if !crossable.is_empty() {
+        if !crossable.is_empty() && can_prune_before(node, policy.effects)? {
             if let Some(child) = node.children.first_mut() {
                 return push_probe_down(child, filter_id, &crossable, policy);
             }
-            return false;
+            return Ok(false);
         }
     }
     if is_exchange(node) {
-        return false;
+        return Ok(false);
     }
 
     let bindable = bindable_members(node, members);
     if bindable.is_empty() {
-        return false;
+        return Ok(false);
     }
-
     if is_probe_semantic_boundary(node) {
-        return place_probe(node, filter_id, &bindable);
+        return Ok(place_probe(node, filter_id, &bindable));
+    }
+    if !can_prune_before(node, policy.effects)? {
+        return Ok(false);
     }
 
     let descend_set = match &node.kind {
         PhysicalPlanKind::HashJoin(join) => {
-            let eq_conditions = join.condition.keys().clone();
-            expand_probe_set_across_join(node, &eq_conditions, &bindable)
+            let eq_conditions = join.condition.keys();
+            expand_probe_set_across_join(node, eq_conditions, &bindable)
         }
+        PhysicalPlanKind::Project(project) => bindable
+            .iter()
+            .filter(|member| {
+                let ids = column_id_vec(member);
+                !ids.is_empty()
+                    && ids.iter().all(|id| {
+                        project.items.iter().any(|item| {
+                            item.output_column_id == *id
+                                && direct_column_id(&item.expr) == Some(*id)
+                        })
+                    })
+            })
+            .cloned()
+            .collect(),
         _ => bindable.clone(),
     };
 
     let mut placed_in_child = false;
     for child in &mut node.children {
-        if push_probe_down(child, filter_id, &descend_set, policy) {
+        if push_probe_down(child, filter_id, &descend_set, policy)? {
             placed_in_child = true;
         }
     }
     if placed_in_child {
-        return true;
+        return Ok(true);
     }
 
-    place_probe(node, filter_id, &bindable)
+    Ok(place_probe(node, filter_id, &bindable))
+}
+
+#[cfg(test)]
+fn test_effect_query() -> ScalarEffectQuery<'static> {
+    ScalarEffectQuery {
+        functions: Some(crate::functions::builtin_sql_function_catalog()),
+        allow_throw_exception: false,
+        control: crate::optimizer::test_optimizer_control(),
+    }
 }
 
 #[cfg(test)]
@@ -735,36 +832,53 @@ pub(crate) fn place_runtime_filters(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,
 ) {
-    place_runtime_filters_with_policy(root, settings, AggregateTopNPlacementPolicy::GlobalGroups);
+    place_runtime_filters_with_policy(
+        root,
+        settings,
+        AggregateTopNPlacementPolicy::GlobalGroups,
+        &test_effect_query(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn place_runtime_filters_for_compiled_test(
+    root: &mut PhysicalPlanNode,
+    settings: &SessionOptimizerSettings,
+) {
+    place_runtime_filters_for_compiled(root, settings, &test_effect_query()).unwrap()
 }
 
 /// Place filters for the sole compiled execution path, including direct UTF-8 Partial groups.
 pub(crate) fn place_runtime_filters_for_compiled(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,
-) {
+    effects: &ScalarEffectQuery<'_>,
+) -> Result<(), SqlCompileError> {
     place_runtime_filters_with_policy(
         root,
         settings,
         AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8,
-    );
+        effects,
+    )
 }
 
 fn place_runtime_filters_with_policy(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,
     policy: AggregateTopNPlacementPolicy,
-) {
+    effects: &ScalarEffectQuery<'_>,
+) -> Result<(), SqlCompileError> {
     debug_assert!(
         tree_has_no_runtime_filters(root),
         "optimizer output must not carry runtime filters; RF placement is a planner-only pass (RFP-1)"
     );
     let config = RuntimeFilterPlacementConfig::from_session(settings);
     if !config.enabled {
-        return;
+        return Ok(());
     }
     let mut next_filter_id: i32 = 0;
-    place_node(root, &config, &mut next_filter_id);
+    place_node_with_effects(root, &config, &mut next_filter_id, effects)?;
     match policy {
         AggregateTopNPlacementPolicy::GlobalGroups => {
             place_aggregate_topn_runtime_filters(root, &mut next_filter_id, config.max_count);
@@ -778,6 +892,7 @@ fn place_runtime_filters_with_policy(
             );
         }
     }
+    Ok(())
 }
 
 fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
@@ -797,39 +912,60 @@ fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
     node.children.iter().all(tree_has_no_runtime_filters)
 }
 
+#[cfg(test)]
 fn place_node(
     node: &mut PhysicalPlanNode,
     config: &RuntimeFilterPlacementConfig,
     next_filter_id: &mut i32,
 ) {
+    place_node_with_effects(node, config, next_filter_id, &test_effect_query()).unwrap()
+}
+
+fn place_node_with_effects(
+    node: &mut PhysicalPlanNode,
+    config: &RuntimeFilterPlacementConfig,
+    next_filter_id: &mut i32,
+    effects: &ScalarEffectQuery<'_>,
+) -> Result<(), SqlCompileError> {
     walk_plan_mut(node, &mut |node| {
-        place_current_node(node, config, next_filter_id);
-    });
+        place_current_node(node, config, next_filter_id, effects)
+    })
+}
+
+fn walk_plan_mut(
+    node: &mut PhysicalPlanNode,
+    visit: &mut impl FnMut(&mut PhysicalPlanNode) -> Result<(), SqlCompileError>,
+) -> Result<(), SqlCompileError> {
+    for child in &mut node.children {
+        walk_plan_mut(child, visit)?;
+    }
+    visit(node)
 }
 
 fn place_current_node(
     node: &mut PhysicalPlanNode,
     config: &RuntimeFilterPlacementConfig,
     next_filter_id: &mut i32,
-) {
+    effects: &ScalarEffectQuery<'_>,
+) -> Result<(), SqlCompileError> {
     if !config.enabled {
-        return;
+        return Ok(());
     }
 
     let (sides, eq_conditions, distribution) = {
         let PhysicalPlanKind::HashJoin(join) = &node.kind else {
-            return;
+            return Ok(());
         };
         let Some(sides) = rf_sides_for_join(join.join_type, join.build_side) else {
-            return;
+            return Ok(());
         };
         let max_child = sides.probe_child.max(sides.build_child);
         if node.children.len() <= max_child {
-            return;
+            return Ok(());
         }
         let distribution = resolve_join_distribution(join);
         if matches!(distribution, JoinDistribution::Unknown) {
-            return;
+            return Ok(());
         }
         (sides, join.condition.keys().clone(), distribution)
     };
@@ -856,7 +992,7 @@ fn place_current_node(
     let min_sel = config.probe_min_selectivity;
 
     if !build_gate_passes(&distribution, build_key_size, build_max) {
-        return;
+        return Ok(());
     }
 
     let local = !matches!(distribution, JoinDistribution::Shuffle);
@@ -895,6 +1031,7 @@ fn place_current_node(
     let policy = ProbePushPolicy {
         allow_cross_exchange: config.allow_cross_exchange,
         cross_exchange: CrossExchangeMode::from(&distribution),
+        effects,
     };
     let mut placed_descs = Vec::with_capacity(descs.len());
     for desc in descs {
@@ -903,7 +1040,7 @@ fn place_current_node(
             desc.filter_id,
             std::slice::from_ref(&desc.probe_expr),
             policy,
-        );
+        )?;
         if !pushed {
             let Some(probe_expr) = bind_expression_to_columns(
                 &desc.probe_expr,
@@ -922,13 +1059,7 @@ fn place_current_node(
     if let PhysicalPlanKind::HashJoin(join) = &mut node.kind {
         join.build_runtime_filters = placed_descs;
     }
-}
-
-fn walk_plan_mut(node: &mut PhysicalPlanNode, f: &mut impl FnMut(&mut PhysicalPlanNode)) {
-    for child in &mut node.children {
-        walk_plan_mut(child, f);
-    }
-    f(node);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1102,7 +1233,9 @@ mod tests {
 
         walk_plan_mut(&mut root, &mut |node| {
             visited.push(node.stats.output_row_count as i32);
-        });
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(visited, vec![3, 2, 4, 1]);
     }
@@ -1588,6 +1721,146 @@ mod tests {
 
         assert!(join.children[0].probe_runtime_filters.is_empty());
         assert_probe_filter(&join.children[0].children[0], 0, 1);
+    }
+
+    #[test]
+    fn probe_preserves_checked_filter_rows_at_the_original_input() {
+        let control = crate::optimizer::test_optimizer_control();
+        let condition = TypedExpr {
+            kind: ExprKind::Literal(crate::analysis::LiteralValue::Bool(false)),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        };
+        let argument = crate::analysis::function_argument(
+            &condition,
+            crate::constant::test_constant_policy(),
+            control,
+        )
+        .unwrap();
+        let resolved = crate::functions::bind_assert_true(
+            crate::functions::builtin_sql_function_catalog(),
+            &[argument],
+            control,
+        )
+        .unwrap();
+        let novarocks_functions::FunctionResultType::Scalar(result) =
+            &resolved.selected.result_type
+        else {
+            unreachable!()
+        };
+        let assertion = TypedExpr {
+            value_type: result.clone(),
+            kind: ExprKind::FunctionCall {
+                name: "assert_true".into(),
+                volatility: resolved.semantics.volatility,
+                binding: crate::binding::SqlFunctionBinding::from_test(
+                    resolved,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                args: vec![condition].into(),
+                distinct: false,
+            },
+        };
+        let int = |value| typed_expr(ExprKind::Literal(crate::analysis::LiteralValue::Int(value)));
+        use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
+        let numerator = int(12);
+        let divisor = col_ref(1, "probe_key");
+        let result = arithmetic_result_value_type_with_op(
+            &numerator.value_type,
+            &divisor.value_type,
+            ArithmeticOperator::Divide,
+        )
+        .unwrap()
+        .with_nullable(true)
+        .unwrap();
+        let div = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(numerator),
+                op: BinOp::Div,
+                right: novarocks_parser::ast::AstBox::new(divisor),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: result,
+        };
+        let bool_type = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false);
+        let division = TypedExpr {
+            value_type: bool_type.with_nullable(true).unwrap(),
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(div),
+                op: BinOp::Gt,
+                right: novarocks_parser::ast::AstBox::new(int(3)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+        };
+        let total = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: novarocks_parser::ast::AstBox::new(col_ref(1, "probe_key")),
+                negated: true,
+            },
+            value_type: bool_type,
+        };
+        let division_effects = test_effect_query().typed(&division).unwrap();
+        assert!(division_effects.permits_filter_row_elimination);
+        assert!(division_effects.expression.may_raise_row_error);
+        // The upstream filter fails on probe row 0, which cannot match build
+        // row 2. Earlier RF placement would hide that failure.
+        let probe_column = out_col(1, "probe_key");
+        let mut probe_leaf = leaf(vec![probe_column.clone()]);
+        let PhysicalPlanKind::Values(input) = &mut probe_leaf.kind else {
+            unreachable!()
+        };
+        input.rows.push(vec![TypedExpr {
+            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(0)),
+            value_type: probe_column.value_type.clone(),
+        }]);
+        let build_column = out_col(2, "build_key");
+        let mut build = leaf(vec![build_column.clone()]);
+        let PhysicalPlanKind::Values(input) = &mut build.kind else {
+            unreachable!()
+        };
+        input.rows.push(vec![TypedExpr {
+            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(2)),
+            value_type: build_column.value_type.clone(),
+        }]);
+        for (predicate, safe) in [(assertion, false), (division, false), (total, true)] {
+            let effects = test_effect_query().typed(&predicate).unwrap();
+            assert_eq!(effects.can_skip_for_earlier_filter(), safe);
+            assert_eq!(effects.expression.may_raise_row_error, !safe);
+            let probe = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Filter(crate::planner::payload::PlanFilterNode {
+                    predicate,
+                }),
+                children: vec![probe_leaf.clone()],
+                output_columns: vec![probe_column.clone()],
+                stats: stats_with_columns(1.0, &[(1, 8.0)]),
+                probe_runtime_filters: vec![],
+            };
+            let mut join = hash_join_node(
+                JoinKind::Inner,
+                JoinDistribution::Broadcast,
+                Some(JoinExecutionMode::Broadcast),
+                vec![eq_cond(
+                    col_ref(1, "probe_key"),
+                    col_ref(2, "build_key"),
+                    false,
+                )],
+                vec![probe, build.clone()],
+                stats_with_columns(1.0, &[(1, 8.0), (2, 8.0)]),
+            );
+            place_node(&mut join, &permissive_config(1024), &mut 0);
+            assert_eq!(expect_hash_join(&join).build_runtime_filters.len(), 1);
+            assert!(join.children[0].probe_runtime_filters.is_empty());
+            if safe {
+                assert!(join.probe_runtime_filters.is_empty());
+                assert_probe_filter(&join.children[0].children[0], 0, 1);
+            } else {
+                assert_probe_filter(&join, 0, 1);
+                assert!(
+                    join.children[0].children[0]
+                        .probe_runtime_filters
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[test]

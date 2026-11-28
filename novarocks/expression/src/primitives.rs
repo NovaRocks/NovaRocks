@@ -56,6 +56,17 @@ pub(crate) fn case_own_effects<'a, E: From<CompileControlError>>(
     work: &mut CompileCheckpoints<'_>,
     comparison_error: impl Fn(ComparisonPrepareError) -> E,
 ) -> Result<novarocks_functions::ScopedExpressionEffects, E> {
+    case_static_own_effects(operand, labels, work, comparison_error)
+        .map(|effects| novarocks_functions::ScopedExpressionEffects::primitive(context, effects))
+}
+
+/// Intrinsic comparison effects of a CASE over its actual comparison types.
+pub fn case_static_own_effects<'a, E: From<CompileControlError>>(
+    operand: Option<&FunctionValueType>,
+    labels: impl Iterator<Item = Result<&'a FunctionValueType, E>>,
+    work: &mut CompileCheckpoints<'_>,
+    comparison_error: impl Fn(ComparisonPrepareError) -> E,
+) -> Result<novarocks_type_contract::ExpressionEffects, E> {
     let mut effects = novarocks_type_contract::ExpressionEffects::PURE_VALUE;
     if let Some(operand) = operand.filter(|ty| PreparedCompositeComparisonRecipe::is_composite(ty))
     {
@@ -68,12 +79,10 @@ pub(crate) fn case_own_effects<'a, E: From<CompileControlError>>(
                 work.control(),
             )
             .map_err(&comparison_error)?;
-            effects.may_raise_row_error |= recipe.may_raise_row_error();
+            effects = effects.join(recipe.static_own_effects());
         }
     }
-    Ok(novarocks_functions::ScopedExpressionEffects::primitive(
-        context, effects,
-    ))
+    Ok(effects)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

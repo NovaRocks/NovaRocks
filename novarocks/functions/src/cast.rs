@@ -1326,16 +1326,15 @@ impl PreparedCastRecipe {
         }
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        if self.trino_mode == Some(TrinoCastMode::Try) {
-            return ScopedExpressionEffects::primitive(context, ExpressionEffects::PURE_VALUE);
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        ExpressionEffects {
+            may_raise_row_error: self.trino_mode != Some(TrinoCastMode::Try)
+                && self.conversion_may_raise(),
+            ..ExpressionEffects::PURE_VALUE
         }
-        ScopedExpressionEffects::primitive(
-            context,
-            ExpressionEffects {
-                may_raise_row_error: self.conversion_may_raise(),
-                ..ExpressionEffects::PURE_VALUE
-            },
-        )
     }
 
     fn uses_native_json_conversion(&self) -> bool {

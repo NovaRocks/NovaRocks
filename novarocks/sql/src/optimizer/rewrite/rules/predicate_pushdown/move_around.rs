@@ -29,7 +29,7 @@ use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::optimizer::rewrite::rules::predicate_pushdown::deriver::derive_inner_join_predicates;
 use crate::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
-    PredicateGroup, PredicateKey, PredicateOrigin, predicate_key,
+    ElidablePredicates, PredicateGroup, PredicateOrigin,
 };
 use crate::optimizer::rewrite::rules::utils::collect_output_ids_opt;
 use crate::optimizer::scalar::{ScalarArena, ScalarId};
@@ -107,18 +107,18 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             &ctx.control_view(),
         )?;
 
-        let left_existing = existing_child_predicate_keys(&left, &arena);
-        let right_existing = existing_child_predicate_keys(&right, &arena);
+        let left_existing = existing_child_predicates(&left, &arena);
+        let right_existing = existing_child_predicates(&right, &arena);
 
         let mut left_fresh = Vec::new();
         let mut right_fresh = Vec::new();
 
         for group in derived {
             match classify_group_side(&group, &left_ids, &right_ids) {
-                Some(ChildSide::Left) if !left_existing.contains(&group.key) => {
+                Some(ChildSide::Left) if !left_existing.contains(&arena, group.expr) => {
                     left_fresh.push(group.expr);
                 }
-                Some(ChildSide::Right) if !right_existing.contains(&group.key) => {
+                Some(ChildSide::Right) if !right_existing.contains(&arena, group.expr) => {
                     right_fresh.push(group.expr);
                 }
                 _ => {}
@@ -240,22 +240,22 @@ fn collect_child_predicate_groups(
     }
 }
 
-fn existing_child_predicate_keys(expr: &OptExpr, arena: &ScalarArena) -> HashSet<PredicateKey> {
-    let mut keys = HashSet::new();
-    collect_existing_child_predicate_keys(expr, &mut keys, arena);
+fn existing_child_predicates(expr: &OptExpr, arena: &ScalarArena) -> ElidablePredicates {
+    let mut keys = ElidablePredicates::default();
+    collect_existing_child_predicates(expr, &mut keys, arena);
     keys
 }
 
-fn collect_existing_child_predicate_keys(
+fn collect_existing_child_predicates(
     expr: &OptExpr,
-    out: &mut HashSet<PredicateKey>,
+    out: &mut ElidablePredicates,
     arena: &ScalarArena,
 ) {
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             collect_top_level_conjunct_keys(arena, filter.predicate, out);
             if !expr.children.is_empty() {
-                collect_existing_child_predicate_keys(expr.unary_input(), out, arena);
+                collect_existing_child_predicates(expr.unary_input(), out, arena);
             }
         }
         Operator::LogicalScan(scan) => {
@@ -265,7 +265,7 @@ fn collect_existing_child_predicate_keys(
         }
         Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
             if !expr.children.is_empty() {
-                collect_existing_child_predicate_keys(expr.unary_input(), out, arena);
+                collect_existing_child_predicates(expr.unary_input(), out, arena);
             }
         }
         Operator::LogicalJoin(join)
@@ -275,8 +275,8 @@ fn collect_existing_child_predicate_keys(
                 collect_top_level_conjunct_keys(arena, cond_id, out);
             }
             if expr.children.len() >= 2 {
-                collect_existing_child_predicate_keys(expr.left(), out, arena);
-                collect_existing_child_predicate_keys(expr.right(), out, arena);
+                collect_existing_child_predicates(expr.left(), out, arena);
+                collect_existing_child_predicates(expr.right(), out, arena);
             }
         }
         _ => {}
@@ -286,12 +286,12 @@ fn collect_existing_child_predicate_keys(
 fn collect_top_level_conjunct_keys(
     arena: &ScalarArena,
     expr: ScalarId,
-    out: &mut HashSet<PredicateKey>,
+    out: &mut ElidablePredicates,
 ) {
     let mut conjuncts = Vec::new();
     scalar_expr::split_conjuncts(arena, expr, &mut conjuncts);
     for conjunct in conjuncts {
-        out.insert(predicate_key(arena, conjunct));
+        out.insert(arena, conjunct);
     }
 }
 

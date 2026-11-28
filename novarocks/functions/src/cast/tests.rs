@@ -197,6 +197,7 @@ fn all_twenty_four_profiles_freeze_types_nullable_and_inert_policies_without_row
                             recipe.own_effects(context()).for_use(context()).unwrap(),
                             ExpressionEffects::PURE_VALUE
                         );
+                        assert_eq!(recipe.static_own_effects(), ExpressionEffects::PURE_VALUE);
                         let foreign = ExpressionEffectContext {
                             region: EvaluationRegionId::new(92),
                             ..context()
@@ -823,6 +824,10 @@ fn decimal_widening_effect_matches_checked_trino_rows() {
                 .for_use(context())
                 .unwrap()
                 .may_raise_row_error,
+            expected.is_none()
+        );
+        assert_eq!(
+            recipe.static_own_effects().may_raise_row_error,
             expected.is_none()
         );
         let selected = recipe

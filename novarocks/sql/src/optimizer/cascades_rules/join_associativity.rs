@@ -200,13 +200,11 @@ impl JoinAssociativity {
         b_group: GroupId,
         c_group: GroupId,
     ) -> Vec<NewExpr> {
-        if [inner_cond, outer_cond].into_iter().flatten().any(|expr| {
-            crate::optimizer::scalar_expr::can_fail(&memo.scalars, expr)
-                || crate::optimizer::scalar_expr::contains_non_replica_deterministic_function(
-                    &memo.scalars,
-                    expr,
-                )
-        }) {
+        if [inner_cond, outer_cond]
+            .into_iter()
+            .flatten()
+            .any(|expr| !memo.scalars.effects(expr).can_share())
+        {
             return vec![];
         }
         // Soundness gate: the new inner join (B JOIN C) reuses inner_cond

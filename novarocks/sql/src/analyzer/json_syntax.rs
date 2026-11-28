@@ -1074,6 +1074,19 @@ mod tests {
             self.original
                 .finish_scalar_binding(function, overload, request, control)
         }
+        fn pure_overload_declaration_observed<'a>(
+            &'a self,
+            function: &novarocks_functions::FunctionId,
+            kind: novarocks_functions::FunctionKind,
+            overload: &novarocks_functions::FunctionOverloadId,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<
+            novarocks_functions::PureOverloadDeclaration<'a>,
+            novarocks_functions::FunctionSpecializationFailure,
+        > {
+            self.original
+                .pure_overload_declaration_observed(function, kind, overload, control)
+        }
         fn contains_aggregate(&self, name: &str) -> bool {
             self.original.contains_aggregate(name)
         }

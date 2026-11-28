@@ -21,7 +21,7 @@
 -- internal CSE Project item while user-visible query output stays unchanged.
 DROP TABLE IF EXISTS ${case_db}.cse_projection_t;
 CREATE TABLE ${case_db}.cse_projection_t (a BIGINT, b BIGINT);
-INSERT INTO ${case_db}.cse_projection_t VALUES ROW(3, 4), ROW(5, 6);
+INSERT INTO ${case_db}.cse_projection_t VALUES ROW(3, 4), ROW(5, 6), ROW(7, NULL);
 
 SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
@@ -35,6 +35,14 @@ SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
+-- @explain_contains=__cse_0
+-- @result_not_contains=__cse_
+SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
+       (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y,
+       typeof(CAST(a AS DOUBLE)) AS input_type
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
+
 SET SESSION enable_common_subexpr_reuse = false;
 
 -- @skip_result_check=true
@@ -42,6 +50,14 @@ SET SESSION enable_common_subexpr_reuse = false;
 EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
        (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
+
+-- @explain_not_contains=__cse_
+-- @result_not_contains=__cse_
+SELECT (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) AS x,
+       (CAST(a AS DOUBLE) + CAST(b AS DOUBLE)) + CAST(a AS DOUBLE) AS y,
+       typeof(CAST(a AS DOUBLE)) AS input_type
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 

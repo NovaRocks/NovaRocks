@@ -50,11 +50,40 @@ fn ordered_eager_right_rand_visits_left_null_and_both_instances_keep_independent
         &program,
         Arc::new(Float64Array::from(vec![None; 6])),
         Arc::new(Float64Array::from(vec![None; 6])),
-        vec![None, Some(false), None, None, Some(true), None],
+        vec![
+            Some(true),
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+        ],
     );
     let rows = [1, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
     let mut evaluator = ordered_instance(&program);
+    let empty = Selection::try_sparse(6, &[]).unwrap();
+    let (_, empty_calls) = observe_calls(|| {
+        evaluator
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &input,
+                    source: None,
+                },
+                ScalarInvocationScope::new(empty, empty),
+                ScalarInvocationActivation::ValidateOnly,
+                &Control,
+                &mut PassThroughCallHost,
+            )
+            .unwrap()
+    });
+    assert!(
+        empty_calls
+            .iter()
+            .all(|call| !matches!(call, LeafCallObservation::Rows { .. }))
+    );
+    assert!(evaluator.instances.is_empty());
+
     let (output, calls) = observe_calls(|| {
         evaluator
             .evaluate(
@@ -72,11 +101,11 @@ fn ordered_eager_right_rand_visits_left_null_and_both_instances_keep_independent
     let rows = calls
         .into_iter()
         .filter_map(|call| match call {
-            LeafCallObservation::Rows { actual, .. } => Some(actual),
+            LeafCallObservation::Rows { actual, demand, .. } => Some((actual, demand)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(rows, vec![vec![4], vec![1, 4]]);
+    assert_eq!(rows, vec![(vec![4], vec![4]), (vec![1, 4], vec![1, 4])]);
     assert_eq!(result(&output), vec![None, Some(false)]);
     assert!(output.errors().is_empty());
     assert_eq!(evaluator.instances.len(), 2);

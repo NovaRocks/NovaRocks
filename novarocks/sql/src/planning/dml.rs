@@ -841,17 +841,23 @@ pub fn begin_final_connector_write_plan(
     // Runtime filters are placed before the reads are stated, because a filter
     // a scan applies is part of what that scan asks its provider for.
     let mut physical = physical;
+    let effects = crate::analysis::scalar_effects::ScalarEffectQuery {
+        functions: Some(compiled.function_catalog.as_ref()),
+        allow_throw_exception: compiled.root_allow_throw_exception,
+        control: &control,
+    };
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         settings,
-    );
+        &effects,
+    )?;
     let (physical, needs, system_needs) = crate::compiler::collect_provider_inputs(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
         row_mutation_match,
         true,
-        &control,
+        &effects,
     )?;
     Ok((
         DmlWriteCompletion {
@@ -994,7 +1000,12 @@ fn complete_connector_write_plan(
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         settings,
-    );
+        &crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: Some(functions.as_ref()),
+            allow_throw_exception: root_allow_throw_exception,
+            control,
+        },
+    )?;
     let (final_context, finalized_targets) = final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
     let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
@@ -1177,17 +1188,23 @@ pub fn begin_final_ctas_connector_write_plan(
         source.constant_policy,
         control,
     )?;
+    let effects = crate::analysis::scalar_effects::ScalarEffectQuery {
+        functions: Some(source.function_catalog.as_ref()),
+        allow_throw_exception: source.root_allow_throw_exception,
+        control,
+    };
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         settings,
-    );
+        &effects,
+    )?;
     let (physical, needs, system_needs) = crate::compiler::collect_provider_inputs(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
         None,
         true,
-        control,
+        &effects,
     )?;
     Ok((
         DmlWriteCompletion {
@@ -1514,16 +1531,22 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
             },
         )?;
     }
+    let effects = crate::analysis::scalar_effects::ScalarEffectQuery {
+        functions: Some(functions.as_ref()),
+        allow_throw_exception: root_allow_throw_exception,
+        control,
+    };
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         &settings,
-    );
+        &effects,
+    )?;
     let (physical, needs) = crate::compiler::collect_provider_needs(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
         row_mutation_match,
-        control,
+        &effects,
     )?;
     Ok((
         DmlChangeStreamCompletion {
@@ -1832,7 +1855,12 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         &settings,
-    );
+        &crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: Some(functions.as_ref()),
+            allow_throw_exception: root_allow_throw_exception,
+            control,
+        },
+    )?;
     let (final_context, finalized_targets) = context.final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
     let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
@@ -2909,7 +2937,12 @@ pub fn build_final_statistics_connector_plan(
     crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
         &mut physical,
         settings,
-    );
+        &crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: Some(functions.as_ref()),
+            allow_throw_exception: root_allow_throw_exception,
+            control,
+        },
+    )?;
     let draft = crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
         &physical,
         version,

@@ -50,8 +50,35 @@ use std::{
 /// Function bindings include complete identity, type and semantic metadata.
 /// Sharing keeps expression nodes compact while preserving one exact binding
 /// from analysis through optimization and physical lowering.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
+#[derive(Clone)]
+pub struct SqlFunctionBinding(Arc<SqlFunctionCallStorage>);
+
+#[derive(Clone)]
+struct SqlFunctionCallStorage {
+    facts: SqlFunctionCallFacts,
+    static_effects: Option<novarocks_functions::StaticScalarCallEffects>,
+}
+
+// Derived proof availability is independent of the bound expression's identity.
+impl std::fmt::Debug for SqlFunctionBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SqlFunctionBinding")
+            .field(&self.0.facts)
+            .finish()
+    }
+}
+impl PartialEq for SqlFunctionBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.facts == other.0.facts
+    }
+}
+impl Eq for SqlFunctionBinding {}
+impl std::hash::Hash for SqlFunctionBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0.facts, state);
+    }
+}
 
 /// Positive evidence of the constructor that supplied an exact result target.
 /// It is not inferred from a function name, selected result or source absence.
@@ -100,8 +127,14 @@ pub(crate) enum PlanBindingAuthority {
 
 impl SqlFunctionBinding {
     pub(crate) fn from_analyzed(call: crate::analyzer::FinalizedAnalysisCall) -> Self {
-        let (resolved, policy, origin, target) = call.into_parts();
-        Self::with_constraint(resolved, policy, origin, target)
+        let (resolved, policy, origin, target, static_effects) = call.into_parts();
+        Self::with_constraint(resolved, policy, origin, target, static_effects)
+    }
+
+    pub(crate) fn static_scalar_effects(
+        &self,
+    ) -> Option<novarocks_functions::StaticScalarCallEffects> {
+        self.0.static_effects
     }
 
     fn with_constraint(
@@ -109,15 +142,19 @@ impl SqlFunctionBinding {
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         result_constraint_origin: SqlResultConstraintOrigin,
         result_constraint: Option<novarocks_functions::FunctionValueType>,
+        static_effects: Option<novarocks_functions::StaticScalarCallEffects>,
     ) -> Self {
-        Self(Arc::new(SqlFunctionCallFacts {
-            resolved,
-            decimal_overflow_policy,
-            result_constraint,
-            result_constraint_origin,
-            statement_start: None,
-            time_zone: None,
-            aggregate_state_source: None,
+        Self(Arc::new(SqlFunctionCallStorage {
+            facts: SqlFunctionCallFacts {
+                resolved,
+                decimal_overflow_policy,
+                result_constraint,
+                result_constraint_origin,
+                statement_start: None,
+                time_zone: None,
+                aggregate_state_source: None,
+            },
+            static_effects,
         }))
     }
 
@@ -142,7 +179,7 @@ impl SqlFunctionBinding {
         origin: SqlResultConstraintOrigin,
         target: Option<novarocks_functions::FunctionValueType>,
     ) -> Self {
-        Self::with_constraint(resolved, policy, origin, target)
+        Self::with_constraint(resolved, policy, origin, target, None)
     }
 
     pub(crate) fn resolve_for_plan(
@@ -173,23 +210,13 @@ impl SqlFunctionBinding {
         mut self,
         facts: novarocks_type_contract::AggregateStateInterpretation,
     ) -> Self {
-        let old = &self.0;
-        self.0 = Arc::new(SqlFunctionCallFacts {
-            resolved: old.resolved.clone(),
-            decimal_overflow_policy: old.decimal_overflow_policy,
-            result_constraint: old.result_constraint.clone(),
-            result_constraint_origin: old.result_constraint_origin.clone(),
-
-            statement_start: old.statement_start,
-            time_zone: old.time_zone,
-            aggregate_state_source: Some(Arc::new(facts)),
-        });
+        Arc::make_mut(&mut self.0).facts.aggregate_state_source = Some(Arc::new(facts));
         self
     }
     pub(crate) fn aggregate_state_source(
         &self,
     ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
-        self.0.aggregate_state_source.as_deref()
+        self.0.facts.aggregate_state_source.as_deref()
     }
 
     /// Attach only the time facts declared by the actual selected overload.
@@ -208,7 +235,7 @@ impl SqlFunctionBinding {
                     self.selected.overload.clone(),
                 )
             })?;
-            let facts = Arc::make_mut(&mut self.0);
+            let facts = &mut Arc::make_mut(&mut self.0).facts;
             facts.statement_start = start.then_some(environment.start);
             facts.time_zone = zone.then_some(environment.zone);
         }
@@ -231,9 +258,10 @@ impl SqlFunctionBinding {
         };
         [
             self.0
+                .facts
                 .statement_start
                 .map(|start| (4, V::StatementStartUtc(start))),
-            self.0.time_zone.map(|zone| (5, V::TimeZone(zone))),
+            self.0.facts.time_zone.map(|zone| (5, V::TimeZone(zone))),
         ]
         .into_iter()
         .flatten()
@@ -249,19 +277,19 @@ impl SqlFunctionBinding {
     }
 
     pub fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
-        self.0.result_constraint.as_ref()
+        self.0.facts.result_constraint.as_ref()
     }
 
     pub fn result_constraint_origin(&self) -> &SqlResultConstraintOrigin {
-        &self.0.result_constraint_origin
+        &self.0.facts.result_constraint_origin
     }
 
     pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {
-        &self.0.resolved
+        &self.0.facts.resolved
     }
 
     pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
-        self.0.decimal_overflow_policy
+        self.0.facts.decimal_overflow_policy
     }
 }
 

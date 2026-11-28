@@ -29,17 +29,19 @@
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
 use crate::compiler::SqlCompileError;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
-use crate::optimizer::operator::{FilterOp, Operator};
+use crate::optimizer::operator::{AggStage, FilterOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
+use crate::optimizer::rewrite::rules::utils::{
+    collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
+};
 use crate::optimizer::scalar::ScalarNode;
 use crate::optimizer::scalar_expr;
 
@@ -101,7 +103,7 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let Operator::LogicalAggregate(agg) = agg_op else {
             return Ok(RewriteResult::Unchanged);
         };
-        if agg_children.len() != 1 {
+        if agg_children.len() != 1 || agg.stage != AggStage::Single {
             return Ok(RewriteResult::Unchanged);
         }
         let aggregate_input = agg_children.remove(0);
@@ -117,32 +119,52 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
-        if scalar_expr::can_fail(&arena, filter_op.predicate)
-            || agg.aggregates.iter().any(|call| {
-                call.source.filter().is_some_and(|predicate| {
-                    !crate::analysis::expr_identity::expression_can_share_evaluation(predicate)
-                }) || call
-                    .source
-                    .arguments()
-                    .iter()
-                    .chain(call.source.order_by().iter().map(|key| &key.expr))
-                    .any(|&id| {
-                        scalar_expr::can_fail(&arena, id)
-                            || scalar_expr::contains_non_deterministic_function(&arena, id)
-                    })
-            })
-        {
+        if agg.group_by.iter().any(|&key| {
+            let effects = arena.effects(key);
+            !effects.expression.permits_boolean_reordering()
+                || !effects.permits_filter_row_elimination
+        }) {
             return Ok(RewriteResult::Unchanged);
         }
+        for call in &agg.aggregates {
+            if let Some(filter) = call.source.filter()
+                && !crate::analysis::expr_identity::expression_can_share_evaluation(
+                    filter,
+                    &ctx.control_view(),
+                )?
+            {
+                return Ok(RewriteResult::Unchanged);
+            }
+            if call
+                .source
+                .arguments()
+                .iter()
+                .chain(call.source.order_by().iter().map(|key| &key.expr))
+                .any(|&id| {
+                    let effects = arena.effects(id);
+                    !effects.can_share() || !effects.permits_filter_row_elimination
+                })
+            {
+                return Ok(RewriteResult::Unchanged);
+            }
+        }
 
-        // GROUP BY key ColumnIds — only bare ColumnRef items contribute
-        // pushable ids; computed GROUP BY expressions do not.
-        let group_by_ids: HashSet<ColumnId> = agg
+        // A bare GROUP BY key may be tested on its original input. Require
+        // the actual aggregate output occurrence to preserve its identity and
+        // complete declaration, including its NULL promise.
+        let input_ids = collect_output_ids_opt(&aggregate_input);
+        let group_keys: HashMap<_, _> = agg
             .group_by
             .iter()
-            .filter_map(|&id| match arena.node(id) {
-                ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => {
-                    Some(*column_id)
+            .zip(&agg.output_layout.group_key_columns)
+            .filter_map(|(&key, output)| match arena.node(key) {
+                ScalarNode::ColumnRef(id)
+                    if *id != ColumnId::UNSET
+                        && *id == output.column_id
+                        && arena.value_type(key) == &output.value_type
+                        && input_ids.contains(id) =>
+                {
+                    Some((*id, &output.value_type))
                 }
                 _ => None,
             })
@@ -152,17 +174,21 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         scalar_expr::split_conjuncts(&arena, filter_op.predicate, &mut conjuncts);
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
-        for conj in conjuncts {
-            let refs = scalar_expr::collect_column_ids_strict(&arena, conj);
-            // Keep the `!refs.is_empty()` guard: constant predicates (empty
-            // refs) are not pushed through aggregates.
-            if let Some(refs) = refs
-                && !refs.is_empty()
-                && refs.iter().all(|id| group_by_ids.contains(id))
-            {
-                pushable.push(conj);
+        let mut can_move = true;
+        for conjunct in conjuncts {
+            let effects = arena.effects(conjunct);
+            let can_skip = effects.can_skip_for_earlier_filter();
+            let mut uses_group_key = false;
+            let matches_input = scalar_expr::all_column_refs_match(&arena, conjunct, |id, ty| {
+                uses_group_key = true;
+                group_keys.get(&id).is_some_and(|&key_type| key_type == ty)
+            });
+            // A constant term does not prove which original groups survive.
+            if can_move && can_skip && effects.can_share() && matches_input && uses_group_key {
+                pushable.push(conjunct);
             } else {
-                remaining.push(conj);
+                remaining.push(conjunct);
+                can_move &= can_skip;
             }
         }
 
@@ -437,6 +463,67 @@ mod tests {
                 other => panic!("expected Filter under Aggregate, got {:?}", other),
             },
             other => panic!("expected Aggregate at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn aggregate_moves_a_key_guard_only_before_the_original_having_error() {
+        for guard_first in [true, false] {
+            let mut arena = ScalarArena::new();
+            let scan = make_scan(&mut arena);
+            let aggregate = make_agg(&mut arena, scan);
+            let total = col_typed_expr("sum_b");
+            let checked = eq_expr(
+                TypedExpr {
+                    value_type: total.value_type.clone(),
+                    kind: ExprKind::BinaryOp {
+                        left: novarocks_parser::ast::AstBox::new(int_lit_expr(12)),
+                        op: BinOp::Div,
+                        right: novarocks_parser::ast::AstBox::new(total),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                },
+                int_lit_expr(4),
+            );
+            let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+            let checked = intern_typed(&mut arena, &checked, control).unwrap();
+            let guard = intern_typed(
+                &mut arena,
+                &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+                control,
+            )
+            .unwrap();
+            let conjuncts = if guard_first {
+                vec![guard, checked]
+            } else {
+                vec![checked, guard]
+            };
+            let predicate = scalar_expr::combine_conjuncts(&mut arena, conjuncts, control)
+                .unwrap()
+                .unwrap();
+            let filter = OptExpr::new(
+                Operator::LogicalFilter(FilterOp { predicate }),
+                vec![aggregate],
+            );
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateAggregate.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    let Operator::LogicalFilter(residual) = &out.op else {
+                        panic!("checked predicate remains above the Aggregate");
+                    };
+                    assert_eq!(residual.predicate, checked);
+                    let aggregate = out.unary_input();
+                    assert!(matches!(aggregate.op, Operator::LogicalAggregate(_)));
+                    let Operator::LogicalFilter(pushed) = &aggregate.unary_input().op else {
+                        panic!("guard moves below the Aggregate");
+                    };
+                    assert_eq!(pushed.predicate, guard);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
         }
     }
 

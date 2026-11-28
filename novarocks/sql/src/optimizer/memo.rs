@@ -87,6 +87,7 @@ pub(crate) struct Memo {
     /// memo operators store only `ScalarId` handles into this arena instead of
     /// owning deep `TypedExpr` trees.
     pub(crate) scalars: ScalarArena,
+    pub(crate) hash_join_enabled: bool,
     pub(crate) function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
 }
 
@@ -104,6 +105,7 @@ impl Memo {
             join_group_index: HashMap::new(),
             reorder_owned_groups: HashSet::new(),
             scalars,
+            hash_join_enabled: true,
             function_catalog: None,
         }
     }

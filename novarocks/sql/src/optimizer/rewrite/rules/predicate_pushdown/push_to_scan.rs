@@ -24,7 +24,7 @@
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
 use crate::compiler::SqlCompileError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
@@ -33,10 +33,7 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
-use crate::optimizer::rewrite::rules::utils::{
-    collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
-};
+use crate::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
 use crate::optimizer::scalar_expr;
 
 pub(crate) struct PushDownPredicateScan;
@@ -91,59 +88,60 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         };
 
         let arena_rc = ctx.scalar_arena();
-        if scalar_expr::can_fail(&arena_rc.borrow(), filter.predicate) {
-            // Moving even a nonthrowing sibling below the checked predicate
-            // can suppress its error by removing rows before evaluation.
-            return Ok(RewriteResult::Unchanged);
-        }
-        let mut conjuncts = Vec::new();
+        let mut pushed = Vec::new();
+        let mut remaining = Vec::new();
         {
             let arena = arena_rc.borrow();
-            scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
-        }
-
-        // Build a temporary OptExpr to use collect_output_ids_opt.
-        let scan_for_ids = OptExpr {
-            op: Operator::LogicalScan(scan.clone()),
-            children: vec![],
-            required_output_columns: required_output_columns.clone(),
-        };
-        let mut scan_ids = collect_output_ids_opt(&scan_for_ids);
-        scan_ids.remove(&crate::column_id::ColumnId::UNSET);
-
-        // Canonical keys of predicates already on the scan to avoid duplicate pushdown.
-        let mut seen: HashSet<String> = {
-            let arena = arena_rc.borrow();
-            scan.predicates
+            // A connector may evaluate an offered atom before any existing
+            // Scan residual. The original residuals precede this Filter.
+            if scan
+                .predicates
                 .iter()
-                .map(|id| predicate_key(&arena, *id))
-                .collect()
-        };
-
-        let mut pushed_any = false;
-        let mut remaining = Vec::new();
-        for conj in conjuncts {
-            if scalar_expr::can_fail(&arena_rc.borrow(), conj) {
-                remaining.push(conj);
-                continue;
+                .any(|&predicate| !arena.effects(predicate).can_skip_for_earlier_filter())
+            {
+                return Ok(RewriteResult::Unchanged);
             }
-            let Some(refs) = scalar_expr::collect_column_ids_strict(&arena_rc.borrow(), conj)
-            else {
-                remaining.push(conj);
-                continue;
-            };
-            if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
-                if seen.insert(predicate_key(&arena_rc.borrow(), conj)) {
-                    scan.predicates.push(conj);
+            let columns: HashMap<_, _> = scan
+                .columns
+                .iter()
+                .map(|column| (column.column_id, &column.value_type))
+                .collect();
+            if columns.len() != scan.columns.len() {
+                return Ok(RewriteResult::Unchanged);
+            }
+            let mut conjuncts = Vec::new();
+            scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
+            let mut seen = HashSet::new();
+            let mut can_move = true;
+            for conjunct in conjuncts {
+                let can_skip = arena.effects(conjunct).can_skip_for_earlier_filter();
+                if can_move
+                    && can_skip
+                    && scalar_expr::all_column_refs_match(&arena, conjunct, |id, ty| {
+                        columns
+                            .get(&id)
+                            .is_some_and(|&column_type| column_type == ty)
+                    })
+                {
+                    // Interner equality is exact typed definition equality. A
+                    // total pure conjunct needs no second occurrence on surviving rows.
+                    if seen.insert(conjunct) {
+                        pushed.push(conjunct);
+                    }
+                } else {
+                    remaining.push(conjunct);
+                    can_move &= can_skip;
                 }
-                pushed_any = true;
-            } else {
-                remaining.push(conj);
             }
-        }
-
-        if !pushed_any {
-            return Ok(RewriteResult::Unchanged);
+            if pushed.is_empty() {
+                return Ok(RewriteResult::Unchanged);
+            }
+            let existing: HashSet<_> = scan.predicates.iter().copied().collect();
+            scan.predicates.extend(
+                pushed
+                    .into_iter()
+                    .filter(|predicate| !existing.contains(predicate)),
+            );
         }
 
         let new_scan = OptExpr {
@@ -160,14 +158,6 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         )?;
         Ok(RewriteResult::Changed(result))
     }
-}
-
-/// Canonical key for structural predicate equality.
-fn predicate_key(
-    arena: &crate::optimizer::scalar::ScalarArena,
-    expr: crate::optimizer::scalar::ScalarId,
-) -> String {
-    canonical_predicate_key(arena, expr).as_str().to_string()
 }
 
 #[cfg(test)]
@@ -529,5 +519,219 @@ mod tests {
             },
             other => panic!("expected Changed, got {:?}", other),
         }
+    }
+    fn bound_call(name: &str, arg: TypedExpr) -> TypedExpr {
+        use novarocks_functions::{
+            FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+        };
+        let arguments = [FunctionArgument::Value {
+            value_type: arg.value_type.clone(),
+            constant: None,
+        }];
+        let binding = crate::functions::builtin_engine_function_catalog()
+            .resolve_bound_trusted(
+                name,
+                FunctionKind::Scalar,
+                FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+        let FunctionResultType::Scalar(value_type) = binding.selected.result_type.clone() else {
+            unreachable!()
+        };
+        let volatility = binding.semantics.volatility;
+        TypedExpr {
+            value_type,
+            kind: ExprKind::FunctionCall {
+                name: name.into(),
+                args: vec![arg].into(),
+                distinct: false,
+                binding: crate::binding::SqlFunctionBinding::from_test(
+                    binding,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                volatility,
+            },
+        }
+    }
+
+    fn ordered_parts(
+        arena: &ScalarArena,
+        filter: &OptExpr,
+    ) -> Vec<crate::optimizer::scalar::ScalarId> {
+        let Operator::LogicalFilter(filter) = &filter.op else {
+            panic!("expected distinct Filter");
+        };
+        let mut parts = Vec::new();
+        scalar_expr::split_conjuncts(arena, filter.predicate, &mut parts);
+        parts
+    }
+
+    #[test]
+    fn scan_moves_a_guard_only_before_the_selected_wait_and_division() {
+        let checked = eq(
+            TypedExpr {
+                value_type: col("a").value_type,
+                kind: ExprKind::BinaryOp {
+                    left: novarocks_parser::ast::AstBox::new(int_lit(12)),
+                    op: BinOp::Div,
+                    right: novarocks_parser::ast::AstBox::new(col("a")),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            },
+            int_lit(4),
+        );
+        let wait = bound_call("sleep", col("b"));
+        let guard = eq(col("a"), int_lit(3));
+        for (guard_first, predicate) in [
+            (true, and(guard.clone(), and(checked.clone(), wait.clone()))),
+            (
+                false,
+                and(checked.clone(), and(guard.clone(), wait.clone())),
+            ),
+            (false, and(wait, and(guard, checked))),
+        ] {
+            let mut arena = ScalarArena::new();
+            let scan = scan_opt(&mut arena, &["a", "b"]);
+            let filter = filter_opt(&mut arena, predicate, scan);
+            let parts = ordered_parts(&arena, &filter);
+            assert_eq!(
+                arena.effects(parts[0]).can_skip_for_earlier_filter(),
+                guard_first
+            );
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    assert_eq!(
+                        ordered_parts(&ctx.scalar_arena().borrow(), &out),
+                        parts[1..]
+                    );
+                    let Operator::LogicalScan(scan) = &out.unary_input().op else {
+                        panic!("residual Filter input is the original Scan");
+                    };
+                    assert_eq!(scan.predicates, parts[..1]);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn new_scan_predicate_cannot_cross_an_existing_wait_residual() {
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "b"]);
+        let [total, wait, guard] = [
+            is_not_null(col("b")),
+            bound_call("sleep", col("b")),
+            eq(col("a"), int_lit(3)),
+        ]
+        .map(|predicate| {
+            crate::planner::optimizer_bridge::scalar::intern_typed(
+                &mut arena,
+                &predicate,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
+        });
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        // An existing occurrence behind the wait gives no permission to offer
+        // the same predicate ahead of that wait.
+        scan_op.predicates = vec![total, wait, guard];
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: guard }),
+            vec![scan],
+        );
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            PushDownPredicateScan.apply(filter, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn keeps_existing_total_scan_predicates_before_new_terms() {
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "b"]);
+        let [original, added] =
+            [eq(col("a"), int_lit(3)), is_not_null(col("b"))].map(|predicate| {
+                crate::planner::optimizer_bridge::scalar::intern_typed(
+                    &mut arena,
+                    &predicate,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap()
+            });
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        scan_op.predicates = vec![original];
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: added }),
+            vec![scan],
+        );
+
+        let RewriteResult::Changed(out) = PushDownPredicateScan
+            .apply(filter, &mut make_ctx(arena))
+            .unwrap()
+        else {
+            panic!("the additional term belongs on the Scan");
+        };
+        let Operator::LogicalScan(scan) = &out.op else {
+            panic!("no residual Filter");
+        };
+        assert_eq!(scan.predicates, [original, added]);
+    }
+
+    #[test]
+    fn necessary_term_cannot_cross_whole_invocation_data() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let mut arena = ScalarArena::new();
+        let mut scan = scan_opt(&mut arena, &["a", "doc"]);
+        let doc_type = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
+        let Operator::LogicalScan(scan_op) = &mut scan.op else {
+            unreachable!()
+        };
+        scan_op.columns[1].value_type = doc_type.clone();
+        let mut doc = col("doc");
+        doc.value_type = doc_type;
+        let atomic = is_not_null(bound_call("__json_canonical_key", doc));
+        let filter = filter_opt(&mut arena, and(atomic, eq(col("a"), int_lit(3))), scan);
+        let parts = ordered_parts(&arena, &filter);
+        assert!(arena.effects(parts[0]).expression.may_raise_invocation_data);
+        assert!(!arena.effects(parts[0]).permits_filter_row_elimination);
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            PushDownPredicateScan.apply(filter, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_same_column_id_with_different_null_promise() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let mut wrong = col("a");
+        wrong.value_type = wrong.value_type.with_nullable(false).unwrap();
+        let filter = filter_opt(&mut arena, eq(wrong, int_lit(1)), scan);
+        assert!(matches!(
+            PushDownPredicateScan
+                .apply(filter, &mut make_ctx(arena))
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 }

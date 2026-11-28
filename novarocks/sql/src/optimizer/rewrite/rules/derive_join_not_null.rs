@@ -105,17 +105,13 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         let (left_preds, right_preds) = {
             let arena = arena_rc.borrow();
             let keys = join_equi_keys_opt(&join, &left, &right, &arena);
-            if keys.is_empty() {
-                return Ok(RewriteResult::Unchanged);
-            }
-
             let left_preds = if derive_left {
-                eligible_not_null(&left, keys.iter().map(|k| k.left), &arena)
+                eligible_not_null(&left, keys.iter().map(|key| key.left), &arena)
             } else {
                 Vec::new()
             };
             let right_preds = if derive_right {
-                eligible_not_null(&right, keys.iter().map(|k| k.right), &arena)
+                eligible_not_null(&right, keys.iter().map(|key| key.right), &arena)
             } else {
                 Vec::new()
             };
@@ -163,8 +159,6 @@ fn eligible_not_null(
         if !arena.nullable(operand) {
             continue;
         }
-        // Keys from join_equi_keys_opt are always bare ColumnRef (Cast/Nested
-        // already peeled); this guard is defensive.
         let ScalarNode::ColumnRef(column_id) = arena.node(operand) else {
             continue;
         };
@@ -845,6 +839,45 @@ mod tests {
         let mut ctx = make_ctx(arena);
         let result = DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap();
         assert!(matches!(result, RewriteResult::Unchanged));
+    }
+
+    #[test]
+    fn a_later_equality_does_not_derive_not_null_before_a_checked_on_term() {
+        let mut arena = ScalarArena::new();
+        let left = col_typed("l", "a", 1, true);
+        let right = col_typed("r", "b", 2, true);
+        let checked = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(right.clone()),
+                op: BinOp::Div,
+                right: novarocks_parser::ast::AstBox::new(right.clone()),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: right.value_type.clone(),
+        };
+        let on = and_expr(eq_expr(checked, right.clone()), eq_expr(left, right));
+        let plan = join_opt(
+            &mut arena,
+            JoinKind::Inner,
+            scan_opt("l", "tl", &[("a", 1, true)]),
+            scan_opt("r", "tr", &[("b", 2, true)]),
+            Some(on),
+        );
+        let Operator::LogicalJoin(join) = &plan.op else {
+            unreachable!()
+        };
+        assert!(
+            arena
+                .effects(join.condition.unwrap())
+                .expression
+                .may_raise_row_error
+        );
+        assert!(matches!(
+            DeriveJoinNotNullPredicate
+                .apply(plan, &mut make_ctx(arena))
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     #[test]

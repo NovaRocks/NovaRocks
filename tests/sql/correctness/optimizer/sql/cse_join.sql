@@ -24,7 +24,7 @@ DROP TABLE IF EXISTS ${case_db}.cse_join_r;
 CREATE TABLE ${case_db}.cse_join_l (a BIGINT);
 CREATE TABLE ${case_db}.cse_join_r (b BIGINT);
 INSERT INTO ${case_db}.cse_join_l VALUES ROW(2), ROW(5), ROW(9);
-INSERT INTO ${case_db}.cse_join_r VALUES ROW(3), ROW(8), ROW(20);
+INSERT INTO ${case_db}.cse_join_r VALUES ROW(3), ROW(8), ROW(20), ROW(NULL);
 
 SET SESSION disable_optimizer_rules = 'JoinCommutativity';
 
@@ -44,4 +44,33 @@ INNER JOIN ${case_db}.cse_join_r r
    AND (CAST(l.a AS DOUBLE) * 2e0) < CAST(r.b AS DOUBLE) + 10e0
 ORDER BY l.a, r.b;
 
+-- The shared expression reads the NULL-extended right output.
+-- @explain_contains=__cse_0
+-- @result_not_contains=__cse_
+SELECT l.a, COALESCE(CAST(r.b AS DOUBLE), 0e0) AS x,
+       COALESCE(CAST(r.b AS DOUBLE), 0e0) + 1e0 AS y
+FROM ${case_db}.cse_join_l l
+LEFT JOIN ${case_db}.cse_join_r r ON l.a = r.b - 1
+ORDER BY l.a;
+
+SET SESSION enable_common_subexpr_reuse = false;
+
+-- @explain_not_contains=__cse_
+-- @result_not_contains=__cse_
+SELECT l.a, r.b
+FROM ${case_db}.cse_join_l l
+INNER JOIN ${case_db}.cse_join_r r
+    ON (CAST(l.a AS DOUBLE) * 2e0) > CAST(r.b AS DOUBLE)
+   AND (CAST(l.a AS DOUBLE) * 2e0) < CAST(r.b AS DOUBLE) + 10e0
+ORDER BY l.a, r.b;
+
+-- @explain_not_contains=__cse_
+-- @result_not_contains=__cse_
+SELECT l.a, COALESCE(CAST(r.b AS DOUBLE), 0e0) AS x,
+       COALESCE(CAST(r.b AS DOUBLE), 0e0) + 1e0 AS y
+FROM ${case_db}.cse_join_l l
+LEFT JOIN ${case_db}.cse_join_r r ON l.a = r.b - 1
+ORDER BY l.a;
+
+SET SESSION enable_common_subexpr_reuse = true;
 SET SESSION disable_optimizer_rules = '';

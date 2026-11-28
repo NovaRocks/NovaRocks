@@ -5561,7 +5561,7 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(arena.value_type(scalar), &expected);
-                    assert!(crate::optimizer::scalar_expr::can_fail(&arena, scalar));
+                    assert!(arena.effects(scalar).may_raise_data());
                     let rebuilt = crate::planner::optimizer_bridge::scalar::materialize_exprs(
                         &arena,
                         &[scalar],
@@ -5692,7 +5692,7 @@ mod tests {
         let scalar =
             crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &actual, &control)
                 .unwrap();
-        assert!(crate::optimizer::scalar_expr::can_fail(&arena, scalar));
+        assert!(arena.effects(scalar).may_raise_data());
         let rebuilt =
             crate::planner::optimizer_bridge::scalar::materialize_exprs(&arena, &[scalar]);
         for expression in [&actual, &rebuilt[0]] {

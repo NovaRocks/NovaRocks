@@ -26,8 +26,8 @@ use novarocks_functions::{
     FunctionResultType,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy, FunctionArgumentType,
-    FunctionValueType, PureCompileControl,
+    ArithmeticOperator, ComparisonOperator, FunctionArgumentType, FunctionValueType,
+    PureCompileControl,
 };
 use std::sync::Arc;
 
@@ -95,16 +95,15 @@ pub(crate) enum PlannedConversion {
     Identity,
     Carrier(CarrierStep),
     ValueConversion {
-        binding: SqlFunctionBinding,
+        binding: novarocks_functions::ResolvedFunctionBinding,
+        intermediate: FunctionValueType,
         tail: Option<CarrierStep>,
     },
 }
 pub(crate) fn plan_conversion(
-    authority: crate::binding::PlanBindingAuthority,
-    functions: &dyn SqlFunctionCatalog,
+    functions: Option<&dyn SqlFunctionCatalog>,
     source: &FunctionValueType,
     target: &FunctionValueType,
-    policy: DecimalOverflowPolicy,
     cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
     control: &dyn PureCompileControl,
 ) -> Result<PlannedConversion, FunctionBindingError> {
@@ -139,6 +138,7 @@ pub(crate) fn plan_conversion(
         value_type: source.clone(),
         constant: None,
     };
+    let functions = functions.ok_or(FunctionBindingError::MissingBindingDeclaration)?;
     let binding = functions.resolve_value_conversion_binding(&argument, &intermediate, control)?;
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
@@ -154,16 +154,11 @@ pub(crate) fn plan_conversion(
         ));
     }
     let tail = (result != target).then(step);
-    let binding = SqlFunctionBinding::from_plan_with_constraint(
-        authority,
+    Ok(PlannedConversion::ValueConversion {
         binding,
-        policy,
-        crate::binding::SqlResultConstraintOrigin::ValueDomainConversion {
-            final_target: target.clone(),
-        },
-        Some(intermediate),
-    );
-    Ok(PlannedConversion::ValueConversion { binding, tail })
+        intermediate,
+        tail,
+    })
 }
 
 pub(crate) fn comparison_type(
@@ -180,6 +175,27 @@ pub(crate) fn comparison_target(
         .clone()
         .with_nullable(source.nullable())
         .expect("validated root NULL contract")
+}
+
+pub(crate) fn membership_operand_can_return_null(
+    source: &FunctionValueType,
+    candidate: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<bool, novarocks_functions::ComparisonPrepareError> {
+    use novarocks_functions::PreparedCompositeComparisonRecipe;
+    if candidate.nullable() {
+        return Ok(true);
+    }
+    if !PreparedCompositeComparisonRecipe::is_composite(source) {
+        return Ok(false);
+    }
+    PreparedCompositeComparisonRecipe::try_new(
+        novarocks_type_contract::KeyRelation::Equal,
+        source,
+        candidate,
+        control,
+    )
+    .map(|recipe| recipe.nullable_result())
 }
 
 pub(crate) const fn arithmetic_operator(op: crate::common::BinOp) -> Option<ArithmeticOperator> {

@@ -19,8 +19,8 @@
 //! remain in the existing comparison and ordered Boolean owners.
 use crate::{ComparisonPrepareError, PreparedComparisonRecipe, ScopedExpressionEffects};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ExpressionEffectContext, FunctionValueType,
-    NativeBetweenPlan, PureCompileControl, ValueLogicalType,
+    CompileCheckpoints, CompilePhase, ExpressionEffectContext, ExpressionEffects,
+    FunctionValueType, NativeBetweenPlan, PureCompileControl, ValueLogicalType,
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedNativeBetweenRecipe {
@@ -75,6 +75,10 @@ impl PreparedNativeBetweenRecipe {
         &self.upper
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::pure_value(context)
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        ExpressionEffects::PURE_VALUE
     }
 }

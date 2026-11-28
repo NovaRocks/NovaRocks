@@ -36,7 +36,9 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::rewrite::rules::utils::wrap_remaining_filter_opt_scalar;
+use crate::optimizer::rewrite::rules::utils::{
+    collect_output_ids_opt, wrap_remaining_filter_opt_scalar,
+};
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
 use crate::optimizer::scalar_expr;
 
@@ -97,30 +99,36 @@ impl LogicalRewriteRule for PushDownPredicateProject {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
-        // Moving a filter below a throwing projection can suppress a required
-        // evaluation on filtered rows. Keep that evaluation at its owner.
-        if scalar_expr::can_fail(&arena, filter.predicate)
-            || proj
-                .items
-                .iter()
-                .any(|item| scalar_expr::can_fail(&arena, item.expr))
-        {
+        // The new Filter can discard rows before any projected value is
+        // needed. Only ordinary row errors in otherwise pure projections may
+        // disappear with those rows.
+        if proj.items.iter().any(|item| {
+            let effects = arena.effects(item.expr);
+            !effects.expression.permits_boolean_reordering()
+                || !effects.permits_filter_row_elimination
+                || scalar_expr::is_internal_assertion(&arena, item.expr)
+        }) {
             return Ok(RewriteResult::Unchanged);
         }
 
+        let bindings = project_bindings(&arena, &proj.items, &project_input);
         let mut conjuncts = Vec::new();
         scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
-        for conj in conjuncts {
-            match remap_predicate_through_project(
-                &mut arena,
-                conj,
-                &proj.items,
-                &ctx.control_view(),
-            )? {
-                Some(rewritten) => pushable.push(rewritten),
-                None => remaining.push(conj),
+        let mut can_move = true;
+        for conjunct in conjuncts {
+            let can_skip = arena.effects(conjunct).can_skip_for_earlier_filter();
+            if can_move
+                && can_skip
+                && let Some(rewritten) =
+                    remap_scalar(&mut arena, conjunct, &bindings, &ctx.control_view())?
+                && arena.effects(rewritten).can_skip_for_earlier_filter()
+            {
+                pushable.push(rewritten);
+            } else {
+                remaining.push(conjunct);
+                can_move &= can_skip;
             }
         }
 
@@ -167,30 +175,29 @@ macro_rules! candidate_or_none {
     };
 }
 
-fn remap_predicate_through_project(
-    arena: &mut ScalarArena,
-    predicate: ScalarId,
-    project_items: &[ScalarProjectItem],
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<Option<ScalarId>, SqlCompileError> {
-    let bindings = project_bindings(arena, project_items);
-    remap_scalar(arena, predicate, &bindings, control)
-}
-
 fn project_bindings(
     arena: &ScalarArena,
     project_items: &[ScalarProjectItem],
+    input: &OptExpr,
 ) -> HashMap<ColumnId, Option<ScalarId>> {
+    let input_ids = collect_output_ids_opt(input);
     let mut bindings = HashMap::new();
     for item in project_items {
         if item.output_column_id == ColumnId::UNSET {
             continue;
         }
         let input = match arena.node(item.expr) {
-            ScalarNode::ColumnRef(input_id) if *input_id != ColumnId::UNSET => Some(item.expr),
+            ScalarNode::ColumnRef(input_id)
+                if *input_id != ColumnId::UNSET && input_ids.contains(input_id) =>
+            {
+                Some(item.expr)
+            }
             _ => None,
         };
-        bindings.insert(item.output_column_id, input);
+        bindings
+            .entry(item.output_column_id)
+            .and_modify(|binding| *binding = None)
+            .or_insert(input);
     }
     bindings
 }
@@ -204,7 +211,11 @@ fn remap_scalar(
     let node = arena.node(expr).clone();
     let value_type = arena.value_type(expr).clone();
     Ok(match node {
-        ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
+        ScalarNode::ColumnRef(column_id) => bindings
+            .get(&column_id)
+            .copied()
+            .flatten()
+            .filter(|&input| arena.value_type(input) == &value_type),
         ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {
             Some(expr)
         }
@@ -962,15 +973,68 @@ mod tests {
         }
     }
     #[test]
-    fn own_row_errors_block_filter_pushdown_but_caught_parse_errors_do_not() {
+    fn project_moves_a_guard_only_before_the_original_filter_error() {
+        let a = col_ref("a", col_id(1));
+        let b = col_ref("b", col_id(2));
+        let guard = eq(a, int_lit(3));
+        let checked = eq(
+            TypedExpr {
+                value_type: b.value_type.clone(),
+                kind: ExprKind::BinaryOp {
+                    left: novarocks_parser::ast::AstBox::new(int_lit(12)),
+                    op: BinOp::Div,
+                    right: novarocks_parser::ast::AstBox::new(b),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            },
+            int_lit(4),
+        );
+        for (guard_first, predicate) in [
+            (true, and(guard.clone(), checked.clone())),
+            (false, and(checked, guard)),
+        ] {
+            let mut arena = ScalarArena::new();
+            let columns = [("a", col_id(1)), ("b", col_id(2))];
+            let scan = scan_opt(&mut arena, &columns);
+            let project = passthrough_project_opt(&mut arena, &columns, None, scan);
+            let filter = filter_opt(&mut arena, predicate, project);
+            let Operator::LogicalFilter(original) = &filter.op else {
+                unreachable!()
+            };
+            let mut conjuncts = Vec::new();
+            scalar_expr::split_conjuncts(&arena, original.predicate, &mut conjuncts);
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateProject.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    let Operator::LogicalFilter(residual) = &out.op else {
+                        panic!("checked predicate remains above the Project");
+                    };
+                    assert_eq!(residual.predicate, conjuncts[1]);
+                    let project = out.unary_input();
+                    assert!(matches!(project.op, Operator::LogicalProject(_)));
+                    let Operator::LogicalFilter(pushed) = &project.unary_input().op else {
+                        panic!("guard moves below the Project");
+                    };
+                    assert_eq!(pushed.predicate, conjuncts[0]);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn filter_eliminates_unused_rows_of_pure_projection_but_retains_internal_assertions() {
         use novarocks_functions::{
             FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
             FunctionValueType,
         };
-        for (name, input_type, expected_change) in [
-            ("assert_true", DataType::Boolean, false),
-            ("json_parse", DataType::Utf8, false),
-            ("__json_try_read_text", DataType::Utf8, true),
+        for (name, input_type, ordinary_row_error, expected_change) in [
+            ("assert_true", DataType::Boolean, true, false),
+            ("json_parse", DataType::Utf8, true, true),
+            ("__json_try_read_text", DataType::Utf8, false, true),
         ] {
             let mut arena = ScalarArena::new();
             let scan = scan_opt(&mut arena, &[("a", col_id(1))]);
@@ -1032,6 +1096,9 @@ mod tests {
                 },
                 output,
             );
+            let effects = arena.effects(call).expression;
+            assert_eq!(effects.may_raise_row_error, ordinary_row_error, "{name}");
+            assert!(!effects.may_raise_invocation_data, "{name}");
             let Operator::LogicalProject(proj) = &mut project.op else {
                 unreachable!()
             };
@@ -1044,11 +1111,70 @@ mod tests {
             let filter = filter_opt(&mut arena, eq(col_ref("a", col_id(1)), int_lit(1)), project);
             let mut ctx = make_ctx(arena);
             let result = PushDownPredicateProject.apply(filter, &mut ctx).unwrap();
-            assert_eq!(
-                matches!(result, RewriteResult::Changed(_)),
-                expected_change,
-                "{name}"
+            match (expected_change, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    let Operator::LogicalProject(project) = &out.op else {
+                        panic!("new Filter belongs below the original Project");
+                    };
+                    assert!(project.items.iter().any(|item| item.expr == call));
+                    assert!(matches!(out.unary_input().op, Operator::LogicalFilter(_)));
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected {name} rewrite: {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn filter_can_eliminate_rows_before_strict_or_catching_cast_without_omitting_projection() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
+
+        for (cast_mode, raises) in [(TrinoCastMode::Explicit, true), (TrinoCastMode::Try, false)] {
+            let mut arena = ScalarArena::new();
+            let key = col_id(1);
+            let text = col_id(2);
+            let result = col_id(3);
+            let mut scan = scan_opt(&mut arena, &[("key", key), ("text", text)]);
+            let Operator::LogicalScan(scan_op) = &mut scan.op else {
+                unreachable!()
+            };
+            let source_type = FunctionValueType::new(DataType::Utf8, true);
+            scan_op.columns[1].value_type = source_type.clone();
+            let input = arena.intern(ScalarNode::ColumnRef(text), source_type);
+            let cast = arena.intern(
+                ScalarNode::Cast {
+                    child: input,
+                    target: DataType::Int64,
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    cast_mode: Some(cast_mode),
+                },
+                FunctionValueType::new(DataType::Int64, true),
             );
+            let effects = arena.effects(cast);
+            assert_eq!(effects.expression.may_raise_row_error, raises);
+            assert!(effects.permits_filter_row_elimination);
+
+            let mut project = passthrough_project_opt(&mut arena, &[("key", key)], None, scan);
+            let Operator::LogicalProject(project_op) = &mut project.op else {
+                unreachable!()
+            };
+            project_op.items.push(ScalarProjectItem {
+                expr: cast,
+                output_name: "cast_result".into(),
+                output_column_id: result,
+                expr_display: None,
+            });
+            let filter = filter_opt(&mut arena, eq(col_ref("key", key), int_lit(42)), project);
+            let mut ctx = make_ctx(arena);
+            let RewriteResult::Changed(out) =
+                PushDownPredicateProject.apply(filter, &mut ctx).unwrap()
+            else {
+                panic!("the bare key can filter before {cast_mode:?}");
+            };
+            let Operator::LogicalProject(project) = &out.op else {
+                panic!("the required Project remains the output owner");
+            };
+            assert_eq!(project.items[1].expr, cast);
+            assert!(matches!(out.unary_input().op, Operator::LogicalFilter(_)));
         }
     }
 }

@@ -72,7 +72,7 @@ impl Rule for JoinCommutativity {
     fn apply(
         &self,
         expr: &MExpr,
-        _memo: &mut Memo,
+        memo: &mut Memo,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
         let _ = control;
@@ -81,8 +81,13 @@ impl Rule for JoinCommutativity {
             return Ok(vec![]);
         };
 
-        // A join must have exactly two children: [left, right].
-        if expr.children.len() != 2 {
+        // The pair cursor walks build rows for each probe row. Swapping
+        // children can move required ON work to a different pair order.
+        if expr.children.len() != 2
+            || op
+                .condition
+                .is_some_and(|condition| !memo.scalars.effects(condition).can_share())
+        {
             return Ok(vec![]);
         }
 

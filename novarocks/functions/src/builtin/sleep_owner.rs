@@ -162,6 +162,10 @@ impl FunctionBindingResolver for SleepOwner {
 }
 
 impl PureFunctionMetadataOwner for SleepOwner {
+    fn permits_filter_row_elimination(&self) -> bool {
+        true
+    }
+
     fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
         crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
     }

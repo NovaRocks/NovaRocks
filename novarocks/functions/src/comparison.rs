@@ -22,7 +22,7 @@ use arrow_array::{types::*, *};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use novarocks_type_contract::{
     CharacterKind, CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
-    FunctionValueType, PureCompileControl, ValueKind, ValueLogicalType,
+    ExpressionEffects, FunctionValueType, PureCompileControl, ValueKind, ValueLogicalType,
     arrow_data_types_exact_observed,
 };
 use std::{cmp::Ordering, error::Error, fmt};
@@ -396,7 +396,11 @@ impl PreparedComparisonRecipe {
     }
     /// Only an admitted ordinary comparison recipe supplies its own pure summary.
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::pure_value(context)
+        ScopedExpressionEffects::primitive(context, self.static_own_effects())
+    }
+
+    pub fn static_own_effects(&self) -> ExpressionEffects {
+        ExpressionEffects::PURE_VALUE
     }
 
     /// The host supplies an actual required row and excludes inherited errors.

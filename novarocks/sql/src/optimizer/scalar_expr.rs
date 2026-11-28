@@ -37,39 +37,51 @@ pub(crate) fn collect_column_ids_strict(
     expr: ScalarId,
 ) -> Option<HashSet<ColumnId>> {
     let mut out = HashSet::new();
-    collect_column_ids_strict_inner(arena, expr, &mut out)?;
+    visit_column_refs(arena, expr, &mut |id, _| {
+        out.insert(id);
+        Some(())
+    })?;
     Some(out)
 }
 
-fn collect_column_ids_strict_inner(
+/// Prove that every actual bound column use agrees with the destination port.
+pub(crate) fn all_column_refs_match(
     arena: &ScalarArena,
     expr: ScalarId,
-    out: &mut HashSet<ColumnId>,
+    mut matches: impl FnMut(ColumnId, &novarocks_type_contract::FunctionValueType) -> bool,
+) -> bool {
+    visit_column_refs(arena, expr, &mut |id, ty| matches(id, ty).then_some(())).is_some()
+}
+
+fn visit_column_refs(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    visit: &mut impl FnMut(ColumnId, &novarocks_type_contract::FunctionValueType) -> Option<()>,
 ) -> Option<()> {
     match arena.node(expr) {
         ScalarNode::ColumnRef(id) => {
             if *id == ColumnId::UNSET {
                 return None;
             }
-            out.insert(*id);
+            visit(*id, arena.value_type(expr))?;
         }
         ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
-            collect_column_ids_strict_inner(arena, *left, out)?;
-            collect_column_ids_strict_inner(arena, *right, out)?;
+            visit_column_refs(arena, *left, visit)?;
+            visit_column_refs(arena, *right, visit)?;
         }
         ScalarNode::UnaryOp { child, .. }
         | ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
         | ScalarNode::IsTruthValue { child, .. }
-        | ScalarNode::Nested(child) => collect_column_ids_strict_inner(arena, *child, out)?,
+        | ScalarNode::Nested(child) => visit_column_refs(arena, *child, visit)?,
         ScalarNode::FunctionCall { args, .. } => {
             for arg in args {
-                collect_column_ids_strict_inner(arena, *arg, out)?;
+                visit_column_refs(arena, *arg, visit)?;
             }
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            collect_column_ids_strict_inner(arena, *body, out)?;
+            visit_column_refs(arena, *body, visit)?;
         }
         ScalarNode::AggregateCall {
             args,
@@ -78,31 +90,31 @@ fn collect_column_ids_strict_inner(
             ..
         } => {
             if let Some(predicate) = filter {
-                collect_column_ids_strict_inner(arena, *predicate, out)?;
+                visit_column_refs(arena, *predicate, visit)?;
             }
             for arg in args {
-                collect_column_ids_strict_inner(arena, *arg, out)?;
+                visit_column_refs(arena, *arg, visit)?;
             }
             for item in order_by {
-                collect_column_ids_strict_inner(arena, item.expr, out)?;
+                visit_column_refs(arena, item.expr, visit)?;
             }
         }
         ScalarNode::InList { child, list, .. } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
+            visit_column_refs(arena, *child, visit)?;
             for item in list {
-                collect_column_ids_strict_inner(arena, *item, out)?;
+                visit_column_refs(arena, *item, visit)?;
             }
         }
         ScalarNode::Between {
             child, low, high, ..
         } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
-            collect_column_ids_strict_inner(arena, *low, out)?;
-            collect_column_ids_strict_inner(arena, *high, out)?;
+            visit_column_refs(arena, *child, visit)?;
+            visit_column_refs(arena, *low, visit)?;
+            visit_column_refs(arena, *high, visit)?;
         }
         ScalarNode::Like { child, pattern, .. } => {
-            collect_column_ids_strict_inner(arena, *child, out)?;
-            collect_column_ids_strict_inner(arena, *pattern, out)?;
+            visit_column_refs(arena, *child, visit)?;
+            visit_column_refs(arena, *pattern, visit)?;
         }
         ScalarNode::Case {
             operand,
@@ -111,14 +123,14 @@ fn collect_column_ids_strict_inner(
             ..
         } => {
             if let Some(operand) = operand {
-                collect_column_ids_strict_inner(arena, *operand, out)?;
+                visit_column_refs(arena, *operand, visit)?;
             }
             for (when, then) in when_then {
-                collect_column_ids_strict_inner(arena, *when, out)?;
-                collect_column_ids_strict_inner(arena, *then, out)?;
+                visit_column_refs(arena, *when, visit)?;
+                visit_column_refs(arena, *then, visit)?;
             }
             if let Some(else_expr) = else_expr {
-                collect_column_ids_strict_inner(arena, *else_expr, out)?;
+                visit_column_refs(arena, *else_expr, visit)?;
             }
         }
         ScalarNode::WindowCall {
@@ -129,16 +141,16 @@ fn collect_column_ids_strict_inner(
             ..
         } => {
             for arg in args {
-                collect_column_ids_strict_inner(arena, *arg, out)?;
+                visit_column_refs(arena, *arg, visit)?;
             }
             for item in function_order_by {
-                collect_column_ids_strict_inner(arena, item.expr, out)?;
+                visit_column_refs(arena, item.expr, visit)?;
             }
             for expr in partition_by {
-                collect_column_ids_strict_inner(arena, *expr, out)?;
+                visit_column_refs(arena, *expr, visit)?;
             }
             for item in order_by {
-                collect_column_ids_strict_inner(arena, item.expr, out)?;
+                visit_column_refs(arena, item.expr, visit)?;
             }
         }
     }
@@ -752,321 +764,19 @@ fn boolean_literal_value(
     result
 }
 
-pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: ScalarId) -> bool {
-    contains_function_matching(arena, expr, |volatility| volatility.is_volatile())
+/// A projection can carry a checked row result or an explicit internal
+/// assertion even when its column is absent from the requested output.
+pub(crate) fn must_retain_projection(arena: &ScalarArena, expr: ScalarId) -> bool {
+    is_internal_assertion(arena, expr) || arena.effects(expr).may_raise_data()
 }
 
-pub(crate) fn contains_non_replica_deterministic_function(
-    arena: &ScalarArena,
-    expr: ScalarId,
-) -> bool {
-    contains_function_matching(arena, expr, |volatility| {
-        !volatility.is_replica_deterministic()
-    })
-}
-
-fn contains_function_matching(
-    arena: &ScalarArena,
-    expr: ScalarId,
-    matches: fn(novarocks_functions::FunctionVolatility) -> bool,
-) -> bool {
-    match arena.node(expr) {
-        ScalarNode::FunctionCall { args, .. } => {
-            arena.function_volatility(expr).is_some_and(matches)
-                || args
-                    .iter()
-                    .any(|arg| contains_function_matching(arena, *arg, matches))
-        }
-        ScalarNode::AggregateCall {
-            args,
-            order_by,
-            filter,
-            ..
-        } => {
-            filter.is_some_and(|predicate| contains_function_matching(arena, predicate, matches))
-                || args
-                    .iter()
-                    .any(|arg| contains_function_matching(arena, *arg, matches))
-                || order_by
-                    .iter()
-                    .any(|item| contains_function_matching(arena, item.expr, matches))
-        }
-        ScalarNode::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter()
-                .any(|arg| contains_function_matching(arena, *arg, matches))
-                || partition_by
-                    .iter()
-                    .any(|expr| contains_function_matching(arena, *expr, matches))
-                || order_by
-                    .iter()
-                    .any(|item| contains_function_matching(arena, item.expr, matches))
-        }
-        ScalarNode::BinaryOp { left, right, .. } => {
-            contains_function_matching(arena, *left, matches)
-                || contains_function_matching(arena, *right, matches)
-        }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
-        | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
-        | ScalarNode::Nested(child) => contains_function_matching(arena, *child, matches),
-        ScalarNode::InList { child, list, .. } => {
-            contains_function_matching(arena, *child, matches)
-                || list
-                    .iter()
-                    .any(|item| contains_function_matching(arena, *item, matches))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => {
-            contains_function_matching(arena, *child, matches)
-                || contains_function_matching(arena, *low, matches)
-                || contains_function_matching(arena, *high, matches)
-        }
-        ScalarNode::Like { child, pattern, .. } => {
-            contains_function_matching(arena, *child, matches)
-                || contains_function_matching(arena, *pattern, matches)
-        }
-        ScalarNode::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            operand.is_some_and(|expr| contains_function_matching(arena, expr, matches))
-                || when_then.iter().any(|(when, then)| {
-                    contains_function_matching(arena, *when, matches)
-                        || contains_function_matching(arena, *then, matches)
-                })
-                || else_expr.is_some_and(|expr| contains_function_matching(arena, expr, matches))
-        }
-        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            contains_function_matching(arena, *body, matches)
-        }
-        ScalarNode::ColumnRef(_)
-        | ScalarNode::LambdaParamRef { .. }
-        | ScalarNode::Literal(_)
-        | ScalarNode::Constant(_) => false,
-    }
-}
-
-// Source-backed own Cast effects; unsupported frozen shapes and allocation
-// failures are not row effects. Recursive casts use the shared scalar caster,
-// while root Cast adds Date calendar conversion and the legacy SQL mode check.
-fn cast_has_intrinsic_row_error(source: &DataType, target: &DataType, root: bool) -> bool {
-    use arrow::datatypes::TimeUnit;
-    if source == target || source == &DataType::Null || target == &DataType::Null {
-        return false;
-    }
-    if root
-        && source == &DataType::Date32
-        && matches!(target, DataType::Float32 | DataType::Float64)
-    {
-        return true;
-    }
-    // ALLOW_THROW_EXCEPTION also governs Decimal-to-Decimal overflow. A
-    // same-scale non-narrowing precision cast is total on the declared source
-    // domain (including a carrier change). Other rescaling/narrowing profiles
-    // remain a conservative effect upper bound, not a claim that every such
-    // profile overflows. The statement flag is not a per-node frozen fact.
-    let decimal_parts = |dtype: &DataType| match dtype {
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Some((*p, *s)),
-        _ => None,
-    };
-    if root && let (Some((sp, ss)), Some((tp, ts))) = (decimal_parts(source), decimal_parts(target))
-    {
-        return ss != ts || tp < sp;
-    }
-    // ALLOW_THROW_EXCEPTION is an existing statement setting rather than a
-    // per-node Decimal policy. Conservatively preserve its lawful error route.
-    if root
-        && matches!(source, DataType::Float32 | DataType::Float64)
-        && matches!(
-            target,
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+pub(crate) fn is_internal_assertion(arena: &ScalarArena, expr: ScalarId) -> bool {
+    arena.effects(expr).has_internal_assertion
+        || matches!(
+            arena.node(expr),
+            ScalarNode::FunctionCall { binding, .. }
+                if binding.function_id.as_str() == crate::functions::ASSERT_TRUE_ID
         )
-    {
-        return true;
-    }
-    if matches!(
-        (source, target),
-        (
-            DataType::Timestamp(TimeUnit::Microsecond, _),
-            DataType::Timestamp(TimeUnit::Nanosecond, _)
-        )
-    ) {
-        return true;
-    }
-    if matches!(target, DataType::Utf8 | DataType::LargeUtf8) {
-        // The exact top-level Timestamp -> Utf8 route has a custom formatter;
-        // Arrow nested/LargeUtf8 formatting remains fallible on temporal values.
-        if matches!((source, target), (DataType::Timestamp(..), DataType::Utf8)) {
-            return false;
-        }
-        return arrow_format_has_row_error(source);
-    }
-    match (source, target) {
-        (DataType::List(source), DataType::List(target)) => {
-            cast_has_intrinsic_row_error(source.data_type(), target.data_type(), false)
-        }
-        (DataType::Struct(source), DataType::Struct(target)) if source.len() == target.len() => {
-            let by_name = target
-                .iter()
-                .all(|field| source.iter().any(|s| s.name() == field.name()));
-            target.iter().enumerate().any(|(index, target)| {
-                let source = if by_name {
-                    source.iter().find(|s| s.name() == target.name()).unwrap()
-                } else {
-                    &source[index]
-                };
-                cast_has_intrinsic_row_error(source.data_type(), target.data_type(), false)
-            })
-        }
-        (DataType::Map(source, _), DataType::Map(target, _)) => {
-            let (DataType::Struct(source), DataType::Struct(target)) =
-                (source.data_type(), target.data_type())
-            else {
-                return false;
-            };
-            // MAP key/value conversion is positional, unlike STRUCT by-name matching.
-            source.len() == 2
-                && target.len() == 2
-                && source.iter().zip(target.iter()).any(|(source, target)| {
-                    cast_has_intrinsic_row_error(source.data_type(), target.data_type(), false)
-                })
-        }
-        (DataType::List(source), DataType::Map(target, _)) => {
-            cast_has_intrinsic_row_error(source.data_type(), target.data_type(), false)
-        }
-        _ => false,
-    }
-}
-
-fn arrow_format_has_row_error(source: &DataType) -> bool {
-    use arrow::datatypes::TimeUnit;
-    match source {
-        DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(_)
-        | DataType::Time64(_)
-        | DataType::Timestamp(
-            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
-            _,
-        ) => true,
-        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            arrow_format_has_row_error(item.data_type())
-        }
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|f| arrow_format_has_row_error(f.data_type())),
-        DataType::Map(entries, _) => arrow_format_has_row_error(entries.data_type()),
-        _ => false,
-    }
-}
-
-fn implicit_cast_has_intrinsic_row_error(source: &DataType, target: &DataType) -> bool {
-    if source == target || source == &DataType::Null {
-        return false;
-    }
-    match (source, target) {
-        (DataType::List(source), DataType::List(target)) => {
-            implicit_cast_has_intrinsic_row_error(source.data_type(), target.data_type())
-        }
-        (_, DataType::Decimal128(..)) => {
-            !novarocks_type_contract::trino_decimal_widening_is_total(source, target)
-        }
-        // The canonical DATE/TIMESTAMP carriers can overflow a narrower clock.
-        (_, DataType::Timestamp(..) | DataType::Time32(..) | DataType::Time64(..)) => true,
-        (_, DataType::Map(..) | DataType::Struct(..)) => true,
-        _ => false,
-    }
-}
-
-fn scalar_invocation_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
-    binding.declared_scalar_invocation_data
-        || binding
-            .admitted_execution_abi
-            .is_some_and(|abi| abi.may_raise_invocation_data())
-}
-
-pub(crate) fn scalar_call_can_fail(binding: &crate::binding::SqlFunctionBinding) -> bool {
-    assert_eq!(
-        binding.kind,
-        novarocks_functions::FunctionKind::Scalar,
-        "a non-row binding cannot be consumed as a scalar function"
-    );
-    use novarocks_type_contract::{
-        FunctionArgumentType, FunctionIntrinsicRowError, OperatorFunction,
-    };
-    if scalar_invocation_can_fail(binding) {
-        return true;
-    }
-    match binding.semantics.intrinsic_row_error {
-        FunctionIntrinsicRowError::NoRowError => false,
-        FunctionIntrinsicRowError::MayRaise => {
-            if matches!(
-                OperatorFunction::from_function_id(&binding.function_id),
-                Some(OperatorFunction::Equal | OperatorFunction::NotEqual)
-            ) && let [
-                FunctionArgumentType::Value(left),
-                FunctionArgumentType::Value(right),
-            ] = binding.selected.argument_types.as_slice()
-            {
-                use novarocks_functions::PreparedCompositeComparisonRecipe;
-                PreparedCompositeComparisonRecipe::equal_may_raise_row_error(left)
-                    || PreparedCompositeComparisonRecipe::equal_may_raise_row_error(right)
-            } else {
-                true
-            }
-        }
-        FunctionIntrinsicRowError::NotRowEvaluated => {
-            unreachable!("a scalar function cannot carry a non-row intrinsic fact")
-        }
-    }
-}
-
-pub(crate) fn scalar_cast_can_fail(
-    source: &novarocks_type_contract::FunctionValueType,
-    result: &novarocks_type_contract::FunctionValueType,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    cast_mode: Option<novarocks_type_contract::TrinoCastMode>,
-) -> bool {
-    use novarocks_type_contract::{DecimalOverflowPolicy, TrinoCastMode};
-    let source_carrier = source.data_type();
-    let result_carrier = result.data_type();
-    match cast_mode {
-        Some(TrinoCastMode::Explicit) => {
-            use novarocks_type_contract::{ValueKind, ValueLogicalType};
-            let total_signed_cast = source.logical_type() == ValueLogicalType::Physical
-                && result.logical_type() == ValueLogicalType::Physical
-                && signed_integer_fits(0, source_carrier)
-                && (novarocks_type_contract::trino_decimal_widening_is_total(
-                    source_carrier,
-                    result_carrier,
-                ) || matches!(result.value_type().kind(), ValueKind::String)
-                    && result_carrier == &DataType::Utf8);
-            // The signed renderer has no length check for unbounded VARCHAR.
-            !(signed_widening_domains(source, result) || total_signed_cast)
-        }
-        Some(TrinoCastMode::StoreAssignment) => !signed_widening_domains(source, result),
-        Some(TrinoCastMode::Try) => false,
-        Some(TrinoCastMode::Implicit) => {
-            implicit_cast_has_intrinsic_row_error(source_carrier, result_carrier)
-        }
-        None => {
-            cast_has_intrinsic_row_error(source_carrier, result_carrier, true)
-                || (decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                    && novarocks_type_contract::is_checked_decimal_numeric_cast(
-                        source_carrier,
-                        result_carrier,
-                    ))
-        }
-    }
 }
 
 fn signed_integer_bounds(arena: &ScalarArena, mut expression: ScalarId) -> Option<(i64, i64)> {
@@ -1107,9 +817,9 @@ fn signed_integer_bounds(arena: &ScalarArena, mut expression: ScalarId) -> Optio
 
 /// Prove that the selected signed operator cannot raise a row arithmetic error.
 /// This does not change the selected overload or discharge an operand's effects.
-fn prove_signed_integer_operator_total(
+pub(super) fn prove_signed_integer_operator_total(
     arena: &ScalarArena,
-    expression: ScalarId,
+    result_type: &novarocks_type_contract::FunctionValueType,
     binding: &crate::binding::SqlFunctionBinding,
     args: &[ScalarId],
 ) -> Option<()> {
@@ -1133,7 +843,7 @@ fn prove_signed_integer_operator_total(
         return None;
     };
     let carrier = result.data_type();
-    if result != arena.value_type(expression)
+    if result != result_type
         || result.logical_type() != ValueLogicalType::Physical
         || !signed_integer_fits(0, carrier)
         || selected_left != arena.value_type(*left)
@@ -1157,131 +867,6 @@ fn prove_signed_integer_operator_total(
     let min = left_min.checked_add(right_min)?;
     let max = left_max.checked_add(right_max)?;
     (signed_integer_fits(min, carrier) && signed_integer_fits(max, carrier)).then_some(())
-}
-
-/// Whether evaluating the scalar can expose an intrinsic row error or a checked
-/// Decimal numeric overflow, including errors from any argument expression.
-/// This effect is independent from function volatility.
-pub(crate) fn can_fail(arena: &ScalarArena, expr: ScalarId) -> bool {
-    use novarocks_functions::PreparedCompositeComparisonRecipe;
-    use novarocks_type_contract::{DecimalOverflowPolicy, ValueLogicalType};
-    let comparison_can_fail = |value| {
-        PreparedCompositeComparisonRecipe::equal_may_raise_row_error(arena.value_type(value))
-    };
-    let decimal = |data_type: &DataType| {
-        matches!(
-            data_type,
-            DataType::Decimal128(..) | DataType::Decimal256(..)
-        )
-    };
-    let own_error = match arena.node(expr) {
-        ScalarNode::FunctionCall { binding, args, .. } => {
-            scalar_call_can_fail(binding)
-                && (scalar_invocation_can_fail(binding)
-                    || prove_signed_integer_operator_total(arena, expr, binding, args).is_none())
-        }
-        ScalarNode::BinaryOp {
-            op,
-            decimal_overflow_policy,
-            ..
-        } => {
-            // Legacy ALLOW_THROW_EXCEPTION can also raise for Decimal multiply.
-            // It is not a per-node frozen fact, so OutputNull cannot prove this
-            // operation error-free. This is MayRaise, not an unconditional error.
-            decimal(arena.data_type(expr))
-                && (*op == BinOp::Mul
-                    || (*decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                        && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Div | BinOp::Mod)))
-        }
-        ScalarNode::Cast {
-            child,
-            decimal_overflow_policy,
-            cast_mode,
-            ..
-        } => scalar_cast_can_fail(
-            arena.value_type(*child),
-            arena.value_type(expr),
-            *decimal_overflow_policy,
-            *cast_mode,
-        ),
-        _ => false,
-    };
-    if own_error {
-        return true;
-    }
-    match arena.node(expr) {
-        ScalarNode::FunctionCall { args, .. } => args.iter().any(|arg| can_fail(arena, *arg)),
-        ScalarNode::AggregateCall {
-            args,
-            order_by,
-            filter,
-            ..
-        } => {
-            filter.is_some_and(|predicate| can_fail(arena, predicate))
-                || args.iter().any(|arg| can_fail(arena, *arg))
-                || order_by.iter().any(|item| can_fail(arena, item.expr))
-        }
-        ScalarNode::WindowCall {
-            args,
-            function_order_by,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(|arg| can_fail(arena, *arg))
-                || function_order_by
-                    .iter()
-                    .any(|item| can_fail(arena, item.expr))
-                || partition_by.iter().any(|expr| can_fail(arena, *expr))
-                || order_by.iter().any(|item| can_fail(arena, item.expr))
-        }
-        ScalarNode::BinaryOp { left, right, .. } => {
-            can_fail(arena, *left) || can_fail(arena, *right)
-        }
-        ScalarNode::UnaryOp { child, .. }
-        | ScalarNode::Cast { child, .. }
-        | ScalarNode::IsNull { child, .. }
-        | ScalarNode::IsTruthValue { child, .. }
-        | ScalarNode::Nested(child) => can_fail(arena, *child),
-        ScalarNode::InList { child, list, .. } => {
-            arena.value_type(*child).logical_type() == ValueLogicalType::Json
-                || comparison_can_fail(*child)
-                || can_fail(arena, *child)
-                || list
-                    .iter()
-                    .any(|item| comparison_can_fail(*item) || can_fail(arena, *item))
-        }
-        ScalarNode::Between {
-            child, low, high, ..
-        } => can_fail(arena, *child) || can_fail(arena, *low) || can_fail(arena, *high),
-        ScalarNode::Like { child, pattern, .. } => {
-            can_fail(arena, *child) || can_fail(arena, *pattern)
-        }
-        ScalarNode::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            operand.is_some_and(|expr| {
-                can_fail(arena, expr)
-                    || comparison_can_fail(expr)
-                    || when_then
-                        .iter()
-                        .any(|(label, _)| comparison_can_fail(*label))
-            }) || when_then
-                .iter()
-                .any(|(when, then)| can_fail(arena, *when) || can_fail(arena, *then))
-                || else_expr.is_some_and(|expr| can_fail(arena, expr))
-        }
-        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            can_fail(arena, *body)
-        }
-        ScalarNode::ColumnRef(_)
-        | ScalarNode::LambdaParamRef { .. }
-        | ScalarNode::Literal(_)
-        | ScalarNode::Constant(_) => false,
-    }
 }
 
 #[cfg(test)]
@@ -1426,7 +1011,7 @@ mod tests {
         );
         let nullable = arena.intern(
             ScalarNode::Cast {
-                cast_mode: None,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Try),
                 child: integer,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: OutputNull,
@@ -1435,16 +1020,22 @@ mod tests {
         );
         let throwing = arena.intern(
             ScalarNode::Cast {
-                cast_mode: None,
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
                 child,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(9, 0), true),
         );
-        assert!(!can_fail(&arena, nullable));
-        assert!(can_fail(&arena, throwing));
-        assert!(!contains_non_deterministic_function(&arena, throwing));
+        assert!(!arena.effects(nullable).may_raise_data());
+        assert!(arena.effects(throwing).may_raise_data());
+        assert!(
+            !arena
+                .effects(throwing)
+                .expression
+                .value_stability
+                .is_volatile()
+        );
         let predicate = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1454,8 +1045,14 @@ mod tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
-        assert!(can_fail(&arena, predicate));
-        assert!(!contains_non_deterministic_function(&arena, predicate));
+        assert!(arena.effects(predicate).may_raise_data());
+        assert!(
+            !arena
+                .effects(predicate)
+                .expression
+                .value_stability
+                .is_volatile()
+        );
     }
 }
 
@@ -1597,7 +1194,10 @@ mod intrinsic_error_consumer_tests {
             selected,
             DecimalOverflowPolicy::OutputNull,
         );
-        assert!(scalar_call_can_fail(&binding));
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+        );
         for (left, expected) in [
             (implicit, false),
             (explicit, false),
@@ -1614,7 +1214,7 @@ mod intrinsic_error_consumer_tests {
                 },
                 result.clone(),
             );
-            assert_eq!(can_fail(&arena, expression), expected);
+            assert_eq!(arena.effects(expression).may_raise_data(), expected);
         }
     }
 
@@ -1668,7 +1268,10 @@ mod intrinsic_error_consumer_tests {
             selected,
             DecimalOverflowPolicy::OutputNull,
         );
-        assert!(scalar_call_can_fail(&binding));
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+        );
         for (literal, expected) in [(1000, false), (0, true), (-1, true)] {
             let original = arena.intern(
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(literal))),
@@ -1693,7 +1296,7 @@ mod intrinsic_error_consumer_tests {
                 },
                 result_type.clone(),
             );
-            assert_eq!(can_fail(&arena, expression), expected);
+            assert_eq!(arena.effects(expression).may_raise_data(), expected);
         }
     }
 
@@ -1710,27 +1313,33 @@ mod intrinsic_error_consumer_tests {
         );
         let total = actual_call(&mut arena, "__json_try_read_text", vec![text]);
         let raises = actual_call(&mut arena, "assert_true", vec![boolean]);
-        assert!(!can_fail(&arena, total));
-        assert!(can_fail(&arena, raises));
-        assert!(!contains_non_deterministic_function(&arena, raises));
+        assert!(!arena.effects(total).may_raise_data());
+        assert!(arena.effects(raises).may_raise_data());
+        assert!(
+            !arena
+                .effects(raises)
+                .expression
+                .value_stability
+                .is_volatile()
+        );
         let mut renamed = arena.node(raises).clone();
         let ScalarNode::FunctionCall { name, .. } = &mut renamed else {
             unreachable!()
         };
         *name = "__json_try_read_text".into();
         let renamed = arena.intern(renamed, arena.value_type(raises).clone());
-        assert!(can_fail(&arena, renamed));
+        assert!(arena.effects(renamed).may_raise_data());
     }
 
     #[test]
-    fn c16_p1_scalar_invocation_data_controls_can_fail_without_runtime_abi_or_name() {
+    fn scalar_invocation_data_requires_the_installed_abi_and_ignores_display_name() {
         let mut arena = ScalarArena::new();
         let text = arena.intern(
             ScalarNode::ColumnRef(ColumnId(1)),
             FunctionValueType::new(DataType::Utf8, true),
         );
         let total = actual_call(&mut arena, "__json_try_read_text", vec![text]);
-        assert!(!can_fail(&arena, total));
+        assert!(!arena.effects(total).may_raise_data());
         let mut node = arena.node(total).clone();
         let ScalarNode::FunctionCall { binding, name, .. } = &mut node else {
             unreachable!()
@@ -1750,8 +1359,15 @@ mod intrinsic_error_consumer_tests {
         *name = "arbitrary_display_name".into();
         let positive = arena.intern(node, arena.value_type(total).clone());
         assert_ne!(positive, total);
-        assert!(can_fail(&arena, positive));
-        assert!(!contains_non_deterministic_function(&arena, positive));
+        assert!(!arena.effects(positive).expression.may_raise_invocation_data);
+        assert_eq!(arena.effects(positive), arena.effects(total));
+        assert!(
+            !arena
+                .effects(positive)
+                .expression
+                .value_stability
+                .is_volatile()
+        );
     }
 
     #[test]
@@ -1780,7 +1396,7 @@ mod intrinsic_error_consumer_tests {
             catching,
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
-        assert!(can_fail(&arena, catching));
+        assert!(arena.effects(catching).may_raise_data());
         let condition = arena.intern(
             ScalarNode::Literal(HashableLiteral(crate::analysis::LiteralValue::Bool(false))),
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1794,7 +1410,7 @@ mod intrinsic_error_consumer_tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
-        assert!(can_fail(&arena, branch));
+        assert!(arena.effects(branch).may_raise_data());
         let wrapper = arena.intern(
             ScalarNode::IsNull {
                 child: branch,
@@ -1802,7 +1418,7 @@ mod intrinsic_error_consumer_tests {
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
-        assert!(can_fail(&arena, wrapper));
+        assert!(arena.effects(wrapper).may_raise_data());
     }
 
     #[test]
@@ -1849,7 +1465,7 @@ mod intrinsic_error_consumer_tests {
                 true,
             ),
         );
-        assert!(can_fail(&arena, agg));
+        assert!(arena.effects(agg).may_raise_data());
         let binding = aggregate;
         for (function_order, partition, over_order, expected) in [
             (total, text, total, false),
@@ -1879,7 +1495,7 @@ mod intrinsic_error_consumer_tests {
                     true,
                 ),
             );
-            assert_eq!(can_fail(&arena, window), expected);
+            assert_eq!(arena.effects(window).may_raise_data(), expected);
         }
     }
 }
@@ -1892,29 +1508,39 @@ mod intrinsic_cast_effect_tests {
     use std::sync::Arc;
 
     #[test]
-    fn lawful_temporal_and_mode_errors_are_independent_of_decimal_null_policy() {
-        for (source, target, expected) in [
-            (DataType::Date32, DataType::Utf8, true),
-            (DataType::Date32, DataType::Float64, true),
+    fn lawful_temporal_and_cast_mode_errors_are_independent_of_decimal_null_policy() {
+        use novarocks_type_contract::TrinoCastMode;
+        for (source, target, mode, expected) in [
             (
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Date32,
+                DataType::Utf8,
+                TrinoCastMode::Explicit,
                 true,
             ),
-            (DataType::Float64, DataType::Int8, true),
-            (DataType::Utf8, DataType::Int64, false),
-            (DataType::Binary, DataType::Utf8, false),
             (
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                DataType::Utf8,
+                DataType::Float64,
+                DataType::Int8,
+                TrinoCastMode::Explicit,
+                true,
+            ),
+            (DataType::Utf8, DataType::Int64, TrinoCastMode::Try, false),
+            (
+                DataType::Int64,
+                DataType::Float64,
+                TrinoCastMode::Explicit,
                 false,
             ),
-            (DataType::Date32, DataType::Date32, false),
+            (
+                DataType::Date32,
+                DataType::Date32,
+                TrinoCastMode::Explicit,
+                false,
+            ),
         ] {
             let mut arena = ScalarArena::new();
             let child = arena.intern(
                 ScalarNode::ColumnRef(ColumnId(1)),
-                novarocks_type_contract::FunctionValueType::new(source, true),
+                novarocks_type_contract::FunctionValueType::new(source.clone(), true),
             );
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
@@ -1922,14 +1548,18 @@ mod intrinsic_cast_effect_tests {
             ] {
                 let cast = arena.intern(
                     ScalarNode::Cast {
-                        cast_mode: None,
+                        cast_mode: Some(mode),
                         child,
                         target: target.clone(),
                         decimal_overflow_policy: policy,
                     },
                     novarocks_type_contract::FunctionValueType::new(target.clone(), true),
                 );
-                assert_eq!(can_fail(&arena, cast), expected);
+                assert_eq!(
+                    arena.effects(cast).may_raise_data(),
+                    expected,
+                    "{source:?} to {target:?} in {mode:?}"
+                );
             }
         }
     }
@@ -1987,7 +1617,7 @@ mod intrinsic_cast_effect_tests {
                 },
                 FunctionValueType::new(target, false),
             );
-            assert_eq!(can_fail(&arena, cast), expected);
+            assert_eq!(arena.effects(cast).may_raise_data(), expected);
         }
     }
 
@@ -1995,6 +1625,11 @@ mod intrinsic_cast_effect_tests {
     fn explicit_signed_cast_totality_requires_full_declared_domain() {
         use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
 
+        let query = crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: None,
+            allow_throw_exception: false,
+            control: crate::optimizer::test_optimizer_control(),
+        };
         for (source, target, expected) in [
             (DataType::Int8, DataType::Decimal128(3, 0), false),
             (DataType::Int16, DataType::Decimal128(5, 0), false),
@@ -2009,6 +1644,11 @@ mod intrinsic_cast_effect_tests {
             (
                 DataType::Decimal128(10, 2),
                 DataType::Decimal128(10, 0),
+                false,
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                DataType::Decimal128(8, 0),
                 true,
             ),
             (DataType::Float64, DataType::Decimal128(38, 0), true),
@@ -2016,120 +1656,119 @@ mod intrinsic_cast_effect_tests {
             let source = FunctionValueType::new(source, true);
             let target = FunctionValueType::new(target, true);
             assert_eq!(
-                scalar_cast_can_fail(
-                    &source,
-                    &target,
-                    DecimalOverflowPolicy::ReportError,
-                    Some(TrinoCastMode::Explicit),
-                ),
+                query
+                    .cast(&source, &target, Some(TrinoCastMode::Explicit))
+                    .unwrap()
+                    .may_raise_data(),
                 expected,
                 "{source:?} to {target:?}"
             );
-            assert!(scalar_cast_can_fail(
-                &source,
-                &target,
-                DecimalOverflowPolicy::ReportError,
-                Some(TrinoCastMode::StoreAssignment),
-            ));
         }
     }
 
     #[test]
-    fn recursive_cast_effect_tracks_existing_name_mapping_and_metadata_identity() {
-        let list = |ty| DataType::List(Arc::new(Field::new("item", ty, true)));
-        let fields = |a, b| {
-            DataType::Struct(vec![Field::new("a", a, true), Field::new("b", b, true)].into())
+    fn recursive_cast_effects_preserve_the_original_nested_conversion_and_catch() {
+        use novarocks_type_contract::{FunctionValueType, TrinoCastMode};
+        let query = crate::analysis::scalar_effects::ScalarEffectQuery {
+            functions: None,
+            allow_throw_exception: false,
+            control: crate::optimizer::test_optimizer_control(),
         };
-        assert!(cast_has_intrinsic_row_error(
-            &list(DataType::Date32),
-            &list(DataType::Utf8),
-            true
-        ));
-        let source = fields(DataType::Int64, DataType::Date32);
-        let by_name = DataType::Struct(
-            vec![
-                Field::new("b", DataType::Utf8, true),
-                Field::new("a", DataType::Int64, true),
-            ]
-            .into(),
-        );
-        assert!(cast_has_intrinsic_row_error(&source, &by_name, true));
-        assert!(!cast_has_intrinsic_row_error(
-            &list(DataType::Utf8),
-            &list(DataType::Utf8),
-            true
-        ));
-        // Root-only calendar and SQL-mode checks are not invented for shared recursive casts.
-        assert!(!cast_has_intrinsic_row_error(
-            &list(DataType::Date32),
-            &list(DataType::Float64),
-            true
-        ));
-        assert!(!cast_has_intrinsic_row_error(
-            &list(DataType::Float64),
-            &list(DataType::Int8),
-            true
-        ));
-        assert!(cast_has_intrinsic_row_error(
-            &list(DataType::Timestamp(TimeUnit::Microsecond, None)),
-            &DataType::Utf8,
-            true
-        ));
+        let list = |ty| {
+            FunctionValueType::new(DataType::List(Arc::new(Field::new("item", ty, true))), true)
+        };
+        let pairs = [
+            (list(DataType::Int64), list(DataType::Float64), false),
+            (list(DataType::Utf8), list(DataType::Utf8), false),
+            (list(DataType::Utf8), list(DataType::Int64), true),
+            (list(DataType::Float64), list(DataType::Int8), true),
+        ];
+        for (source, result, raises) in pairs {
+            assert_eq!(
+                query
+                    .cast(&source, &result, Some(TrinoCastMode::Explicit))
+                    .unwrap()
+                    .may_raise_data(),
+                raises,
+            );
+            assert!(
+                !query
+                    .cast(&source, &result, Some(TrinoCastMode::Try))
+                    .unwrap()
+                    .may_raise_data()
+            );
+        }
     }
+
     #[test]
-    fn decimal_multiply_preserves_legacy_error_effect_without_a_frozen_allow_flag() {
+    fn decimal_arithmetic_effects_read_the_frozen_policy_and_allow_flag() {
         use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-        let mut arena = ScalarArena::new();
-        for dtype in [
-            DataType::Decimal128(38, 0),
-            DataType::Decimal256(76, 0),
-            DataType::Float64,
-        ] {
-            let left = arena.intern(
-                ScalarNode::ColumnRef(ColumnId(51)),
-                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
-            );
-            let right = arena.intern(
-                ScalarNode::ColumnRef(ColumnId(52)),
-                novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
-            );
-            for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
-                for policy in [OutputNull, ReportError] {
-                    let expr = arena.intern(
-                        ScalarNode::BinaryOp {
-                            op,
-                            left,
-                            right,
-                            decimal_overflow_policy: policy,
-                        },
-                        novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
-                    );
-                    let is_decimal =
-                        matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
-                    assert_eq!(
-                        can_fail(&arena, expr),
-                        is_decimal && (op == BinOp::Mul || policy == ReportError),
-                        "{dtype:?}/{op:?}/{policy:?}"
-                    );
-                    assert!(!contains_non_deterministic_function(&arena, expr));
+        for allow_throw in [false, true] {
+            let mut arena = ScalarArena::new();
+            arena
+                .bind_effect_environment(
+                    crate::functions::test_function_catalog_snapshot(),
+                    allow_throw,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap();
+            for dtype in [DataType::Decimal128(38, 0), DataType::Float64] {
+                let left = arena.intern(
+                    ScalarNode::ColumnRef(ColumnId(51)),
+                    novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+                );
+                let right = arena.intern(
+                    ScalarNode::ColumnRef(ColumnId(52)),
+                    novarocks_type_contract::FunctionValueType::new(dtype.clone(), true),
+                );
+                for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod] {
+                    let result = match dtype {
+                        DataType::Decimal128(p, s) => {
+                            novarocks_type_contract::decimal_arithmetic_result_type(
+                                p,
+                                s,
+                                p,
+                                s,
+                                crate::compiler::selected_scalar_call::arithmetic_operator(op)
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                        }
+                        _ => dtype.clone(),
+                    };
+                    for policy in [OutputNull, ReportError] {
+                        let expr = arena.intern(
+                            ScalarNode::BinaryOp {
+                                op,
+                                left,
+                                right,
+                                decimal_overflow_policy: policy,
+                            },
+                            novarocks_type_contract::FunctionValueType::new(result.clone(), true),
+                        );
+                        let is_decimal =
+                            matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
+                        assert_eq!(
+                            arena.effects(expr).may_raise_data(),
+                            is_decimal
+                                && (op == BinOp::Mul && allow_throw || policy == ReportError),
+                            "{dtype:?}/{op:?}/{policy:?}"
+                        );
+                        assert!(!arena.effects(expr).expression.value_stability.is_volatile());
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn legacy_decimal_cast_effect_distinguishes_proven_same_scale_widening() {
+    fn implicit_decimal_cast_effect_distinguishes_proven_same_scale_widening() {
         use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
         let mut arena = ScalarArena::new();
         for (source, target, expected) in [
             (
                 DataType::Decimal128(38, 0),
                 DataType::Decimal128(3, 0),
-                true,
-            ),
-            (
-                DataType::Decimal256(76, 0),
-                DataType::Decimal128(38, 0),
                 true,
             ),
             (DataType::Decimal128(5, 3), DataType::Decimal128(4, 2), true),
@@ -2139,21 +1778,11 @@ mod intrinsic_cast_effect_tests {
                 false,
             ),
             (
-                DataType::Decimal128(38, 0),
-                DataType::Decimal256(76, 0),
-                false,
-            ),
-            (
-                DataType::Decimal256(38, 0),
-                DataType::Decimal128(38, 0),
-                false,
-            ),
-            (
                 DataType::Decimal128(9, 2),
                 DataType::Decimal128(9, 2),
                 false,
             ),
-            (DataType::Int64, DataType::Decimal128(9, 0), false),
+            (DataType::Int32, DataType::Decimal128(10, 0), false),
         ] {
             let child = arena.intern(
                 ScalarNode::ColumnRef(ColumnId(61)),
@@ -2161,14 +1790,18 @@ mod intrinsic_cast_effect_tests {
             );
             let cast = arena.intern(
                 ScalarNode::Cast {
-                    cast_mode: None,
+                    cast_mode: Some(novarocks_type_contract::TrinoCastMode::Implicit),
                     child,
                     target: target.clone(),
                     decimal_overflow_policy: OutputNull,
                 },
                 novarocks_type_contract::FunctionValueType::new(target.clone(), true),
             );
-            assert_eq!(can_fail(&arena, cast), expected, "{source:?} -> {target:?}");
+            assert_eq!(
+                arena.effects(cast).may_raise_data(),
+                expected,
+                "{source:?} -> {target:?}"
+            );
         }
     }
 }

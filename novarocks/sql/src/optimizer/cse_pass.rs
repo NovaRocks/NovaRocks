@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use arrow::datatypes::DataType;
 
 use crate::column_id::{ColumnId, ColumnRefFactory};
-use crate::common::OutputColumn;
+use crate::common::{BinOp, OutputColumn};
 use crate::compiler::SqlCompileError;
 use crate::optimizer::cost::{CostInput, CostOptions, broadcast_decision, compute_cost_estimate};
 use crate::optimizer::operator::{Operator, ScalarProjectItem};
@@ -37,7 +37,10 @@ use crate::optimizer::property::PhysicalPropertySet;
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
 use crate::optimizer::statistics::Statistics;
-use novarocks_type_contract::{CompilePhase, PureCompileControl};
+use novarocks_type_contract::{CompilePhase, EvaluationDemand, PureCompileControl};
+
+mod use_sites;
+use use_sites::{UseRoot, UseSites, boolean_connective};
 
 /// Stable rule name for `SET disable_optimizer_rules`.
 pub(crate) const CSE_RULE: &str = "CommonSubexpressionReuse";
@@ -196,25 +199,6 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
     }
 }
 
-fn count_subexprs(scalars: &ScalarArena, roots: &[ScalarId]) -> HashMap<ScalarId, usize> {
-    let mut counts = HashMap::new();
-    for &root in roots {
-        count_subexprs_inner(scalars, root, &mut counts);
-    }
-    counts
-}
-
-fn count_subexprs_inner(
-    scalars: &ScalarArena,
-    id: ScalarId,
-    counts: &mut HashMap<ScalarId, usize>,
-) {
-    *counts.entry(id).or_default() += 1;
-    for child in child_ids(scalars, id) {
-        count_subexprs_inner(scalars, child, counts);
-    }
-}
-
 fn subtree_size(scalars: &ScalarArena, id: ScalarId) -> usize {
     1 + child_ids(scalars, id)
         .into_iter()
@@ -223,7 +207,7 @@ fn subtree_size(scalars: &ScalarArena, id: ScalarId) -> usize {
 }
 
 fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
-    if scalar_expr::can_fail(scalars, id) {
+    if !scalars.effects(id).can_share() {
         return false;
     }
     match scalars.node(id) {
@@ -234,20 +218,9 @@ fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
         | ScalarNode::LambdaFunction { .. } => false,
-        ScalarNode::Cast { child, .. } => {
-            !matches!(scalars.node(*child), ScalarNode::ColumnRef(_))
-                && !scalar_expr::contains_non_deterministic_function(scalars, id)
-        }
-        _ => !scalar_expr::contains_non_deterministic_function(scalars, id),
+        ScalarNode::Cast { child, .. } => !matches!(scalars.node(*child), ScalarNode::ColumnRef(_)),
+        _ => true,
     }
-}
-
-fn cse_semantic_guard_ids(scalars: &ScalarArena, roots: &[ScalarId]) -> HashSet<ScalarId> {
-    let mut guards = HashSet::new();
-    for &root in roots {
-        collect_cse_semantic_guard_ids(scalars, root, &mut guards);
-    }
-    guards
 }
 
 fn is_complex_data_type(data_type: &DataType) -> bool {
@@ -255,22 +228,6 @@ fn is_complex_data_type(data_type: &DataType) -> bool {
         data_type,
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     )
-}
-
-fn collect_cse_semantic_guard_ids(
-    scalars: &ScalarArena,
-    id: ScalarId,
-    guards: &mut HashSet<ScalarId>,
-) {
-    if let ScalarNode::InList { child, .. } = scalars.node(id)
-        && is_complex_data_type(scalars.data_type(*child))
-        && !scalar_contains_column_ref(scalars, *child)
-    {
-        guard_subtree(scalars, *child, guards);
-    }
-    for child in child_ids(scalars, id) {
-        collect_cse_semantic_guard_ids(scalars, child, guards);
-    }
 }
 
 fn scalar_contains_column_ref(scalars: &ScalarArena, id: ScalarId) -> bool {
@@ -282,61 +239,15 @@ fn scalar_contains_column_ref(scalars: &ScalarArena, id: ScalarId) -> bool {
     }
 }
 
-fn guard_subtree(scalars: &ScalarArena, id: ScalarId, guards: &mut HashSet<ScalarId>) {
-    if !guards.insert(id) {
-        return;
-    }
-    for child in child_ids(scalars, id) {
-        guard_subtree(scalars, child, guards);
-    }
-}
-
-fn first_seen_order(scalars: &ScalarArena, roots: &[ScalarId]) -> HashMap<ScalarId, usize> {
-    let mut order = HashMap::new();
-    let mut next = 0;
-    for &root in roots {
-        record_first_seen(scalars, root, &mut order, &mut next);
-    }
-    order
-}
-
+#[cfg(test)]
 fn pick_commons(scalars: &ScalarArena, roots: &[ScalarId]) -> Vec<ScalarId> {
-    let counts = count_subexprs(scalars, roots);
-    let first_seen = first_seen_order(scalars, roots);
-    let semantic_guards = cse_semantic_guard_ids(scalars, roots);
-    let mut candidates = counts
-        .into_iter()
-        .filter_map(|(id, count)| {
-            if count >= 2 && !semantic_guards.contains(&id) && eligible(scalars, id) {
-                Some(id)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|&id| {
-        (
-            subtree_size(scalars, id),
-            first_seen.get(&id).copied().unwrap_or(usize::MAX),
-        )
-    });
-    candidates
-}
-
-fn record_first_seen(
-    scalars: &ScalarArena,
-    id: ScalarId,
-    order: &mut HashMap<ScalarId, usize>,
-    next: &mut usize,
-) {
-    if order.contains_key(&id) {
-        return;
-    }
-    order.insert(id, *next);
-    *next += 1;
-    for child in child_ids(scalars, id) {
-        record_first_seen(scalars, child, order, next);
-    }
+    UseSites::inspect(
+        scalars,
+        roots.iter().copied().map(UseRoot::value),
+        crate::optimizer::test_optimizer_control(),
+    )
+    .expect("test CSE roots have valid control")
+    .candidates(scalars)
 }
 
 fn collect_column_refs(
@@ -450,171 +361,157 @@ fn collect_column_refs_inner(
     }
 }
 
-fn substitute(
-    scalars: &mut ScalarArena,
-    id: ScalarId,
-    subst: &HashMap<ScalarId, ScalarId>,
-    control: &dyn PureCompileControl,
-) -> Result<ScalarId, SqlCompileError> {
-    control.checkpoint(CompilePhase::Validate, 0)?;
-    if let Some(&replacement) = subst.get(&id) {
-        return Ok(replacement);
+struct Substitution<'a> {
+    replacements: &'a HashMap<ScalarId, ScalarId>,
+    unchanged_arguments: &'a HashSet<ScalarId>,
+    control: &'a dyn PureCompileControl,
+}
+
+impl Substitution<'_> {
+    fn apply(&self, scalars: &mut ScalarArena, id: ScalarId) -> Result<ScalarId, SqlCompileError> {
+        self.apply_below(scalars, id, None)
     }
 
-    let node = scalars.node(id).clone();
-    let value_type = scalars.value_type(id).clone();
-    let rewritten = match node {
-        ScalarNode::BinaryOp {
-            op,
-            left,
-            right,
-            decimal_overflow_policy,
-        } => ScalarNode::BinaryOp {
-            op,
-            left: substitute(scalars, left, subst, control)?,
-            right: substitute(scalars, right, subst, control)?,
-            decimal_overflow_policy,
-        },
-        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
-            op,
-            child: substitute(scalars, child, subst, control)?,
-        },
-        ScalarNode::FunctionCall {
-            name,
-            args,
-            distinct,
-            binding,
-            volatility,
-        } => ScalarNode::FunctionCall {
-            name,
-            args: args
-                .into_iter()
-                .map(|arg| substitute(scalars, arg, subst, control))
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            distinct,
-            binding,
-            volatility,
-        },
-        ScalarNode::AggregateCall {
-            occurrence,
-            filter,
-            name,
-            args,
-            distinct,
-            order_by,
-            resolved,
-        } => ScalarNode::AggregateCall {
-            occurrence,
-            filter: filter
-                .map(|id| substitute(scalars, id, subst, control))
-                .transpose()?,
-            name,
-            args: args
-                .into_iter()
-                .map(|arg| substitute(scalars, arg, subst, control))
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            distinct,
-            order_by: order_by
-                .into_iter()
-                .map(|mut key| {
-                    key.expr = substitute(scalars, key.expr, subst, control)?;
-                    Ok(key)
-                })
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            resolved,
-        },
-        ScalarNode::Cast {
-            cast_mode,
-            child,
-            target,
-            decimal_overflow_policy,
-        } => ScalarNode::Cast {
-            cast_mode,
-            child: substitute(scalars, child, subst, control)?,
-            target,
-            decimal_overflow_policy,
-        },
-        ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
-            child: substitute(scalars, child, subst, control)?,
-            negated,
-        },
-        ScalarNode::InList {
-            child,
-            list,
-            negated,
-        } => ScalarNode::InList {
-            child: substitute(scalars, child, subst, control)?,
-            list: list
-                .into_iter()
-                .map(|item| substitute(scalars, item, subst, control))
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            negated,
-        },
-        ScalarNode::Between {
-            child,
-            low,
-            high,
-            negated,
-        } => ScalarNode::Between {
-            child: substitute(scalars, child, subst, control)?,
-            low: substitute(scalars, low, subst, control)?,
-            high: substitute(scalars, high, subst, control)?,
-            negated,
-        },
-        ScalarNode::Like {
-            child,
-            pattern,
-            negated,
-        } => ScalarNode::Like {
-            child: substitute(scalars, child, subst, control)?,
-            pattern: substitute(scalars, pattern, subst, control)?,
-            negated,
-        },
-        ScalarNode::Case {
-            ieee_float_equality,
-            operand,
-            when_then,
-            else_expr,
-        } => ScalarNode::Case {
-            ieee_float_equality,
-            operand: operand
-                .map(|operand| substitute(scalars, operand, subst, control))
-                .transpose()?,
-            when_then: when_then
-                .into_iter()
-                .map(|(when, then)| {
-                    Ok((
-                        substitute(scalars, when, subst, control)?,
-                        substitute(scalars, then, subst, control)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, SqlCompileError>>()?,
-            else_expr: else_expr
-                .map(|else_expr| substitute(scalars, else_expr, subst, control))
-                .transpose()?,
-        },
-        ScalarNode::IsTruthValue {
-            child,
-            value,
-            negated,
-        } => ScalarNode::IsTruthValue {
-            child: substitute(scalars, child, subst, control)?,
-            value,
-            negated,
-        },
-        ScalarNode::Nested(child) => {
-            ScalarNode::Nested(substitute(scalars, child, subst, control)?)
+    #[recursive::recursive]
+    fn apply_below(
+        &self,
+        scalars: &mut ScalarArena,
+        id: ScalarId,
+        flattened_by: Option<BinOp>,
+    ) -> Result<ScalarId, SqlCompileError> {
+        self.control.checkpoint(CompilePhase::Validate, 0)?;
+        let node = scalars.node(id);
+        let connective = boolean_connective(node);
+        let flattened = connective.is_some() && connective == flattened_by;
+        if !flattened && let Some(&replacement) = self.replacements.get(&id) {
+            return Ok(replacement);
         }
-        ScalarNode::ColumnRef(_)
-        | ScalarNode::Literal(_)
-        | ScalarNode::Constant(_)
-        | ScalarNode::LambdaParamRef { .. }
-        | ScalarNode::WindowCall { .. }
-        | ScalarNode::Lambda { .. }
-        | ScalarNode::LambdaFunction { .. } => return Ok(id),
-    };
+        if self.unchanged_arguments.contains(&id) {
+            return Ok(id);
+        }
+        let node = node.clone();
+        let value_type = scalars.value_type(id).clone();
+        let rewritten = match node {
+            ScalarNode::BinaryOp {
+                op,
+                left,
+                right,
+                decimal_overflow_policy,
+            } => ScalarNode::BinaryOp {
+                op,
+                left: self.apply_below(scalars, left, connective)?,
+                right: self.apply_below(scalars, right, connective)?,
+                decimal_overflow_policy,
+            },
+            ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
+                op,
+                child: self.apply(scalars, child)?,
+            },
+            ScalarNode::FunctionCall {
+                name,
+                args,
+                distinct,
+                binding,
+                volatility,
+            } => ScalarNode::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.apply(scalars, arg))
+                    .collect::<Result<Vec<_>, SqlCompileError>>()?,
+                distinct,
+                binding,
+                volatility,
+            },
+            ScalarNode::Cast {
+                cast_mode,
+                child,
+                target,
+                decimal_overflow_policy,
+            } => ScalarNode::Cast {
+                cast_mode,
+                child: self.apply(scalars, child)?,
+                target,
+                decimal_overflow_policy,
+            },
+            ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
+                child: self.apply(scalars, child)?,
+                negated,
+            },
+            ScalarNode::InList {
+                child,
+                list,
+                negated,
+            } => ScalarNode::InList {
+                child: self.apply(scalars, child)?,
+                list: list
+                    .into_iter()
+                    .map(|item| self.apply(scalars, item))
+                    .collect::<Result<Vec<_>, SqlCompileError>>()?,
+                negated,
+            },
+            ScalarNode::Between {
+                child,
+                low,
+                high,
+                negated,
+            } => ScalarNode::Between {
+                child: self.apply(scalars, child)?,
+                low: self.apply(scalars, low)?,
+                high: self.apply(scalars, high)?,
+                negated,
+            },
+            ScalarNode::Like {
+                child,
+                pattern,
+                negated,
+            } => ScalarNode::Like {
+                child: self.apply(scalars, child)?,
+                pattern: self.apply(scalars, pattern)?,
+                negated,
+            },
+            ScalarNode::Case {
+                ieee_float_equality,
+                operand,
+                when_then,
+                else_expr,
+            } => ScalarNode::Case {
+                ieee_float_equality,
+                operand: operand
+                    .map(|operand| self.apply(scalars, operand))
+                    .transpose()?,
+                when_then: when_then
+                    .into_iter()
+                    .map(|(when, then)| {
+                        Ok((self.apply(scalars, when)?, self.apply(scalars, then)?))
+                    })
+                    .collect::<Result<Vec<_>, SqlCompileError>>()?,
+                else_expr: else_expr
+                    .map(|else_expr| self.apply(scalars, else_expr))
+                    .transpose()?,
+            },
+            ScalarNode::IsTruthValue {
+                child,
+                value,
+                negated,
+            } => ScalarNode::IsTruthValue {
+                child: self.apply(scalars, child)?,
+                value,
+                negated,
+            },
+            ScalarNode::Nested(child) => ScalarNode::Nested(self.apply(scalars, child)?),
+            ScalarNode::ColumnRef(_)
+            | ScalarNode::Literal(_)
+            | ScalarNode::Constant(_)
+            | ScalarNode::LambdaParamRef { .. }
+            | ScalarNode::AggregateCall { .. }
+            | ScalarNode::WindowCall { .. }
+            | ScalarNode::Lambda { .. }
+            | ScalarNode::LambdaFunction { .. } => return Ok(id),
+        };
 
-    scalars.intern_observed(rewritten, value_type, control)
+        scalars.intern_observed(rewritten, value_type, self.control)
+    }
 }
 
 fn build_commons(
@@ -834,19 +731,81 @@ fn available_output_ids(node: &OptimizedOperatorNode) -> HashSet<ColumnId> {
     }
 }
 
-fn prelude_binds_to_outputs(
+/// Compare every original value reference with the actual target inputs,
+/// including multiple references to one column with different declarations.
+fn binds_to_input(
     scalars: &ScalarArena,
-    prelude: &[ScalarProjectItem],
-    output_columns: &[OutputColumn],
+    root: ScalarId,
+    input: &OptimizedOperatorNode,
+    visible: &HashSet<ColumnId>,
+    passthrough: Option<&crate::optimizer::operator::ProjectOp>,
 ) -> bool {
-    let available = output_columns
-        .iter()
-        .map(|column| column.column_id)
-        .collect::<HashSet<_>>();
-    let roots = prelude.iter().map(|item| item.expr).collect::<Vec<_>>();
-    collect_column_refs(scalars, &roots)
+    fn all_columns(
+        scalars: &ScalarArena,
+        id: ScalarId,
+        visit: &impl Fn(ScalarId, ColumnId) -> bool,
+    ) -> bool {
+        let dependencies = match scalars.node(id) {
+            ScalarNode::ColumnRef(column) => return visit(id, *column),
+            ScalarNode::AggregateCall { .. }
+            | ScalarNode::WindowCall { .. }
+            | ScalarNode::LambdaParamRef { .. }
+            | ScalarNode::Lambda { .. }
+            | ScalarNode::LambdaFunction { .. } => return false,
+            _ => child_ids(scalars, id),
+        };
+        dependencies
+            .into_iter()
+            .all(|child| all_columns(scalars, child, visit))
+    }
+
+    all_columns(scalars, root, &|id, column| {
+        if column == ColumnId::UNSET || !visible.contains(&column) {
+            return false;
+        }
+        let mut inputs = input
+            .output_columns
+            .iter()
+            .filter(|item| item.column_id == column);
+        let input_type = if let Some(item) = inputs.next() {
+            if inputs.next().is_some() {
+                return false;
+            }
+            &item.value_type
+        } else {
+            return repeat_virtual_output_columns(input)
+                .iter()
+                .find(|item| item.column_id == column)
+                .is_some_and(|item| {
+                    passthrough.is_none() && &item.value_type == scalars.value_type(id)
+                });
+        };
+        if input_type != scalars.value_type(id) {
+            return false;
+        }
+
+        passthrough.is_none_or(|project| {
+            let mut items = project.items.iter().filter(|item| item.output_column_id == column);
+            items.next().is_some_and(|item| {
+                items.next().is_none()
+                    && matches!(scalars.node(item.expr), ScalarNode::ColumnRef(source) if *source == column)
+                    && scalars.value_type(item.expr) == input_type
+            })
+        })
+    })
+}
+
+fn candidates_for_input(
+    scalars: &ScalarArena,
+    sites: &UseSites,
+    input: &OptimizedOperatorNode,
+) -> Vec<ScalarId> {
+    let visible = available_output_ids(input);
+    sites
+        .candidates(scalars)
         .into_iter()
-        .all(|(column_id, _)| available.contains(&column_id))
+        .filter(|&common| binds_to_input(scalars, common, input, &visible, None))
+        .collect()
 }
 
 fn synthetic_project_explain_stats(
@@ -996,9 +955,12 @@ fn insert_or_reuse_project_below(
         return Ok(());
     }
 
-    let can_reuse_project = match &child.op {
-        Operator::PhysicalProject(_) if child.children.len() == 1 => {
-            prelude_binds_to_outputs(scalars, &prelude, &child.children[0].output_columns)
+    let can_reuse_project = match (&child.op, child.children.as_slice()) {
+        (Operator::PhysicalProject(project), [input]) => {
+            let visible = available_output_ids(input);
+            prelude
+                .iter()
+                .all(|item| binds_to_input(scalars, item.expr, input, &visible, Some(project)))
         }
         _ => false,
     };
@@ -1059,20 +1021,26 @@ fn rewrite_project(
         .iter()
         .map(|item| item.expr)
         .collect::<Vec<_>>();
-    let commons = pick_commons(scalars, &roots);
-    if commons.is_empty() {
+    let [child] = node.children.as_slice() else {
         return Ok(());
-    }
-    if node.children.len() != 1 {
+    };
+    let sites = UseSites::inspect(scalars, roots.iter().copied().map(UseRoot::value), control)?;
+    let commons = candidates_for_input(scalars, &sites, child);
+    if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalProject(project) = &mut node.op else {
         unreachable!("checked project operator above");
     };
     for item in &mut project.items {
-        item.expr = substitute(scalars, item.expr, &subst, control)?;
+        item.expr = substitution.apply(scalars, item.expr)?;
     }
 
     let input_refs = collect_column_refs(scalars, &roots);
@@ -1168,20 +1136,29 @@ fn rewrite_filter(
     let Operator::PhysicalFilter(filter) = &node.op else {
         return Ok(());
     };
-    let roots = [filter.predicate];
-    let commons = pick_commons(scalars, &roots);
-    if commons.is_empty() {
+    let [child] = node.children.as_slice() else {
         return Ok(());
-    }
-    if node.children.len() != 1 {
+    };
+    let sites = UseSites::inspect(
+        scalars,
+        [UseRoot::new(filter.predicate, EvaluationDemand::TruthOnly)],
+        control,
+    )?;
+    let commons = candidates_for_input(scalars, &sites, child);
+    if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalFilter(filter) = &mut node.op else {
         unreachable!("checked filter operator above");
     };
-    filter.predicate = substitute(scalars, filter.predicate, &subst, control)?;
+    filter.predicate = substitution.apply(scalars, filter.predicate)?;
     insert_or_reuse_project_below(
         &mut node.children[0],
         prelude,
@@ -1217,17 +1194,23 @@ fn rewrite_aggregate(
         roots.extend(spec.source.arguments().iter().copied());
         roots.extend(spec.source.order_by().iter().map(|key| key.expr));
     }
-    let commons = pick_commons(scalars, &roots);
+    let sites = UseSites::inspect(scalars, roots.into_iter().map(UseRoot::value), control)?;
+    let commons = candidates_for_input(scalars, &sites, &node.children[0]);
     if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalHashAggregate(aggregate) = &mut node.op else {
         unreachable!("checked aggregate operator above");
     };
     for group_by in &mut aggregate.group_by {
-        *group_by = substitute(scalars, *group_by, &subst, control)?;
+        *group_by = substitution.apply(scalars, *group_by)?;
     }
     let is_merge = aggregate.is_merge.clone();
     for (index, spec) in aggregate.aggregates.iter_mut().enumerate() {
@@ -1236,10 +1219,10 @@ fn rewrite_aggregate(
         }
         spec.source.rewrite_channels(|arguments, order_by| {
             for arg in arguments {
-                *arg = substitute(scalars, *arg, &subst, control)?;
+                *arg = substitution.apply(scalars, *arg)?;
             }
             for key in order_by {
-                key.expr = substitute(scalars, key.expr, &subst, control)?;
+                key.expr = substitution.apply(scalars, key.expr)?;
             }
             Ok::<_, SqlCompileError>(())
         })?;
@@ -1266,9 +1249,27 @@ fn rewrite_join(
     if node.children.len() != 2 {
         return Ok(());
     }
-    let condition = match &node.op {
-        Operator::PhysicalHashJoin(join) => *join.condition.residual(),
-        Operator::PhysicalNestLoopJoin(join) => join.condition,
+    let (condition, demand) = match &node.op {
+        Operator::PhysicalHashJoin(join) => (
+            *join.condition.residual(),
+            if join.condition.is_null_aware() {
+                EvaluationDemand::Value
+            } else {
+                EvaluationDemand::TruthOnly
+            },
+        ),
+        Operator::PhysicalNestLoopJoin(join) => (
+            join.condition,
+            if matches!(
+                join.join_type,
+                crate::common::JoinKind::NullAwareLeftAnti
+                    | crate::common::JoinKind::LeftMark { .. }
+            ) {
+                EvaluationDemand::Value
+            } else {
+                EvaluationDemand::TruthOnly
+            },
+        ),
         _ => return Ok(()),
     };
     let Some(condition) = condition else {
@@ -1277,7 +1278,10 @@ fn rewrite_join(
 
     let left_columns = output_column_set(&node.children[0]);
     let right_columns = output_column_set(&node.children[1]);
-    let commons = pick_commons(scalars, &[condition]);
+    let sites = UseSites::inspect(scalars, [UseRoot::new(condition, demand)], control)?;
+    let commons = sites.candidates(scalars);
+    let left_visible = available_output_ids(&node.children[0]);
+    let right_visible = available_output_ids(&node.children[1]);
     let mut left_commons = Vec::new();
     let mut right_commons = Vec::new();
     for common in commons {
@@ -1285,8 +1289,16 @@ fn rewrite_join(
             side_subset(scalars, common, &left_columns),
             side_subset(scalars, common, &right_columns),
         ) {
-            (true, false) => left_commons.push(common),
-            (false, true) => right_commons.push(common),
+            (true, false)
+                if binds_to_input(scalars, common, &node.children[0], &left_visible, None) =>
+            {
+                left_commons.push(common)
+            }
+            (false, true)
+                if binds_to_input(scalars, common, &node.children[1], &right_visible, None) =>
+            {
+                right_commons.push(common)
+            }
             _ => {}
         }
     }
@@ -1317,7 +1329,13 @@ fn rewrite_join(
             control,
         )?;
     }
-    let new_condition = substitute(scalars, condition, &subst, control)?;
+
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
+    let new_condition = substitution.apply(scalars, condition)?;
     match &mut node.op {
         Operator::PhysicalHashJoin(join) => *join.condition.residual_mut() = Some(new_condition),
         Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
@@ -1343,20 +1361,26 @@ fn rewrite_sort(
     };
     let mut roots = sort.items.iter().map(|key| key.expr).collect::<Vec<_>>();
     roots.extend(sort.analytic_partition_exprs.iter().copied());
-    let commons = pick_commons(scalars, &roots);
+    let sites = UseSites::inspect(scalars, roots.into_iter().map(UseRoot::value), control)?;
+    let commons = candidates_for_input(scalars, &sites, &node.children[0]);
     if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalSort(sort) = &mut node.op else {
         unreachable!("checked sort operator above");
     };
     for key in &mut sort.items {
-        key.expr = substitute(scalars, key.expr, &subst, control)?;
+        key.expr = substitution.apply(scalars, key.expr)?;
     }
     for expr in &mut sort.analytic_partition_exprs {
-        *expr = substitute(scalars, *expr, &subst, control)?;
+        *expr = substitution.apply(scalars, *expr)?;
     }
     insert_or_reuse_project_below(
         &mut node.children[0],
@@ -1384,17 +1408,23 @@ fn rewrite_topn(
         return Ok(());
     };
     let roots = topn.items.iter().map(|key| key.expr).collect::<Vec<_>>();
-    let commons = pick_commons(scalars, &roots);
+    let sites = UseSites::inspect(scalars, roots.into_iter().map(UseRoot::value), control)?;
+    let commons = candidates_for_input(scalars, &sites, &node.children[0]);
     if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalTopN(topn) = &mut node.op else {
         unreachable!("checked topn operator above");
     };
     for key in &mut topn.items {
-        key.expr = substitute(scalars, key.expr, &subst, control)?;
+        key.expr = substitution.apply(scalars, key.expr)?;
     }
     insert_or_reuse_project_below(
         &mut node.children[0],
@@ -1427,24 +1457,30 @@ fn rewrite_window(
         roots.extend(spec.partition_by.iter().copied());
         roots.extend(spec.order_by.iter().map(|key| key.expr));
     }
-    let commons = pick_commons(scalars, &roots);
+    let sites = UseSites::inspect(scalars, roots.into_iter().map(UseRoot::value), control)?;
+    let commons = candidates_for_input(scalars, &sites, &node.children[0]);
     if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalWindow(window) = &mut node.op else {
         unreachable!("checked window operator above");
     };
     for spec in &mut window.window_exprs {
         for arg in &mut spec.args {
-            *arg = substitute(scalars, *arg, &subst, control)?;
+            *arg = substitution.apply(scalars, *arg)?;
         }
         for partition in &mut spec.partition_by {
-            *partition = substitute(scalars, *partition, &subst, control)?;
+            *partition = substitution.apply(scalars, *partition)?;
         }
         for key in &mut spec.order_by {
-            key.expr = substitute(scalars, key.expr, &subst, control)?;
+            key.expr = substitution.apply(scalars, key.expr)?;
         }
     }
     insert_or_reuse_project_below(
@@ -1474,30 +1510,40 @@ fn rewrite_change_event_expand(
     };
     let mut roots = Vec::new();
     for event in &expand.events {
-        roots.extend(event.predicate);
+        roots.extend(
+            event
+                .predicate
+                .map(|expr| UseRoot::new(expr, EvaluationDemand::TruthOnly)),
+        );
         roots.extend(
             event
                 .assignments
                 .iter()
-                .filter_map(|assignment| assignment.expr),
+                .filter_map(|assignment| assignment.expr.map(UseRoot::selected_value)),
         );
     }
-    let commons = pick_commons(scalars, &roots);
+    let sites = UseSites::inspect(scalars, roots, control)?;
+    let commons = candidates_for_input(scalars, &sites, &node.children[0]);
     if commons.is_empty() {
         return Ok(());
     }
 
     let (prelude, subst) = build_commons(scalars, factory, &commons, control)?;
+    let substitution = Substitution {
+        replacements: &subst,
+        unchanged_arguments: sites.unchanged_call_arguments(),
+        control,
+    };
     let Operator::PhysicalChangeEventExpand(expand) = &mut node.op else {
         unreachable!("checked change-event expand operator above");
     };
     for event in &mut expand.events {
         if let Some(predicate) = event.predicate {
-            event.predicate = Some(substitute(scalars, predicate, &subst, control)?);
+            event.predicate = Some(substitution.apply(scalars, predicate)?);
         }
         for assignment in &mut event.assignments {
             if let Some(expr) = assignment.expr {
-                assignment.expr = Some(substitute(scalars, expr, &subst, control)?);
+                assignment.expr = Some(substitution.apply(scalars, expr)?);
             }
         }
     }
@@ -1515,7 +1561,7 @@ fn rewrite_change_event_expand(
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, Field, Fields};
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use crate::column_id::{ColumnId, ColumnRefFactory};
     use crate::common::OutputColumn;
@@ -1538,7 +1584,7 @@ mod tests {
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId(id)),
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         )
     }
 
@@ -1550,7 +1596,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         )
     }
 
@@ -1562,7 +1608,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         )
     }
 
@@ -1602,10 +1648,10 @@ mod tests {
         )
     }
 
-    fn int_lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
+    fn double_lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
         arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Float(value as f64))),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         )
     }
 
@@ -1619,7 +1665,7 @@ mod tests {
             arena,
             name,
             &args,
-            DataType::Int64,
+            DataType::Float64,
             true,
             volatility,
         );
@@ -1631,7 +1677,7 @@ mod tests {
                 distinct: false,
                 volatility,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         )
     }
 
@@ -1640,10 +1686,10 @@ mod tests {
             ScalarNode::Cast {
                 cast_mode: None,
                 child,
-                target: DataType::Int64,
+                target: DataType::Float64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         )
     }
 
@@ -1660,7 +1706,7 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(column_id),
             name: name.to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
 
             is_internal: false,
         }
@@ -1891,18 +1937,18 @@ mod tests {
         let a_plus_b = add(&mut arena, a, b);
         let cse_ref = arena.intern(
             ScalarNode::ColumnRef(ColumnId(99)),
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let mut subst = std::collections::HashMap::new();
         subst.insert(a_plus_b, cse_ref);
 
         let root = add(&mut arena, a_plus_b, a);
-        let rewritten = super::substitute(
-            &mut arena,
-            root,
-            &subst,
-            crate::optimizer::test_optimizer_control(),
-        )
+        let rewritten = super::Substitution {
+            replacements: &subst,
+            unchanged_arguments: &HashSet::new(),
+            control: crate::optimizer::test_optimizer_control(),
+        }
+        .apply(&mut arena, root)
         .unwrap();
 
         match arena.node(rewritten) {
@@ -1960,7 +2006,7 @@ mod tests {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let body = add(&mut arena, lambda_param, captured);
         let lambda = arena.intern(
@@ -1968,7 +2014,7 @@ mod tests {
                 params: vec!["x".to_string()],
                 body,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
 
         let refs = super::collect_column_refs(&arena, &[lambda]);
@@ -2241,7 +2287,7 @@ mod tests {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let lambda_body = add(&mut arena, lambda_param, a);
         let lambda = arena.intern(
@@ -2249,7 +2295,7 @@ mod tests {
                 params: vec!["x".to_string()],
                 body: lambda_body,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let child = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
@@ -2524,13 +2570,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![
-                (ColumnId(101), "a", DataType::Int64, true),
-                (ColumnId(102), "b", DataType::Int64, true),
+                (ColumnId(101), "a", DataType::Float64, true),
+                (ColumnId(102), "b", DataType::Float64, true),
                 (ColumnId(109), "__grouping_fn_0", DataType::Int64, false),
                 (
                     project.items[3].output_column_id,
                     "__cse_0",
-                    DataType::Int64,
+                    DataType::Float64,
                     true
                 ),
             ]
@@ -2716,8 +2762,8 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let lower = gt(&mut arena, a_plus_b, ten);
         let upper = lt(&mut arena, a_plus_b, twenty);
         let predicate = and(&mut arena, lower, upper);
@@ -2828,8 +2874,8 @@ mod tests {
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
         let a_plus_b = add(&mut arena, a, b);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let lower = gt(&mut arena, a_plus_b, ten);
         let upper = lt(&mut arena, a_plus_b, twenty);
         let predicate = and(&mut arena, lower, upper);
@@ -2891,8 +2937,8 @@ mod tests {
         let x = col(&mut arena, 201);
         let y = col(&mut arena, 202);
         let x_plus_y = add(&mut arena, x, y);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let lower = gt(&mut arena, x_plus_y, ten);
         let upper = lt(&mut arena, x_plus_y, twenty);
         let predicate = and(&mut arena, lower, upper);
@@ -3019,7 +3065,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3033,7 +3079,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3092,7 +3138,10 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let a = col(&mut arena, 101);
         let b = col(&mut arena, 102);
-        let grouping = col(&mut arena, 109);
+        let grouping = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(109)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let a_plus_b = add(&mut arena, a, b);
         let values = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
         let repeat = OptimizedOperatorNode {
@@ -3137,7 +3186,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3151,7 +3200,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3229,7 +3278,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "sum",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3243,7 +3292,7 @@ mod tests {
                             vec![],
                             crate::functions::test_resolved_aggregate(
                                 "avg",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3303,7 +3352,7 @@ mod tests {
                             vec![sort_key(a_mul_b)],
                             crate::functions::test_resolved_aggregate(
                                 "array_agg",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3317,7 +3366,7 @@ mod tests {
                             vec![sort_key(a_mul_b)],
                             crate::functions::test_resolved_aggregate(
                                 "array_agg",
-                                &[DataType::Int64],
+                                &[DataType::Float64],
                                 false,
                             ),
                         ),
@@ -3501,7 +3550,7 @@ mod tests {
                         &arena,
                         "sum",
                         &[a_mul_b],
-                        DataType::Int64,
+                        DataType::Float64,
                         true,
                     ),
                     function_order_by: vec![],
@@ -3566,8 +3615,8 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let left_a = col(&mut arena, 101);
         let right_b = col(&mut arena, 201);
-        let two = int_lit(&mut arena, 2);
-        let ten = int_lit(&mut arena, 10);
+        let two = double_lit(&mut arena, 2);
+        let ten = double_lit(&mut arena, 10);
         let left_a_times_two = mul(&mut arena, left_a, two);
         let lower = gt(&mut arena, left_a_times_two, right_b);
         let upper_bound = add(&mut arena, right_b, ten);
@@ -3633,8 +3682,8 @@ mod tests {
         let left_a = col(&mut arena, 101);
         let right_b = col(&mut arena, 201);
         let right_key = col(&mut arena, 202);
-        let two = int_lit(&mut arena, 2);
-        let ten = int_lit(&mut arena, 10);
+        let two = double_lit(&mut arena, 2);
+        let ten = double_lit(&mut arena, 10);
         let right_b_times_two = mul(&mut arena, right_b, two);
         let lower = gt(&mut arena, right_b_times_two, left_a);
         let upper_bound = add(&mut arena, left_a, ten);
@@ -3716,8 +3765,8 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let left_a = col(&mut arena, 101);
         let right_b = col(&mut arena, 201);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let left_times_right = mul(&mut arena, left_a, right_b);
         let lower = gt(&mut arena, left_times_right, ten);
         let upper = lt(&mut arena, left_times_right, twenty);
@@ -3758,9 +3807,9 @@ mod tests {
         let mut arena = ScalarArena::new();
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let shared = col(&mut arena, 101);
-        let one = int_lit(&mut arena, 1);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let one = double_lit(&mut arena, 1);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let shared_plus_one = add(&mut arena, shared, one);
         let lower = gt(&mut arena, shared_plus_one, ten);
         let upper = lt(&mut arena, shared_plus_one, twenty);
@@ -3802,14 +3851,14 @@ mod tests {
         let mut factory = crate::column_id::ColumnRefFactory::new();
         let left_a = col(&mut arena, 101);
         let right_b = col(&mut arena, 201);
-        let ten = int_lit(&mut arena, 10);
-        let twenty = int_lit(&mut arena, 20);
+        let ten = double_lit(&mut arena, 10);
+        let twenty = double_lit(&mut arena, 20);
         let lambda_param = arena.intern(
             ScalarNode::LambdaParamRef {
                 name: "x".to_string(),
                 slot_id: 7,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let lambda_body = add(&mut arena, lambda_param, right_b);
         let lambda = arena.intern(
@@ -3817,13 +3866,13 @@ mod tests {
                 params: vec!["x".to_string()],
                 body: lambda_body,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let binding = crate::optimizer::scalar::test_function_binding(
             &arena,
             "test_lambda_wrapper",
             &[left_a, lambda],
-            DataType::Int64,
+            DataType::Float64,
             true,
             crate::functions::FunctionVolatility::Immutable,
         );
@@ -3835,7 +3884,7 @@ mod tests {
                 args: vec![left_a, lambda],
                 distinct: false,
             },
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         );
         let lower = gt(&mut arena, captures_right, ten);
         let upper = lt(&mut arena, captures_right, twenty);
@@ -3873,11 +3922,18 @@ mod tests {
     #[test]
     fn cse_real_project_insertion_keeps_original_control_failure_and_no_scalar_publication() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
-        struct RefuseInsertion(CompileControlError, std::sync::Mutex<Vec<u32>>);
+        struct RefuseInsertion(
+            CompileControlError,
+            std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+        );
         impl PureCompileControl for RefuseInsertion {
-            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-                self.1.lock().unwrap().push(units);
-                if units > 0 {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                self.1.lock().unwrap().push((phase, units));
+                if phase == CompilePhase::Validate && units > 0 {
                     Err(self.0.clone())
                 } else {
                     Ok(())
@@ -3925,8 +3981,17 @@ mod tests {
             // The positive observation comes from actual scalar interning,
             // after discovery selected the repeated arithmetic expression.
             let observations = control.1.lock().unwrap();
-            assert!(observations.last().is_some_and(|units| *units > 0));
-            assert_eq!(observations.iter().filter(|units| **units > 0).count(), 1);
+            let is_insertion = |(phase, units): &(CompilePhase, u32)| {
+                *phase == CompilePhase::Validate && *units > 0
+            };
+            assert!(observations.last().is_some_and(is_insertion));
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|event| is_insertion(event))
+                    .count(),
+                1
+            );
             assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
             let Operator::PhysicalProject(project) = &node.op else {
                 panic!("project must remain")
@@ -3967,12 +4032,12 @@ mod tests {
         );
         let refs = super::collect_column_refs(&arena, &[nested]);
         assert_eq!(refs, vec![(ColumnId(41), source_type.clone())]);
-        let rewritten = super::substitute(
-            &mut arena,
-            nested,
-            &std::collections::HashMap::new(),
-            crate::optimizer::test_optimizer_control(),
-        )
+        let rewritten = super::Substitution {
+            replacements: &std::collections::HashMap::new(),
+            unchanged_arguments: &HashSet::new(),
+            control: crate::optimizer::test_optimizer_control(),
+        }
+        .apply(&mut arena, nested)
         .unwrap();
         assert_eq!(arena.value_type(rewritten), &source_type);
     }

@@ -34,6 +34,7 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_type_contract::{CompileCheckpoints, TemporalPrecision, TemporalType};
 
 use super::completion::{ProviderPredicateOccurrenceId, ProviderReadPredicateNeed};
+use crate::analysis::scalar_effects::ScalarEffectQuery;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::planner::payload::PlanScanNode;
@@ -48,17 +49,19 @@ pub(super) fn lower_provider_predicates(
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
     row_mutation_match: bool,
+    effects: &ScalarEffectQuery<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
-    lower_provider_conjunction(scan, columns, row_mutation_match, false, work)
+    lower_provider_conjunction(scan, columns, row_mutation_match, false, effects, work)
 }
 
 pub(super) fn lower_delete_provider_predicates(
     scan: &PlanScanNode,
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
+    effects: &ScalarEffectQuery<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
-    lower_provider_conjunction(scan, columns, false, true, work)
+    lower_provider_conjunction(scan, columns, false, true, effects, work)
 }
 
 fn lower_provider_conjunction(
@@ -66,11 +69,17 @@ fn lower_provider_conjunction(
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
     row_mutation_match: bool,
     delete_probe: bool,
+    effects: &ScalarEffectQuery<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Box<[ProviderReadPredicateNeed]>, super::SqlCompileError> {
     let mut predicates = Vec::new();
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
         work.step()?;
+        // A provider may reduce input before any engine residual, even with
+        // a non-exact offer. Stop where this would skip original demanded work.
+        if !effects.typed(predicate)?.can_skip_for_earlier_filter() {
+            break;
+        }
         let Ok(occurrence) = u32::try_from(ordinal) else {
             continue;
         };
@@ -686,7 +695,12 @@ mod tests {
             novarocks_type_contract::CompilePhase::Validate,
         )
         .unwrap();
-        let result = lower_provider_predicates(scan, columns, false, &mut work).unwrap();
+        let effects = ScalarEffectQuery {
+            functions: Some(crate::functions::builtin_sql_function_catalog()),
+            allow_throw_exception: true,
+            control: &control,
+        };
+        let result = lower_provider_predicates(scan, columns, false, &effects, &mut work).unwrap();
         work.finish().unwrap();
         result
     }
@@ -809,6 +823,16 @@ mod tests {
                 value_type: ConnectorValueType::Integer,
             },
         )])
+    }
+
+    #[test]
+    fn provider_offers_stop_before_the_original_required_division() {
+        let mut division = comparison(BinOp::Div, integer(12), column_ref());
+        division.value_type = column_ref().value_type.with_nullable(true).unwrap();
+        let fallible = comparison(BinOp::Gt, division, integer(3));
+        let guard = comparison(BinOp::Eq, column_ref(), integer(1));
+        assert!(offered(&scan(vec![fallible.clone(), guard.clone()]), &columns()).is_empty());
+        assert_eq!(offered(&scan(vec![guard, fallible]), &columns()).len(), 1);
     }
 
     #[test]

@@ -9,3 +9,15 @@ a	b
 a	b
 3	4
 8	9
+
+-- query 7
+-- types	bigint	bigint
+a	b
+3	4
+8	9
+
+-- query 9
+-- types	bigint	bigint
+a	b
+3	4
+8	9
