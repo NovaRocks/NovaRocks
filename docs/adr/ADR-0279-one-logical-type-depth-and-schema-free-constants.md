@@ -1,5 +1,5 @@
 ---
-id: ADR-0278
+id: ADR-0279
 title: "One logical type depth and schema-free constants"
 domain: [sql-compiler, memory-governance, provider-spi]
 status: active
@@ -17,7 +17,7 @@ code-anchors:
   - "novarocks/plan-codec/src/physical_aggregate_binding_v2 (explicit aggregate state capability)"
 ---
 
-# ADR-0278 统一逻辑类型深度与常量记录
+# ADR-0279 统一逻辑类型深度与常量记录
 
 - 状态：已接受设计，目标提交已完成本地验证
 - 日期：2026-11-27

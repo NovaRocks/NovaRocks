@@ -61,7 +61,7 @@ code-anchors:
 5. **独立引用独立保活。** 不可变结构可以 cheap clone；新创建的结构由自己的小型 hold 负责。临时 expected 类型只持有临时 scope，准备产物不能保留这份临时主账。最后实际引用退出才释放相应责任，取消和 terminal 不能代替退出。
 6. **保留原合同的严格校验。** FE 冻结完整声明，BE 用同一个原类型作者验证。SQL 的公开 NULL 声明反映实际表达式与错误策略保证；root 保持精确校验。不能靠第二 resolver、从 selected 结果反签 expected、改为 Unsupported 或放宽 oracle 通过迁移。
 
-类型深度、单层编码语法与类型遍历工作区由 [ADR-0278](ADR-0278-one-logical-type-depth-and-schema-free-constants.md) 细化。裁决 4 的原构造与资源职责继续适用。
+类型深度、单层编码语法与类型遍历工作区由 [ADR-0279](ADR-0279-one-logical-type-depth-and-schema-free-constants.md) 细化。裁决 4 的原构造与资源职责继续适用。
 
 ## 接受的妥协（诚实记录）
 
