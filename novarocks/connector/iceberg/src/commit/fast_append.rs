@@ -138,7 +138,11 @@ async fn prepare_append(
             Operation::Append,
             manifests,
             summary,
-            super::overwrite::SnapshotSummaryMode::FullRefreshAppend,
+            if intent.protocol().is_partition_replace() {
+                super::overwrite::SnapshotSummaryMode::Inherit
+            } else {
+                super::overwrite::SnapshotSummaryMode::FullRefreshAppend
+            },
         )
         .await;
     }

@@ -643,6 +643,14 @@ pub(crate) fn derive_statistics(
                 }
             }
 
+            Operator::LogicalContentApply(_) | Operator::PhysicalContentApply(_) => {
+                let weighted = child_statistics(memo, &expr.children, 0);
+                Statistics {
+                    output_row_count: weighted.output_row_count,
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: HashMap::new(),
+                }
+            }
             Operator::PhysicalChangeEventExpand(expand) => {
                 derive_change_event_expand_statistics(expand, expr, memo)
             }
@@ -2734,6 +2742,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
         Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
+        Operator::LogicalContentApply(op) | Operator::PhysicalContentApply(op) => {
+            op.output_columns.clone()
+        }
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         Operator::PhysicalSystemTable(v) => v.columns.clone(),

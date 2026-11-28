@@ -131,6 +131,7 @@ code-anchors:
 ### pipeline-execution
 
 - [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
+- [ADR-0278](ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md) — ContentApply 如何按本地实际参与位置冻结删除核验的作者单位，并按结构证明维护计划的输入覆盖（active；最终候选验收待独立取证）
 - [ADR-0269](ADR-0269-cte-multicast-freezes-exact-branches.md) — 共享 CTE 为何逐分支绑定既有 stream sink，撤回、End、实际退出与共享 backing 如何分工（active）
 - [ADR-0248](ADR-0248-parquet-reader-sizing-and-scan-output-policy.md) — Parquet 读取规模和扫描输出为何各有作者，完整前缀、来源持有和合作调度如何交接（active，替代 ADR-0014 的批预算与会话属性 ADR-0222 的读设置传递阶段安排）
 - [ADR-0252](ADR-0252-trino-casts-and-row-error-scopes.md) — Trino 转换语境、完整类型与选中行错误作用域如何在编译、折叠和执行中保持一致（active）
@@ -144,7 +145,7 @@ code-anchors:
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
-- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留；生产节点作者一项由 ADR-0278 部分替代）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0221](ADR-0221-schema-free-online-units-and-prepared-layout-recipes.md) — 在线数据为何在准备期冻结完整布局、只传独立标准批次，并分开物理NULL、逻辑requiredness、原预算与真实线程退出（active；补充ADR-0209，普通root IPC保持）（COW 结果用途与编码由 ADR-0233 部分替代，共享 NRU1/BatchRecipe 与原 root IPC 保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
@@ -173,9 +174,10 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
-- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼）
-- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
-- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0278](ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md) — Iceberg MV 如何复用精确源窗口和目标 main 条件，承接可见元组维护、退役与严格重放（active；最终候选验收待独立取证）
+- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼；裁决 7 的非聚合选路由 ADR-0278 部分替代）
+- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条；非聚合跨进程接续妥协由 ADR-0278 部分替代）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active；新非聚合解释键与分支存储角色由 ADR-0278 部分替代）
 - [ADR-0264](ADR-0264-iceberg-rewrites-preserve-row-identity.md) — Iceberg OPTIMIZE 保留已分配的行身份，由 manifest list 为重写输出分配新范围，v3 缺 next-row-id 返回明确诊断（active。部分替代 ADR-0171 的重写 lineage 规则和 ADR-0174 的 P7a。原不可变 operation、依赖验证、产物归属和其余 vendor 补丁政策继续有效）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — Iceberg 写类为何共用紧凑接收与 operation 账本，怎样选择建表位置、冻结追加条件并按精确对象清理（active；部分替代 lake publication ADR-0110、ADR-0171、ADR-0198、Iceberg ADR-0239 与维护 ADR-0243）
 - [ADR-0260](ADR-0260-iceberg-metadata-delete-proves-original-fields-on-each-round.md) — Iceberg 元数据 DELETE 如何在原读观察证明完全吸收，并按当轮最新文件与获胜快照解释原字段和计数（active；部分替代 ADR-0251）
@@ -291,7 +293,7 @@ code-anchors:
 
 - [ADR-0237](ADR-0237-pure-logical-execution-and-original-host-custody.md) — 逻辑执行与 attempt 为何分别由纯核心决定、QA 为何只监督执行器并保管原注册/退出、FA 为何只承接原载体，以及共享运行时来源/失败交接和宿主一次性清理切点（active；部分替代 ADR-0198 的异步逻辑 actor 妥协及 ADR-0230 的桥，其余业务、协议与原传输规则保留）
 - [ADR-0227](ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md) — 元数据列举与任务传输为何使用真实容量边界，组批为何只作目标，回复布局为何只在 Joint 记责而不构成回复总字节治理（active；部分替代 Task创建版0158、0170、0196、HMS版0216与0224的准确固定额度条款，其余规则保留）
-- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留；生产节点作者一项由 ADR-0278 部分替代）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
@@ -348,7 +350,7 @@ code-anchors:
 - [ADR-0274](ADR-0274-window-setup-precedes-tracked-batch-output.md) — 窗口调用怎样核对原重载，在需求前完成必需检查并按实际布局和预算发射（active）
 
 - [ADR-0272](ADR-0272-collection-lambdas-use-bound-body-requests.md) — 集合 lambda 如何定稿原重载、按需请求准确体，以及如何沿原宿主保管捕获、错误与资源（active）
-- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active；新非聚合解释键与分支存储角色由 ADR-0278 部分替代）
 - [ADR-0266](ADR-0266-array-scalar-overloads-and-host-admission.md) — 数组标量重载如何共用值关系、转换与宿主准入，以及与 Trino 484 的接口差异（active）
 - [ADR-0263](ADR-0263-trino-scalar-values-and-publication-eligibility.md) — Trino 标量定型、UUID 呈现与受影响 MV 的发布资格（active；发布资格和旧定义格式由 ADR-0267 部分替代；标量定型、行错误、UUID 及会话准入继续有效）
 - [ADR-0256](ADR-0256-temporal-calls-freeze-overloads-and-selected-row-effects.md) — 时态调用如何冻结重载、环境和选中行错误，并以实际发布验值完成 MV 切换（active）
@@ -547,7 +549,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — REST CTAS 如何在最终位置使用标准建表事务、将同名竞争投影为已知拒绝并按对象交接清理权（active）
 - [ADR-0233](ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md) — Iceberg UPDATE/MERGE 为何统一 MOR、表属性为何不选算法、完整 V/W/T、可达字节与赋值 NULL 为何由原写入作者验证（active；替代 ADR-0063，部分替代 ADR-0049/0055/0191/0221 的 COW 接缝，其余 Provider、折叠与共享 codec 规则保留）
-- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0222](ADR-0222-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留；生产节点作者一项由 ADR-0278 部分替代）
 - [ADR-0219](ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md) — Iceberg lineage 为何只认格式版本、MV为何观察所选快照范围、重复匹配为何按物理行与子句判重并由规划声明Trino错误（active；部分替代ADR-0055的属性准入历史，Provider策略与SQL谓词所有权保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
@@ -575,9 +577,10 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
-- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼）
-- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条）
-- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active）
+- [ADR-0278](ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md) — 非聚合 MV 如何按可见元组维护、建立持久删除核验义务、用同一基准严格恢复并保护名字（active；最终候选验收待独立取证）
+- [ADR-0271](ADR-0271-iceberg-change-window-facts-and-complete-enumeration.md) — Iceberg 源窗口怎样冻结增量能力、净零依据、负权重与差集体量，并由自然末批证明完整枚举（active，部分替代 ADR-0207 的准备投影词汇与空 Delta 称呼；裁决 7 的非聚合选路由 ADR-0278 部分替代）
+- [ADR-0268](ADR-0268-iceberg-mv-converges-from-the-original-commit.md) — Iceberg MV 如何以每轮 main CAS 发布、以原派发证据结算未知结果并保留精确清理与管理保护（active；部分替代 ADR-0180 第 4 条；非聚合跨进程接续妥协由 ADR-0278 部分替代）
+- [ADR-0267](ADR-0267-mv-publishes-bound-source-and-storage-facts.md) — MV 如何沿原语句捕获结构化源事实、用真实存储映射解释发布并在绑定变化时重建（active；新非聚合解释键与分支存储角色由 ADR-0278 部分替代）
 - [ADR-0262](ADR-0262-iceberg-write-classes-and-exact-create-cleanup.md) — MV 文档建表如何直接暂存于最终位置，全量刷新与重分区如何原子发布 delete、append 与文档（active；第 6 条的全量 delete 阶段证据见 ADR-0268）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator 由 [ADR-0243](ADR-0243-statement-authorized-iceberg-metadata-maintenance.md) 部分替代，Catalog 准入与三态 publication 保留）
 - [ADR-0226](ADR-0226-engine-metadata-through-typed-system-relations.md) — 引擎元数据为何通过原语句的类型化批快照进入独立系统关系，名称、只读、Provider与真实退出为何各守原所有者（active；旧 SHOW 保留条款由 ADR-0232 部分替代，类型化系统关系与真实退出保留，验证范围独立核对）
@@ -633,6 +636,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：Rust 的普通分配失败会终止进程，所以可恢复的容量控制只能建立在**比单次分配更粗的事前授权**上——先取额度、再分配、最后结算，且授予额度内的结算不会因容量失败。一个进程一个权威，账户成严格树，账户对父级持有的份额**就是**它的承诺；已下放的独立域内 funded 步骤不触父/root；补额修改在足够的父级余额停止，祖先增长资格门仍须握手。配置目标与历史债务独立。归属绑定在稳定 allocation origin，真实退出后残留交同分支祖先，物理释放以前仍计费。覆盖是**两级**且诚实的：硬治理覆盖声明的对象集合，其余由进程分配观测按 headroom 预算测量并列出盲区——不冒充按查询精确归属，也不承诺避免所有物理 OOM。授权、实际分配、共享持有、回收估计与物理压力是五个必须分别表达、永不相加的事实。本领域与 `runtime-role` 的工作治理是同一进程内的两半：ADR-0147 拥有责任、scope、阶段准入与取消，本领域拥有容量机制本身，并回答 ADR-0147 重评估条件 2 点名的「扩展真实内存来源与强制接入」。
 
+- [ADR-0278](ADR-0278-query-memory-follows-original-execution-ownership.md) — 查询归属沿原工作入口传播，真实执行退出后交接残留与退休账户（active）
 - [ADR-0277](ADR-0277-third-party-encoding-buffers-use-transport-headroom.md) — 随查询数据变化的第三方编码缓冲归传输服务和 H，Root 的结构请求字节由原位置与尺寸推导（active，承接 ADR-0170 与 ADR-0148）
 - [ADR-0276](ADR-0276-plan-freezing-uses-frontend-planning-memory.md) — FE 静态片段冻结的规划侧内存归属、可失败整段编码分配和最后字节别名观测（active）
 - [ADR-0227](ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md) — 元数据列举与任务传输为何使用真实容量边界，组批为何只作目标，回复布局为何只在 Joint 记责而不构成回复总字节治理（active；部分替代 Task创建版0158、0170、0196、HMS版0216与0224的准确固定额度条款，其余规则保留）

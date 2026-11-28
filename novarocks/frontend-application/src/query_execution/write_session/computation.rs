@@ -255,13 +255,6 @@ pub(crate) struct AcceptedWriteSegment {
 }
 impl AcceptedWriteSegment {
     /// Evidence from this exact computation cut, never the Session's query union.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "RWM-10 reads this attempt's accepted verification evidence."
-        )
-    )]
     pub(crate) const fn delete_verification(&self) -> Option<DeleteVerificationCounts> {
         self.delete_verification
     }

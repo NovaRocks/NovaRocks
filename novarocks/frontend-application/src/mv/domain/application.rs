@@ -64,19 +64,38 @@ pub struct MvAlterStatement {
 }
 
 // Design: ADR-0101 (docs/adr/ADR-0101-native-sql-language-authority-and-owner-boundaries.md)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvRefreshRequestMode {
+    IncrementalAllowed,
+    Full,
+    #[expect(
+        dead_code,
+        reason = "Only the governed explicit rebuild operation can construct this mode."
+    )]
+    ExplicitRebuild,
+}
+
 /// Frontend-owned refresh request. The request keeps the admitted target name
 /// distinct from SQL planning's immutable refresh semantic value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshRequest {
     pub name_parts: Vec<String>,
-    pub full: bool,
+    pub mode: MvRefreshRequestMode,
 }
 
 impl MvRefreshRequest {
+    pub const fn is_full(&self) -> bool {
+        !matches!(self.mode, MvRefreshRequestMode::IncrementalAllowed)
+    }
+
+    pub const fn is_explicit_rebuild(&self) -> bool {
+        matches!(self.mode, MvRefreshRequestMode::ExplicitRebuild)
+    }
+
     pub fn sql_refresh_statement(&self) -> novarocks_sql::planning::mv::MvRefreshStatement {
         novarocks_sql::planning::mv::MvRefreshStatement {
             name_parts: self.name_parts.clone(),
-            full: self.full,
+            full: self.is_full(),
         }
     }
 }

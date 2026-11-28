@@ -100,6 +100,7 @@ struct AppState {
     next_fault_sequence: Arc<AtomicU64>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
     traffic: Arc<Mutex<TrafficCounters>>,
+    retained_requests: Option<Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>>,
 }
 
 /// Cumulative traffic forwarded to the real REST Catalog. Fixture control
@@ -197,6 +198,7 @@ pub enum PublicationFault {
     BeforeDispatchForbidden,
     BeforeDispatchHoldForConcurrentShell,
     BeforeRequirementCheckHoldForConcurrentShell,
+    BeforeDispatchHoldAcrossFrontendExit,
     AfterCommitBeforeResponse,
     /// Lose the successful response and withhold exact readback until release.
     AfterCommitBeforeResponseHideTableLoad,
@@ -217,6 +219,9 @@ impl PublicationFault {
             Self::BeforeRequirementCheckHoldForConcurrentShell => {
                 "before-requirement-check-hold-for-concurrent-shell"
             }
+            Self::BeforeDispatchHoldAcrossFrontendExit => {
+                "before-dispatch-hold-across-frontend-exit"
+            }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitBeforeResponseHideTableLoad => {
                 "after-commit-before-response-hide-table-load"
@@ -235,6 +240,7 @@ struct ArmedNextFault {
     action: PublicationAction,
     fault: PublicationFault,
     target: Option<ExactTableTarget>,
+    retained_mv_commit: Option<RetainedMvCommit>,
     release: Arc<tokio::sync::Notify>,
     released: Arc<AtomicBool>,
 }
@@ -260,12 +266,25 @@ struct ExactTableTarget {
     table: String,
 }
 
+/// Exact Iceberg wire effects used by cross-FE recovery scenarios.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetainedMvCommit {
+    Publication,
+    Retirement,
+    PendingMarker,
+    PendingReleased,
+    ManagementSlot,
+}
+
 #[derive(Deserialize, Serialize)]
 struct ArmNextFaultRequest {
     action: PublicationAction,
     fault: PublicationFault,
     #[serde(default)]
     target: Option<ExactTableTarget>,
+    #[serde(default)]
+    retained_mv_commit: Option<RetainedMvCommit>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -296,6 +315,7 @@ impl PublicationCatalogFixture {
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
             mutations: Arc::clone(&mutations),
             traffic: Arc::clone(&traffic),
+            retained_requests: Some(Arc::new(Mutex::new(Vec::new()))),
         };
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -312,12 +332,24 @@ impl PublicationCatalogFixture {
                     ready_tx
                         .send(())
                         .expect("signal publication catalog fixture ready");
+                    let retained_requests = state
+                        .retained_requests
+                        .clone()
+                        .expect("fixture request owner");
                     axum::serve(listener, router(state))
                         .with_graceful_shutdown(async move {
                             let _ = shutdown_rx.await;
                         })
                         .await
                         .expect("serve publication catalog fixture");
+                    let retained = std::mem::take(
+                        &mut *retained_requests
+                            .lock()
+                            .expect("retained publication request ownership"),
+                    );
+                    for request in retained {
+                        request.await.expect("retained publication request exited");
+                    }
                 });
             })?;
         if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(5)) {
@@ -405,7 +437,7 @@ impl FixtureControl {
     }
 
     pub fn arm_next(&self, action: &str, fault: &str) -> Result<FixtureFaultGuard> {
-        self.arm_next_target(action, fault, None)
+        self.arm_next_target(action, fault, None, None)
     }
 
     pub fn arm_next_for_table(
@@ -422,6 +454,39 @@ impl FixtureControl {
                 namespace: namespace.to_owned(),
                 table: table.to_owned(),
             }),
+            None,
+        )
+    }
+
+    pub fn retain_mv_commit(
+        &self,
+        namespace: &str,
+        table: &str,
+        kind: RetainedMvCommit,
+    ) -> Result<FixtureFaultGuard> {
+        self.fault_mv_commit(
+            namespace,
+            table,
+            kind,
+            PublicationFault::BeforeDispatchHoldAcrossFrontendExit,
+        )
+    }
+
+    pub fn fault_mv_commit(
+        &self,
+        namespace: &str,
+        table: &str,
+        kind: RetainedMvCommit,
+        fault: PublicationFault,
+    ) -> Result<FixtureFaultGuard> {
+        self.arm_next_target(
+            PublicationAction::TableCommit.as_str(),
+            fault.as_str(),
+            Some(ExactTableTarget {
+                namespace: namespace.to_owned(),
+                table: table.to_owned(),
+            }),
+            Some(kind),
         )
     }
 
@@ -430,6 +495,7 @@ impl FixtureControl {
         action: &str,
         fault: &str,
         target: Option<ExactTableTarget>,
+        retained_mv_commit: Option<RetainedMvCommit>,
     ) -> Result<FixtureFaultGuard> {
         let action = parse_action(action)?;
         let fault = parse_fault(fault)?;
@@ -440,6 +506,7 @@ impl FixtureControl {
                 action,
                 fault,
                 target,
+                retained_mv_commit,
             })
             .send()
             .context("arm publication catalog next-action fault")?
@@ -550,6 +617,9 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
         "before-requirement-check-hold-for-concurrent-shell" => {
             Ok(PublicationFault::BeforeRequirementCheckHoldForConcurrentShell)
         }
+        "before-dispatch-hold-across-frontend-exit" => {
+            Ok(PublicationFault::BeforeDispatchHoldAcrossFrontendExit)
+        }
         "after-commit-before-response" => Ok(PublicationFault::AfterCommitBeforeResponse),
         "after-commit-before-response-hide-table-load" => {
             Ok(PublicationFault::AfterCommitBeforeResponseHideTableLoad)
@@ -587,6 +657,11 @@ impl FixtureFaultGuard {
         self.control.wait_until_entered(&self.arm_id, deadline)
     }
 
+    pub fn wait_until_retained(&self, deadline: Instant) -> Result<()> {
+        self.control
+            .wait_for_trace_event(&self.arm_id, "retained-before-forwarding", deadline)
+    }
+
     pub fn wait_until_downstream_successful_hold(&self, deadline: Instant) -> Result<()> {
         self.control.wait_for_trace_event(
             &self.arm_id,
@@ -619,6 +694,7 @@ impl FixtureFaultGuard {
             | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {
                 "downstream-response"
             }
+            PublicationFault::BeforeDispatchHoldAcrossFrontendExit => "retained-request-exited",
             PublicationFault::AfterCommitBeforeResponse
             | PublicationFault::AfterCommitBeforeResponseHideTableLoad => {
                 "response-dropped-after-downstream-success"
@@ -691,6 +767,7 @@ pub async fn serve(config: FixtureConfig) -> Result<()> {
         next_fault_sequence: Arc::new(AtomicU64::new(1)),
         mutations: Arc::new(Mutex::new(BTreeMap::new())),
         traffic: Arc::new(Mutex::new(TrafficCounters::default())),
+        retained_requests: None,
     };
     axum::serve(listener, router(state))
         .await
@@ -722,13 +799,32 @@ async fn arm_next_fault(
     Json(request): Json<ArmNextFaultRequest>,
 ) -> Response {
     let lost_response = request.fault == PublicationFault::AfterCommitBeforeResponseHideTableLoad;
-    let exact_table_supported = if lost_response {
-        request.action == PublicationAction::TableCommit
+    let retain_through_exit =
+        request.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit;
+    let exact_effect = request.retained_mv_commit.is_some();
+    let table_commit = request.action == PublicationAction::TableCommit;
+    let exact_effect_supported = table_commit
+        && matches!(
+            request.fault,
+            PublicationFault::BeforeDispatchForbidden
+                | PublicationFault::BeforeDispatchHoldAcrossFrontendExit
+                | PublicationFault::AfterCommitBeforeResponse
+                | PublicationFault::AfterCommitBeforeResponseHideTableLoad
+                | PublicationFault::AfterCommitHoldForFrontendKill
+        );
+    let exact_table_supported = if exact_effect {
+        exact_effect_supported
+    } else if lost_response {
+        table_commit
+    } else if retain_through_exit {
+        request.action == PublicationAction::CatalogMutation
     } else {
         request.action == PublicationAction::TableLoad
             && request.fault == PublicationFault::CorruptPackage
     };
-    if (lost_response && request.target.is_none())
+    if (retain_through_exit && state.retained_requests.is_none())
+        || (exact_effect && !exact_effect_supported)
+        || ((lost_response || retain_through_exit || exact_effect) && request.target.is_none())
         || request.target.as_ref().is_some_and(|target| {
             !exact_table_supported
                 || target.namespace.is_empty()
@@ -760,6 +856,7 @@ async fn arm_next_fault(
         action: request.action,
         fault: request.fault,
         target: request.target,
+        retained_mv_commit: request.retained_mv_commit,
         release: Arc::new(tokio::sync::Notify::new()),
         released: Arc::new(AtomicBool::new(false)),
     });
@@ -853,6 +950,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
             action,
             &parts.method,
             parts.uri.path(),
+            &bytes,
             entered_unix_nanos,
         ) {
             Ok(fault) => fault,
@@ -900,20 +998,58 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         }
         record_fault_event(&state, armed, "before-requirement-check-release");
     }
+    if let Some(armed) = fault.as_ref()
+        && armed.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit
+    {
+        let armed = armed.clone();
+        let retained = state
+            .retained_requests
+            .clone()
+            .expect("validated retained request owner");
+        let (result, response) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let mut stopped = state.stopped.clone();
+            record_fault_event(&state, &armed, "retained-before-forwarding");
+            tokio::select! {
+                _ = armed.release.notified() => {},
+                _ = stopped.changed() => {},
+            }
+            let response = forward_request(&state, parts, bytes, mutation_target, fault).await;
+            record_fault_event(&state, &armed, "retained-request-exited");
+            let _ = result.send(response);
+        });
+        retained
+            .lock()
+            .expect("retained publication request ownership")
+            .push(request);
+        return response
+            .await
+            .unwrap_or_else(|_| temporary_failure("retained publication request did not return"));
+    }
+    forward_request(&state, parts, bytes, mutation_target, fault).await
+}
+
+async fn forward_request(
+    state: &AppState,
+    parts: axum::http::request::Parts,
+    bytes: Bytes,
+    mutation_target: Option<(TargetMutationAction, String, String)>,
+    fault: Option<ArmedNextFault>,
+) -> Response {
     if *state.stopped.borrow() {
         return temporary_failure("publication fixture stopped before forwarding");
     }
     if let Some(armed) = fault.as_ref() {
-        record_fault_event(&state, armed, "request-forwarded");
+        record_fault_event(state, armed, "request-forwarded");
     }
     if let Some((action, namespace, table)) = mutation_target.as_ref() {
-        record_mutation(&state, *action, namespace, table, false);
+        record_mutation(state, *action, namespace, table, false);
     }
     let method = parts.method.clone();
     let request_body_bytes = bytes.len() as u64;
     let forwarded_at = Instant::now();
     let (response, response_body_bytes) =
-        proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+        proxy_request(state, parts.method, parts.uri, parts.headers, bytes).await;
     if let Some((TargetMutationAction::TableCommit, namespace, table)) = mutation_target.as_ref() {
         let mut mutations = state.mutations.lock().expect("publication mutation mutex");
         let counts = mutations
@@ -927,7 +1063,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     let roundtrip_nanos = u64::try_from(forwarded_at.elapsed().as_nanos())
         .expect("catalog request duration exceeds u64 nanoseconds");
     record_traffic(
-        &state,
+        state,
         &method,
         response.status(),
         request_body_bytes,
@@ -940,12 +1076,16 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     if response.status().is_success()
         && let Some((action, namespace, table)) = mutation_target.as_ref()
     {
-        record_mutation(&state, *action, namespace, table, true);
+        record_mutation(state, *action, namespace, table, true);
     }
     if let Some(armed) = fault.as_ref() {
-        record_fault_event(&state, armed, "downstream-response");
+        record_fault_event(state, armed, "downstream-response");
         if response.status().is_success() {
-            record_fault_event(&state, armed, "downstream-success");
+            record_fault_event(state, armed, "downstream-success");
+        } else if armed.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit
+            && response.status() == StatusCode::CONFLICT
+        {
+            record_fault_event(state, armed, "downstream-conflict");
         }
     }
     if let Some(armed) = fault
@@ -973,24 +1113,24 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 );
             }
             PublicationFault::AfterCommitHoldForFrontendKill => {
-                record_fault_event(&state, &armed, "response-held-after-downstream-success");
+                record_fault_event(state, &armed, "response-held-after-downstream-success");
                 let mut stopped = state.stopped.clone();
                 tokio::select! {
                     _ = armed.release.notified() => {},
                     _ = stopped.changed() => {},
                 }
-                record_fault_event(&state, &armed, "response-dropped-after-downstream-success");
+                record_fault_event(state, &armed, "response-dropped-after-downstream-success");
                 return temporary_failure("publication REST response released after frontend kill");
             }
             PublicationFault::IncompleteDiscovery => {
                 // A valid empty list means discovery completed with no
                 // namespaces. The MV contract needs an actual standard REST
                 // read failure so SPI classifies this catalog as Incomplete.
-                record_fault_event(&state, &armed, "discovery-response-replaced");
+                record_fault_event(state, &armed, "discovery-response-replaced");
                 return temporary_failure("catalog discovery read failed");
             }
             PublicationFault::CorruptPackage => {
-                record_fault_event(&state, &armed, "package-response-corrupted");
+                record_fault_event(state, &armed, "package-response-corrupted");
                 return response_with_headers(
                     StatusCode::OK,
                     HeaderMap::new(),
@@ -1004,7 +1144,8 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 unreachable!("returned before dispatch")
             }
             PublicationFault::BeforeDispatchHoldForConcurrentShell
-            | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {}
+            | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell
+            | PublicationFault::BeforeDispatchHoldAcrossFrontendExit => {}
         }
     }
     response
@@ -1237,6 +1378,7 @@ fn take_matching_fault(
     action: PublicationAction,
     method: &Method,
     path: &str,
+    body: &[u8],
     entered_unix_nanos: Option<u64>,
 ) -> Result<Option<ArmedNextFault>> {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
@@ -1246,8 +1388,19 @@ fn take_matching_fault(
     if armed.action != action {
         return Ok(None);
     }
+    if armed.fault == PublicationFault::BeforeDispatchHoldAcrossFrontendExit
+        && action == PublicationAction::CatalogMutation
+        && *method != Method::DELETE
+    {
+        return Ok(None);
+    }
     if let Some(target) = &armed.target
         && !matches_exact_target(target, path)?
+    {
+        return Ok(None);
+    }
+    if let Some(kind) = armed.retained_mv_commit
+        && !is_retained_mv_commit(body, kind)
     {
         return Ok(None);
     }
@@ -1281,6 +1434,75 @@ fn take_matching_fault(
         matched_unix_nanos,
     });
     Ok(Some(armed))
+}
+
+fn is_retained_mv_commit(body: &[u8], kind: RetainedMvCommit) -> bool {
+    let Ok(request) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let guarded = request["requirements"]
+        .as_array()
+        .is_some_and(|requirements| {
+            requirements.iter().any(|requirement| {
+                requirement["type"] == "assert-ref-snapshot-id"
+                    && requirement["ref"] == "main"
+                    && requirement["snapshot-id"].is_i64()
+            })
+        });
+    let Some(updates) = request["updates"].as_array().filter(|_| guarded) else {
+        return false;
+    };
+    let marker_prefix = match kind {
+        RetainedMvCommit::PendingMarker => Some("novarocks.doc.v2.mark.novarocks.mv~pending~"),
+        RetainedMvCommit::PendingReleased => {
+            Some("novarocks.doc.v2.mark.novarocks.mv~pending-released~")
+        }
+        _ => None,
+    };
+    if let Some(prefix) = marker_prefix {
+        return matches!(updates.as_slice(), [update]
+        if update["action"] == "set-properties"
+            && update["updates"].as_object().is_some_and(|properties|
+                properties.keys().any(|key| key.starts_with(prefix))));
+    }
+    let Some(main) = updates.iter().find_map(|update| {
+        (update["action"] == "set-snapshot-ref" && update["ref-name"] == "main")
+            .then(|| update["snapshot-id"].as_i64())
+            .flatten()
+    }) else {
+        return false;
+    };
+    const SLOT_CHANGE: &str = "novarocks.document.slot-change.v1";
+    if kind == RetainedMvCommit::ManagementSlot {
+        const MANAGEMENT: &str = "novarocks.doc.v2.slot.novarocks.storage~management";
+        let writes_original_slot = updates.iter().any(|update| {
+            update["action"] == "set-properties"
+                && update["updates"][MANAGEMENT]
+                    .as_str()
+                    .and_then(|slot| serde_json::from_str::<Value>(slot).ok())
+                    .is_some_and(|slot| slot["writer"].as_i64() == Some(main))
+        });
+        return writes_original_slot
+            && updates.iter().any(|update| {
+                update["action"] == "add-snapshot"
+                    && update["snapshot"]["snapshot-id"].as_i64() == Some(main)
+                    && update["snapshot"]["summary"]["operation"] == "replace"
+                    && update["snapshot"]["summary"][SLOT_CHANGE] == "true"
+            });
+    }
+    let key = match kind {
+        RetainedMvCommit::Publication => "novarocks.doc.v2.record.novarocks.mv~publication",
+        RetainedMvCommit::Retirement => "novarocks.doc.v2.record.novarocks.mv~retirement",
+        RetainedMvCommit::PendingMarker
+        | RetainedMvCommit::PendingReleased
+        | RetainedMvCommit::ManagementSlot => unreachable!("other effect handled above"),
+    };
+    updates.iter().any(|update| {
+        update["action"] == "add-snapshot"
+            && update["snapshot"]["snapshot-id"].as_i64() == Some(main)
+            && update["snapshot"]["summary"][SLOT_CHANGE] != "true"
+            && update["snapshot"]["summary"].get(key).is_some()
+    })
 }
 
 fn record_fault_event(state: &AppState, armed: &ArmedNextFault, event: &str) {
@@ -1555,6 +1777,70 @@ mod tests {
     }
 
     #[test]
+    fn retained_mv_effects_match_only_the_original_guarded_wire_shape() {
+        let guard = json!({"type":"assert-ref-snapshot-id", "ref":"main", "snapshot-id":8});
+        let marker_commit = |kind: &str| {
+            let key = format!("novarocks.doc.v2.mark.novarocks.mv~{kind}~original");
+            json!({
+                "requirements":[guard.clone()],
+                "updates":[{"action":"set-properties","updates":{(key):"opaque"}}]
+            })
+        };
+        let snapshot_commit = |record: &str| {
+            json!({
+                "requirements":[guard.clone()],
+                "updates":[
+                    {"action":"add-snapshot","snapshot":{"snapshot-id":9,"summary":{(record):"opaque"}}},
+                    {"action":"set-snapshot-ref","ref-name":"main","snapshot-id":9}
+                ]
+            })
+        };
+        let mut slot = snapshot_commit("novarocks.doc.v2.record.novarocks.mv~publication");
+        slot["updates"][0]["snapshot"]["summary"]["operation"] = json!("replace");
+        slot["updates"][0]["snapshot"]["summary"]["novarocks.document.slot-change.v1"] =
+            json!("true");
+        slot["updates"].as_array_mut().unwrap().push(json!({
+            "action":"set-properties",
+            "updates":{"novarocks.doc.v2.slot.novarocks.storage~management":"{\"writer\":9}"}
+        }));
+        let candidates = [
+            (marker_commit("pending"), RetainedMvCommit::PendingMarker),
+            (
+                marker_commit("pending-released"),
+                RetainedMvCommit::PendingReleased,
+            ),
+            (slot, RetainedMvCommit::ManagementSlot),
+            (
+                snapshot_commit("novarocks.doc.v2.record.novarocks.mv~publication"),
+                RetainedMvCommit::Publication,
+            ),
+            (
+                snapshot_commit("novarocks.doc.v2.record.novarocks.mv~retirement"),
+                RetainedMvCommit::Retirement,
+            ),
+        ];
+        for (mut candidate, exact) in candidates {
+            for kind in [
+                RetainedMvCommit::PendingMarker,
+                RetainedMvCommit::PendingReleased,
+                RetainedMvCommit::ManagementSlot,
+                RetainedMvCommit::Publication,
+                RetainedMvCommit::Retirement,
+            ] {
+                assert_eq!(
+                    is_retained_mv_commit(&serde_json::to_vec(&candidate).unwrap(), kind),
+                    kind == exact
+                );
+            }
+            candidate["requirements"] = json!([]);
+            assert!(!is_retained_mv_commit(
+                &serde_json::to_vec(&candidate).unwrap(),
+                exact
+            ));
+        }
+    }
+
+    #[test]
     fn one_shot_fault_only_consumes_its_matching_standard_action() {
         let (_stopped, stopped) = tokio::sync::watch::channel(false);
         let state = AppState {
@@ -1567,6 +1853,7 @@ mod tests {
                     action: PublicationAction::TableCommit,
                     fault: PublicationFault::AfterCommitBeforeResponse,
                     target: None,
+                    retained_mv_commit: None,
                     release: Arc::new(tokio::sync::Notify::new()),
                     released: Arc::new(AtomicBool::new(false)),
                 }),
@@ -1576,6 +1863,7 @@ mod tests {
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
             mutations: Arc::new(Mutex::new(BTreeMap::new())),
             traffic: Arc::new(Mutex::new(TrafficCounters::default())),
+            retained_requests: None,
         };
         assert!(
             take_matching_fault(
@@ -1583,6 +1871,7 @@ mod tests {
                 PublicationAction::StageCreate,
                 &Method::POST,
                 "/v1/namespaces/ns/tables/t",
+                &[],
                 None
             )
             .unwrap()
@@ -1593,6 +1882,7 @@ mod tests {
             PublicationAction::TableCommit,
             &Method::POST,
             "/v1/namespaces/ns/tables/t",
+            &[],
             None,
         )
         .unwrap()
@@ -1605,6 +1895,7 @@ mod tests {
                 PublicationAction::TableCommit,
                 &Method::POST,
                 "/v1/namespaces/ns/tables/t",
+                &[],
                 None
             )
             .unwrap()

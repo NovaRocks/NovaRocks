@@ -321,6 +321,7 @@ pub struct BackendDataRuntime {
     message_limits: TransportMessageLimits,
     channels: native_channel_cache::NativeChannelCache,
     transport_admission: Option<native_transport_admission::NativeTransportAdmission>,
+    transport_memory_observation: Option<novarocks_memory::LaneShards>,
 }
 
 impl BackendDataRuntime {
@@ -338,6 +339,7 @@ impl BackendDataRuntime {
             channels: native_channel_cache::NativeChannelCache::bounded()
                 .expect("frozen Native channel-cache geometry is finite"),
             transport_admission: None,
+            transport_memory_observation: None,
         }
     }
     /// A BE host gets its own channel generation over the process admission.
@@ -353,6 +355,7 @@ impl BackendDataRuntime {
             message_limits: self.message_limits,
             channels: native_channel_cache::NativeChannelCache::bounded()?,
             transport_admission: Some(admission),
+            transport_memory_observation: self.transport_memory_observation.clone(),
         })
     }
 
@@ -360,6 +363,18 @@ impl BackendDataRuntime {
         &self,
     ) -> Option<&native_transport_admission::NativeTransportAdmission> {
         self.transport_admission.as_ref()
+    }
+
+    pub fn with_transport_memory_observation(
+        mut self,
+        owner: novarocks_memory::LaneShards,
+    ) -> Self {
+        self.transport_memory_observation = Some(owner);
+        self
+    }
+
+    pub(crate) fn transport_memory_observation(&self) -> Option<&novarocks_memory::LaneShards> {
+        self.transport_memory_observation.as_ref()
     }
 
     #[expect(
@@ -377,6 +392,8 @@ impl BackendDataRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        let future =
+            crate::native_server::observe_native_work(work.observation().cloned(), || future);
         let (obligation, panic, wake) = work.into_parts();
         let future = novarocks_control_runtime::exit_work::run_future(obligation, future, panic);
         self.handle.spawn(ParticipationExitWakeFuture {

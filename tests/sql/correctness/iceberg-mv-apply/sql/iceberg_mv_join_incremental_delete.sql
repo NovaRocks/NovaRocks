@@ -18,9 +18,8 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,join,incremental_delete,target_apply
--- Test Point: join MV incremental refresh resolves target delete rows through framework target scan.
--- Method: Create a two-base join MV, refresh initial state, then delete/update/insert base rows and refresh incrementally.
--- Scope: Join delta coalescing, framework target apply-key locator, target position delete commit.
+-- Test Point: a two-base join MV preserves its visible bag across base deletions and inserts.
+-- Explain the eligible strategy before refreshing and verify the published rows after it.
 
 -- query 1
 -- @skip_result_check=true
@@ -69,7 +68,9 @@ INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
 
 -- query 5
 -- @skip_result_check=true
--- @explain_contains=IcebergVersionTable
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 6
@@ -114,7 +115,9 @@ FROM TABLE(sequence(3500, 3999)) AS gs(id);
 
 -- query 11
 -- @skip_result_check=true
--- @explain_contains=IcebergVersionTable
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 12

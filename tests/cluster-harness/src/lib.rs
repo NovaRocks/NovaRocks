@@ -3797,6 +3797,7 @@ pub struct CrossProcessCluster {
     expected_eligible_backend_count: usize,
     be_config_paths: Vec<PathBuf>,
     fe_config_path: PathBuf,
+    mv_startup_grace: MvStartupGrace,
     be_processes: Vec<ManagedProcess>,
     fe_process: ManagedProcess,
     be_log_history: Vec<String>,
@@ -3811,6 +3812,214 @@ pub struct CrossProcessCluster {
     role_sessions_joined: bool,
     unconfirmed_role_launch: bool,
     fixture_budget: Option<fixture_run::RunBudget>,
+}
+
+/// The declaration belongs to the test fixture that owns all previous FE
+/// launches. Scenarios that hold a remote effect across restart settle it
+/// themselves before calling `declare_fe_mv_startup_effects_settled`.
+struct MvStartupGrace {
+    deployment: String,
+    evidence_file: PathBuf,
+    frontend_info_log: PathBuf,
+    launch_nonce: String,
+    prior_incarnations: BTreeSet<String>,
+    automatic: bool,
+}
+
+struct MvStartupObservation<'a> {
+    state: &'a str,
+    incarnation: &'a str,
+    prior_incarnations: &'a str,
+    end_reason: &'a str,
+}
+
+impl<'a> MvStartupObservation<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        let marker = novarocks_failpoint::observation_marker::MV_NAME_STARTUP_GRACE;
+        if !line.split_whitespace().any(|word| word == marker) {
+            return None;
+        }
+        let field = |key: &str| {
+            line.split_whitespace().find_map(|word| {
+                let (name, value) = word.split_once('=')?;
+                (name == key).then(|| value.trim_matches('"'))
+            })
+        };
+        Some(Self {
+            state: field("state")?,
+            incarnation: field("incarnation")?,
+            prior_incarnations: field("prior_incarnations")?,
+            end_reason: field("end_reason")?,
+        })
+    }
+}
+
+impl MvStartupGrace {
+    fn new(
+        deployment: String,
+        runtime_dir: &Path,
+        environment: &mut BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let runtime_dir = runtime_dir
+            .canonicalize()
+            .context("resolve FE runtime directory")?;
+        let log_dir = PathBuf::from(
+            environment
+                .entry("NOVAROCKS_LOG_DIR".into())
+                .or_insert_with(|| {
+                    runtime_dir
+                        .join("fe-server-log")
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .as_str(),
+        );
+        let basename = environment
+            .entry("NOVAROCKS_LOG_BASENAME".into())
+            .or_insert_with(|| "novarocks".into());
+        Ok(Self {
+            deployment,
+            evidence_file: runtime_dir.join("mv-startup-isolation.toml"),
+            frontend_info_log: log_dir.join(format!("{basename}.INFO")),
+            launch_nonce: next_fragment_failure_token(0),
+            prior_incarnations: BTreeSet::new(),
+            automatic: true,
+        })
+    }
+
+    fn configure_launch(&self, rendered: &str, automatic_restart: bool) -> Result<String> {
+        let mut config: Value = rendered.parse().context("parse rendered FE config")?;
+        let root = config
+            .as_table_mut()
+            .context("rendered FE config is not a table")?;
+        let mv_management = table_mut(root, "mv_management");
+        let isolation = table_mut(mv_management, "startup_isolation");
+        isolation.insert(
+            "evidence_file".into(),
+            Value::String(self.evidence_file.to_string_lossy().into_owned()),
+        );
+        isolation.insert(
+            "launch_nonce".into(),
+            Value::String(self.launch_nonce.clone()),
+        );
+        if automatic_restart {
+            // The fixture proves settlement after restart. The successor must
+            // have time to read the declaration inside the restart deadline.
+            table_mut(root, "standalone_server")
+                .entry("iceberg_maintenance_tick_interval_ms")
+                .or_insert(Value::Integer(1000));
+        }
+        toml::to_string(&config).context("serialize FE startup isolation config")
+    }
+
+    fn current_log(&self) -> Result<String> {
+        match fs::read_to_string(&self.frontend_info_log) {
+            Ok(log) => Ok(log),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error)
+                .with_context(|| format!("read FE log {}", self.frontend_info_log.display())),
+        }
+    }
+
+    fn prepare_successor(&mut self, config_path: &Path) -> Result<()> {
+        let log = self.current_log()?;
+        if let Some(prior) = log.lines().rev().find_map(MvStartupObservation::parse) {
+            self.prior_incarnations.insert(prior.incarnation.to_owned());
+        }
+        match fs::remove_file(&self.evidence_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove previous FE isolation declaration"),
+        }
+        self.launch_nonce = next_fragment_failure_token(0);
+        let rendered = fs::read_to_string(config_path).context("read retiring FE config")?;
+        fs::write(
+            config_path,
+            self.configure_launch(&rendered, self.automatic)?,
+        )
+        .context("write successor FE startup isolation config")
+    }
+
+    fn publish(&self, observation: &MvStartupObservation<'_>) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct Declaration<'a> {
+            deployment: &'a str,
+            for_incarnation: &'a str,
+            nonce: &'a str,
+            isolated_incarnations: BTreeSet<&'a str>,
+            all_other_incarnations_settled: bool,
+            isolated_at_unix_ms: u64,
+            source: &'a str,
+        }
+        let mut isolated_incarnations = self
+            .prior_incarnations
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        isolated_incarnations.extend(
+            observation
+                .prior_incarnations
+                .split(',')
+                .filter(|id| !id.is_empty()),
+        );
+        ensure!(
+            !isolated_incarnations.contains(observation.incarnation),
+            "FE startup observation includes this launch in the prior incarnations"
+        );
+        let declaration = Declaration {
+            deployment: &self.deployment,
+            for_incarnation: observation.incarnation,
+            nonce: &self.launch_nonce,
+            isolated_incarnations,
+            all_other_incarnations_settled: true,
+            isolated_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+            source: "test fixture settled effects of retired FE launches",
+        };
+        let parent = self
+            .evidence_file
+            .parent()
+            .context("FE evidence path has no parent")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(toml::to_string(&declaration)?.as_bytes())?;
+        temporary
+            .persist(&self.evidence_file)
+            .context("publish FE startup isolation declaration")?;
+        Ok(())
+    }
+
+    fn finish(&self, process: &ManagedProcess, deadline: Instant) -> Result<()> {
+        let mut declared = false;
+        loop {
+            ensure!(
+                process.is_running()?,
+                "FE exited before completing MV startup grace"
+            );
+            let log = self.current_log()?;
+            if let Some(observation) = log.lines().rev().find_map(MvStartupObservation::parse)
+                && !self.prior_incarnations.contains(observation.incarnation)
+            {
+                match (observation.state, observation.end_reason) {
+                    ("active", _) if !declared => {
+                        self.publish(&observation)?;
+                        declared = true;
+                    }
+                    ("ended", "declaration") if declared || self.evidence_file.is_file() => {
+                        return Ok(());
+                    }
+                    ("ended", "no_restart_evidence") if !declared => return Ok(()),
+                    ("ended", reason) => bail!("FE MV startup grace ended unexpectedly: {reason}"),
+                    _ => {}
+                }
+            }
+            thread::sleep(
+                remaining_until(deadline, "FE MV startup grace")?
+                    .min(RESOURCE_CONVERGENCE_POLL_INTERVAL),
+            );
+        }
+    }
 }
 
 /// Final role build captures outlive successful runtime cleanup. This is a
@@ -4139,6 +4348,11 @@ impl CrossProcessCluster {
         runtime_dir.retain_on_failure = true;
         let native_trust_fixture =
             PreparedNativeTrustFixture::prepare(native_trust_fixture, runtime_dir.path())?;
+        let mv_startup_grace = MvStartupGrace::new(
+            native_trust_fixture.fixture.deployment_id.clone(),
+            runtime_dir.path(),
+            &mut fe_environment,
+        )?;
         fe_environment.insert(
             SYSTEM_NATIVE_TRUST_SECRET_ENV.to_string(),
             native_trust_fixture.shared_secret.clone(),
@@ -4269,7 +4483,8 @@ impl CrossProcessCluster {
 
         // Write FE config.
         let fe_config_path = runtime_dir.path().join("fe.toml");
-        let rendered_fe_config = render(ClusterProcessRole::Fe, 0)?;
+        let rendered_fe_config =
+            mv_startup_grace.configure_launch(&render(ClusterProcessRole::Fe, 0)?, false)?;
         fs::write(&fe_config_path, &rendered_fe_config)
             .with_context(|| format!("write {}", fe_config_path.display()))?;
         let effective_launch_config_evidence =
@@ -4528,6 +4743,7 @@ impl CrossProcessCluster {
             expected_eligible_backend_count,
             be_config_paths,
             fe_config_path,
+            mv_startup_grace,
             be_processes,
             fe_process,
             be_log_history: vec![String::new(); cluster_size],
@@ -4744,7 +4960,7 @@ impl CrossProcessCluster {
     }
 
     /// Read the original backend registry without synthesizing missing samples.
-    pub fn backend_exchange_flow_metrics(&self, index: usize) -> Result<String> {
+    pub fn backend_metrics_text(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         scrape_prometheus_metrics(self.runtime.be[index].http)
     }
@@ -5204,6 +5420,18 @@ impl CrossProcessCluster {
 }
 
 impl CrossProcessCluster {
+    pub fn fe_server_info_log(&self) -> Result<String> {
+        self.mv_startup_grace.current_log()
+    }
+
+    pub fn defer_fe_mv_startup_isolation(&mut self) {
+        self.mv_startup_grace.automatic = false;
+    }
+
+    pub fn declare_fe_mv_startup_effects_settled(&self, deadline: Instant) -> Result<()> {
+        self.mv_startup_grace.finish(&self.fe_process, deadline)
+    }
+
     fn restart_frontend_until(
         &mut self,
         deadline: Instant,
@@ -5239,6 +5467,8 @@ impl CrossProcessCluster {
             after_exit()
                 .context("after the original frontend exit, before its successor launch")?;
         }
+        self.mv_startup_grace
+            .prepare_successor(&self.fe_config_path)?;
         let marker = &format!(
             "{} role=fe trino_port=",
             novarocks_failpoint::observation_marker::READY
@@ -5308,6 +5538,9 @@ impl CrossProcessCluster {
             &mut self.be_processes,
         )
         .context("cross-process backend topology barrier after FE restart")?;
+        if self.mv_startup_grace.automatic {
+            self.declare_fe_mv_startup_effects_settled(deadline)?;
+        }
         Ok(())
     }
 }
@@ -7028,6 +7261,67 @@ fn table_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mv_startup_isolation_names_the_new_launch_and_all_observed_old_launches() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut environment = std::collections::BTreeMap::new();
+        let mut grace =
+            super::MvStartupGrace::new("test-deployment".into(), runtime.path(), &mut environment)
+                .unwrap();
+        let previous_nonce = grace.launch_nonce.clone();
+        let config_path = runtime.path().join("fe.toml");
+        std::fs::write(&config_path, grace.configure_launch("", false).unwrap()).unwrap();
+        let marker = novarocks_failpoint::observation_marker::MV_NAME_STARTUP_GRACE;
+        let old_log = format!(
+            "{marker} state=\"ended\" incarnation=\"previous\" prior_incarnations=\"\" discovery_complete=true end_reason=\"no_restart_evidence\"\n"
+        );
+        std::fs::create_dir_all(grace.frontend_info_log.parent().unwrap()).unwrap();
+        std::fs::write(&grace.frontend_info_log, old_log).unwrap();
+        std::fs::write(&grace.evidence_file, "stale declaration").unwrap();
+
+        grace.prepare_successor(&config_path).unwrap();
+        assert_ne!(previous_nonce, grace.launch_nonce);
+        assert!(!grace.evidence_file.exists());
+        let config: toml::Value = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config["mv_management"]["startup_isolation"]["launch_nonce"].as_str(),
+            Some(grace.launch_nonce.as_str())
+        );
+        assert_eq!(
+            config["standalone_server"]["iceberg_maintenance_tick_interval_ms"].as_integer(),
+            Some(1000)
+        );
+        let active = format!(
+            "{marker} state=\"active\" incarnation=\"successor\" prior_incarnations=\"discovered,previous\" discovery_complete=false end_reason=\"\""
+        );
+        grace
+            .publish(&super::MvStartupObservation::parse(&active).unwrap())
+            .unwrap();
+        let evidence: toml::Value = std::fs::read_to_string(&grace.evidence_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(evidence["for_incarnation"].as_str(), Some("successor"));
+        assert_eq!(
+            evidence["nonce"].as_str(),
+            Some(grace.launch_nonce.as_str())
+        );
+        assert_eq!(
+            evidence["all_other_incarnations_settled"].as_bool(),
+            Some(true)
+        );
+        let prior = evidence["isolated_incarnations"].as_array().unwrap();
+        assert_eq!(
+            prior
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["discovered", "previous"]
+        );
+    }
 
     #[test]
     fn actual_role_build_output_survives_successful_runtime_removal() {

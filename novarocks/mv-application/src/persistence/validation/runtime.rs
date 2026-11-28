@@ -47,7 +47,7 @@ pub struct RuntimeInterpretationFacts {
     pub definition_revision: DocumentRevision,
     pub output_bindings: Vec<RuntimeOutputBindingFacts>,
     pub aggregate_layout: RuntimeAggregateLayoutFacts,
-    pub apply_key: RuntimeApplyKeyFacts,
+    pub apply_key: Option<RuntimeApplyKeyFacts>,
     /// The complete ordered branch identity set derived while compiling D.
     /// It is checked against `branches` so an adapter cannot silently omit a
     /// UNION arm while constructing L.
@@ -169,10 +169,9 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                     encoding: slot.encoding,
                 })
                 .collect(),
-            apply_key: ApplyKey {
-                kind: value.apply_key.kind,
-                components: value
-                    .apply_key
+            apply_key: value.apply_key.map(|apply_key| ApplyKey {
+                kind: apply_key.kind,
+                components: apply_key
                     .ordered_components
                     .into_iter()
                     .map(|component| ApplyKeyComponent {
@@ -180,7 +179,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                         target_field_id: component.target_field_id,
                     })
                     .collect(),
-            },
+            }),
             aggregates: value
                 .aggregate_layout
                 .aggregates
@@ -280,18 +279,20 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     })
                     .collect(),
             },
-            apply_key: RuntimeApplyKeyFacts {
-                kind: value.apply_key.kind,
-                ordered_components: value
-                    .apply_key
-                    .components
-                    .iter()
-                    .map(|component| RuntimeApplyKeyComponentFacts {
-                        logical_id: component.logical_id.clone(),
-                        target_field_id: component.target_field_id.clone(),
-                    })
-                    .collect(),
-            },
+            apply_key: value
+                .apply_key
+                .as_ref()
+                .map(|apply_key| RuntimeApplyKeyFacts {
+                    kind: apply_key.kind,
+                    ordered_components: apply_key
+                        .components
+                        .iter()
+                        .map(|component| RuntimeApplyKeyComponentFacts {
+                            logical_id: component.logical_id.clone(),
+                            target_field_id: component.target_field_id.clone(),
+                        })
+                        .collect(),
+                }),
             definition_branch_identities: value
                 .branches
                 .iter()

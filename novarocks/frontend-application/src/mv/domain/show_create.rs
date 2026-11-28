@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_mv_application::persistence::documents::MvDocumentError;
-use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
 use novarocks_parser::{Span, build, printer::print_create_materialized_view_definition};
 use novarocks_query_application::{
     api::{CatalogTableReadBinding, QueryResult, build_string_query_result},
@@ -83,7 +83,7 @@ pub(crate) async fn execute(
         )));
     }
     let documents =
-        decode_current_keyed_documents(observation.view, storage.catalog_handle().clone())
+        resolve_current_keyed_documents(observation.view, storage.catalog_handle().clone())
             .map_err(document_application_error)?;
     let name = build::object_name(
         [

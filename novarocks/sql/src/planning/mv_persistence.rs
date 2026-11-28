@@ -51,6 +51,7 @@ pub struct SqlMvCreatePersistenceFacts {
     outputs: Vec<SqlMvPersistenceOutputFacts>,
     aggregates: Vec<SqlMvPersistenceAggregateFacts>,
     union_branches: Vec<SqlMvPersistenceUnionBranchFacts>,
+    partition_replacement_sources: Option<Vec<(SqlMvRelationOccurrenceId, Vec<bool>)>>,
     view_dependencies: Vec<SqlMvViewDependency>,
 }
 
@@ -72,6 +73,14 @@ impl SqlMvCreatePersistenceFacts {
     }
 
     /// Ordered UNION ALL leaves. A non-UNION query has no branch records.
+    /// The original source occurrence and direct, same-type output columns
+    /// for each row-preserving single-table UNION ALL leaf.
+    pub fn partition_replacement_sources(
+        &self,
+    ) -> Option<&[(SqlMvRelationOccurrenceId, Vec<bool>)]> {
+        self.partition_replacement_sources.as_deref()
+    }
+
     pub fn union_branches(&self) -> &[SqlMvPersistenceUnionBranchFacts] {
         &self.union_branches
     }
@@ -251,6 +260,10 @@ impl SqlMvPersistenceOutputFacts {
 
     pub fn value_type(&self) -> &ValueTypeRef {
         self.value_type.value_type()
+    }
+
+    pub fn function_value_type(&self) -> &FunctionValueType {
+        &self.value_type
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {
@@ -501,13 +514,100 @@ pub(super) fn project_create_persistence_facts(
         Vec::new()
     };
 
+    let partition_replacement_sources = replacement_sources(query, &output_leaves, &builder);
     Ok(SqlMvCreatePersistenceFacts {
         relation_occurrences: builder.occurrences,
         outputs,
         aggregates: builder.aggregates,
         union_branches,
+        partition_replacement_sources,
         view_dependencies: view_dependencies.to_vec(),
     })
+}
+
+fn replacement_sources(
+    query: &ResolvedQuery,
+    leaves: &[&ResolvedQuery],
+    builder: &ProjectionBuilder,
+) -> Option<Vec<(SqlMvRelationOccurrenceId, Vec<bool>)>> {
+    fn row_local(expression: &TypedExpr) -> bool {
+        walk_expression(expression, &mut |expression| match expression.kind {
+            ExprKind::WindowCall { .. } | ExprKind::SubqueryPlaceholder { .. } => Err(()),
+            _ => Ok(true),
+        })
+        .is_ok()
+    }
+
+    fn row_preserving(query: &ResolvedQuery) -> bool {
+        if query.limit.is_some()
+            || query.offset.is_some()
+            || !query.local_cte_ids.is_empty()
+            || query.order_by.iter().any(|item| !row_local(&item.expr))
+        {
+            return false;
+        }
+        match &query.body {
+            QueryBody::SetOperation(set) => row_preserving(&set.left) && row_preserving(&set.right),
+            QueryBody::Select(select) => {
+                matches!(select.from, Some(Relation::Scan(_)))
+                    && !select.has_aggregation
+                    && !select.distinct
+                    && select.group_by.is_empty()
+                    && select.having.is_none()
+                    && select.apply_specs.is_empty()
+                    && select.predicate_apply_specs.is_empty()
+                    && select
+                        .projection
+                        .iter()
+                        .map(|projection| &projection.expr)
+                        .chain(select.filter.iter())
+                        .all(row_local)
+            }
+            QueryBody::Values(_) => false,
+        }
+    }
+
+    if !row_preserving(query) {
+        return None;
+    }
+    leaves
+        .iter()
+        .map(|leaf| {
+            let QueryBody::Select(select) = &leaf.body else {
+                return None;
+            };
+            let Some(Relation::Scan(scan)) = &select.from else {
+                return None;
+            };
+            let occurrence = *builder.scan_occurrences.get(&(scan as *const _))?;
+            let outputs = leaf
+                .output_columns
+                .iter()
+                .filter(|column| !column.is_internal)
+                .zip(
+                    query
+                        .output_columns
+                        .iter()
+                        .filter(|column| !column.is_internal),
+                )
+                .map(|(column, output)| {
+                    let Some(lineage) = builder.source_fields_by_column_id.get(&column.column_id)
+                    else {
+                        return false;
+                    };
+                    // UNION can make the root nullable while carrying the
+                    // same original value from a non-nullable branch.
+                    column.value_type.value_type().kind() == output.value_type.value_type().kind()
+                        && lineage.passthrough
+                        && lineage.fields.len() == 1
+                        && lineage.fields.iter().all(|field| {
+                            field.occurrence_id == occurrence && field.path.fields.len() == 1
+                        })
+                })
+                .collect();
+            Some((occurrence, outputs))
+        })
+        .collect()
 }
 
 /// Returns whether the root is a UNION ALL while always collecting its leaves.
@@ -1463,6 +1563,27 @@ mod tests {
         input(sql)
             .create_persistence_facts()
             .expect("persistence facts")
+    }
+
+    #[test]
+    fn partition_replacement_keeps_direct_lineage_per_union_occurrence() {
+        let direct = facts("SELECT id AS k FROM t UNION ALL SELECT id AS k FROM t");
+        let sources = direct.partition_replacement_sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0].0, sources[1].0);
+        assert_eq!(sources[0].1, [true]);
+        assert_eq!(sources[1].1, [true]);
+        assert!(direct.outputs()[0].direct_source().is_none());
+
+        let computed = facts("SELECT id AS k FROM t UNION ALL SELECT id + 1 AS k FROM t");
+        let sources = computed.partition_replacement_sources().unwrap();
+        assert_eq!(sources[0].1, [true]);
+        assert_eq!(sources[1].1, [false]);
+
+        let nullable = facts("SELECT id AS k FROM t UNION ALL SELECT amount AS k FROM t");
+        let sources = nullable.partition_replacement_sources().unwrap();
+        assert_eq!(sources[0].1, [true]);
+        assert_eq!(sources[1].1, [true]);
     }
 
     fn refs(output: &SqlMvPersistenceOutputFacts) -> Vec<(u32, u32, &str)> {

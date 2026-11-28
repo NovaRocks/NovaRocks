@@ -102,6 +102,48 @@ pub fn grouped_state_topn_key_supported(
         && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
 }
 
+/// Data layouts accepted for exact content identity, including nested values.
+/// Exchange placement can use a smaller subset of those columns.
+pub fn supports_result_content_key(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::{DataType::*, TimeUnit};
+    match data_type {
+        Null
+        | Boolean
+        | Int8
+        | Int16
+        | Int32
+        | Int64
+        | UInt8
+        | UInt16
+        | UInt32
+        | UInt64
+        | Float32
+        | Float64
+        | Date32
+        | Date64
+        | Timestamp(_, _)
+        | Duration(_)
+        | Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        | Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
+        | Decimal128(_, _)
+        | Decimal256(_, _)
+        | Utf8
+        | LargeUtf8
+        | Utf8View
+        | Binary
+        | LargeBinary
+        | BinaryView => true,
+        FixedSizeBinary(width) => *width > 0,
+        List(item) => supports_result_content_key(item.data_type()),
+        Struct(fields) => fields
+            .iter()
+            .all(|field| supports_result_content_key(field.data_type())),
+        Map(entries, _) => matches!(entries.data_type(), Struct(fields)
+            if fields.len() == 2 && fields.iter().all(|field| supports_result_content_key(field.data_type()))),
+        _ => false,
+    }
+}
+
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
@@ -125,9 +167,11 @@ pub fn grouped_state_topn_key_supported(
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
 /// Revision 47 retires package and call-request constant quota fields.
-/// Revision 48 places one RecordBatch message in every IPC constant pool.
-/// Revision 49 freezes ordered aggregation as a Single call without merge state.
-pub const PLAN_CONTRACT_REVISION: u32 = 49;
+/// Revision 48 installs content application and its demand filter placement
+/// on main. The earlier F9 branch used revisions 48 and 49 for its own formats.
+/// Revision 50 combines content application with single-message RecordBatch
+/// constants and the explicit ordered aggregate Single contract.
+pub const PLAN_CONTRACT_REVISION: u32 = 50;
 
 #[cfg(test)]
 mod tests;

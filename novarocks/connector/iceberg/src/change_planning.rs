@@ -567,6 +567,18 @@ fn change_partition_transform_name(transform: &crate::iceberg::spec::Transform) 
     }
 }
 
+pub(crate) fn exact_partition_value(
+    literal: Option<&crate::iceberg::spec::Literal>,
+) -> Option<ConnectorChangePartitionValue> {
+    match change_partition_value(literal) {
+        ChangePartitionValue::Null => Some(ConnectorChangePartitionValue::Null),
+        ChangePartitionValue::Primitive(value) => {
+            Some(ConnectorChangePartitionValue::String(Arc::from(value)))
+        }
+        ChangePartitionValue::Unsupported(_) => None,
+    }
+}
+
 fn change_partition_value(literal: Option<&crate::iceberg::spec::Literal>) -> ChangePartitionValue {
     let Some(crate::iceberg::spec::Literal::Primitive(value)) = literal else {
         return match literal {

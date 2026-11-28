@@ -2359,12 +2359,45 @@ impl ProductionManifestAttemptProjection {
             &mut self.pending_initializer,
         )
         .map_err(projection_failure)?;
+        let coverage = self
+            .credential_anchor
+            .as_ref()
+            .and_then(|original| original.split_coverage())
+            .cloned();
         let initializing = self.pending_initializer.as_mut().unwrap();
+        if coverage.is_some() {
+            initializing.require_enumeration_coverage();
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(fault) = self.credential_anchor.as_ref().and_then(|original| {
+            original
+                .content_target_early_close
+                .lock()
+                .expect("original content target grant")
+                .take()
+        }) {
+            initializing
+                .bind_content_target_early_close(fault)
+                .map_err(projection_message)?;
+        }
         initializing
             .initialize()
             .await
             .map_err(projection_failure)?;
         initializing.take_ready_in(&mut self.pending_ready);
+        if let Some(coverage) = coverage {
+            let receipts = self
+                .pending_ready
+                .as_ref()
+                .unwrap()
+                .enumeration_receipts()
+                .ok_or_else(|| {
+                    projection_message("Native MV lost its frozen split enumeration obligation")
+                })?;
+            coverage
+                .install(execution, receipts)
+                .map_err(projection_message)?;
+        }
         let (ready_execution, artifacts, schedule, ready_feedback, credential_leases) = self
             .pending_ready
             .as_mut()

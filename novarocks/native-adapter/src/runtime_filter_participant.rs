@@ -121,12 +121,14 @@ impl NativeRuntimeFilterParticipantFactory {
                 "invalid runtime filter transport policy: {error:?}"
             ))
         })?;
+        let observation = sender_work.observation().cloned();
         RuntimeFilterParticipant::from_installed(
             execution_id,
             install,
             state,
             transport_policy,
             GrpcRuntimeFilterEnvelopeSink::new(self.runtime.clone(), sender_work),
+            observation,
         )
     }
 }
@@ -137,6 +139,7 @@ pub struct RuntimeFilterParticipant {
     state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
     dispatch_closed: Arc<RwLock<bool>>,
+    observation: Option<novarocks_memory::LaneShards>,
     close_hook: RuntimeFilterParticipantCloseHook,
     #[cfg(novarocks_dev_controls)]
     accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous,
@@ -250,6 +253,7 @@ impl RuntimeFilterParticipant {
         state: Arc<WorkerRuntimeFilterParticipant>,
         transport_policy: BackendRuntimeFilterRetryPolicy,
         transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
+        observation: Option<novarocks_memory::LaneShards>,
     ) -> Result<Arc<Self>, RuntimeFilterContractError> {
         let outbound = Arc::new(BackendParticipantOutbound::new(
             install.clone(),
@@ -264,6 +268,7 @@ impl RuntimeFilterParticipant {
             state,
             outbound,
             dispatch_closed: Arc::new(RwLock::new(false)),
+            observation,
             close_hook: Arc::new(|_, _| Ok(())),
             #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
@@ -361,6 +366,16 @@ impl RuntimeFilterParticipant {
         {
             return rejected(QUERY_UNAVAILABLE_REJECTION);
         }
+        match &self.observation {
+            Some(owner) => owner.run(|| self.dispatch_admitted_envelope(envelope)),
+            None => self.dispatch_admitted_envelope(envelope),
+        }
+    }
+
+    fn dispatch_admitted_envelope(
+        &self,
+        envelope: BackendNativeRuntimeFilterEnvelope,
+    ) -> BackendIngressResult {
         let kind = envelope.kind();
         let channel_id = envelope.channel_id();
         let route = *envelope.route_identity();
@@ -540,6 +555,7 @@ impl RuntimeFilterParticipant {
             state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
             dispatch_closed: Arc::clone(&self.dispatch_closed),
+            observation: self.observation.clone(),
             close_hook,
             #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
@@ -1078,6 +1094,7 @@ mod tests {
                 state,
                 transport_policy,
                 transport_sink,
+                None,
             )
         }
     }

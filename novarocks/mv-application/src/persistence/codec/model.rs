@@ -125,12 +125,22 @@ pub struct InterpretationDocument {
     pub outputs: Vec<OutputBinding>,
     /// Set semantics, canonically sorted by slot identity.
     pub state_slots: Vec<StateSlot>,
-    pub apply_key: ApplyKey,
+    pub apply_key: Option<ApplyKey>,
     /// Set semantics, canonically sorted by aggregate identity.
     pub aggregates: Vec<AggregateInterpretation>,
     /// Ordered UNION branches. Their position is semantic.
     pub branches: Vec<BranchInterpretation>,
     pub target: TargetBinding,
+}
+
+impl InterpretationDocument {
+    pub fn is_aggregate(&self) -> bool {
+        !self.aggregates.is_empty()
+    }
+
+    pub fn apply_key_kind(&self) -> Option<ApplyKeyKind> {
+        self.apply_key.as_ref().map(|key| key.kind)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

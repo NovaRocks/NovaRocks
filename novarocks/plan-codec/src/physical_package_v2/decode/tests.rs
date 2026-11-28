@@ -518,7 +518,7 @@ fn change_stream_package_refuses_role_and_cut_downgrades() {
         .find(|package| package.fragment().id().get() == 3)
         .unwrap();
     type PackageMutation = fn(&mut wire::FragmentPackage);
-    let cases: [(&str, PackageMutation); 11] = [
+    let cases: [(&str, PackageMutation); 13] = [
         ("summary uses relational root", |dto| {
             dto.cuts
                 .as_mut()
@@ -602,6 +602,12 @@ fn change_stream_package_refuses_role_and_cut_downgrades() {
         }),
         ("missing mandatory stage policy", |dto| {
             dto.fragment.as_mut().unwrap().stage_placement = None;
+        }),
+        ("missing mandatory input completion policy", |dto| {
+            dto.fragment.as_mut().unwrap().input_completion = 0;
+        }),
+        ("unknown input completion policy", |dto| {
+            dto.fragment.as_mut().unwrap().input_completion = i32::MAX;
         }),
         ("zero explicit stage cap", |dto| {
             dto.fragment
@@ -716,16 +722,17 @@ fn change_stream_receiver_preserves_each_interrupted_control_prefix() {
 #[test]
 fn prior_plan_contract_revision_is_refused_before_constant_frames() {
     let package = cv_package();
-    let prior_revision = p::PLAN_CONTRACT_REVISION - 1;
-    let bytes = mutated(&package, |dto| {
-        dto.required.as_mut().unwrap().plan_contract_revision = prior_revision;
-        dto.constants[0].arrow_ipc = vec![0xff];
-    });
-    assert!(matches!(
-        refused(&bytes),
-        PackageDecodeError::Metadata(PackageMetadataCodecError::PlanContractRevision { required })
-            if required == prior_revision
-    ));
+    for prior_revision in [48, 49] {
+        let bytes = mutated(&package, |dto| {
+            dto.required.as_mut().unwrap().plan_contract_revision = prior_revision;
+            dto.constants[0].arrow_ipc = vec![0xff];
+        });
+        assert!(matches!(
+            refused(&bytes),
+            PackageDecodeError::Metadata(PackageMetadataCodecError::PlanContractRevision { required })
+                if required == prior_revision
+        ));
+    }
 }
 
 #[test]

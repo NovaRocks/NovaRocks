@@ -169,6 +169,7 @@ pub(crate) struct AttemptRuntimeFilterDeploymentBindingFacts {
     pub coverage_witness_id: Option<u32>,
     pub role: AttemptRuntimeFilterBindingRoleFacts,
     pub feedback_wait: Option<FrontendRuntimeFilterFeedbackWaitEligibility>,
+    pub content_demand: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendRuntimeFilterFeedbackWaitEligibility {
@@ -215,7 +216,8 @@ impl AttemptRuntimeFilterFacts {
                     let consumer = &filter.consumers[index];
                     let scan_type = match consumer.target {
                         novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField { .. }
-                        | novarocks_physical_plan::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+                        | novarocks_physical_plan::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                        | novarocks_physical_plan::RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => {
                             let value = consumer.endpoint.values.first().ok_or_else(|| {
                                 format!("runtime filter {} scan consumer has no value", filter.id.get())
                             })?;
@@ -240,6 +242,12 @@ impl AttemptRuntimeFilterFacts {
                 coverage_witness_id: witness,
                 role,
                 feedback_wait: None,
+                content_demand: match binding.role {
+                    novarocks_physical_plan::RuntimeFilterBindingRole::Consumer(index) =>
+                        matches!(filter.consumers[index].target,
+                            novarocks_physical_plan::RuntimeFilterConsumerTarget::ContentDemandScanField { .. }),
+                    novarocks_physical_plan::RuntimeFilterBindingRole::Producer(_) => false,
+                },
             });
         }
         seal_split_feedback_waits(plan, &mut deployment_bindings, control)?;
@@ -429,7 +437,8 @@ fn completed_reduction(
                 .iter()
                 .find_map(|producer| match producer.target {
                     PhysicalProducerTarget::AggregateTopNKey { limit, .. } => Some(limit),
-                    PhysicalProducerTarget::JoinBuildKey { .. } => None,
+                    PhysicalProducerTarget::JoinBuildKey { .. }
+                    | PhysicalProducerTarget::ContentDemand { .. } => None,
                 })
                 .ok_or_else(|| {
                     format!(
@@ -527,6 +536,7 @@ fn validate_producer_target(
     producer: &RuntimeFilterProducer,
 ) -> Result<(), String> {
     match producer.target {
+        PhysicalProducerTarget::ContentDemand { .. } => {}
         PhysicalProducerTarget::JoinBuildKey { equality } => {
             filter
                 .equality_witnesses
@@ -568,7 +578,8 @@ fn producer_target_facts(
                     .key_ordinal,
             })
         }
-        PhysicalProducerTarget::AggregateTopNKey { .. } => None,
+        PhysicalProducerTarget::AggregateTopNKey { .. }
+        | PhysicalProducerTarget::ContentDemand { .. } => None,
     }
 }
 
@@ -589,6 +600,7 @@ fn validate_consumer_target(
             }
         },
         PhysicalConsumerTarget::ScanField { .. }
+        | PhysicalConsumerTarget::ContentDemandScanField { .. }
         | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
             scan_type.ok_or_else(|| {
                 "a completed scan runtime filter has no pinned output type".to_string()
@@ -617,6 +629,7 @@ fn consumer_target_facts(
             }
         },
         PhysicalConsumerTarget::ScanField { .. }
+        | PhysicalConsumerTarget::ContentDemandScanField { .. }
         | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
             AttemptRuntimeFilterConsumerTarget::SourceBoundary
         }

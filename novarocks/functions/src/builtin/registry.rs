@@ -422,22 +422,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // Stable relational identity for IMV join coalesce rows. Object-ID salts
-    // are opaque connector bytes, not UTF-8 UUIDs.
-    add(
-        m,
-        "join_row_key",
-        Signature::new(
-            vec![
-                TypeSpec::Binary,
-                TypeSpec::Int64,
-                TypeSpec::Binary,
-                TypeSpec::Int64,
-            ],
-            TypeSpec::Utf8,
-        ),
-    );
-
     // group_concat / string_agg accept any number of args (variadic) and
     // return Utf8. They're aggregates but show up in expression context
     // through the analyzer's projection.

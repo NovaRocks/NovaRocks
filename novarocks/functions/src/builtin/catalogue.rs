@@ -1134,8 +1134,6 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "bar",
     "width_bucket",
     "strpos",
-    // The join key hashes every non-null pair and propagates null inputs.
-    "join_row_key",
     // Case folding is defined for every string.
     "lcase",
     "lower",

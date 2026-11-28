@@ -89,13 +89,21 @@ pub(super) enum StepPreparedKind {
     MetadataOnly,
     Data,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Phase {
     Prepare,
     Activate,
     Precommit,
+    Retire(novarocks_result_contract::DeleteVerificationCounts),
     Project,
-    Close,
+    Close(PendingRelease),
+}
+
+#[derive(Clone)]
+pub(super) enum PendingRelease {
+    None,
+    NotStarted,
+    Refused(Box<novarocks_spi::connector::LakePublicationTerminal>),
 }
 
 /// The Action owns this header before creating its first borrowed phase.
@@ -111,6 +119,8 @@ pub(super) struct StepSource {
     begin: Arc<WriteBeginReceiving>,
     precommit_registration: CurrentProjectionRegistration,
     project_registration: CurrentProjectionRegistration,
+    retirement: novarocks_spi::connector::ConnectorCatalogMutationReceiving,
+    release_registration: CurrentProjectionRegistration,
     closed: AtomicBool,
 }
 struct Body {
@@ -155,6 +165,7 @@ struct Body {
     commit_result: Option<Result<(), MvPhaseFailure>>,
     project: Option<ProjectInput>,
     terminal_recorded: Option<(EffectDisposition, Result<(), QueryServiceError>)>,
+    retirement_settled: bool,
 }
 struct ProjectInput {
     context: ConnectorRequestContext,
@@ -182,6 +193,14 @@ impl std::fmt::Display for PhaseExitUnproven {
 impl std::error::Error for PhaseExitUnproven {}
 
 impl StepSource {
+    pub(super) fn pending_fence(
+        &self,
+    ) -> Option<Arc<crate::mv::domain::refresh::pending_fence::PendingFence>> {
+        self.io
+            .pending_fence()
+            .map(|(fence, _, _)| Arc::clone(fence))
+    }
+
     pub(super) fn new(
         input: Arc<CommandInput>,
         request: StepRequest,
@@ -197,6 +216,7 @@ impl StepSource {
             target,
             statement,
             repartition,
+            replay,
         } = request
         else {
             return Err(service(
@@ -252,6 +272,8 @@ impl StepSource {
             _ => None,
         };
         let preparation_input = Arc::new(MvRefreshPreparationInput {
+            query_memory_budget_bytes: input.services.query_memory_budget_bytes,
+            optimizer_settings: execution.optimizer_settings().clone(),
             source: input.ports.clone(),
             session_properties,
             current_catalog: input.current_catalog.clone(),
@@ -259,6 +281,7 @@ impl StepSource {
             statement,
             connector_context: context.clone(),
             repartition_fields: repartition,
+            replay,
             request,
         });
         let session_properties = Arc::clone(execution.session_property_inputs());
@@ -304,6 +327,7 @@ impl StepSource {
                 commit_result: None,
                 project: None,
                 terminal_recorded: None,
+                retirement_settled: false,
             }))),
             response: Mutex::new(None),
             active: AtomicBool::new(false),
@@ -320,6 +344,8 @@ impl StepSource {
             ),
             precommit_registration: CurrentProjectionRegistration::new(),
             project_registration: CurrentProjectionRegistration::new(),
+            retirement: Default::default(),
+            release_registration: CurrentProjectionRegistration::new(),
             closed: AtomicBool::new(false),
         }))
     }
@@ -373,8 +399,14 @@ impl StepSource {
     pub(super) fn precommit(self: &Arc<Self>) -> PhaseFuture {
         self.phase(Phase::Precommit)
     }
-    pub(super) fn close(self: &Arc<Self>) -> PhaseFuture {
-        self.phase(Phase::Close)
+    pub(super) fn retire(
+        self: &Arc<Self>,
+        counts: novarocks_result_contract::DeleteVerificationCounts,
+    ) -> PhaseFuture {
+        self.phase(Phase::Retire(counts))
+    }
+    pub(super) fn close(self: &Arc<Self>, release: PendingRelease) -> PhaseFuture {
+        self.phase(Phase::Close(release))
     }
     pub(super) fn project(
         self: &Arc<Self>,
@@ -416,6 +448,18 @@ impl StepSource {
     pub(super) fn prepared_kind(&self) -> Result<Option<StepPreparedKind>, QueryServiceError> {
         Ok(self.loan()?.body.as_ref().unwrap().kind)
     }
+    pub(super) fn requires_delete_verification(&self) -> Result<bool, QueryServiceError> {
+        Ok(self
+            .loan()?
+            .body
+            .as_ref()
+            .unwrap()
+            .admitted
+            .as_ref()
+            .and_then(|admitted| admitted.content_pending())
+            .is_some())
+    }
+
     pub(super) fn release_business_activity(&self) -> Result<(), QueryServiceError> {
         if self.active.load(Ordering::Acquire) {
             return Err(service("MV business phase Future has not exited"));
@@ -576,6 +620,9 @@ impl StepSource {
     ) -> Result<(), QueryServiceError> {
         let mut loan = self.loan()?;
         let body = loan.body.as_mut().unwrap();
+        if body.retirement_settled {
+            return Ok(());
+        }
         if let Some((original, result)) = &body.terminal_recorded {
             return if *original == disposition {
                 result.clone()
@@ -615,7 +662,17 @@ impl StepSource {
         result
     }
     pub(super) fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
-        let mut result = None;
+        let retirement = self.retirement.observation();
+        let mut result = match retirement.validated_outcome() {
+            Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            })) => Some(StatementExternalEffectDisposition::KnownCommitted),
+            Some(Ok(ExternalMutationOutcome::CommitUnknown { .. })) => {
+                Some(StatementExternalEffectDisposition::CommitUnknown)
+            }
+            _ => None,
+        };
         for registration in [
             self.io.registration(),
             &self.precommit_registration,
@@ -693,6 +750,10 @@ impl StepSource {
             .project_registration
             .poll_registration_closed(cx)
             .is_pending();
+        pending |= self
+            .release_registration
+            .poll_registration_closed(cx)
+            .is_pending();
         match self.io.poll_closed(cx) {
             Poll::Pending => pending = true,
             Poll::Ready(Err(health)) => return Poll::Ready(Err(health)),
@@ -711,8 +772,9 @@ impl StepSource {
             Phase::Prepare => body.prepare(self).await,
             Phase::Activate => body.activate(self).await,
             Phase::Precommit => body.precommit(self).await,
+            Phase::Retire(counts) => body.retire(self, counts).await,
             Phase::Project => body.project(self).await,
-            Phase::Close => body.close(self).await,
+            Phase::Close(release) => body.close(self, release).await,
         }
     }
 }
@@ -886,6 +948,9 @@ impl Body {
         self.exact_write = Some(exact);
         self.target = prepared.target_binding.take();
         self._rewrite = prepared.rewrite.take();
+        if let Some(decision) = prepared.strategy.as_ref() {
+            tracing::debug!(strategy = ?decision.strategy, content_rejection = ?decision.content_rejection, "Selected MV refresh strategy");
+        }
         let work = std::mem::replace(&mut prepared.prepared.work, PreparedMvRefreshWork::NoOp);
         match work {
             PreparedMvRefreshWork::MetadataOnly { write, admitted } => {
@@ -981,6 +1046,27 @@ impl Body {
                     .map_err(connector_error)?;
                 self.session = Some(session);
                 let credentials = self.initial.as_ref().unwrap().credentials();
+                #[cfg(novarocks_dev_controls)]
+                if self
+                    .admitted
+                    .as_ref()
+                    .is_some_and(|admitted| admitted.content_pending().is_some())
+                    && let Some(controls) = &self.input.services.controls
+                {
+                    let target = self
+                        .product_target
+                        .as_ref()
+                        .expect("admitted MV refresh target");
+                    *credentials
+                        .content_target_early_close
+                        .lock()
+                        .expect("original content target grant") = controls
+                        .claim_content_target_enumeration_close(
+                            target.catalog().expect("admitted Iceberg catalog"),
+                            target.namespace(),
+                            target.name(),
+                        );
+                }
                 credentials
                     .bind_write_production_session(self.session.as_ref().unwrap())
                     .map_err(service)?;
@@ -1016,6 +1102,17 @@ impl Body {
                     .unwrap()
                     .take_assembly_in(&mut self.assembly)
                     .map_err(service)?;
+                if let Some(fence) = self
+                    .admitted
+                    .as_ref()
+                    .and_then(|admitted| admitted.content_pending())
+                {
+                    self.assembly
+                        .as_mut()
+                        .unwrap()
+                        .apply_content_memory_budget(fence.requirement().budget())
+                        .map_err(service)?;
+                }
             }
             Some(StepPreparedKind::MetadataOnly) => {
                 self.session = Some(
@@ -1039,6 +1136,190 @@ impl Body {
         }
         Ok(())
     }
+    async fn retire(
+        &mut self,
+        source: &StepSource,
+        counts: novarocks_result_contract::DeleteVerificationCounts,
+    ) -> Result<(), MvPhaseFailure> {
+        use novarocks_mv_application::persistence::{
+            codec::{Marker, RetirementRecord},
+            keyed_documents::observe_current_keyed_documents_with_management_async,
+        };
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationOperation, ConnectorMutationOperationId,
+            ExternalMutationEffect, KeyedMutation, KeyedMutationIntent, KeyedRetirement,
+        };
+
+        let publication = self
+            .intent
+            .as_ref()
+            .ok_or_else(|| phase_service("MV retirement lost its original publication"))?;
+        let planning = self.planning.as_ref().unwrap();
+        let admitted = self
+            .admitted
+            .as_ref()
+            .ok_or_else(|| phase_service("MV retirement lost its original management admission"))?;
+        let fence = admitted
+            .content_pending()
+            .ok_or_else(|| phase_service("MV retirement has no exact Pending fence"))?;
+        let documents = planning
+            .derive_document_storage_lease()
+            .map_err(connector_error)?;
+        let request = crate::mv::domain::staged_create::keyed_request(
+            &documents,
+            publication.admission().target().clone(),
+            publication.target_object_id().clone(),
+            self.context.clone(),
+        );
+        let entrance = self.input.ports.management_entrance().map_err(service)?;
+        let (observed, _) =
+            observe_current_keyed_documents_with_management_async(&documents, request, entrance)
+                .await
+                .map_err(|error| phase_service(error.to_string()))?;
+        fence.verify(&observed).map_err(service)?;
+        let operation_id =
+            ConnectorMutationOperationId::from_bytes(self.attempt.publication_id.to_bytes());
+        let record = RetirementRecord {
+            retired_publication: fence.publication().clone(),
+            operation: operation_id,
+            requested: i64::try_from(counts.requested())
+                .map_err(|error| service(error.to_string()))?,
+            matched: i64::try_from(counts.matched()).map_err(|error| service(error.to_string()))?,
+            insufficient_keys: i64::try_from(counts.insufficient_keys())
+                .map_err(|error| service(error.to_string()))?,
+            content_fingerprint: Some(counts.fingerprint().to_le_bytes()),
+        };
+        let retired = novarocks_spi::connector::LakePublicationId::try_from_bytes(
+            record
+                .retired_publication
+                .as_bytes()
+                .try_into()
+                .map_err(|_| service("MV retirement invalid publication identity"))?,
+        )
+        .map_err(connector_error)?;
+        let invalid_marker = Marker::Invalid {
+            publication: record.retired_publication.clone(),
+            retirement_record_revision: record.revision().map_err(|e| service(e.to_string()))?,
+        }
+        .encode()
+        .map_err(|error| service(error.to_string()))?;
+        let intent = KeyedMutationIntent {
+            admission: publication.admission().clone(),
+            expected_metadata: observed.view.metadata_version.clone(),
+            expected_snapshot: observed.view.current_snapshot,
+            mutation: KeyedMutation::Retirement(Box::new(KeyedRetirement {
+                operation_id,
+                retired_publication: retired,
+                expected_root: observed.versions.binding.identity(),
+                baseline_snapshot_id: fence.evidence().baseline_snapshot,
+                retired_record: fence.baseline_record().clone(),
+                record: record
+                    .encode()
+                    .map_err(|error| service(error.to_string()))?,
+                invalid_marker,
+            })),
+        };
+        let mutation = planning.derive_mutation_lease().map_err(connector_error)?;
+        let admitted = Arc::get_mut(self.admitted.as_mut().unwrap())
+            .ok_or_else(|| phase_service("MV retirement admission has an active borrower"))?;
+        admitted
+            .mark_dispatched(self.attempt.publication_id)
+            .map_err(service)?;
+        let call = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease_async_in(
+            &mutation,
+            operation_id,
+            ConnectorCatalogMutationOperation::KeyedDocuments { intent },
+            self.context.clone(),
+            &source.retirement,
+        )
+        .await;
+        let (outcome, dispatched, finalization) = {
+            let observed = source.retirement.observation();
+            (
+                observed
+                    .validated_outcome()
+                    .map(|outcome| outcome.cloned().map_err(Clone::clone)),
+                observed.dispatched(),
+                observed
+                    .finalization_context()
+                    .and_then(|context| context.as_ref().ok())
+                    .cloned(),
+            )
+        };
+        let admitted = Arc::try_unwrap(self.admitted.take().unwrap())
+            .map_err(|_| phase_service("MV retirement cannot settle its original admission"))?;
+        self.retirement_settled = true;
+        match outcome {
+            Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                ..
+            })) => {
+                admitted
+                    .record_terminal(EffectDisposition::KnownCommitted)
+                    .map_err(service)?;
+                call.map_err(connector_error)?;
+                let context =
+                    finalization.unwrap_or_else(|| self.context.clone().after_external_effect());
+                let catalog = documents.catalog_handle().clone();
+                let readiness = self
+                    .input
+                    .ports
+                    .readiness()
+                    .in_requests(self.requests.clone());
+                let factory = CurrentProjectionMetadataCpu::existing_obligation(
+                    self.cpu.clone(),
+                    self.root.clone(),
+                    self.window.clone(),
+                    self.io.clone(),
+                    context.clone(),
+                    self.runtime.clone(),
+                    self.wake.clone(),
+                );
+                install_published_current_projection_async_in(
+                    entrance,
+                    &readiness,
+                    self.input.ports.connector_control(),
+                    catalog,
+                    self.product_target.as_ref().unwrap().clone(),
+                    *self.attempt.publication_id.as_uuid(),
+                    None,
+                    context,
+                    &factory,
+                    &source.project_registration,
+                )
+                .await
+                .map_err(|error| {
+                    domain_error(MvApplicationError::new(
+                        MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                        error.to_string(),
+                    ))
+                })?;
+                Ok(())
+            }
+            Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. })) => {
+                admitted
+                    .record_unknown_publication(self.attempt.publication_id, &evidence, None)
+                    .map_err(service)?;
+                Err(domain_error(MvApplicationError::new(
+                    MvApplicationErrorKind::CommitUnknown,
+                    "MV retirement result is unknown",
+                )))
+            }
+            _ => {
+                let disposition = if dispatched && outcome.is_none() {
+                    EffectDisposition::CommitUnknown
+                } else {
+                    EffectDisposition::KnownUncommitted
+                };
+                admitted.record_terminal(disposition).map_err(service)?;
+                call.map_err(connector_error)?;
+                Err(phase_service(
+                    "MV retirement has no applied original effect",
+                ))
+            }
+        }
+    }
+
     async fn precommit(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         if self.precommit.is_some() {
             return Err(phase_service("MV original precommit was already started"));
@@ -1238,7 +1519,162 @@ impl Body {
             domain_error(domain)
         })
     }
-    async fn close(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
+    async fn release_pending(
+        &self,
+        source: &StepSource,
+        release: PendingRelease,
+    ) -> Result<(), MvPhaseFailure> {
+        use crate::mv::domain::staged_create::{
+            CurrentProjectionServices, install_marked_current_projection_async_in, keyed_request,
+        };
+        use crate::query_execution::mv_assembly::refresh_preparation::binding_marker::write_binding_marker;
+        use novarocks_mv_application::persistence::{
+            keyed_documents::{
+                pending_release_after_recovery_refusal, pending_release_for_publication,
+            },
+            resolution::ApplicablePublication,
+        };
+        use novarocks_spi::connector::ConnectorOperationControl;
+
+        let (fence, planning, expected) = source
+            .io
+            .pending_fence()
+            .expect("release borrows the original Pending fence");
+        if fence.is_recovery() && matches!(release, PendingRelease::NotStarted) {
+            return Ok(());
+        }
+        let documents = planning
+            .derive_document_storage_lease()
+            .map_err(connector_error)?;
+        let readiness = self
+            .input
+            .ports
+            .readiness()
+            .in_requests(self.requests.clone());
+        let entrance = self.input.ports.management_entrance().map_err(service)?;
+        let context = self.context.clone().after_external_effect();
+        self.io
+            .check_existing_metadata_obligation_context(&self.root, &context)
+            .map_err(original_error)?;
+        let marker = fence.release();
+        let (release_key, release_value) = marker
+            .encode()
+            .map_err(|error| service(error.to_string()))?;
+        let mut recovering_release = false;
+        loop {
+            let reader = readiness.candidate_reader();
+            let observed = reader
+                .observe_current_application_async(
+                    &documents,
+                    keyed_request(
+                        &documents,
+                        expected.source_revision().target.clone(),
+                        expected.source_revision().target_object_id.clone(),
+                        context.clone(),
+                    ),
+                )
+                .await
+                .map_err(|error| phase_service(error.to_string()))?;
+            if observed.view.markers.get(&release_key) == Some(&release_value) {
+                return Ok(());
+            }
+            if !fence.is_present(&observed.view) {
+                return Ok(());
+            }
+            if fence.is_recovery() {
+                fence.verify(&observed).map_err(service)?;
+            } else if !matches!(
+                observed.applicable_publication(),
+                ApplicablePublication::Bound(publication) if publication == fence.publication()
+            ) {
+                return Ok(());
+            }
+            if let PendingRelease::Refused(terminal) = &release {
+                let intent = self
+                    .intent
+                    .as_ref()
+                    .ok_or_else(|| phase_service("MV release lost the refused publication"))?;
+                let authorized = if fence.is_recovery() {
+                    pending_release_after_recovery_refusal(
+                        &observed.view,
+                        intent,
+                        fence.publication(),
+                        terminal,
+                        fence.evidence(),
+                    )
+                } else {
+                    pending_release_for_publication(
+                        &observed.view,
+                        intent,
+                        fence.publication(),
+                        terminal,
+                    )
+                }
+                .map_err(|error| service(error.to_string()))?;
+                if authorized.is_none() {
+                    return Ok(());
+                }
+            }
+            context
+                .original_operation_control()
+                .check_active()
+                .map_err(connector_error)?;
+            match write_binding_marker(
+                &self.input.ports,
+                planning,
+                observed,
+                marker.clone(),
+                context.clone(),
+                tokio::time::sleep_until(tokio::time::Instant::from_std(context.deadline())),
+            )
+            .await
+            {
+                Ok(Some(committed)) => {
+                    let factory = CurrentProjectionMetadataCpu::existing_obligation(
+                        self.cpu.clone(),
+                        self.root.clone(),
+                        self.window.clone(),
+                        self.io.clone(),
+                        context.clone(),
+                        self.runtime.clone(),
+                        self.wake.clone(),
+                    );
+                    install_marked_current_projection_async_in(
+                        CurrentProjectionServices {
+                            entrance,
+                            readiness: &readiness,
+                            connector_control: self.input.ports.connector_control(),
+                            metadata_cpu: &factory,
+                            registration: &source.release_registration,
+                        },
+                        documents.catalog_handle().clone(),
+                        expected.clone(),
+                        committed,
+                        context.clone(),
+                    )
+                    .await
+                    .map_err(|error| phase_service(error.to_string()))?;
+                    return Ok(());
+                }
+                Ok(None) => return Ok(()),
+                Err(error)
+                    if error.kind() == MvApplicationErrorKind::CommitUnknown
+                        || (recovering_release
+                            && error.kind() == MvApplicationErrorKind::BindingInvalidated) =>
+                {
+                    recovering_release = true;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(domain_error(error)),
+            }
+        }
+    }
+
+    async fn close(
+        &mut self,
+        source: &StepSource,
+        release: PendingRelease,
+    ) -> Result<(), MvPhaseFailure> {
         // The outer Step waits for Native and its publication Call first. These
         // are only this Source's concrete CPU, Provider and registration tails.
         if let Some(write) = self.write.as_mut() {
@@ -1265,6 +1701,23 @@ impl Body {
         poll_fn(|cx| source.io.poll_closed(cx))
             .await
             .map_err(|health| health_error(source, health))?;
+        if !matches!(release, PendingRelease::None) && source.io.pending_fence().is_some() {
+            if let Some(admitted) = self.admitted.take() {
+                let admitted = Arc::try_unwrap(admitted).map_err(|_| {
+                    phase_service("MV Pending release still borrows its original admission")
+                })?;
+                let result = admitted
+                    .record_terminal(EffectDisposition::KnownUncommitted)
+                    .map_err(service);
+                self.terminal_recorded =
+                    Some((EffectDisposition::KnownUncommitted, result.clone()));
+                result?;
+            }
+            if let Err(error) = self.release_pending(source, release).await {
+                tracing::warn!(reason = %error.service, "Exact MV Pending release remains unresolved");
+            }
+        }
+        poll_fn(|cx| source.release_registration.poll_registration_closed(cx)).await;
         source.closed.store(true, Ordering::Release);
         Ok(())
     }

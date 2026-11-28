@@ -116,6 +116,8 @@ struct DeclarationFile {
     for_incarnation: String,
     nonce: String,
     isolated_incarnations: Vec<String>,
+    #[serde(default)]
+    all_other_incarnations_settled: bool,
     isolated_at_unix_ms: u64,
     source: String,
     /// Absent means every target this deployment owns. Present means only
@@ -173,6 +175,7 @@ fn parse_declaration(source: &str) -> Result<StartupIsolationDeclaration, String
         nonce,
         isolated_incarnations,
         scope,
+        all_other_incarnations_settled: file.all_other_incarnations_settled,
         isolated_at,
         source: file.source,
     })
@@ -203,6 +206,15 @@ source = "systemd: novarocks-fe.service MainPID 1234 exited"
             declaration.isolated_at,
             ManagementTimestamp::from_unix_millis(1_726_650_000_000)
         );
+    }
+
+    #[test]
+    fn a_deployment_can_explicitly_declare_all_old_effects_settled() {
+        let declaration = parse_declaration(&format!(
+            "{COMPLETE}\nall_other_incarnations_settled = true\n",
+        ))
+        .unwrap();
+        assert!(declaration.all_other_incarnations_settled);
     }
 
     #[test]

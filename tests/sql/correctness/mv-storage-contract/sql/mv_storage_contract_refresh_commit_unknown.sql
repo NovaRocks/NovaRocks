@@ -7,8 +7,8 @@
 -- @sequential=true
 -- @tags=mv,iceberg,rest,minio,storage-contract
 -- FULL publishes consecutive delete/append snapshots in one REST commit.
--- Hide the response and readback for the original query. The same owner
--- must keep the unresolved effect guarded until an admitted observation.
+-- Hide the response and readback for the original query. The next refresh
+-- observes the landed publication under the same owner and advances only P.
 
 -- query 1
 -- @skip_result_check=true
@@ -61,16 +61,18 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_rows_where=Property=UnsettledEffects
 -- @result_rows_count=1
--- @result_rows_expect=Value=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('mvunknown_${uuid0}', 'ns_${uuid0}', 'target_mv');
 
 -- query 11
 -- @skip_result_check=true
--- @mv_resume_management=target_mv,catalog=mvunknown_${uuid0},database=ns_${uuid0}
-SELECT 1;
+RESET SESSION "mvunknown_${uuid0}".incremental_refresh_enabled;
+REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 12
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=3,slot-changes=0,table-commits=4,full-refreshes=2,metadata-only-last=true,logical-rows=5,total-records=5,source=fact
 -- @result_rows_where=Property=UnsettledEffects
 -- @result_rows_count=1
 -- @result_rows_expect=Value=0

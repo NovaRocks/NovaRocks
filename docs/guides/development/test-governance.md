@@ -247,16 +247,20 @@ IDE 默认 Cargo/libtest 单例按钮仍可局部调试，并获得库级 monito
 
 主 target 仍用于增量开发则保留。停止编辑器和构建、核对 owner/无消费者及材料交接后，用 `cargo clean --target-dir <exact-worktree-target>` 清理主缓存；仅回收 IDE 时给准确私有目录。兼容程序用准确 `target/variants/compatible` / `other-island` 目录回收，不把它们当 Cargo cache。finish/archive 承担临时变体处置和失败材料保留责任，不删除其它 worktree、共享 fixture 或未知缓存；未解决失败继续保留，历史报告不回写成新 PASS。
 
-当前 MV 测试保持受控过渡，LNP-3A/LNP-3D、storage-contract 和 system 现有 SQL/expected/独立 oracle 不重写，旧 CALL/directive 禁止扩展。whole-family wipe 绑定本次 FE launch 与 MV Accelerator family，一次认领、隔离串行，先由原 MV owner 停止 admission 并实际 join 后台；不能把传入 MV 名当逐 MV 权限，也不能删 whole StateStore 代替。
+MV 测试迁移逐条保存 SQL、预期和独立 oracle 的性质。替代保护按获批判据验证，保留失败、未运行和清理缺口。
+旧 CALL/directive 在各自退役前保持原合同。whole-family wipe 绑定本次 FE launch 与 MV Accelerator family，
+一次认领并隔离串行，先由原 MV owner 停止 admission 并实际 join 后台。擦除权限以本次领取的 Accelerator family 为准。
 
 | 唯一后续产品 owner | 成对迁移的现有性质与载体 |
 |---|---|
-| 7B3 | LNP-3A、LNP-3D 对应 case、`mv/lake-publication-restart-rebuild`：非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交与管理接续 |
+| RWM-10c | 承接 LNP-3A、LNP-3D、MV storage-contract 及 `mv/lake-publication-restart-rebuild` 等 System 场景的非聚合冷恢复、配置/paused、known-committed、Unknown、迟到提交和管理接续。用湖上资格、严格恢复、原 Root 退出及名字宽限取得替代证据。 |
+| RWM-10d | 接手明确重建与结束启动宽限的用户运维入口，以及剩余 CALL、challenge、审计、启动隔离文件及管理测试指令的迁移与退役。旧入口原用途所需的覆盖继续保留到对应替代证据通过。 |
 | 7B4 | spine SUM/COUNT、T/S/P 聚合状态、聚合冷恢复及后续刷新；保留缓存 restart 不冒充缺失缓存恢复 |
 | 7B5 | V/S 身份、view 发现与 CREATE/DROP、fixture/REST 路由、实际 materialized S 读取与 SQL fallback；适配前序已迁移场景 |
 | 7B11 | SQL/system 独立 document graph、shared-document-revisions、文档格式；替代保护通过后退出只服务旧图形的 package/provenance 消费者 |
 
-每个 owner 按自身 accepted spec/approved plan 取得替代保护后逐项退役，最后消费者退出再删共享载体。G2 不新增启动期缓存缺失、管理收束或通用擦除 API，不代表上述产品任务已完成。
+每个 owner 按自身 accepted spec/approved plan 取得替代保护后逐项退役，最后消费者退出再删共享载体。
+G2 的范围限于既有测试入口。RWM-10c 的 owner 交接与最终候选在原生 1FE+3BE 的验收结果分别记录。
 
 ## 当前功能资产、成本与频率
 

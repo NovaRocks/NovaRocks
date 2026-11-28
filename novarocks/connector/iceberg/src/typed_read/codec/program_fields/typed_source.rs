@@ -319,11 +319,7 @@ fn validate_column_declaration(
         let schema = table.mutation_metadata()?.ok_or_else(|| {
             invalid_creation("Iceberg table did not declare mutation file metadata")
         })?;
-        let expected = if source.id == mutation_partition::SPEC_ID {
-            schema.spec_field()
-        } else {
-            schema.partition_field()
-        };
+        let expected = schema.read_field(source.id, !column.nullable());
         if !matches!(relation, IcebergRuntimeRelation::Table(_))
             || !column.is_base_column()
             || source.name != expected.name

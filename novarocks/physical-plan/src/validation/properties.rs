@@ -2051,6 +2051,24 @@ fn derive_node_output_properties_from(
             }
             return Ok(Some(expected));
         }
+        NodeKind::ContentApply(spec) => {
+            let [weighted, target_input] = node.inputs.as_ref() else {
+                return Ok(None);
+            };
+            let (Some(weighted), Some(target_input)) = (
+                children.get(fragment, weighted),
+                children.get(fragment, target_input),
+            ) else {
+                return Ok(None);
+            };
+            if !super::content_apply::routes_agree(spec, weighted, target_input) {
+                errors.push(ValidationError::new(
+                    path,
+                    "content application requires one shared native exchange hash partition space",
+                ));
+            }
+            Some(empty)
+        }
         NodeKind::GenerateSeries { .. } => {
             let expected = crate::PhysicalProperties {
                 distribution: Distribution::Singleton,

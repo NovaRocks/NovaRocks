@@ -138,6 +138,24 @@ impl BackendReductionState {
         }
     }
 
+    /// The initial reducer domain is known only after the authorized demand's
+    /// entire producer coverage closes successfully.
+    pub(super) fn completed_membership_snapshot(
+        &self,
+        empty_content_demand: bool,
+    ) -> Option<BackendReducedLogicalSnapshot> {
+        self.latest_snapshot().or_else(|| {
+            if !empty_content_demand {
+                return None;
+            }
+            Some(BackendReducedLogicalSnapshot::membership(
+                self.policy.channel().channel_id(),
+                LogicalVersion::FIRST,
+                self.membership.as_ref()?.domain().clone(),
+            ))
+        })
+    }
+
     pub fn submit(
         &mut self,
         stream: BackendProducerStreamIdentity,

@@ -31,13 +31,21 @@ CREATE SCHEMA mvincr_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvincr_${uuid0}.ns_${uuid0}.fact (k VARCHAR, v BIGINT) WITH (format_version = 3);
-INSERT INTO mvincr_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10);
+CREATE TABLE mvincr_${uuid0}.ns_${uuid0}.fact (
+    k VARCHAR, v BIGINT, cold_a VARBINARY, cold_b VARBINARY
+) WITH (format_version = 3);
+-- Keep 24 MiB of distinct digest bytes outside the tiny append window.
+-- The complete source remains more expensive without changing the MV rows.
+INSERT INTO mvincr_${uuid0}.ns_${uuid0}.fact
+SELECT 'cold', -n, sha512(to_utf8(CAST(n AS VARCHAR))),
+       sha512(to_utf8('second-' || CAST(n AS VARCHAR)))
+FROM TABLE(sequence(1, 196608)) AS cold(n);
+INSERT INTO mvincr_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('east', 10);
 
 -- query 4
 -- @skip_result_check=true
 USE mvincr_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW target_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+CREATE MATERIALIZED VIEW target_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact WHERE v > 0;
 
 -- query 5
 -- @skip_result_check=true
@@ -46,7 +54,11 @@ REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO mvincr_${uuid0}.ns_${uuid0}.fact VALUES ROW('west', 20);
+-- @result_contains=MV refresh: AppendOnly
+-- @result_contains=MV optimizer cost AppendOnly:
+-- @result_contains=MV optimizer cost FullReplace:
+INSERT INTO mvincr_${uuid0}.ns_${uuid0}.fact (k, v) VALUES ROW('west', 20);
+EXPLAIN REFRESH MATERIALIZED VIEW target_mv;
 
 -- query 7
 -- @result_contains=MV_OCC_BASELINE

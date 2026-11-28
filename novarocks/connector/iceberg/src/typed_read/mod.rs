@@ -37,6 +37,7 @@ pub mod change_window_page_source;
 pub mod codec;
 pub mod column_handle;
 pub mod delete_manager;
+pub(crate) mod exact_source_slice;
 pub mod merge;
 pub(crate) mod output;
 pub mod page_source;

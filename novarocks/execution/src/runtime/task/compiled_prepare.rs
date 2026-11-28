@@ -569,6 +569,9 @@ fn prepare_compiled_task_in(
                 .install_join_build_control(context.join_build_control.clone());
             Arc::get_mut(&mut state)
                 .expect("newly constructed runtime state has no aliases")
+                .install_content_apply_insert_control(context.content_apply_insert_control.clone());
+            Arc::get_mut(&mut state)
+                .expect("newly constructed runtime state has no aliases")
                 .install_query_tracker_witness(context.query_tracker_witness.clone());
             if let Some((task, observer)) = context
                 .result_identity

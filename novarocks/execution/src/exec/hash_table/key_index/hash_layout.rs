@@ -236,10 +236,6 @@ mod tests {
 /// this is deliberately not a complete Layout or allocation upper bound.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HashTableCost {
-    #[expect(
-        dead_code,
-        reason = "Retains the original locked-table modeled bucket-count fact; it is not capacity authority."
-    )]
     pub(super) buckets: usize,
     pub(super) entry_slot_bytes: u128,
     pub(super) control_byte_minimum: u128,
@@ -267,5 +263,43 @@ impl HashLayout {
             control_byte_minimum: buckets as u128,
             unmodeled_trailer_and_alignment: buckets != 0,
         })
+    }
+
+    /// Ask the same locked HashTable constructor for its whole allocation
+    /// layout, including the private group trailer and padding. The allocator
+    /// deliberately refuses the request before any backing is acquired.
+    pub(super) fn fresh_table_bytes<T>(items: usize) -> Option<(usize, u128)> {
+        use hashbrown::{HashTable, TryReserveError};
+
+        let geometry = Self::table_cost::<T>(items)?;
+        let mut table = HashTable::<T, _>::new_in(LayoutOnly);
+        let bytes = match table.try_reserve(items, |_| unreachable!("fresh table has no entries")) {
+            Ok(()) if items == 0 => 0,
+            Err(TryReserveError::AllocError { layout }) => layout.size() as u128,
+            _ => return None,
+        };
+        (bytes
+            >= geometry
+                .entry_slot_bytes
+                .checked_add(geometry.control_byte_minimum)?)
+        .then_some((geometry.buckets, bytes))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LayoutOnly;
+
+// SAFETY: This allocator always refuses and never hands out backing. Therefore
+// the caller cannot obtain a pointer that needs deallocation through it.
+unsafe impl allocator_api2::alloc::Allocator for LayoutOnly {
+    fn allocate(
+        &self,
+        _: std::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        Err(allocator_api2::alloc::AllocError)
+    }
+
+    unsafe fn deallocate(&self, _: std::ptr::NonNull<u8>, _: std::alloc::Layout) {
+        unreachable!("layout-only allocator has no backing")
     }
 }

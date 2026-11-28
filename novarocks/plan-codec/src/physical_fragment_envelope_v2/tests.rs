@@ -240,6 +240,7 @@ fn raw(output: EncodedFragmentEnvelope) -> wire::Fragment {
         summaries: output.summaries,
         dop_domain: Some(output.dop_domain),
         stage_placement: Some(output.stage_placement),
+        input_completion: output.input_completion,
         runtime_filter_ids: output.runtime_filter_ids,
         ..Default::default()
     }
@@ -294,6 +295,27 @@ fn prefixes<T>(call: impl Fn(&Control) -> Result<T, Error>, success: bool, wide:
         }
     }
 }
+#[test]
+fn input_completion_is_an_exact_fragment_declaration() {
+    let (mut wire, _) = encoded(&fragment(p::FragmentSink::Result, false));
+    assert_eq!(
+        wire.input_completion,
+        wire::FragmentInputCompletion::MayShortCircuit as i32
+    );
+    wire.input_completion = wire::FragmentInputCompletion::MustDrain as i32;
+    assert_eq!(
+        decode(&wire, limits(), &Control::default())
+            .unwrap()
+            .0
+            .input_completion,
+        p::FragmentInputCompletion::MustDrain
+    );
+    for invalid in [0, i32::MAX] {
+        wire.input_completion = invalid;
+        assert!(decode(&wire, limits(), &Control::default()).is_err());
+    }
+}
+
 #[test]
 fn envelope_all_five_sinks_preserve_hand_authored_headers_and_ordered_routes() {
     for sink in [

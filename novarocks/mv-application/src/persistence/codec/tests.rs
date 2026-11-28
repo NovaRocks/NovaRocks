@@ -705,3 +705,65 @@ fn keyed_aggregate_publication_checks_state_format() {
     assert_eq!(decoded, legacy);
     validate_published_aggregate_contracts(&decoded).unwrap();
 }
+
+#[test]
+fn legacy_non_aggregate_interpretation_decodes_and_differs_from_new_content_layout() {
+    use crate::persistence::keyed_documents::build_keyed_versions;
+    use crate::persistence::rebuild_classification::{
+        RebuildEvidence, RefreshBindingClassification, classify_refresh_binding,
+    };
+    use crate::persistence::test_support::union_all_keyed_projection_fixture;
+    use crate::product::MvTarget;
+
+    let fixture = union_all_keyed_projection_fixture(
+        MvTarget::from_parts(Some("ice"), "sales", "mv"),
+        None,
+        2,
+        2,
+        5,
+    );
+    let legacy = build_keyed_versions(
+        &fixture.definition,
+        &fixture.interpretation,
+        fixture.binding.clone(),
+        fixture.mapping.clone(),
+    )
+    .unwrap();
+    let bytes = legacy.interpretation.content();
+    let mut content = keyed::decode_keyed_interpretation(bytes).unwrap();
+    assert_eq!(content.apply_key_kind(), Some(ApplyKeyKind::BaseRowId));
+    assert!(!content.is_aggregate());
+    assert!(crate::persistence::validation::validate_new_interpretation(&content).is_err());
+
+    content.apply_key = None;
+    assert!(keyed::encode_keyed_interpretation(&content).is_err());
+    content.branches.clear();
+    content.target.fields.retain(|field| {
+        !matches!(
+            field.logical_identity,
+            PhysicalFieldLogicalIdentity::ApplyKey(_) | PhysicalFieldLogicalIdentity::Branch(_)
+        )
+    });
+    let current = build_keyed_versions(
+        &fixture.definition,
+        &content,
+        fixture.binding,
+        fixture.mapping,
+    )
+    .unwrap();
+    let current_l = keyed::decode_keyed_interpretation(current.interpretation.content()).unwrap();
+    assert!(current_l.apply_key.is_none());
+    assert!(current_l.branches.is_empty());
+    assert!(crate::persistence::validation::validate_new_interpretation(&current_l).is_ok());
+    let root = DocumentRevision::from_canonical_bytes(b"current binding");
+    assert!(matches!(
+        classify_refresh_binding::<String>(
+            RebuildEvidence::from(&legacy),
+            Ok(RebuildEvidence::from(&current)),
+            PublicationEvidence::Unpublished(&root),
+            &[],
+        ).unwrap(),
+        RefreshBindingClassification::NeedsRebuild(Marker::NeedsRebuild { changes, .. })
+            if changes.len() == 1 && changes[0].kind == BindingChangeKind::Interpretation
+    ));
+}

@@ -223,10 +223,34 @@ impl Scenario for ObservationFamilies {
             &self.intent.take(OBSERVATION_QUERIES.len())?,
             &baseline,
         )?;
+        let transport_bytes = (0..context.handle().be_count())
+            .map(|backend| {
+                let sample = context.handle().backend_metrics_text(backend)?;
+                fs::write(
+                    context
+                        .scenario_root()
+                        .join(format!("be-{backend}-memory-observation.prom")),
+                    &sample,
+                )?;
+                let read_gauge = |name: &str| -> Result<i64> {
+                    sample
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                        .with_context(|| format!("BE[{backend}] missing original gauge {name}"))?
+                        .parse()
+                        .with_context(|| format!("BE[{backend}] invalid original gauge {name}"))
+                };
+                ensure!(
+                    read_gauge("novarocks_backend_native_transport_attribution_covered")? == 1,
+                    "BE[{backend}] did not bind the Native transport observation"
+                );
+                read_gauge("novarocks_backend_native_transport_attributed_bytes")
+            })
+            .collect::<Result<Vec<_>>>()?;
         fs::write(
             context.scenario_root().join("memory-attribution.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 4,
+                "schema_version": 5,
                 "backend_process_ids": ids.backends,
                 "functional_native_observation": true,
                 "active_cancellation_observed": true,
@@ -234,6 +258,7 @@ impl Scenario for ObservationFamilies {
                 "during_query": resource_record(&during),
                 "after_cancel": resource_record(&after),
                 "regexp_cancellation": regexp,
+                "native_transport_tagged_bytes_after_exit": transport_bytes,
             }))?,
         )?;
         context.action("verified distributed rows, original Native boundary evidence and active Trino cancellation with actual reader exit and resource convergence on independent backends");

@@ -46,6 +46,8 @@ pub use novarocks_connector_contract::{ConnectorReadBinding, ConnectorReadRelati
 
 mod source_preparation;
 pub use source_preparation::{
+    ConnectorExactPartitionSliceOutcome, ConnectorExactPartitionSliceVolume,
+    ConnectorExactSourcePartitionField, ConnectorExactSourcePartitionSlice,
     ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture,
     ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
     ConnectorReadSourceSelection, ConnectorReadSplitPreparation,
@@ -504,6 +506,14 @@ pub enum ConnectorReadRelationPreparationKind {
         object_id: crate::connector::ConnectorTableObjectId,
         snapshot_id: Option<i64>,
         selection: Option<super::ConnectorMvTargetPartitionSelection>,
+    },
+    /// Full ordinary read of the exact frozen MV storage object, with
+    /// content target integrity and required position identity.
+    FrozenMvContentTarget {
+        table: crate::connector::ConnectorTableHandle,
+        original_source: crate::connector::ConnectorProcessLocalPayload,
+        object_id: crate::connector::ConnectorTableObjectId,
+        snapshot_id: i64,
     },
     Metadata {
         request: Option<super::ConnectorReadMetadataRequest>,
@@ -1310,6 +1320,7 @@ pub struct ConnectorReadSplitOpenRequest {
     constraint: ConnectorReadConstraint,
     table: ConnectorReadTableHandle,
     preparation: Option<ConnectorReadSplitPreparation>,
+    enumeration_coverage: bool,
 }
 impl ConnectorReadSplitOpenRequest {
     pub const fn new(
@@ -1326,12 +1337,20 @@ impl ConnectorReadSplitOpenRequest {
             dynamic_filter_columns,
             constraint,
             preparation: None,
+            enumeration_coverage: false,
         }
     }
     pub fn with_source_preparation(mut self, preparation: ConnectorReadSplitPreparation) -> Self {
         self.preparation = Some(preparation);
         self
     }
+    /// Require attribution for every omitted file of this frozen scan.
+    /// This travels only with the original coordinator split-open request.
+    pub fn with_enumeration_coverage(mut self) -> Self {
+        self.enumeration_coverage = true;
+        self
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -1341,6 +1360,7 @@ impl ConnectorReadSplitOpenRequest {
         BTreeSet<ConnectorReadColumnHandle>,
         ConnectorReadConstraint,
         Option<ConnectorReadSplitPreparation>,
+        bool,
     ) {
         (
             self.session,
@@ -1349,6 +1369,7 @@ impl ConnectorReadSplitOpenRequest {
             self.dynamic_filter_columns,
             self.constraint,
             self.preparation,
+            self.enumeration_coverage,
         )
     }
 }

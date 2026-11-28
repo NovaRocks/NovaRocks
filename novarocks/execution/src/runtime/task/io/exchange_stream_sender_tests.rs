@@ -253,7 +253,7 @@ fn sender(
     ordinal: u32,
     delivery: ExchangeDeliveryRequirement,
 ) -> Arc<ExchangeStreamSender> {
-    sender_in_query(transport, scheduler, ordinal, delivery, 1)
+    sender_in_query(transport, scheduler, ordinal, delivery, 1, None)
 }
 fn sender_in_query(
     transport: Arc<Scripted>,
@@ -261,6 +261,7 @@ fn sender_in_query(
     ordinal: u32,
     delivery: ExchangeDeliveryRequirement,
     query: i64,
+    observation: Option<novarocks_memory::lane::LaneShards>,
 ) -> Arc<ExchangeStreamSender> {
     ExchangeStreamSender::try_new(
         ExchangeStreamSenderConfig {
@@ -277,18 +278,19 @@ fn sender_in_query(
         transport,
         scheduler,
         Arc::new(Observable::new()),
+        observation,
     )
     .unwrap()
 }
 fn scheduler(bytes: usize) -> Arc<ExchangeUnitSendScheduler> {
-    ExchangeUnitSendScheduler::try_new(bytes, 64, 1024).unwrap()
+    ExchangeUnitSendScheduler::try_new(bytes, 64, 1024, None).unwrap()
 }
 
 #[test]
 fn sender_accepts_a_payload_above_the_legacy_constant_inside_its_unit_bound() {
     let wide = 96 * 1024 * 1024;
     let transport = Arc::new(Scripted::default());
-    let scheduler = ExchangeUnitSendScheduler::try_new(wide, 4, wide).unwrap();
+    let scheduler = ExchangeUnitSendScheduler::try_new(wide, 4, wide, None).unwrap();
     let sender = ExchangeStreamSender::try_new(
         ExchangeStreamSenderConfig {
             stream: stream_in_query(1, 1),
@@ -304,6 +306,7 @@ fn sender_accepts_a_payload_above_the_legacy_constant_inside_its_unit_bound() {
         transport,
         scheduler,
         Arc::new(Observable::new()),
+        None,
     )
     .unwrap();
     let payload = Bytes::from(vec![7u8; 65 * 1024 * 1024]);
@@ -317,7 +320,7 @@ fn sender_accepts_a_payload_above_the_legacy_constant_inside_its_unit_bound() {
 
     let narrow = 64 * 1024 * 1024;
     let transport = Arc::new(Scripted::default());
-    let scheduler = ExchangeUnitSendScheduler::try_new(narrow, 4, narrow).unwrap();
+    let scheduler = ExchangeUnitSendScheduler::try_new(narrow, 4, narrow, None).unwrap();
     let sender = ExchangeStreamSender::try_new(
         ExchangeStreamSenderConfig {
             stream: stream_in_query(2, 1),
@@ -333,6 +336,7 @@ fn sender_accepts_a_payload_above_the_legacy_constant_inside_its_unit_bound() {
         transport,
         scheduler,
         Arc::new(Observable::new()),
+        None,
     )
     .unwrap();
     let before = sender.snapshot();
@@ -370,7 +374,8 @@ fn grant_precedes_offer_and_shared_activity_and_capacity_wait_spends_no_sequence
             invalid,
             transport.clone(),
             scheduler.clone(),
-            Arc::new(Observable::new())
+            Arc::new(Observable::new()),
+            None,
         ),
         Err(ExchangeUnitSenderError::InvalidLimits)
     ));
@@ -1006,6 +1011,7 @@ fn a_many_stream_query_does_not_take_the_single_stream_querys_turn() {
         0,
         ExchangeDeliveryRequirement::DemandDriven,
         1,
+        None,
     );
     publish(&active, b"one", false);
     let many = (1..=6)
@@ -1016,6 +1022,7 @@ fn a_many_stream_query_does_not_take_the_single_stream_querys_turn() {
                 ordinal,
                 ExchangeDeliveryRequirement::DemandDriven,
                 1,
+                None,
             )
         })
         .collect::<Vec<_>>();
@@ -1028,6 +1035,7 @@ fn a_many_stream_query_does_not_take_the_single_stream_querys_turn() {
         1,
         ExchangeDeliveryRequirement::DemandDriven,
         2,
+        None,
     );
     publish(&single, b"two", false);
     assert_eq!(transport.queued(), 1);
@@ -1061,6 +1069,81 @@ fn a_many_stream_query_does_not_take_the_single_stream_querys_turn() {
     while transport.queued() > 0 {
         drop(transport.take());
     }
+    assert_eq!(scheduler.snapshot().calls, 0);
+}
+
+#[test]
+fn shared_scheduler_dispatches_the_next_query_under_its_own_observation() {
+    use novarocks_memory::attribution::AttributingAllocator;
+    use novarocks_memory::lane::RecordRef;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    let authority = crate::runtime::execution_runtime::test_memory_authority();
+    let account = || {
+        authority
+            .create_account(
+                novarocks_memory::AccountKind::Work,
+                novarocks_memory::ExternalRef::NONE,
+            )
+            .unwrap()
+    };
+    let first_account = account();
+    let next_account = account();
+    let first_owner = first_account.create_lane_shards();
+    let next_owner = next_account.create_lane_shards();
+    let expected = next_owner.explicit_owner().reference().unwrap();
+    let transport = Scripted::granting();
+    let service = authority.root().create_lane_shards();
+    let scheduler = ExchangeUnitSendScheduler::try_new(3, 64, 1024, Some(service.clone())).unwrap();
+    let service_origin = first_owner.run(|| {
+        scheduler.update_state(|_| crate::runtime::execution_services::test_attributed_allocation())
+    });
+    assert_eq!(
+        service_origin,
+        service.explicit_owner().reference().unwrap()
+    );
+    let first = sender_in_query(
+        transport.clone(),
+        scheduler.clone(),
+        0,
+        ExchangeDeliveryRequirement::DemandDriven,
+        1,
+        Some(first_owner.clone()),
+    );
+    let next = sender_in_query(
+        transport.clone(),
+        scheduler.clone(),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+        2,
+        Some(next_owner),
+    );
+    publish(&first, b"one", false);
+    publish(&next, b"two", false);
+    assert_eq!(transport.queued(), 1);
+    assert_eq!(next.snapshot().active_calls, 0);
+
+    let origin = Arc::new(Mutex::new(None));
+    let sample = origin.clone();
+    next.observable().add_observer(Arc::new(move || {
+        let mut sample = sample.lock().unwrap();
+        if sample.is_none() {
+            let allocator = AttributingAllocator::new(System);
+            let layout = Layout::from_size_align(1024, 8).unwrap();
+            // SAFETY: valid tagged layout, exact address and paired release.
+            let block = unsafe { allocator.alloc(layout) };
+            assert!(!block.is_null());
+            // SAFETY: the tagged wrapper initialized the 8-byte source tail.
+            *sample = Some(unsafe { RecordRef::read(block.add(layout.size())) });
+            // SAFETY: release the same block with the same allocator and layout.
+            unsafe { allocator.dealloc(block, layout) };
+        }
+    }));
+    first_owner.run(|| transport.take().complete(1, 1));
+    let call = transport.take();
+    assert_eq!(call.frame.receiver.stream, next.config.stream);
+    assert_eq!(*origin.lock().unwrap(), Some(expected));
+    call.complete(1, 1);
     assert_eq!(scheduler.snapshot().calls, 0);
 }
 
@@ -1101,6 +1184,7 @@ fn final_owner_exit_removes_watch_and_does_not_restart_queued_retries() {
         2,
         ExchangeDeliveryRequirement::DemandDriven,
         1,
+        None,
     );
     publish(&stopped, b"one", false);
     transport
@@ -1124,13 +1208,14 @@ fn final_owner_exit_removes_watch_and_does_not_restart_queued_retries() {
 #[test]
 fn peer_blocked_large_unit_does_not_block_healthy_peer_with_available_bytes() {
     let transport = Scripted::granting();
-    let scheduler = ExchangeUnitSendScheduler::try_new(10, 1, 1024).unwrap();
+    let scheduler = ExchangeUnitSendScheduler::try_new(10, 1, 1024, None).unwrap();
     let first = sender_in_query(
         transport.clone(),
         scheduler.clone(),
         1,
         ExchangeDeliveryRequirement::DemandDriven,
         1,
+        None,
     );
     let stream = first.config.stream;
     let mut config = first.config.clone();
@@ -1146,6 +1231,7 @@ fn peer_blocked_large_unit_does_not_block_healthy_peer_with_available_bytes() {
         transport.clone(),
         scheduler.clone(),
         Arc::new(Observable::new()),
+        None,
     )
     .unwrap();
     let healthy = sender_in_query(
@@ -1154,6 +1240,7 @@ fn peer_blocked_large_unit_does_not_block_healthy_peer_with_available_bytes() {
         1,
         ExchangeDeliveryRequirement::DemandDriven,
         2,
+        None,
     );
     publish(&first, b"one", false);
     publish(&blocked, b"12345678", false);
@@ -1836,6 +1923,7 @@ fn a_demand_retry_keeps_the_sender_group_live_until_the_timer_exits() {
             transport.clone(),
             scheduler(16),
             gates,
+            None,
         )
         .unwrap();
     group

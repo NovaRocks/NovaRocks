@@ -63,6 +63,7 @@ pub(crate) enum LogicalPlanKind {
     CTEProduce(PlanCTEProduceNode),
     CTEConsume(PlanCTEConsumeNode),
     Apply(Box<LogicalApplyNode>),
+    ContentApply(crate::optimizer::operator::ContentApplyOp),
     ImvDelta(LogicalImvDeltaNode),
     ImvVersion(LogicalImvVersionNode),
 }
@@ -99,6 +100,7 @@ impl LogicalPlanKind {
             LogicalPlanKind::CTEProduce(_) => "CTEProduce",
             LogicalPlanKind::CTEConsume(_) => "CTEConsume",
             LogicalPlanKind::Apply(_) => "Apply",
+            LogicalPlanKind::ContentApply(_) => "ContentApply",
             LogicalPlanKind::ImvDelta(_) => "ImvDelta",
             LogicalPlanKind::ImvVersion(_) => "ImvVersion",
         }
@@ -128,6 +130,7 @@ impl LogicalPlanKind {
             "CTEProduce",
             "CTEConsume",
             "Apply",
+            "ContentApply",
             "ImvDelta",
             "ImvVersion",
         ]

@@ -28,10 +28,6 @@ use novarocks_value_arrays::ValueViolation;
 const CONTENT_FINGERPRINT_SEED: u64 = 0x4e52_434f_4e54_454e;
 
 impl PreparedKeyBatch<'_> {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RWM-10 consumes deterministic content evidence.")
-    )]
     pub(crate) fn content_fingerprint(
         &self,
         occurrence: usize,

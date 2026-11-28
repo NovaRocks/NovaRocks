@@ -1279,6 +1279,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
     let fragment = Fragment::from(crate::plan::FragmentParts {
         summaries: Box::default(),
         stage_placement: fragment.stage_placement().clone(),
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         id: fragment.id(),
         root: fragment.root(),
         nodes,
@@ -2255,6 +2256,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
     let fragment = Fragment::from(crate::plan::FragmentParts {
         summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         id: original.id(),
         root: original.root(),
         values,

@@ -411,6 +411,8 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
             | Operator::PhysicalAssertOneRow(_)
             | Operator::LogicalImvDelta(_)
             | Operator::LogicalImvVersion(_)
+            | Operator::LogicalContentApply(_)
+            | Operator::PhysicalContentApply(_)
             | Operator::PhysicalDistribution(_) => false,
         })
     }
@@ -482,6 +484,8 @@ fn operator_has_scalars(op: &Operator) -> bool {
         | Operator::PhysicalAssertOneRow(_)
         | Operator::LogicalImvDelta(_)
         | Operator::LogicalImvVersion(_)
+        | Operator::LogicalContentApply(_)
+        | Operator::PhysicalContentApply(_)
         | Operator::PhysicalDistribution(_) => false,
     }
 }

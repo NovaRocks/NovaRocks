@@ -253,6 +253,10 @@ pub enum PhysicalPlanKind {
     NestLoopJoin(PhysicalNestLoopJoinNode),
     SetOp(PhysicalSetOpNode),
     ChangeEventExpand(DistributedChangeEventExpandNode),
+    ContentApply {
+        route_keys: Box<[u32]>,
+        demand_keys: Box<[u32]>,
+    },
     CTEAnchor(PlanCTEAnchorNode),
     CTEProduce(PlanCTEProduceNode),
     CTEConsume(PlanCTEConsumeNode),
@@ -282,6 +286,7 @@ impl PhysicalPlanKind {
             "NestLoopJoin",
             "SetOp",
             "ChangeEventExpand",
+            "ContentApply",
             "CTEAnchor",
             "CTEProduce",
             "CTEConsume",

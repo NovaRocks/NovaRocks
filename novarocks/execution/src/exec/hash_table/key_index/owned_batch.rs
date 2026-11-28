@@ -50,6 +50,18 @@ pub(super) struct OwnedKeyBatch {
     len: usize,
     _storage: ValueTypeStorageLifetime,
 }
+
+/// Variable representatives retain a source coordinate and an Arrow view per
+/// key. Fixed representatives keep only their typed payload and validity.
+pub(super) fn coordinate_bytes(ty: &arrow::datatypes::DataType) -> usize {
+    if super::prepared::is_fixed(ty) {
+        0
+    } else if novarocks_value_arrays::ByteLayout::from_data_type(ty).is_some() {
+        std::mem::size_of::<PageRow>() + std::mem::size_of::<u128>()
+    } else {
+        OwnedCanonicalColumn::coordinate_bytes()
+    }
+}
 /// Reusable candidate scratch. Capacity is an allocation detail; larger calls
 /// grow under the original owner instead of becoming a row/collision quota.
 pub(super) struct CompareScratch {

@@ -3,3 +3,10 @@
 k	v
 east	10
 west	20
+
+-- query 14
+-- types	varchar	bigint
+k	v
+east	10
+north	30
+west	20

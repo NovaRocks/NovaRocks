@@ -127,16 +127,30 @@ pub fn mv_keyed_scheduler_semantic_decision(
     now: i64,
     inputs: Option<&[PublicationInput]>,
 ) -> MvSchedulerSemanticDecision {
+    use crate::persistence::keyed_documents::MvCurrentDataEligibility;
+    let data = facts.data_eligibility();
+    let config = facts.configuration();
+    if !config.paused
+        && config.refresh_policy != RefreshPolicy::Manual
+        && let Some(
+            MvCurrentDataEligibility::ExplicitRebuild | MvCurrentDataEligibility::Unattributed,
+        ) = data
+    {
+        return MvSchedulerSemanticDecision::Invalid {
+            reason: data.unwrap().as_str().to_string(),
+        };
+    }
     if let Some(inputs) = inputs
         && let Err(reason) = validate_current_inputs(&facts.binding().occurrences, inputs)
     {
         return MvSchedulerSemanticDecision::Invalid { reason };
     }
+    let publication = facts
+        .publication()
+        .filter(|_| data != Some(MvCurrentDataEligibility::StrictRecovery));
     semantic_decision(
-        facts.configuration(),
-        facts
-            .publication()
-            .map(|p| (p.publication_prepared_at_ms, p.inputs.as_slice())),
+        config,
+        publication.map(|p| (p.publication_prepared_at_ms, p.inputs.as_slice())),
         now,
         inputs,
     )

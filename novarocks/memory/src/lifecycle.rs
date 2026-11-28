@@ -82,13 +82,28 @@ impl Account {
         &self,
         evidence: &TeardownEvidence<'_>,
     ) -> Result<TransferReceipt, TeardownError> {
+        self.retire_with_exit_check(|| evidence.validate())
+    }
+
+    /// Consumes the application owner's aggregate exit fact. Call only after
+    /// the owner has verified and removed the exact execution scope containing
+    /// its tasks, operators, and I/O. The owner retains I/O deadline validation.
+    /// Memory still validates its own active scopes and external responsibility.
+    pub fn retire_after_owner_exit(&self) -> Result<TransferReceipt, TeardownError> {
+        self.retire_with_exit_check(|| Ok(()))
+    }
+
+    fn retire_with_exit_check(
+        &self,
+        validate_exit: impl FnOnce() -> Result<(), TeardownError>,
+    ) -> Result<TransferReceipt, TeardownError> {
         if self.0.parent.is_none() {
             return Err(TeardownError::CannotRetireRoot);
         }
         if self.0.control.load(crate::sync::Ordering::Acquire) != 0 {
             return Err(TeardownError::ProtectedControlOwner);
         }
-        evidence.validate()?;
+        validate_exit()?;
         let members = self.close_members();
         // Closed membership cannot admit a new producer. Preflight every
         // captured issuing lane before any responsibility or funding handoff.

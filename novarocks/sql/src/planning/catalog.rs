@@ -290,109 +290,6 @@ pub struct ConnectorReadTableFacts {
     pub planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
 }
 
-/// Immutable SQL materialization facts for one admission-frozen IMV target
-/// locator. Provider handles, leases, and scan materializations remain in
-/// Core's request-local binding store; SQL receives only the copied locator
-/// identity and the opaque binding token.
-pub struct SqlMvTargetLocatorTableFacts {
-    catalog: String,
-    namespace: String,
-    table: String,
-    target_table_uuid: String,
-    target_snapshot_id: Option<i64>,
-    apply_key_column: String,
-    branch_id_column: Option<String>,
-    binding: crate::binding::SqlTableBindingId,
-}
-
-impl SqlMvTargetLocatorTableFacts {
-    pub fn try_new(
-        catalog: String,
-        namespace: String,
-        table: String,
-        target_table_uuid: String,
-        target_snapshot_id: Option<i64>,
-        apply_key_column: String,
-        branch_id_column: Option<String>,
-        binding: crate::binding::SqlTableBindingId,
-    ) -> Result<Self, String> {
-        for (label, value) in [
-            ("catalog", &catalog),
-            ("namespace", &namespace),
-            ("table", &table),
-            ("target table UUID", &target_table_uuid),
-            ("apply key column", &apply_key_column),
-        ] {
-            if value.is_empty() {
-                return Err(format!("IMV target locator {label} cannot be empty"));
-            }
-        }
-        if branch_id_column.as_ref().is_some_and(String::is_empty) {
-            return Err("IMV target locator branch ID column cannot be empty".to_string());
-        }
-        Ok(Self {
-            catalog,
-            namespace,
-            table,
-            target_table_uuid,
-            target_snapshot_id,
-            apply_key_column,
-            branch_id_column,
-            binding,
-        })
-    }
-}
-
-/// Opaque SQL analyzer materialization for an IMV target locator.
-pub struct MvTargetLocatorTableMaterialization {
-    resolved: crate::catalog::ResolvedAnalyzerTable,
-}
-
-impl MvTargetLocatorTableMaterialization {
-    pub fn into_resolved_table(self) -> crate::catalog::ResolvedAnalyzerTable {
-        self.resolved
-    }
-}
-
-/// Materialize a frozen IMV target locator without exposing the SQL scan graph
-/// to application code.
-pub fn materialize_mv_target_locator_table(
-    facts: SqlMvTargetLocatorTableFacts,
-) -> MvTargetLocatorTableMaterialization {
-    use crate::planner::table::{
-        ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
-    };
-
-    let planner = TableDef {
-        name: facts.table.clone(),
-        columns: Vec::new(),
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: ScanSource::Sql(SqlScanSource::new(
-            facts.binding,
-            SqlTableIdentity {
-                catalog: facts.catalog.clone(),
-                namespace: facts.namespace.clone(),
-                table: facts.table,
-            },
-            SqlScanKind::MvTargetLocator {
-                facts: SqlMvTargetLocatorScan {
-                    target_table_uuid: facts.target_table_uuid,
-                    target_snapshot_id: facts.target_snapshot_id,
-                    apply_key_column: facts.apply_key_column,
-                    branch_id_column: facts.branch_id_column,
-                },
-            },
-        )),
-    };
-    MvTargetLocatorTableMaterialization {
-        resolved: crate::catalog::ResolvedAnalyzerTable::from_planner(
-            Some(&facts.catalog),
-            &facts.namespace,
-            planner,
-        ),
-    }
-}
-
 /// Opaque SQL materialization for one admitted connector read.  The embedded
 /// analyzer relation is intentionally inaccessible outside this crate.
 pub struct ConnectorReadTableMaterialization {
@@ -908,7 +805,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::planner::table::{ScanSource, SqlScanKind};
 
     #[test]
     fn m07_external_view_rejects_complete_nested_private_type_without_top_domain() {
@@ -1112,84 +1008,6 @@ mod tests {
         let crate::planner::table::ScanSource::Sql(source) = &mut original.planner.source;
         source.table.catalog = "other".to_string();
         assert!(project_query_local_overlay_name(original, "analytics", "orders").is_err());
-    }
-
-    #[test]
-    fn mv_target_locator_materialization_preserves_frozen_identity_and_binding() {
-        let mut allocator = test_binding_allocator();
-        let binding = allocator.allocate().expect("target binding");
-        let facts = SqlMvTargetLocatorTableFacts::try_new(
-            "ice".to_string(),
-            "analytics".to_string(),
-            "mv_orders".to_string(),
-            "target-uuid".to_string(),
-            Some(42),
-            "__nova_apply_key".to_string(),
-            Some("__nova_branch_id".to_string()),
-            binding,
-        )
-        .expect("valid target locator facts");
-        let materialization = materialize_mv_target_locator_table(facts).into_resolved_table();
-
-        assert_eq!(
-            materialization_identity_facts(&materialization).fqn(),
-            "ice.analytics.mv_orders"
-        );
-        validate_materialization_binding(&materialization, binding)
-            .expect("target locator retains frozen binding");
-        let ScanSource::Sql(source) = &materialization.planner.source;
-        let SqlScanKind::MvTargetLocator { facts } = &source.kind else {
-            panic!("target locator must retain its specialized scan kind");
-        };
-        assert_eq!(facts.target_table_uuid, "target-uuid");
-        assert_eq!(facts.target_snapshot_id, Some(42));
-        assert_eq!(facts.apply_key_column, "__nova_apply_key");
-        assert_eq!(facts.branch_id_column.as_deref(), Some("__nova_branch_id"));
-    }
-
-    #[test]
-    fn mv_target_locator_facts_fail_closed_for_incomplete_identity() {
-        let binding = test_binding_allocator().allocate().expect("target binding");
-        for (catalog, namespace, table, uuid, apply_key) in [
-            (
-                "",
-                "analytics",
-                "mv_orders",
-                "target-uuid",
-                "__nova_apply_key",
-            ),
-            ("ice", "", "mv_orders", "target-uuid", "__nova_apply_key"),
-            ("ice", "analytics", "", "target-uuid", "__nova_apply_key"),
-            ("ice", "analytics", "mv_orders", "", "__nova_apply_key"),
-            ("ice", "analytics", "mv_orders", "target-uuid", ""),
-        ] {
-            assert!(
-                SqlMvTargetLocatorTableFacts::try_new(
-                    catalog.to_string(),
-                    namespace.to_string(),
-                    table.to_string(),
-                    uuid.to_string(),
-                    None,
-                    apply_key.to_string(),
-                    None,
-                    binding,
-                )
-                .is_err()
-            );
-        }
-        assert!(
-            SqlMvTargetLocatorTableFacts::try_new(
-                "ice".to_string(),
-                "analytics".to_string(),
-                "mv_orders".to_string(),
-                "target-uuid".to_string(),
-                None,
-                "__nova_apply_key".to_string(),
-                Some(String::new()),
-                binding,
-            )
-            .is_err()
-        );
     }
 
     #[test]

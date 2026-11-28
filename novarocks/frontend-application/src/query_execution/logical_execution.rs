@@ -195,6 +195,9 @@ impl InitialComputationReservation {
                 reservation: Mutex::new(Some(reservation)),
                 terminal,
                 write_production_session: Mutex::new(None),
+                split_coverage: std::sync::OnceLock::new(),
+                #[cfg(novarocks_dev_controls)]
+                content_target_early_close: Mutex::new(None),
             }),
             reserved: Some(reserved),
         })
@@ -264,17 +267,64 @@ impl Drop for InitialComputationReservation {
     }
 }
 
+/// Receives the original attempt's frozen enumeration receipts.
+pub(crate) struct SplitCoverageReceiving {
+    execution: QueryExecutionId,
+    receipts: std::sync::OnceLock<Arc<super::split_assignment::SplitEnumerationReceipts>>,
+}
+
+impl SplitCoverageReceiving {
+    pub(crate) fn install(
+        &self,
+        execution: QueryExecutionId,
+        receipts: Arc<super::split_assignment::SplitEnumerationReceipts>,
+    ) -> Result<(), &'static str> {
+        if execution != self.execution {
+            return Err("split coverage belongs to another Native attempt");
+        }
+        self.receipts
+            .set(receipts)
+            .map_err(|_| "split coverage was already installed")
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        self.receipts
+            .get()
+            .and_then(|receipts| receipts.complete(self.execution))
+            .is_some()
+    }
+}
+
 /// One exact reservation plus the same strong terminal resolver. Holding this
 /// Arc grants neither a second start nor the right to create another collector.
 pub(crate) struct InitialComputationCredentials {
     execution: QueryExecutionId,
     reservation: Mutex<Option<QueryAttemptReservation>>,
     terminal: Arc<AttemptTerminalCredentialResolver>,
+    split_coverage: std::sync::OnceLock<Arc<SplitCoverageReceiving>>,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) content_target_early_close:
+        Mutex<Option<crate::mv::test_controls::ContentTargetEnumerationClose>>,
     write_production_session:
         Mutex<Option<std::sync::Weak<super::write_session::ConnectorWriteSession>>>,
 }
 
 impl InitialComputationCredentials {
+    pub(crate) fn require_split_coverage(&self) -> Arc<SplitCoverageReceiving> {
+        self.split_coverage
+            .get_or_init(|| {
+                Arc::new(SplitCoverageReceiving {
+                    execution: self.execution,
+                    receipts: std::sync::OnceLock::new(),
+                })
+            })
+            .clone()
+    }
+
+    pub(crate) fn split_coverage(&self) -> Option<&Arc<SplitCoverageReceiving>> {
+        self.split_coverage.get()
+    }
+
     pub(crate) fn bind_write_production_session(
         &self,
         session: &Arc<super::write_session::ConnectorWriteSession>,

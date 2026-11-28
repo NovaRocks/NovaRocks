@@ -5,6 +5,10 @@ domain: [provider-spi, frontend-mv]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0278
+    scope: "The non-aggregate cross-process takeover compromise is replaced by strict replay from Pending and conditional main publication."
+    link: "ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md"
 partially-supersedes:
   - id: ADR-0180
     scope: "Ruling 4 immediate conflict termination for an MV slot update whose admitted slot writers still match. Main advancement, exact writer comparison, and Ruling 6 cleanup authority remain active."

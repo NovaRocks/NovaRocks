@@ -46,16 +46,19 @@ SELECT k1, v1 FROM lnp3d_commit_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- query 4
 -- The lake publication survived the killed FE, while its management effect
 -- did not acquire an automatic new-process owner.
+-- @skip_result_check=true
 -- @retry_count=40
 -- @retry_interval_ms=250
--- @skip_result_check=true
--- @result_contains=AWAITING_EFFECT_SETTLEMENT
+-- @result_rows_where=Property=UnsettledEffects
+-- @result_rows_count=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('lnp3d_commit_${uuid0}', 'ns_${uuid0}', 'orders_mv');
 
 -- query 5
--- @mv_resume_management=orders_mv,catalog=lnp3d_commit_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW lnp3d_commit_${uuid0}.ns_${uuid0}.orders_mv;
 
 -- query 6
 -- @cleanup=true

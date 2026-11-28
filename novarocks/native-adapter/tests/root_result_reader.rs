@@ -1919,6 +1919,11 @@ async fn installation_in_progress_is_preparing_without_new_read_holder() {
 // These probes concern Tonic's post-root-admission allocations. No listener
 // or H2 connection is installed, so they make no pre-decode lane claim.
 use hyper::body::Body as HttpBody;
+use novarocks_memory::attribution::{
+    ATTRIBUTION_THRESHOLD_BYTES, ATTRIBUTION_TOKEN_BYTES, AttributingAllocator,
+    binding::flush_current, future::AttributedFuture,
+};
+use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_native_adapter::root_result_unary::{NativeRootUnaryBody, root_result_unary};
 use novarocks_proto_models::novarocks as wire;
 use prost::Message;
@@ -2083,7 +2088,8 @@ thread_local! {
 }
 struct SendAllocationProbe;
 #[global_allocator]
-static SEND_ALLOCATOR: SendAllocationProbe = SendAllocationProbe;
+static SEND_ALLOCATOR: AttributingAllocator<SendAllocationProbe> =
+    AttributingAllocator::new(SendAllocationProbe);
 unsafe impl GlobalAlloc for SendAllocationProbe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
@@ -2121,7 +2127,11 @@ unsafe impl GlobalAlloc for SendAllocationProbe {
 fn start_send_probe(capacity: usize) {
     SEND_PHYSICAL.with(|cell| {
         let mut probe = PhysicalProbe::EMPTY;
-        probe.selected_size = capacity;
+        probe.selected_size = if capacity >= ATTRIBUTION_THRESHOLD_BYTES {
+            capacity + ATTRIBUTION_TOKEN_BYTES
+        } else {
+            capacity
+        };
         cell.set(probe);
     });
     SEND_ALLOC_COUNT.with(|value| value.set(0));
@@ -2531,14 +2541,34 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     let read = fixture.request(Some(1), 0, 1);
     let framed_bytes = framed_data_reply_len(&read, Bytes::from(vec![0; count]));
     let request = unary_request(&read);
+    let authority = MemoryAuthority::new(AuthorityConfig::new(8 << 20, 8 << 20, 0)).unwrap();
+    let service = authority
+        .create_account(AccountKind::Service, ExternalRef::NONE)
+        .unwrap()
+        .create_lane_shards();
+    let query = authority
+        .create_account(AccountKind::Work, ExternalRef::NONE)
+        .unwrap()
+        .create_lane_shards();
+    let service_before = service.snapshot().tagged_bytes;
+    let query_before = query.snapshot().tagged_bytes;
     let capture = SendCapture::begin(framed_bytes);
-    let mut body = root_result_unary(&fixture.reader, request)
-        .await
-        .into_body();
-    let data = unary_data(&mut body).await;
+    let (mut body, data) = AttributedFuture::new(service.clone(), || async {
+        let mut body = root_result_unary(&fixture.reader, request)
+            .await
+            .into_body();
+        let data = unary_data(&mut body).await;
+        (body, data)
+    })
+    .await;
     capture.stop();
     assert_eq!(data.len(), framed_bytes);
-    send_snapshot().live_alias(data.as_ptr(), data.len());
+    let probe = send_snapshot();
+    let allocation = probe.live_alias(data.as_ptr(), data.len());
+    let backing_bytes = framed_bytes + ATTRIBUTION_TOKEN_BYTES;
+    assert_eq!(probe.records[allocation].bytes, backing_bytes);
+    assert!(service.snapshot().tagged_bytes - service_before >= backing_bytes as i128);
+    assert_eq!(query.snapshot().tagged_bytes, query_before);
     assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 1);
     assert!(data.len() > RootProfileV1::SEGMENT_BYTES && data.len() <= SEGMENT);
     let message = unary_receipt(unary_message(&data));
@@ -2559,9 +2589,19 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
             .await
             .is_none()
     );
+    let last = data.slice(5..6);
     drop(body);
     drop(data);
+    assert!(!send_snapshot().records[allocation].dealloc_returned);
+    let before_last_alias = service.snapshot().tagged_bytes;
+    query.run(|| drop(last));
+    flush_current();
     assert!(SEND_FREED.with(Cell::get));
+    assert_eq!(
+        before_last_alias - service.snapshot().tagged_bytes,
+        backing_bytes as i128
+    );
+    assert_eq!(query.snapshot().tagged_bytes, query_before);
 }
 
 #[tokio::test]
@@ -2640,6 +2680,10 @@ async fn unary_exact_data_backing_survives_all_nonfinal_clone_and_short_slice_dr
     let before = send_snapshot();
     assert!(!before.invalid, "{before:?}");
     let allocation = before.live_alias(data.as_ptr(), data.len());
+    // Short ambient frames reach the underlying allocator at the original
+    // size. The global observer counts them in its process small band without
+    // an appended source token.
+    assert!(framed_bytes < ATTRIBUTION_THRESHOLD_BYTES);
     assert_eq!(before.records[allocation].bytes, framed_bytes);
     assert_eq!(data.len(), framed_bytes);
     assert!(data.len() < SEGMENT / 1024);

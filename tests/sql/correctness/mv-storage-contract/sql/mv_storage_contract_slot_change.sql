@@ -172,6 +172,7 @@ REFRESH MATERIALIZED VIEW unknown_slot_mv;
 -- @result_rows_where=Property=LatestSlotChangeConclusion
 -- @result_rows_count=1
 -- @result_rows_expect=Value=Committed
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('mvslot_${uuid0}', 'ns_${uuid0}', 'unknown_slot_mv');
 
 -- query 20
@@ -179,6 +180,7 @@ CALL novarocks_mv_management_status('mvslot_${uuid0}', 'ns_${uuid0}', 'unknown_s
 -- @result_rows_where=Property=PendingSlotChanges
 -- @result_rows_count=1
 -- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('mvslot_${uuid0}', 'ns_${uuid0}', 'unknown_slot_mv');
 
 -- query 21

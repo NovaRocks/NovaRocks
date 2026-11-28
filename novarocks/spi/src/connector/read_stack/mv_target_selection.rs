@@ -59,6 +59,32 @@ impl ConnectorMvTargetPartitionSelection {
         keys: Vec<Vec<ConnectorMvPartitionValue>>,
         snapshot_id: i64,
     ) -> Result<Self, ConnectorError> {
+        if keys.len() > MAX_MV_TARGET_PARTITION_KEYS {
+            return Err(invalid("MV target selection exceeds the key limit"));
+        }
+        if keys.iter().flatten().any(|value| {
+            matches!(value, ConnectorMvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
+        }) {
+            return Err(invalid("MV target selection value exceeds the byte limit"));
+        }
+        Self::for_exact_replacement(
+            object_id,
+            partition_spec_version,
+            partition_fields,
+            keys,
+            snapshot_id,
+        )
+    }
+
+    /// An exact write predicate retains every admitted affected target key.
+    /// The bounded target read optimization uses its separately checked constructor.
+    pub fn for_exact_replacement(
+        object_id: ConnectorTableObjectId,
+        partition_spec_version: Bytes,
+        partition_fields: Vec<MvExactPartitionField>,
+        keys: Vec<Vec<ConnectorMvPartitionValue>>,
+        snapshot_id: i64,
+    ) -> Result<Self, ConnectorError> {
         if partition_spec_version.is_empty() || partition_spec_version.len() > 1024 {
             return Err(invalid(
                 "MV target selection requires a bounded exact partition spec",
@@ -79,9 +105,6 @@ impl ConnectorMvTargetPartitionSelection {
                 ));
             }
         }
-        if keys.len() > MAX_MV_TARGET_PARTITION_KEYS {
-            return Err(invalid("MV target selection exceeds the key limit"));
-        }
         let mut unique_keys = HashSet::with_capacity(keys.len());
         for key in &keys {
             if key.len() != partition_fields.len() {
@@ -89,12 +112,7 @@ impl ConnectorMvTargetPartitionSelection {
                     "MV target selection key width differs from its fields",
                 ));
             }
-            if key.iter().any(|value| {
-                matches!(value, ConnectorMvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
-            }) {
-                return Err(invalid("MV target selection value exceeds the byte limit"));
-            }
-            if !unique_keys.insert(key.clone()) {
+            if !unique_keys.insert(key) {
                 return Err(invalid("MV target selection repeats a partition key"));
             }
         }
@@ -130,4 +148,46 @@ impl ConnectorMvTargetPartitionSelection {
 
 fn invalid(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::MvExactPartitionTransform;
+
+    #[test]
+    fn partition_replacement_keeps_keys_beyond_the_read_optimization_bound() {
+        let object = ConnectorTableObjectId::try_new(Bytes::from_static(b"target")).unwrap();
+        let spec = Bytes::from_static(b"spec");
+        let fields = vec![
+            MvExactPartitionField::try_new(
+                Bytes::from_static(b"partition-field"),
+                Bytes::from_static(b"source-field"),
+                MvExactPartitionTransform::Identity,
+            )
+            .unwrap(),
+        ];
+        let keys = (0..=MAX_MV_TARGET_PARTITION_KEYS)
+            .map(|value| vec![ConnectorMvPartitionValue::String(value.to_string().into())])
+            .collect::<Vec<_>>();
+        assert!(
+            ConnectorMvTargetPartitionSelection::try_new(
+                object.clone(),
+                spec.clone(),
+                fields.clone(),
+                keys.clone(),
+                41
+            )
+            .is_err()
+        );
+        let exact = ConnectorMvTargetPartitionSelection::for_exact_replacement(
+            object,
+            spec,
+            fields,
+            keys.clone(),
+            41,
+        )
+        .unwrap();
+        assert_eq!(exact.keys(), keys);
+    }
 }

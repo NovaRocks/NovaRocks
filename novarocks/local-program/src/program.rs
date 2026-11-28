@@ -561,6 +561,28 @@ pub struct ProgramPositionShardInput {
     pub partition: SlotId,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramContentApplyTarget {
+    pub file: SlotId,
+    pub position: SlotId,
+    pub spec_id: SlotId,
+    pub partition: SlotId,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramContentApply {
+    pub weighted_input: ProgramNodeId,
+    pub target_input: ProgramNodeId,
+    pub weighted_content: Box<[SlotId]>,
+    pub target_content: Box<[SlotId]>,
+    pub route_keys: Box<[u32]>,
+    pub weight: SlotId,
+    pub target: ProgramContentApplyTarget,
+    pub demand_filters: Box<[(usize, crate::StaticFilterProducer)]>,
+    /// The ordered DeleteVerification layout, independent of the data port.
+    pub summary_slots: [SlotId; 4],
+}
+
 #[derive(Clone, Debug)]
 pub enum ProgramNodeKind {
     AssertNumRows {
@@ -628,6 +650,7 @@ pub enum ProgramNodeKind {
         /// File, spec, partition, author driver, high32, container, index, count, bitmap.
         output_slots: [SlotId; 9],
     },
+    ContentApply(ProgramContentApply),
     UnionAll {
         inputs: Vec<ProgramNodeId>,
     },
@@ -741,7 +764,10 @@ pub enum ProgramNodeKind {
 
 impl ProgramNodeKind {
     pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
-        None
+        match self {
+            Self::ContentApply(_) => Some(crate::SummaryKind::DeleteVerification),
+            _ => None,
+        }
     }
 
     /// The unary pipeline steps built iteratively by Execution.
@@ -788,6 +814,10 @@ impl ProgramNodeKind {
                 for input in inputs {
                     visit(input.input)?;
                 }
+            }
+            Self::ContentApply(spec) => {
+                visit(spec.weighted_input)?;
+                visit(spec.target_input)?;
             }
             Self::Join { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
                 visit(*left)?;
@@ -1011,7 +1041,7 @@ impl ProgramNodeKind {
                     }
                 }
             }
-            Self::PositionShard { .. } | Self::WriteLayoutKey { .. } => {}
+            Self::PositionShard { .. } | Self::ContentApply(_) | Self::WriteLayoutKey { .. } => {}
             Self::Sort { order_by, mode, .. } => {
                 for sort in order_by.iter().chain(mode.partition_by()) {
                     visit(Some(sort.expr), Value)?;
@@ -1756,17 +1786,41 @@ impl LocalProgramGraph {
                     let author = nodes
                         .get(id.index())
                         .ok_or(LocalProgramError::InvalidSink)?;
-                    if summary.kind() == crate::SummaryKind::WriteCounts
-                        || author.kind.summary_authorship() != Some(summary.kind())
-                        || !work.projection_matches(
-                            &author.output_layout,
-                            summary.branch().output_columns(),
-                            summary.layout(),
-                        )?
+                    let ProgramNodeKind::ContentApply(spec) = &author.kind else {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    };
+                    if author.kind.summary_authorship() != Some(summary.kind())
+                        || spec.summary_slots.as_slice() != summary.layout().slots()
+                        || !matches!(sink, Some(StaticSinkProgram::ChangeStreamRouter { .. }))
+                        || id == root
                     {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
+                    for slot in spec.summary_slots {
+                        for output in author
+                            .output_layout
+                            .slots()
+                            .iter()
+                            .chain(nodes[root.index()].output_layout.slots())
+                        {
+                            work.step()?;
+                            if slot == *output {
+                                return Err(LocalProgramError::InvalidSink.into());
+                            }
+                        }
+                    }
                 }
+            }
+        }
+        for (ordinal, node) in nodes.iter().enumerate() {
+            work.step()?;
+            if let Some(kind) = node.kind.summary_authorship()
+                && (seen_summaries.get(crate::SummaryKind::WriteCounts).is_none() || !summaries.iter().any(|summary| {
+                    summary.kind() == kind
+                        && matches!(summary.author(), crate::StaticSummaryAuthor::Node(owner) if owner.index() == ordinal)
+                }))
+            {
+                return Err(LocalProgramError::InvalidSink.into());
             }
         }
         if let Some(sink) = &sink {
@@ -2055,6 +2109,11 @@ fn node_filter_ids(
                 add(filter.producer.binding_id())?;
             }
         }
+        ProgramNodeKind::ContentApply(spec) => {
+            for (_, producer) in &spec.demand_filters {
+                add(producer.binding_id())?;
+            }
+        }
         ProgramNodeKind::Join {
             runtime_filters,
             runtime_filter_consumers,
@@ -2104,6 +2163,52 @@ fn validate_relationships(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::ContentApply(spec) => {
+            let weighted = nodes[spec.weighted_input.index()].output_layout();
+            let target = nodes[spec.target_input.index()].output_layout();
+            for (ordinal, producer) in &spec.demand_filters {
+                work.step()?;
+                let ty = spec
+                    .weighted_content
+                    .get(*ordinal)
+                    .and_then(|slot| weighted.value_binding(*slot))
+                    .ok_or(LocalProgramError::LayoutMismatch)?;
+                let crate::StaticFilterContract::Membership {
+                    canonical,
+                    value_type,
+                } = producer.contract()
+                else {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                };
+                if producer.kind() != crate::FilterProducerKind::Membership
+                    || producer.reduction() != crate::FilterReduction::SetUnion
+                    || canonical.null_semantics() != crate::FilterNullSemantics::NullSafeEqual
+                    || ty.value_type() != value_type.value_type()
+                {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                }
+            }
+            for (layout, content, extra) in [
+                (weighted, spec.weighted_content.as_ref(), &[spec.weight][..]),
+                (
+                    target,
+                    spec.target_content.as_ref(),
+                    &[
+                        spec.target.file,
+                        spec.target.position,
+                        spec.target.spec_id,
+                        spec.target.partition,
+                    ][..],
+                ),
+            ] {
+                for slot in content.iter().chain(extra) {
+                    work.step()?;
+                    if layout.value_binding(*slot).is_none() {
+                        return Err(LocalProgramError::LayoutMismatch.into());
+                    }
+                }
+            }
+        }
         ProgramNodeKind::AssertNumRows { input, mode } => {
             if !layout_matches(nodes, *input, &node.output_layout, work)? {
                 return Err(LocalProgramError::LayoutMismatch.into());
@@ -2230,6 +2335,22 @@ fn validate_shape(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::ContentApply(spec) => {
+            let width = spec.weighted_content.len();
+            if width == 0
+                || width != spec.target_content.len()
+                || width.checked_add(5) != Some(node.output_layout.slots().len())
+                || spec.route_keys.is_empty()
+            {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for &key in &spec.route_keys {
+                work.step()?;
+                if key as usize >= width {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+        }
         ProgramNodeKind::Filter { predicates, .. } => {
             let empty = predicates.is_empty();
             work.step()?;

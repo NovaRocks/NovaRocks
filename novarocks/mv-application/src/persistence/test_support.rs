@@ -261,13 +261,13 @@ fn sample_interpretation(definition: &DefinitionDocument) -> InterpretationDocum
                 encoding: StateEncoding::NativeColumnV1,
             },
         ],
-        apply_key: ApplyKey {
+        apply_key: Some(ApplyKey {
             kind: ApplyKeyKind::GroupRowId,
             components: vec![ApplyKeyComponent {
                 logical_id: apply_key_id(44),
                 target_field_id: field_id(34),
             }],
-        },
+        }),
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
@@ -786,13 +786,13 @@ pub fn union_all_keyed_projection_fixture(
             })
             .collect(),
         state_slots: Vec::new(),
-        apply_key: ApplyKey {
+        apply_key: Some(ApplyKey {
             kind: ApplyKeyKind::BaseRowId,
             components: vec![ApplyKeyComponent {
                 logical_id: apply_id,
                 target_field_id: apply_field,
             }],
-        },
+        }),
         aggregates: Vec::new(),
         branches: branch_ids
             .into_iter()

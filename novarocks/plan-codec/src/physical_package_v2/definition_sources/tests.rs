@@ -481,6 +481,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(u32::MAX),
             root: table,
             values,
@@ -683,6 +684,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(9),
             root: source,
             values: values
@@ -851,6 +853,7 @@ pub(in crate::physical_package_v2) fn values_package_with_pool(
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(5),
             root: source,
             values: values

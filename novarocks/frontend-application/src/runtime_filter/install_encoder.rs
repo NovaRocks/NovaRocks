@@ -67,6 +67,7 @@ pub(crate) struct FrontendRuntimeFilterFeedbackChannel {
     pub(crate) publishers: Vec<FrontendRuntimeFilterFeedbackPublisherSlot>,
     pub(crate) scan_bindings: Vec<FrontendRuntimeFilterFeedbackScanBinding>,
     pub(crate) wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility,
+    pub(crate) content_demand: bool,
 }
 
 impl FrontendRuntimeFilterFeedbackChannel {

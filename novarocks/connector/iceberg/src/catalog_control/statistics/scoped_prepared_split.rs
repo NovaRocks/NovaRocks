@@ -98,6 +98,7 @@ enum Phase {
 /// finish every hard data check before any To endpoint proof can begin.
 pub(crate) struct PreparedSplitEndpoint {
     pub(crate) files: Vec<IcebergPlannedDataFile>,
+    pub(crate) pruning: novarocks_spi::connector::read_stack::SplitPruningLedger,
     pub(crate) retention: ConnectorPayloadRetentionGuard,
 }
 

@@ -86,6 +86,7 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(0),
             root: node,
             values: BTreeMap::new(),

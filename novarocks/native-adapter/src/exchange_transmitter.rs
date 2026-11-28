@@ -120,7 +120,14 @@ impl<F> ExchangeCallFuture<F> {
         // If capture destruction panics, retain the original activity instead
         // of authoring a false exit while unwinding the remaining fields.
         let activity = ManuallyDrop::new(self.activity.take());
-        drop(self.future.take());
+        let future = self.future.take();
+        match activity
+            .as_ref()
+            .and_then(ExchangeCallActivity::memory_observation)
+        {
+            Some(observation) => observation.run(|| drop(future)),
+            None => drop(future),
+        }
         drop(ManuallyDrop::into_inner(activity));
     }
 }
@@ -129,12 +136,15 @@ impl<F: Future<Output = ()>> Future for ExchangeCallFuture<F> {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        let result = this
-            .future
-            .as_mut()
-            .expect("live exchange call")
-            .as_mut()
-            .poll(context);
+        let future = this.future.as_mut().expect("live exchange call");
+        let result = match this
+            .activity
+            .as_ref()
+            .and_then(ExchangeCallActivity::memory_observation)
+        {
+            Some(observation) => observation.run(|| future.as_mut().poll(context)),
+            None => future.as_mut().poll(context),
+        };
         if result.is_ready() {
             this.finish();
         }
@@ -156,10 +166,17 @@ fn spawn_exchange_call(
     activity: ExchangeCallActivity,
     future: impl Future<Output = ()> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
-    runtime.handle().spawn(ExchangeCallFuture {
-        future: Some(Box::pin(future)),
-        activity: Some(activity),
-    })
+    let observation = activity.memory_observation().cloned();
+    let spawn = || {
+        runtime.handle().spawn(ExchangeCallFuture {
+            future: Some(Box::pin(future)),
+            activity: Some(activity),
+        })
+    };
+    match observation {
+        Some(observation) => observation.run(spawn),
+        None => spawn(),
+    }
 }
 
 #[cfg(novarocks_dev_controls)]
@@ -818,6 +835,88 @@ pub(crate) mod tests {
         );
         runtime.block_on(job).unwrap();
         assert_eq!(*events.lock().unwrap(), ["capture", "activity"]);
+    }
+
+    #[test]
+    fn pending_exchange_call_restores_outer_owner_and_destroys_capture_under_original_owner() {
+        use novarocks_memory::attribution::AttributingAllocator;
+        use novarocks_memory::lane::RecordRef;
+        use std::alloc::{GlobalAlloc, Layout, System};
+
+        fn origin() -> RecordRef {
+            let allocator = AttributingAllocator::new(System);
+            let layout = Layout::from_size_align(1024, 8).unwrap();
+            // SAFETY: a valid nonzero layout with the exact paired release.
+            let block = unsafe { allocator.alloc(layout) };
+            assert!(!block.is_null());
+            // SAFETY: this allocator initialized the source tail for the tagged block.
+            let source = unsafe { RecordRef::read(block.add(layout.size())) };
+            // SAFETY: release the original block under its original allocator and layout.
+            unsafe { allocator.dealloc(block, layout) };
+            source
+        }
+
+        #[derive(Default)]
+        struct WorkFacts {
+            polls: Vec<RecordRef>,
+            capture: Option<RecordRef>,
+            activity: Option<RecordRef>,
+        }
+        struct PendingCall(Arc<std::sync::Mutex<WorkFacts>>);
+        impl Future for PendingCall {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                self.0.lock().unwrap().polls.push(origin());
+                Poll::Pending
+            }
+        }
+        impl Drop for PendingCall {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().capture = Some(origin());
+            }
+        }
+
+        let authority = crate::backend_test_support::test_memory_authority();
+        let account = authority
+            .create_account(
+                novarocks_memory::AccountKind::Work,
+                novarocks_memory::ExternalRef::NONE,
+            )
+            .unwrap();
+        let owner = account.create_lane_shards();
+        let outer = account.create_lane_shards();
+        let expected_owner = owner.explicit_owner().reference().unwrap();
+        let expected_outer = outer.explicit_owner().reference().unwrap();
+
+        for attempted_poll in [true, false] {
+            let facts = Arc::new(std::sync::Mutex::new(WorkFacts::default()));
+            let activity_facts = facts.clone();
+            let mut call = ExchangeCallFuture {
+                future: Some(Box::pin(PendingCall(facts.clone()))),
+                activity: Some(ExchangeCallActivity::for_test_with_observation(
+                    &owner,
+                    move || {
+                        let mut facts = activity_facts.lock().unwrap();
+                        assert_eq!(facts.capture, Some(expected_owner));
+                        facts.activity = Some(origin());
+                    },
+                )),
+            };
+            outer.run(|| {
+                if attempted_poll {
+                    let mut context = Context::from_waker(std::task::Waker::noop());
+                    assert_eq!(Pin::new(&mut call).poll(&mut context), Poll::Pending);
+                    assert_eq!(origin(), expected_outer);
+                }
+                drop(call);
+                assert_eq!(origin(), expected_outer);
+            });
+            let facts = facts.lock().unwrap();
+            assert_eq!(facts.polls.len(), usize::from(attempted_poll));
+            assert!(facts.polls.iter().all(|record| *record == expected_owner));
+            assert_eq!(facts.activity, Some(expected_outer));
+        }
     }
 
     #[test]

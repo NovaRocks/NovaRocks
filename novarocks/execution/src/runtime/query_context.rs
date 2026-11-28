@@ -47,6 +47,16 @@ impl QueryMemoryAccount {
     pub fn into_account(self) -> Account {
         self.account
     }
+    pub fn bind(
+        self,
+        execution: QueryExecutionId,
+        authority: Arc<novarocks_memory::MemoryAuthority>,
+    ) -> Result<QueryMemoryBinding, QueryMemoryBindingError> {
+        if self.execution != execution {
+            return Err(QueryMemoryBindingError::OwnerAttemptMismatch);
+        }
+        QueryMemoryBinding::try_new(execution, authority, self.account)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryMemoryAccountError {

@@ -264,7 +264,7 @@ fn target_state_old_scan(
 ) -> Result<LogicalPlanNode, SqlCompileError> {
     let mut locator_metadata_columns = target_state_locator_metadata_columns();
     locator_metadata_columns
-        .extend_from_slice(super::target_locator::target_file_metadata_columns(ctx));
+        .extend_from_slice(super::position_metadata::target_file_metadata_columns(ctx));
     let old_columns = if branch_scope.is_some() {
         target_state_branch_scoped_old_scan_columns(
             ctx,
@@ -1193,11 +1193,11 @@ fn aggregate_change_stream_output_columns(
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
-    for field in super::target_locator::target_file_metadata_columns(ctx) {
+    for field in super::position_metadata::target_file_metadata_columns(ctx) {
         columns.push(allocate_imv_output_column(
             ctx,
             &field.name,
-            super::target_locator::nullable_file_metadata_value(field)?,
+            super::position_metadata::nullable_file_metadata_value(field)?,
             true,
         )?);
     }
@@ -1214,7 +1214,7 @@ fn is_locator_metadata_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(crate::common::ICEBERG_FILE_PATH_COL)
         || name.eq_ignore_ascii_case(crate::common::ICEBERG_ROW_POS_COL)
         || is_reuse_lineage_metadata_column(name)
-        || super::target_locator::is_target_file_metadata(name)
+        || super::position_metadata::is_target_file_metadata(name)
 }
 
 fn is_reuse_lineage_metadata_column(name: &str) -> bool {
@@ -1499,7 +1499,7 @@ fn aggregate_old_state_passthrough_items(
 
     for output in outputs
         .iter()
-        .filter(|column| super::target_locator::is_target_file_metadata(&column.name))
+        .filter(|column| super::position_metadata::is_target_file_metadata(&column.name))
     {
         push_unique_name(&mut names, &output.name);
     }

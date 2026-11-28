@@ -503,6 +503,11 @@ pub enum ProviderReadRelationNeed {
         target_snapshot_id: Option<i64>,
         use_affected_partitions: bool,
     },
+    MvContentTarget {
+        relation: TableIdentity,
+        target_table_uuid: String,
+        target_snapshot_id: i64,
+    },
     PinnedFileSet {
         relation: TableIdentity,
     },
@@ -535,6 +540,7 @@ impl ProviderReadRelationNeed {
             | Self::Metadata { relation, .. }
             | Self::Delta { relation, .. }
             | Self::MvTarget { relation, .. }
+            | Self::MvContentTarget { relation, .. }
             | Self::PinnedFileSet { relation } => relation,
         }
     }
@@ -544,7 +550,8 @@ impl ProviderReadRelationNeed {
             Self::Data { .. }
             | Self::FrozenInputSet { .. }
             | Self::PinnedFileSet { .. }
-            | Self::MvTarget { .. } => ConnectorReadRelationKind::Table,
+            | Self::MvTarget { .. }
+            | Self::MvContentTarget { .. } => ConnectorReadRelationKind::Table,
             Self::Metadata { .. } => ConnectorReadRelationKind::SystemTable,
             Self::Delta { .. } => ConnectorReadRelationKind::ChangeWindow,
         }
@@ -584,6 +591,11 @@ impl fmt::Debug for ProviderReadRelationNeed {
                 debug
                     .field("target_snapshot_id", target_snapshot_id)
                     .field("use_affected_partitions", use_affected_partitions);
+            }
+            Self::MvContentTarget {
+                target_snapshot_id, ..
+            } => {
+                debug.field("content_target_snapshot_id", target_snapshot_id);
             }
             Self::PinnedFileSet { .. } => {}
         }
@@ -897,6 +909,9 @@ fn validate_provider_relation(
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
         } => target_snapshot_id.is_some_and(|snapshot| snapshot < 0),
+        ProviderReadRelationNeed::MvContentTarget {
+            target_snapshot_id, ..
+        } => *target_snapshot_id < 0,
         ProviderReadRelationNeed::PinnedFileSet { .. } => false,
     };
     if invalid_snapshot {
@@ -937,6 +952,14 @@ pub(super) fn provider_relation_need_from_sql_scan(
             to_snapshot_id: *to_snapshot_id,
         },
         SqlScanKind::PinnedFileSet => ProviderReadRelationNeed::PinnedFileSet { relation },
+        SqlScanKind::MvContentTarget {
+            target_table_uuid,
+            target_snapshot_id,
+        } => ProviderReadRelationNeed::MvContentTarget {
+            relation,
+            target_table_uuid: target_table_uuid.clone(),
+            target_snapshot_id: *target_snapshot_id,
+        },
         SqlScanKind::MvTargetState { facts } => ProviderReadRelationNeed::MvTarget {
             relation,
             target_table_uuid: facts.target_table_uuid.clone(),
@@ -945,12 +968,6 @@ pub(super) fn provider_relation_need_from_sql_scan(
                 facts.partition_constraint,
                 crate::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
             ),
-        },
-        SqlScanKind::MvTargetLocator { facts } => ProviderReadRelationNeed::MvTarget {
-            relation,
-            target_table_uuid: facts.target_table_uuid.clone(),
-            target_snapshot_id: facts.target_snapshot_id,
-            use_affected_partitions: false,
         },
         SqlScanKind::ConnectorRead
         => {
@@ -3663,9 +3680,11 @@ fn table_identity_bytes(identity: &TableIdentity) -> Result<u64, CompletionProto
 }
 
 fn statistics_metric_bytes(metric: &StatisticsMetric) -> Result<u64, CompletionProtocolError> {
-    use StatisticsMetric::{AverageSize, Maximum, Minimum, NullCount, RowCount, ThetaNdv};
+    use StatisticsMetric::{
+        AverageSize, DataFileBytes, Maximum, Minimum, NullCount, RowCount, ThetaNdv,
+    };
     match metric {
-        RowCount => Ok(0),
+        RowCount | DataFileBytes => Ok(0),
         NullCount { column }
         | Minimum { column }
         | Maximum { column }
@@ -3728,6 +3747,9 @@ fn provider_relation_dynamic_bytes(
         | ProviderReadRelationNeed::Delta { .. }
         | ProviderReadRelationNeed::PinnedFileSet { .. } => 0,
         ProviderReadRelationNeed::MvTarget {
+            target_table_uuid, ..
+        }
+        | ProviderReadRelationNeed::MvContentTarget {
             target_table_uuid, ..
         } => checked_size(target_table_uuid.len())?,
     };

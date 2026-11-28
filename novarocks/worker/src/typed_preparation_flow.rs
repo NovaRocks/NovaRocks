@@ -79,7 +79,10 @@ impl ScanPreparationTimer {
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
             .name("nova-scan-pause-timer".to_string())
-            .spawn(move || run_timer(receiver))
+            .spawn(move || {
+                novarocks_memory::attribution::roles::enter_registered_thread_role("scan_control");
+                run_timer(receiver)
+            })
             .expect("start backend scan preparation timer");
         Arc::new(Self {
             sender,

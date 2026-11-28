@@ -1,0 +1,19 @@
+-- query 2
+-- types	varchar	bigint
+label	multiplicity
+NULL	1
+kept	1
+nan	2
+zero	1
+
+-- query 4
+-- types	varchar(4)	varchar	bigint	bigint	bigint	bigint	bigint
+origin	label	multiplicity	zero_tuple	nan_tuple	retained_tuple	null_tuple
+full	NULL	1	0	0	0	1
+full	kept	1	0	0	1	0
+full	nan	1	0	1	0	0
+full	zero	1	1	0	0	0
+mv	NULL	1	0	0	0	1
+mv	kept	1	0	0	1	0
+mv	nan	1	0	1	0	0
+mv	zero	1	1	0	0	0

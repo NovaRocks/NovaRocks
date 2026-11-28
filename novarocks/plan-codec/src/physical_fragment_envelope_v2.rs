@@ -47,6 +47,7 @@ pub(crate) struct DecodedFragmentEnvelope {
     pub(crate) summaries: Box<[p::SummaryOutput]>,
     pub(crate) dop_domain: p::PipelineDopDomain,
     pub(crate) stage_placement: p::StagePlacementPolicy,
+    pub(crate) input_completion: p::FragmentInputCompletion,
     pub(crate) runtime_filters: Box<[p::RuntimeFilterId]>,
 }
 #[derive(Debug, PartialEq)]
@@ -57,6 +58,7 @@ pub(crate) struct EncodedFragmentEnvelope {
     pub(crate) summaries: Vec<wire::SummaryOutput>,
     pub(crate) dop_domain: wire::PipelineDopDomain,
     pub(crate) stage_placement: wire::StagePlacementPolicy,
+    pub(crate) input_completion: i32,
     pub(crate) runtime_filter_ids: Vec<u32>,
 }
 fn required<T>(
@@ -891,6 +893,12 @@ fn emit_encode(
         id: input.id().get(),
         root_node_id: input.root().get(),
         stage_placement: encode_placement(input.stage_placement(), w)?,
+        input_completion: match input.input_completion() {
+            p::FragmentInputCompletion::MayShortCircuit => {
+                wire::FragmentInputCompletion::MayShortCircuit
+            }
+            p::FragmentInputCompletion::MustDrain => wire::FragmentInputCompletion::MustDrain,
+        } as i32,
         sink: wire::FragmentSink { kind: Some(kind) },
         summaries: list(input.summaries(), w, |output, w| {
             crate::physical_summary_v2::encode_output(*output, w)
@@ -996,6 +1004,17 @@ fn emit_decode(
     let dop = required(input.dop_domain.as_ref(), "prepared DOP is absent", w)?;
     let output = DecodedFragmentEnvelope {
         id: p::FragmentId::new(input.id),
+        input_completion: match wire::FragmentInputCompletion::try_from(input.input_completion) {
+            Ok(wire::FragmentInputCompletion::MayShortCircuit) => {
+                p::FragmentInputCompletion::MayShortCircuit
+            }
+            Ok(wire::FragmentInputCompletion::MustDrain) => p::FragmentInputCompletion::MustDrain,
+            _ => {
+                return Err(invalid(
+                    "fragment input completion policy is absent or unknown",
+                ));
+            }
+        },
         stage_placement: decode_placement(
             required(
                 input.stage_placement.as_ref(),

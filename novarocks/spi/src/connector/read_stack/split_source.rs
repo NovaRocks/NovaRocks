@@ -27,18 +27,127 @@ use crate::connector::ConnectorError;
 
 use super::dynamic_filter::DynamicFilterSnapshot;
 
-/// One batch of splits, plus whether enumeration has finished.
+/// The reason an exact file inventory did not produce splits for a file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitPruningBasis {
+    StaticPredicate,
+    PartitionSelection,
+    DynamicFilter,
+    EmptyDemand,
+    UnsatisfiablePredicate,
+}
+
+impl SplitPruningBasis {
+    const ALL: [Self; 5] = [
+        Self::StaticPredicate,
+        Self::PartitionSelection,
+        Self::DynamicFilter,
+        Self::EmptyDemand,
+        Self::UnsatisfiablePredicate,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::StaticPredicate => 0,
+            Self::PartitionSelection => 1,
+            Self::DynamicFilter => 2,
+            Self::EmptyDemand => 3,
+            Self::UnsatisfiablePredicate => 4,
+        }
+    }
+}
+
+/// An order-independent digest of the file identities attributed to one reason.
+/// The digest describes the inventory. It does not decide file eligibility.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrunedSplitFiles {
+    pub file_count: u64,
+    pub identity_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SplitPruningLedger {
+    files: [PrunedSplitFiles; 5],
+    /// Ordinary scans may prove an empty predicate without making an exact
+    /// file inventory. Such a proof cannot stand in for the inventory.
+    unenumerated_unsatisfiable: bool,
+    /// An ordinary scan can prune ranges from an already partially assigned
+    /// file. The whole-file ledger cannot describe those remaining ranges.
+    unaccounted_split_remainder: bool,
+}
+
+impl SplitPruningLedger {
+    pub fn record_file(
+        &mut self,
+        basis: SplitPruningBasis,
+        identity_digest: [u8; 32],
+    ) -> Result<(), ConnectorError> {
+        let files = &mut self.files[basis.index()];
+        files.file_count = files.file_count.checked_add(1).ok_or_else(|| {
+            ConnectorError::new(
+                crate::connector::ConnectorErrorKind::CorruptData,
+                "Split pruning file count overflow",
+            )
+        })?;
+        // Addition modulo 2^256 preserves order-independence without
+        // retaining all identities or cancelling identical contributions.
+        let mut carry = 0_u16;
+        for (sum, input) in files.identity_digest.iter_mut().zip(identity_digest).rev() {
+            let next = u16::from(*sum) + u16::from(input) + carry;
+            *sum = next as u8;
+            carry = next >> 8;
+        }
+        Ok(())
+    }
+
+    pub fn complete_file_inventory(&self) -> bool {
+        !self.unenumerated_unsatisfiable && !self.unaccounted_split_remainder
+    }
+
+    pub fn mark_unenumerated_unsatisfiable(&mut self) {
+        self.unenumerated_unsatisfiable = true;
+    }
+
+    pub fn mark_unaccounted_split_remainder(&mut self) {
+        self.unaccounted_split_remainder = true;
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (SplitPruningBasis, PrunedSplitFiles)> + '_ {
+        SplitPruningBasis::ALL
+            .into_iter()
+            .zip(self.files)
+            .filter(|(basis, files)| {
+                files.file_count != 0
+                    || (*basis == SplitPruningBasis::UnsatisfiablePredicate
+                        && self.unenumerated_unsatisfiable)
+            })
+    }
+}
+
+#[derive(Debug)]
+pub enum SplitEnumeration {
+    More,
+    NaturalEnd(Box<SplitPruningLedger>),
+    Closed,
+}
+
+/// One batch of splits. Closing a source can settle delivery without proving
+/// that the original enumeration reached a natural end.
 #[derive(Debug)]
 pub struct ConnectorSplitBatch<S> {
     splits: Vec<S>,
-    no_more_splits: bool,
+    enumeration: SplitEnumeration,
 }
 
 impl<S> ConnectorSplitBatch<S> {
-    pub const fn new(splits: Vec<S>, no_more_splits: bool) -> Self {
-        Self {
-            splits,
-            no_more_splits,
+    pub fn new(splits: Vec<S>, no_more_splits: bool) -> Self {
+        if no_more_splits {
+            Self::natural_end(splits, SplitPruningLedger::default())
+        } else {
+            Self {
+                splits,
+                enumeration: SplitEnumeration::More,
+            }
         }
     }
 
@@ -46,15 +155,26 @@ impl<S> ConnectorSplitBatch<S> {
     pub const fn empty() -> Self {
         Self {
             splits: Vec::new(),
-            no_more_splits: false,
+            enumeration: SplitEnumeration::More,
         }
     }
 
-    /// The final, empty batch.
-    pub const fn finished() -> Self {
+    /// The final, empty batch from a naturally exhausted source.
+    pub fn finished() -> Self {
+        Self::natural_end(Vec::new(), SplitPruningLedger::default())
+    }
+
+    pub fn natural_end(splits: Vec<S>, pruning: SplitPruningLedger) -> Self {
+        Self {
+            splits,
+            enumeration: SplitEnumeration::NaturalEnd(Box::new(pruning)),
+        }
+    }
+
+    pub const fn closed() -> Self {
         Self {
             splits: Vec::new(),
-            no_more_splits: true,
+            enumeration: SplitEnumeration::Closed,
         }
     }
 
@@ -66,9 +186,20 @@ impl<S> ConnectorSplitBatch<S> {
         self.splits
     }
 
-    /// An empty batch is not end of enumeration unless this is set.
+    pub fn into_parts(self) -> (Vec<S>, SplitEnumeration) {
+        (self.splits, self.enumeration)
+    }
+
+    pub fn map_splits<T>(self, map: impl FnMut(S) -> T) -> ConnectorSplitBatch<T> {
+        ConnectorSplitBatch {
+            splits: self.splits.into_iter().map(map).collect(),
+            enumeration: self.enumeration,
+        }
+    }
+
+    /// An empty batch is not the end of delivery unless this is set.
     pub const fn no_more_splits(&self) -> bool {
-        self.no_more_splits
+        !matches!(self.enumeration, SplitEnumeration::More)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,6 +266,21 @@ mod tests {
         let finished = ConnectorSplitBatch::<u32>::finished();
         assert!(finished.is_empty());
         assert!(finished.no_more_splits());
+    }
+
+    #[test]
+    fn mapping_preserves_natural_end_and_early_close() {
+        let mut pruning = SplitPruningLedger::default();
+        pruning
+            .record_file(SplitPruningBasis::DynamicFilter, [1; 32])
+            .unwrap();
+        let source = ConnectorSplitBatch::natural_end(vec![1_u32], pruning.clone());
+        let (splits, end) = source.map_splits(u64::from).into_parts();
+        assert_eq!(splits, vec![1_u64]);
+        assert!(matches!(end, SplitEnumeration::NaturalEnd(value) if *value == pruning));
+        let closed = ConnectorSplitBatch::<u32>::closed().map_splits(u64::from);
+        assert!(closed.no_more_splits());
+        assert!(matches!(closed.into_parts().1, SplitEnumeration::Closed));
     }
 
     #[test]

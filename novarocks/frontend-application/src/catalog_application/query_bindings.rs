@@ -86,6 +86,11 @@ pub enum QueryTableBindingSelector {
     /// table apart.
     SessionWriteTarget(u32),
     Snapshot(i64),
+    /// One exact partition-replacement source in D's own occurrence order.
+    MvPartitionReplacementSource {
+        snapshot_id: i64,
+        occurrence_id: u32,
+    },
     Metadata(SqlMetadataTableKind),
     QualifiedMetadata {
         kind: SqlMetadataTableKind,
@@ -133,6 +138,24 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::Snapshot(snapshot_id),
+        )
+    }
+
+    pub(crate) fn mv_partition_replacement_source(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        snapshot_id: i64,
+        occurrence_id: u32,
+    ) -> Self {
+        Self::new(
+            catalog,
+            namespace,
+            table,
+            QueryTableBindingSelector::MvPartitionReplacementSource {
+                snapshot_id,
+                occurrence_id,
+            },
         )
     }
 

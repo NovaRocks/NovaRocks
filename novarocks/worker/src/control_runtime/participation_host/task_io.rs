@@ -863,6 +863,12 @@ impl ParticipationHostRecord {
                 Ok(job) => job,
                 Err(error) => return Err(reject(TaskIoError::Host(error), ticket)),
             };
+            job.set_memory_observation(
+                self.resources
+                    .work_registry
+                    .as_ref()
+                    .and_then(|work| work.query_memory_observation()),
+            );
             let capture = match owner.issue_preparation_capture() {
                 Ok(capture) => capture,
                 Err(error) => {

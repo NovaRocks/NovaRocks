@@ -147,6 +147,7 @@ fn rebuild(
         operators,
         &allowed,
         CompiledProgramFacts {
+            input_completion: novarocks_local_program::InputCompletion::MayShortCircuit,
             writes: program.write_recipes().clone(),
             exchange_inputs: program.exchange_inputs().clone(),
             scan_inputs: program.scan_inputs().clone(),
@@ -1637,10 +1638,9 @@ fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> Execution
 
 /// The union of every membership contribution `events` submitted, and the
 /// partition and sequence it closed with.
-fn published_membership(
-    events: &[ProducerEvent],
-    digest: [u8; 32],
-) -> (BTreeSet<i64>, bool, Option<(u32, u64)>) {
+pub(crate) type PublishedMembership = (BTreeSet<i64>, bool, Option<(u32, u64)>);
+
+fn published_membership(events: &[ProducerEvent], digest: [u8; 32]) -> PublishedMembership {
     let mut values = BTreeSet::new();
     let mut contains_null = false;
     let mut close = None;
@@ -1687,6 +1687,19 @@ fn published_membership(
         }
     }
     (values, contains_null, close)
+}
+
+pub(crate) fn observe_int64_membership_producer(
+    binding: u32,
+    digest: [u8; 32],
+) -> (
+    execution::RuntimeFilterSessionRef,
+    impl Fn() -> PublishedMembership,
+) {
+    let observed = Arc::new(RecordingProducer::default());
+    let session = FakeSession::producers(&[(binding, &observed)]);
+    let report = move || published_membership(&observed.events.lock().unwrap(), digest);
+    (session, report)
 }
 
 // The build driver publishes exactly the membership of its evaluated build

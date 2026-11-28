@@ -117,6 +117,7 @@ impl UnifiedStatisticsResolver {
                 narrowed_read: None,
                 table: table.table.clone(),
                 row_mutation_current: table.row_mutation_current.clone(),
+                observed_source: None,
                 data_version: table.data_version.clone(),
                 metrics,
                 context,

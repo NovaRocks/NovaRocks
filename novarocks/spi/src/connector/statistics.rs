@@ -112,11 +112,23 @@ impl fmt::Debug for StatisticsEvidenceRevision {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StatisticsMetric {
     RowCount,
-    NullCount { column: Arc<str> },
-    Minimum { column: Arc<str> },
-    Maximum { column: Arc<str> },
-    AverageSize { column: Arc<str> },
-    ThetaNdv { column: Arc<str> },
+    /// Bytes in the original visible data-file roster, excluding delete files.
+    DataFileBytes,
+    NullCount {
+        column: Arc<str>,
+    },
+    Minimum {
+        column: Arc<str>,
+    },
+    Maximum {
+        column: Arc<str>,
+    },
+    AverageSize {
+        column: Arc<str>,
+    },
+    ThetaNdv {
+        column: Arc<str>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1009,6 +1021,8 @@ pub struct StatisticsReadRequest {
     pub table: ConnectorTableHandle,
     /// An ordinary Current occurrence pinned by a row mutation's original admission.
     pub row_mutation_current: Option<super::ConnectorRowMutationCurrent>,
+    /// Exact original source observation for snapshot-scoped statistics.
+    pub observed_source: Option<super::ConnectorProcessLocalPayload>,
     /// The read as it stands after negotiation, when one has happened.
     ///
     /// Statistics for a table and statistics for a read of that table are
@@ -1682,7 +1696,7 @@ fn bounded_payload(bytes: Bytes, label: &str) -> Result<Bytes, ConnectorError> {
 
 fn metric_column(metric: &StatisticsMetric) -> Option<&str> {
     match metric {
-        StatisticsMetric::RowCount => None,
+        StatisticsMetric::RowCount | StatisticsMetric::DataFileBytes => None,
         StatisticsMetric::NullCount { column }
         | StatisticsMetric::Minimum { column }
         | StatisticsMetric::Maximum { column }

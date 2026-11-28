@@ -24,10 +24,9 @@
 //! the documents, and assuming there was none is the one assumption that can
 //! corrupt the target.
 //!
-//! So management closes on exactly that possibility. The barrier stands for
-//! everything the old incarnation could have dispatched, and only evidence
-//! that the old writer can no longer act retires it. Reading the view is
-//! unaffected: a published materialization is what the lake says it is.
+//! Aggregate targets retain a barrier for the old writer's possible effects.
+//! Non-aggregate targets enter exact SameOwner re-observation and register
+//! their management slot before the new incarnation writes.
 
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, EffectTerminalFact,
@@ -39,9 +38,8 @@ use novarocks_spi::connector::CatalogHandle;
 
 /// Close management on one target this process rediscovered from the lake.
 ///
-/// Returns whether a barrier was installed. A target this process itself
-/// wrote, or one owned by another deployment, gets none: the first has nothing
-/// to recover, and the second is not this deployment's to close.
+/// Returns whether a same-deployment continuation was installed for a
+/// target last written by a different process incarnation.
 pub(crate) fn close_recovered_target_management(
     entrance: &ManagementEntrance,
     catalog: CatalogHandle,
@@ -54,12 +52,21 @@ pub(crate) fn close_recovered_target_management(
     if source.process_incarnation == *entrance.incarnation() {
         return Ok(false);
     }
+    entrance.note_startup_incarnation(&source.process_incarnation);
     let target = ManagedMvTarget::try_new(
         catalog,
         source.target.clone(),
         source.target_object_id.clone(),
     )
     .map_err(|error| format!("name the recovered MV target: {error:?}"))?;
+    if !projection.facts.interpretation().is_aggregate() {
+        entrance
+            .recover_non_aggregate_target(target, source.process_incarnation.clone())
+            .map_err(|error| {
+                format!("continue recovered non-aggregate MV management: {error:?}")
+            })?;
+        return Ok(true);
+    }
     let barrier = recovery_barrier(&target, &source.process_incarnation);
     let observation = entrance
         .begin_recovered_target(
@@ -175,6 +182,34 @@ mod tests {
                 .covers(EffectScope::CATALOG_AND_OBJECT_DELETION),
             "an operator has to cover both paths before management reopens"
         );
+    }
+
+    #[test]
+    fn a_rediscovered_non_aggregate_uses_barrier_free_same_owner_readmission() {
+        let facts = novarocks_mv_application::persistence::test_support::union_all_keyed_projection_fixture(
+            MvTarget::from_parts(Some("ice"), "sales", "mv"),
+            Some(1), 2, 2, 1,
+        ).build().unwrap();
+        let projection = StoredKeyedMvProjection { mv_id: 1, facts };
+        let entrance = entrance("test-deployment", "this-process");
+        assert!(close_recovered_target_management(&entrance, catalog(), &projection).unwrap());
+        let table = table(&projection);
+        assert_eq!(
+            entrance.management_phase(&table),
+            MvManagementPhase::AwaitingObservation
+        );
+        assert!(entrance.unsettled_effects(&table).is_empty());
+        let previous_incarnation = entrance.non_aggregate_reobservation(&table).unwrap();
+        assert_eq!(previous_incarnation.as_str(), "test-process");
+        let state = entrance
+            .begin_readmission(
+                &table,
+                ManagementContinuation::SameOwner {
+                    previous_incarnation,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.phase(), novarocks_mv_application::management::ManagementObservationPhase::AwaitingFreshObservation);
     }
 
     #[test]

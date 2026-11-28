@@ -306,6 +306,11 @@ fn node_runtime_filter_bindings(kind: &ProgramNodeKind) -> Vec<u32> {
             .iter()
             .map(|filter| filter.producer.binding_id())
             .collect(),
+        ProgramNodeKind::ContentApply(spec) => spec
+            .demand_filters
+            .iter()
+            .map(|(_, producer)| producer.binding_id())
+            .collect(),
         ProgramNodeKind::Join {
             runtime_filters,
             runtime_filter_consumers,
@@ -523,6 +528,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         function_set,
         error,
         None,
+        None,
         1,
         0,
         novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
@@ -546,6 +552,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     _function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
+    task_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     local_exchange_bytes_per_driver: usize,
     local_exchange_max_rows: i64,
     output_batch_rows: std::num::NonZeroU32,
@@ -579,6 +586,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
             crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation::new(
                 graph.summaries(),
             )?,
+        task_tracker,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: 1,
@@ -690,9 +698,9 @@ fn build_node(
             if ctx
                 .summary_authors
                 .declares(kind, novarocks_local_program::StaticSummaryAuthor::Node(id))
+                && !(kind == novarocks_result_contract::SummaryKind::DeleteVerification
+                    && matches!(node.kind(), ProgramNodeKind::ContentApply(_)))
             {
-                // Every currently admitted node family declares no authorship.
-                // A future family must take the exact obligation in its factory arm.
                 return Err(
                     crate::exec::operators::logical_change_summary::summary_failure(
                         crate::exec::operators::logical_change_summary::SummaryFailure::Author(
@@ -1310,6 +1318,11 @@ fn build_recursive_node(
             ));
             Ok(build)
         }
+        ProgramNodeKind::ContentApply(spec) => {
+            let weighted = build_node(program, spec.weighted_input, ctx, error, ordered)?;
+            let target = build_node(program, spec.target_input, ctx, error, ordered)?;
+            content_apply::assemble(program, id, node_id, weighted, target, ctx, error)
+        }
         ProgramNodeKind::PositionShard {
             inputs,
             output_slots,
@@ -1798,6 +1811,8 @@ pub(crate) use writer_tests::{
     compiled_statistics_finish_fixture, compiled_statistics_writer_fixture,
 };
 
+#[path = "compiled_content_apply.rs"]
+mod content_apply;
 #[path = "compiled_join.rs"]
 mod join_pipelines;
 
@@ -1860,6 +1875,8 @@ mod join_tests;
 #[cfg(test)]
 #[path = "compiled_runtime_filter_tests.rs"]
 mod runtime_filter_tests;
+#[cfg(test)]
+pub(crate) use runtime_filter_tests::observe_int64_membership_producer;
 #[cfg(test)]
 pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixture;
 

@@ -29,9 +29,13 @@ CREATE CATALOG imv_pf_cut_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 
 CREATE SCHEMA imv_pf_cut_${uuid0}.ns_${uuid0};
 CREATE TABLE imv_pf_cut_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
-  v2 BIGINT
+  v2 BIGINT,
+  unused_payload VARCHAR
 ) WITH (format_version = 3);
-INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES
+INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders
+SELECT -id, 0, to_hex(sha256(to_utf8(CAST(id AS VARCHAR))))
+FROM TABLE(sequence(1, 4096)) AS cold(id);
+INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders (k1, v2) VALUES
   ROW(1, 10), ROW(1, 20), ROW(2, 40), ROW(3, 5);
 USE imv_pf_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW pf_mv_${uuid0} AS SELECT k1, v2 FROM orders WHERE v2 > 0;
@@ -45,25 +49,27 @@ REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 -- Delta with both a delete and an insert before inspecting the refresh-time plan.
 -- @skip_result_check=true
 DELETE FROM imv_pf_cut_${uuid0}.ns_${uuid0}.orders WHERE k1 = 2;
-INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES ROW(4, 7);
+INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders (k1, v2) VALUES ROW(4, 7);
 
 -- query 4
 -- Default EXPLAIN REFRESH should print the actual refresh logical plan.
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=CONTENT APPLY
 -- @result_contains=predicate: v2 > CAST(0 AS Int64)
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=LEFT OUTER JOIN
+-- @result_not_contains=__nova_base_row_id
 -- @result_not_contains=source:
 EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 5
 -- VERBOSE should include the same refresh plan shape plus refresh source detail.
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=CONTENT APPLY
 -- @result_contains=predicate: v2 > CAST(0 AS Int64)
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=LEFT OUTER JOIN
+-- @result_not_contains=__nova_base_row_id
 -- @result_contains=source: IcebergDeltaTable
--- @result_contains=source: IcebergMvTargetLocator
+-- @result_contains=source: IcebergMvContentTarget
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW pf_mv_${uuid0}

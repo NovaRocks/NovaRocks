@@ -30,6 +30,7 @@ use crate::iceberg::{Result, TableIdent, TableRequirement, TableUpdate};
 pub enum RequestShape {
     SnapshotProducing,
     MetadataOnly,
+    FencedMarkers,
     RefRetention,
     DocumentExpiry,
     Create,
@@ -120,6 +121,7 @@ impl FrozenRequest {
                 },
                 RequestShape::SnapshotProducing
                 | RequestShape::MetadataOnly
+                | RequestShape::FencedMarkers
                 | RequestShape::RefRetention
                 | RequestShape::DocumentExpiry,
             ) => {
@@ -175,6 +177,28 @@ impl FrozenRequest {
                     return Err(invalid(
                         "Metadata-only publication must not acquire a ref CAS",
                     ));
+                }
+                if parts.shape == RequestShape::FencedMarkers {
+                    let uuid_match = TableRequirement::UuidMatch { uuid: *uuid };
+                    let main_match = TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "main".into(),
+                        snapshot_id: *parent,
+                    };
+                    if parts.target_ref != "main"
+                        || parts.requirements.len() != 2
+                        || !parts.requirements.contains(&uuid_match)
+                        || !parts.requirements.contains(&main_match)
+                    {
+                        return Err(invalid(
+                            "Fenced marker publication must assert UUID and exact main",
+                        ));
+                    }
+                    let [update] = parts.updates.as_slice() else {
+                        return Err(invalid(
+                            "Fenced marker publication requires one marker property update",
+                        ));
+                    };
+                    validate_fenced_marker_update(update)?;
                 }
                 if parts.shape == RequestShape::DocumentExpiry {
                     // Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
@@ -436,6 +460,21 @@ pub(crate) fn validate_document_expiry_update(update: &TableUpdate) -> Result<()
     }
 }
 
+pub(crate) fn validate_fenced_marker_update(update: &TableUpdate) -> Result<()> {
+    use crate::document_storage::keyed::keys::{DocumentKey, parse_key};
+    if let TableUpdate::SetProperties { updates } = update
+        && !updates.is_empty()
+        && updates
+            .keys()
+            .all(|key| matches!(parse_key(key, false), Ok(Some(DocumentKey::Marker(_)))))
+    {
+        return Ok(());
+    }
+    Err(invalid(
+        "Fenced marker publication only permits keyed marker property updates",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +587,42 @@ mod tests {
         for _ in 0..8 {
             assert_eq!(request.to_rest_json().unwrap(), json);
         }
+        assert_eq!(request.ref_snapshot_after("main"), None);
+    }
+
+    #[test]
+    fn fenced_marker_request_asserts_exact_main_and_only_writes_markers() {
+        let mut input = parts(RequestShape::FencedMarkers);
+        let marker = "novarocks.doc.v2.mark.novarocks.mv~pending~example";
+        input.updates.push(TableUpdate::SetProperties {
+            updates: HashMap::from([(marker.into(), "opaque".into())]),
+        });
+        assert!(FrozenRequest::new(input).is_err());
+
+        let fenced_parts = || {
+            let mut input = parts(RequestShape::FencedMarkers);
+            input
+                .requirements
+                .push(TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10),
+                });
+            input
+        };
+        let mut input = fenced_parts();
+        input.updates.push(TableUpdate::SetProperties {
+            updates: HashMap::from([("unrelated".into(), "value".into())]),
+        });
+        assert!(FrozenRequest::new(input).is_err());
+
+        let mut input = fenced_parts();
+        input.updates.push(TableUpdate::SetProperties {
+            updates: HashMap::from([(marker.into(), "opaque".into())]),
+        });
+        let request = FrozenRequest::new(input).unwrap();
+        let wire = request.to_rest_json().unwrap();
+        assert_eq!(wire["requirements"][1]["snapshot-id"], 10);
+        assert_eq!(wire["updates"][0]["updates"][marker], "opaque");
         assert_eq!(request.ref_snapshot_after("main"), None);
     }
 

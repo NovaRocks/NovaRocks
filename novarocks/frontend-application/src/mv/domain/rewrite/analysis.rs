@@ -37,9 +37,9 @@ use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 
 use bytes::Bytes;
 use novarocks_sql::compiler::{
-    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts, SqlImvPartitionFacts,
-    SqlImvPartitionFieldFacts, SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts,
-    SqlMvRelationOccurrenceId,
+    SqlImvBaseFieldFacts, SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
+    SqlImvPartitionFacts, SqlImvPartitionFieldFacts, SqlImvPartitionTransformFacts,
+    SqlImvQualifiedFieldFacts, SqlMvRelationOccurrenceId,
 };
 
 use crate::mv::domain::rewrite::context::{
@@ -60,10 +60,7 @@ pub(crate) struct MvRewriteAnalysisInput<'a> {
     pub join_analysis: SqlMvRefreshJoinAnalysis,
     /// SQL aggregate calls and the physical layout derived from D's query.
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
-    pub source_fields: std::collections::BTreeMap<
-        u32,
-        Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
-    >,
+    pub sql_source_fields: std::collections::BTreeMap<u32, Vec<SqlImvBaseFieldFacts>>,
     pub direct_output_sources:
         crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
 }
@@ -149,7 +146,7 @@ pub(crate) fn freeze_rewrite_analysis_facts(
         join,
         partition,
         aggregate,
-        source_fields: input.source_fields,
+        sql_source_fields: input.sql_source_fields,
         direct_output_sources: input.direct_output_sources,
     })
 }

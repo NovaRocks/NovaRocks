@@ -29,6 +29,7 @@ use super::*;
 
 mod aggregate_sequence_contract;
 pub(crate) mod constant_fixture;
+pub(crate) mod content_apply_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
 mod guarantee_admission;

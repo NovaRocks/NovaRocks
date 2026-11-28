@@ -899,6 +899,31 @@ pub struct PositionShardAggregation {
     pub output: PositionShardOutput,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentApplyTarget {
+    pub file: ValueId,
+    pub position: ValueId,
+    pub spec_id: ValueId,
+    pub partition: ValueId,
+}
+
+impl ContentApplyTarget {
+    pub const fn columns(self) -> [ValueId; 4] {
+        [self.file, self.position, self.spec_id, self.partition]
+    }
+}
+
+/// Weighted content is input zero. Live target rows are input one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentApplySpec {
+    pub weighted_content: Box<[ValueId]>,
+    pub target_content: Box<[ValueId]>,
+    /// Ordered ordinals in the two corresponding content tuples.
+    pub route_keys: Box<[u32]>,
+    pub weight: ValueId,
+    pub target: ContentApplyTarget,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     Scan {
@@ -1014,6 +1039,8 @@ pub enum NodeKind {
     },
     /// Emit the complete file's position shards after all input routes end.
     PositionShard(PositionShardAggregation),
+    /// Apply weighted result content and author the Task's delete verification.
+    ContentApply(ContentApplySpec),
     /// Appends the provider's partition key with the task's layout spread.
     WriteLayoutKey {
         key_inputs: Box<[ValueId]>,
@@ -1034,9 +1061,11 @@ pub type AggregateContractRef<'a> = (&'a [(RootOrdinal, ValueId)], &'a [Aggregat
 
 impl NodeKind {
     /// Authorship is a closed node-family fact, never inferred from values.
-    /// No current node family authors a Task summary.
     pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
-        None
+        match self {
+            Self::ContentApply(_) => Some(crate::SummaryKind::DeleteVerification),
+            _ => None,
+        }
     }
 
     /// The one aggregate state contract, shared by ordinary aggregation and
@@ -1181,6 +1210,7 @@ impl NodeKind {
             | Self::AssertOneRow(_)
             | Self::ExchangeSource { .. }
             | Self::PositionShard(_)
+            | Self::ContentApply(_)
             | Self::WriteLayoutKey { .. }
             | Self::TableWriter { .. } => {}
         }
@@ -1196,6 +1226,19 @@ pub struct PhysicalNode {
     pub output: OutputPort,
     pub kind: NodeKind,
     pub expressions: Option<std::sync::Arc<novarocks_expression_contract::BoundExprSet>>,
+}
+
+impl PhysicalNode {
+    /// Ordered outputs on the data port. A summary author also declares its
+    /// independent fields in the frozen output, after its data fields.
+    pub fn data_output_columns(&self) -> &[ValueId] {
+        let width = match &self.kind {
+            NodeKind::ContentApply(spec) => spec.weighted_content.len().saturating_add(5),
+            _ => self.output.columns.len(),
+        };
+        // Validation separately rejects an incomplete or oversized declaration.
+        &self.output.columns[..width.min(self.output.columns.len())]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1222,6 +1265,13 @@ pub enum FragmentSink {
     Noop,
 }
 
+/// Whether local operators may stop reading inputs after their result is known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FragmentInputCompletion {
+    MayShortCircuit,
+    MustDrain,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fragment {
     id: FragmentId,
@@ -1232,6 +1282,7 @@ pub struct Fragment {
     summaries: Box<[crate::SummaryOutput]>,
     dop_domain: PipelineDopDomain,
     stage_placement: crate::StagePlacementPolicy,
+    input_completion: FragmentInputCompletion,
     runtime_filters: Box<[RuntimeFilterId]>,
     pub(crate) call_requests: crate::FragmentCallRequests,
     pub(crate) calls: crate::FrozenFragmentCalls,
@@ -1248,6 +1299,7 @@ impl Fragment {
             summaries: self.summaries,
             dop_domain: self.dop_domain,
             stage_placement: self.stage_placement,
+            input_completion: self.input_completion,
             runtime_filters: self.runtime_filters,
             call_requests: self.call_requests,
             calls: self.calls,
@@ -1284,6 +1336,10 @@ impl Fragment {
 
     pub const fn sink(&self) -> &FragmentSink {
         &self.sink
+    }
+
+    pub const fn input_completion(&self) -> FragmentInputCompletion {
+        self.input_completion
     }
 
     pub fn summaries(&self) -> &[crate::SummaryOutput] {
@@ -1586,6 +1642,9 @@ pub enum RuntimeFilterProducerTarget {
     JoinBuildKey {
         equality: crate::RuntimeFilterEqualityWitnessId,
     },
+    ContentDemand {
+        content_ordinal: u32,
+    },
     AggregateTopNKey {
         group_key_ordinal: u32,
         /// Exact TopN whose monotonic bound is contributed by this
@@ -1642,6 +1701,10 @@ pub enum RuntimeFilterConsumerTarget {
         lineage: Box<[RuntimeFilterLineageStep]>,
     },
     AggregateTopNScanField {
+        producer: crate::RuntimeFilterWitnessId,
+        lineage: Box<[RuntimeFilterLineageStep]>,
+    },
+    ContentDemandScanField {
         producer: crate::RuntimeFilterWitnessId,
         lineage: Box<[RuntimeFilterLineageStep]>,
     },
@@ -1937,6 +2000,7 @@ pub(crate) struct FragmentParts {
     pub summaries: Box<[crate::SummaryOutput]>,
     pub dop_domain: PipelineDopDomain,
     pub stage_placement: crate::StagePlacementPolicy,
+    pub input_completion: FragmentInputCompletion,
     pub runtime_filters: Box<[RuntimeFilterId]>,
     pub call_requests: crate::FragmentCallRequests,
     pub calls: crate::FrozenFragmentCalls,
@@ -1953,6 +2017,7 @@ impl From<FragmentParts> for Fragment {
             summaries: parts.summaries,
             dop_domain: parts.dop_domain,
             stage_placement: parts.stage_placement,
+            input_completion: parts.input_completion,
             runtime_filters: parts.runtime_filters,
             call_requests: parts.call_requests,
             calls: parts.calls,

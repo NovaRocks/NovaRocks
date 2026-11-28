@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot;
 use novarocks_execution_contract::{TaskIdentity, TaskStatusVersion};
+use novarocks_query_application::api::StatementExternalEffectDisposition;
 use novarocks_query_application::session_control::{ClientQueryId, SessionToken, StatementToken};
 use novarocks_types::{QueryExecutionId, QueryId};
 
@@ -763,6 +764,64 @@ impl StatementObservationHandle {
         {
             state.publish_root_status(self, fact);
         }
+    }
+
+    /// Called by the original MV Action only after its complete retirement poll.
+    /// The root identity is copied from the original status author for this
+    /// authenticated statement and exact bound attempt.
+    pub(crate) fn observe_mv_action_actual_exit(
+        &self,
+        external_effect: Option<StatementExternalEffectDisposition>,
+    ) {
+        let Some((query, statement, fact)) = self.mv_action_exit_binding() else {
+            return;
+        };
+        let root = fact.root;
+        let execution = root.query_execution_id();
+        let external_effect = match external_effect {
+            Some(StatementExternalEffectDisposition::KnownCommitted) => "known_committed",
+            Some(StatementExternalEffectDisposition::KnownUncommitted) => "known_uncommitted",
+            Some(StatementExternalEffectDisposition::CommitUnknown) => "commit_unknown",
+            None => "none",
+        };
+        eprintln!(
+            "{} client_query_id={} session_key={} statement_generation={} execution_id={}:{}:{} stage={} task={} backend={} status_version={} external_effect={external_effect}",
+            novarocks_failpoint::observation_marker::MV_ACTION_ACTUAL_EXIT,
+            query,
+            statement.session().key().get(),
+            statement.generation(),
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            root.stage_id().get(),
+            root.task_id().get(),
+            root.backend_process_id(),
+            fact.status_version.get(),
+        );
+    }
+
+    fn mv_action_exit_binding(
+        &self,
+    ) -> Option<(
+        ClientQueryId,
+        StatementToken,
+        StatementRootStatusObservation,
+    )> {
+        let owner = self.owner.as_ref()?.upgrade()?;
+        let mut state = owner.state.lock().ok()?;
+        if !owner.active(&mut state) {
+            return None;
+        }
+        let run = state.run_mut(self)?;
+        let fact = run.root_status?;
+        if run.binding_error.is_some()
+            || !fact.installed
+            || run.execution != Some(fact.root.query_execution_id())
+        {
+            return None;
+        }
+        let ObservationTarget::ClientQuery(query) = &run.target;
+        Some((query.clone(), run.statement?, fact))
     }
 
     /// Snapshot the already-applied Host observation at the first read call.

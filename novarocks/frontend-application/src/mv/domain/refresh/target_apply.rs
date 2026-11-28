@@ -20,10 +20,7 @@
 use novarocks_sql::planning::mv::{SqlMvInternalTargetColumn, mv_internal_target_column};
 use novarocks_sql::semantic::TableColumnDef;
 
-pub(crate) fn apply_key_table_column() -> TableColumnDef {
-    internal_target_column(SqlMvInternalTargetColumn::ApplyKey)
-}
-
+#[cfg(test)]
 pub(crate) fn join_apply_key_table_column() -> TableColumnDef {
     internal_target_column(SqlMvInternalTargetColumn::JoinApplyKey)
 }
@@ -42,9 +39,10 @@ fn internal_target_column(kind: SqlMvInternalTargetColumn) -> TableColumnDef {
     }
 }
 
-pub(crate) fn ensure_base_row_lineage_contract(
+pub(crate) fn ensure_base_source_contract(
     observation: &crate::mv::domain::storage_observation::MvSourceSchemaObservation,
     base_fqn: &str,
+    aggregate: bool,
 ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
     // The MV owner authors a data refusal before compilation/publication; keep
     // this original fact through the existing compile-source bridge.
@@ -58,7 +56,17 @@ pub(crate) fn ensure_base_row_lineage_contract(
             ),
         )
     };
-    if !observation.is_format_v3() {
+    use novarocks_spi::connector::MvSourceFormatVersion;
+
+    if !aggregate {
+        return match observation.format_version() {
+            MvSourceFormatVersion::V2 | MvSourceFormatVersion::V3 => Ok(()),
+            MvSourceFormatVersion::V1 => Err(refusal(format!(
+                "non-aggregate Iceberg materialized views require base table {base_fqn} to use Iceberg format-version=2 or 3"
+            ))),
+        };
+    }
+    if observation.format_version() != MvSourceFormatVersion::V3 {
         return Err(refusal(format!(
             "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3"
         )));

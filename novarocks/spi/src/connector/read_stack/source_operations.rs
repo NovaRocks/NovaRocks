@@ -28,6 +28,29 @@ use std::{
     task::{Context, Poll, Waker},
 };
 pub(super) type StopRequest = Arc<dyn Fn() + Send + Sync>;
+type ObserveWork = dyn Fn(&mut dyn FnMut()) + Send + Sync;
+
+/// A synchronous observation boundary carried by admitted work. It does not
+/// grant access or extend the lifetime of the operation.
+#[derive(Clone, Default)]
+pub struct ConnectorWorkObservation(Option<Arc<ObserveWork>>);
+
+impl ConnectorWorkObservation {
+    /// The observer must invoke the original step synchronously, exactly once.
+    pub fn new(observe: impl Fn(&mut dyn FnMut()) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(observe)))
+    }
+
+    pub fn run<T>(&self, step: impl FnOnce() -> T) -> T {
+        let Some(observe) = &self.0 else {
+            return step();
+        };
+        let mut step = Some(step);
+        let mut value = None;
+        observe(&mut || value = Some(step.take().expect("one observed source step")()));
+        value.expect("source observer ran the original step")
+    }
+}
 type PanicPayload = Box<dyn Any + Send>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorSourceExitProof {
@@ -208,6 +231,7 @@ struct SourceFault {
 #[derive(Clone)]
 pub struct ConnectorSourceOperations {
     inner: Arc<Mutex<SourceState>>,
+    observe_work: ConnectorWorkObservation,
 }
 #[derive(Default)]
 struct SourceState {
@@ -265,9 +289,20 @@ impl ConnectorSourceOperations {
     pub fn root(_admission: &novarocks_control_runtime::obligation::AdmissionProof) -> Self {
         Self::empty()
     }
+    /// Carries an application-supplied synchronous observation boundary with
+    /// the same admitted source. The observer must run the step exactly once.
+    pub fn with_work_observer(
+        mut self,
+        observe: impl Fn(&mut dyn FnMut()) + Send + Sync + 'static,
+    ) -> Self {
+        self.observe_work = ConnectorWorkObservation::new(observe);
+        self
+    }
+
     fn empty() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SourceState::default())),
+            observe_work: ConnectorWorkObservation::default(),
         }
     }
     #[cfg(any(test, novarocks_dev_controls))]
@@ -300,11 +335,17 @@ impl ConnectorSourceOperations {
         })
     }
     pub fn child(&self) -> Result<Self, ConnectorError> {
-        let child = Self::empty();
+        let mut child = Self::empty();
+        child.observe_work = self.observe_work.clone();
         let weak = Arc::downgrade(&child.inner);
+        let observe_work = child.observe_work.clone();
         let ticket = self.admit(Arc::new(move || {
             if let Some(inner) = weak.upgrade() {
-                Self { inner }.seal();
+                Self {
+                    inner,
+                    observe_work: observe_work.clone(),
+                }
+                .seal();
             }
         }))?;
         let notice = {
@@ -464,6 +505,10 @@ pub struct ConnectorOperationTicket {
     ended: bool,
 }
 impl ConnectorOperationTicket {
+    pub fn work_observation(&self) -> ConnectorWorkObservation {
+        self.operations.observe_work.clone()
+    }
+
     /// Publish this admitted operation's authored failure without claiming its
     /// physical exit. Later cleanup or an unknown destructor keeps the same slot.
     pub fn report_work_failure(&self, cause: ConnectorError) {

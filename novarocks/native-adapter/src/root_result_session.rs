@@ -37,6 +37,7 @@ use novarocks_execution::runtime::task::io::{
 };
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
+use novarocks_memory::LaneShards;
 use novarocks_result_contract::{
     BorrowedScalarLeaf, FrozenRootOutput, InternalResultDomain, RootOutputKind, RootProfileV1,
     ScalarLeafCursor,
@@ -583,6 +584,7 @@ pub struct NativeRootResultSession {
 // The facade's guard only requests cancellation; it never publishes exit.
 struct NativeRootWork {
     shared: Arc<RootSessionState>,
+    observation: LaneShards,
 }
 
 // Four distinct input phases allow independent data holders to exit even if
@@ -659,6 +661,7 @@ impl NativeRootResultSession {
         preparation_child: &Arc<
             crate::backend_task_execution::prepared_owner::NativePreparationChild,
         >,
+        observation: &LaneShards,
     ) -> Result<Arc<Self>, TaskIoError> {
         let control = preparation.runtime_control();
         if control.identity() != channel.spec().task
@@ -675,6 +678,7 @@ impl NativeRootResultSession {
             control,
             preparation_child,
             preparation.readiness_waker(),
+            observation,
         )
     }
 
@@ -684,6 +688,7 @@ impl NativeRootResultSession {
         failure_reporter: RootFailureReporter,
         preparation: &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
         readiness: std::task::Waker,
+        observation: &LaneShards,
     ) -> Result<Arc<Self>, TaskIoError> {
         let contract = &channel.spec().contract;
         // Every closed internal domain has its producer codec; only a scalar
@@ -812,6 +817,7 @@ impl NativeRootResultSession {
             .map_err(io_error)?;
         let work = Arc::new(NativeRootWork {
             shared: shared.clone(),
+            observation: observation.clone(),
         }) as Arc<dyn RootProducerJob>;
         let registration = match reservation.commit(work) {
             Ok(registration) => registration,
@@ -1553,6 +1559,10 @@ impl RootResultSession for NativeRootResultSession {
     }
 }
 impl RootProducerJob for NativeRootWork {
+    fn memory_observation(&self) -> &LaneShards {
+        &self.observation
+    }
+
     fn turn(&self) -> RootProducerTurn {
         #[cfg(test)]
         {
@@ -2123,6 +2133,7 @@ pub(crate) mod terminal_observation_tests {
         budget: Arc<ResultRetainedBudget>,
         limits: WorkerResultRetainedLimits,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+        observation: &LaneShards,
     ) -> Result<Arc<NativeRootResultSession>, TaskIoError> {
         let child =
             crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
@@ -2142,8 +2153,13 @@ pub(crate) mod terminal_observation_tests {
         channel
             .bind_preparation_exit_waker(preparation.readiness_waker())
             .unwrap_or_else(|_| panic!("one original Root exit waker"));
-        let result =
-            NativeRootResultSession::try_open_prepared(channel.clone(), pool, preparation, &child);
+        let result = NativeRootResultSession::try_open_prepared(
+            channel.clone(),
+            pool,
+            preparation,
+            &child,
+            observation,
+        );
         if result.is_err() {
             channel.close(RootRetentionClose::ParticipationAborted);
         }
@@ -2318,6 +2334,7 @@ pub(crate) mod terminal_observation_tests {
                 budget.clone(),
                 limits,
                 health.clone(),
+                crate::root_producer_pool::test_job_observation(),
             )
             .unwrap();
             Self {
@@ -2570,10 +2587,15 @@ pub(crate) mod terminal_observation_tests {
                     pool.execution_health(),
                 )
                 .unwrap();
-            let error =
-                NativeRootResultSession::try_open_prepared(channel, &pool, preparation, &child)
-                    .err()
-                    .expect("foreign original Task control must be refused");
+            let error = NativeRootResultSession::try_open_prepared(
+                channel,
+                &pool,
+                preparation,
+                &child,
+                crate::root_producer_pool::test_job_observation(),
+            )
+            .err()
+            .expect("foreign original Task control must be refused");
             assert!(preparation.runtime_control().accepted().is_none());
             error.failure_fact()
         });
@@ -3420,6 +3442,7 @@ pub(crate) mod terminal_observation_tests {
                 callback_budget,
                 limits,
                 callback_health,
+                crate::root_producer_pool::test_job_observation(),
             )
             .unwrap();
             session.channel().mark_participation_owned().unwrap();
@@ -3463,6 +3486,7 @@ pub(crate) mod terminal_observation_tests {
                 budget,
                 limits,
                 body_health,
+                crate::root_producer_pool::test_job_observation(),
             )
             .unwrap();
             session.channel().mark_participation_owned().unwrap();

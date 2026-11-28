@@ -58,6 +58,7 @@ pub(crate) struct MvObservedBinding {
     pub(crate) document: BindingDocument,
     pub(crate) revisions: BTreeMap<u32, ConnectorExactSemanticRevision>,
     pub(crate) direct_output_sources: MvDirectOutputSources,
+    pub(crate) replacement_output_sources: Option<BTreeMap<u32, MvDirectOutputSources>>,
     pub(crate) schemas: BTreeMap<String, storage::MvSourceSchemaObservation>,
 }
 
@@ -260,6 +261,35 @@ pub(crate) fn observe_mv_binding(
             direct_output_sources.insert(output.identity(), provider.clone());
         }
     }
+    let replacement_output_sources = sql_facts
+        .partition_replacement_sources()
+        .map(|branches| {
+            branches
+                .iter()
+                .map(|(occurrence, direct)| {
+                    let occurrence = occurrence.get();
+                    let fields = direct
+                        .iter()
+                        .zip(&outputs)
+                        .filter(|(is_direct, _)| **is_direct)
+                        .map(|(_, output)| {
+                            let mut providers = output
+                                .source_fields
+                                .iter()
+                                .filter(|field| field.occurrence_id == occurrence);
+                            match (providers.next(), providers.next()) {
+                                (Some(field), None) => Ok((output.identity(), field.clone())),
+                                _ => Err(invalid(
+                                    "MV replacement output lacks one exact source field",
+                                )),
+                            }
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Ok((occurrence, fields))
+                })
+                .collect::<Result<_, _>>()
+        })
+        .transpose()?;
     Ok(MvObservedBinding {
         relations,
         document: BindingDocument {
@@ -269,6 +299,7 @@ pub(crate) fn observe_mv_binding(
         },
         revisions,
         direct_output_sources,
+        replacement_output_sources,
         schemas,
     })
 }
@@ -506,7 +537,7 @@ mod tests {
             identity,
             ConnectorTableObjectId::try_new(Bytes::from_static(b"object-1")).expect("object"),
             Bytes::from_static(b"schema-2"),
-            true,
+            novarocks_spi::connector::MvSourceFormatVersion::V3,
             Some(1),
             true,
             vec![

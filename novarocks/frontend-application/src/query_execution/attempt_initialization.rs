@@ -443,6 +443,9 @@ struct ProductionInitializationState {
     schedule: Option<ValidatedFragmentSchedule>,
     scan_keys: Vec<(FragmentId, i32)>,
     next_scan: usize,
+    enumeration_coverage: bool,
+    #[cfg(novarocks_dev_controls)]
+    early_close: Option<crate::query_execution::split_assignment::ContentTargetEarlyClose>,
     session: Option<novarocks_spi::connector::read_stack::ConnectorSession>,
     connector_context: ConnectorRequestContext,
     metadata_preparation:
@@ -771,6 +774,22 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             plan_node_id,
         )
         .map_err(failed)?;
+        let source = if self.enumeration_coverage {
+            source.with_enumeration_coverage()
+        } else {
+            source
+        };
+        #[cfg(novarocks_dev_controls)]
+        let source = match self.early_close.take_if(|early_close| {
+            early_close.scan
+                == crate::query_execution::split_assignment::ScanNodeKey::new(
+                    fragment_id,
+                    plan_node_id,
+                )
+        }) {
+            Some(early_close) => source.with_content_target_early_close(early_close),
+            None => source,
+        };
         let identity = AttemptSourceIdentity {
             execution_id: self.execution_id,
             fragment_id: source.fragment_id(),
@@ -866,6 +885,12 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         // readiness check. Once moved into the round plan, normal round
         // teardown becomes their sole close owner.
         let sources = self.sources.take_sources();
+        let enumeration_receipts = self.enumeration_coverage.then(|| {
+            Arc::new(super::split_assignment::SplitEnumerationReceipts::new(
+                self.execution_id,
+                targets.keys().copied(),
+            ))
+        });
         let split_assignment_plan = (!self.scan_keys.is_empty()).then(|| {
             RoundSplitAssignmentPlan::new(
                 targets,
@@ -874,6 +899,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 self.initial_dynamic_filter_wait_cap,
                 self.blocking_io.clone(),
             )
+            .with_enumeration_receipts(enumeration_receipts.clone())
         });
         *ready = Some(AttemptReady {
             execution_id: self.execution_id,
@@ -881,6 +907,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             schedule: Some(self.schedule.take().unwrap()),
             feedback: Arc::clone(&self.feedback),
             split_assignment_plan,
+            enumeration_receipts,
             credential_leases: Some(credential_leases),
             closed_split_remainder: None,
             close_job: None,
@@ -901,6 +928,55 @@ pub(crate) struct AttemptInitializing {
 }
 
 impl AttemptInitializing {
+    /// The MV native phase selects this before any of the attempt's reads open.
+    pub(crate) fn require_enumeration_coverage(&mut self) {
+        assert!(
+            self.progress.state.next_scan == 0 && self.progress.expected.is_none(),
+            "coverage precedes source opening"
+        );
+        self.progress.state.enumeration_coverage = true;
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn bind_content_target_early_close(
+        &mut self,
+        fault: crate::mv::test_controls::ContentTargetEnumerationClose,
+    ) -> Result<(), &'static str> {
+        assert!(
+            self.progress.state.next_scan == 0 && self.progress.expected.is_none(),
+            "control must bind before source opening"
+        );
+        let state = &mut self.progress.state;
+        assert!(
+            state.early_close.is_none(),
+            "only one original target-close grant"
+        );
+        let artifacts = state
+            .artifacts
+            .as_ref()
+            .expect("original frozen content target plan");
+        let mut targets = artifacts.typed_scans().filter(|&(fragment, node)| {
+            artifacts
+                .share_connector_attempt_access(fragment, node)
+                .is_some_and(|entry| entry.content_target)
+        });
+        let (fragment, node) = targets
+            .next()
+            .ok_or("MV content target close has no exact frozen scan")?;
+        if targets.next().is_some() {
+            return Err("MV content target close has multiple frozen scans");
+        }
+        let scan = crate::query_execution::split_assignment::ScanNodeKey::new(fragment, node);
+        state.early_close = Some(
+            crate::query_execution::split_assignment::ContentTargetEarlyClose {
+                execution: state.execution_id,
+                scan,
+                fault,
+            },
+        );
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Each input is an independently frozen fact needed before an attempt may become ready."
@@ -949,6 +1025,9 @@ impl AttemptInitializing {
                     ),
                     scan_keys,
                     next_scan: 0,
+                    enumeration_coverage: false,
+                    #[cfg(novarocks_dev_controls)]
+                    early_close: None,
                     session: None,
                     connector_context,
                     metadata_preparation,
@@ -1048,6 +1127,7 @@ pub(crate) struct AttemptReady {
     schedule: Option<ValidatedFragmentSchedule>,
     feedback: Arc<RuntimeFilterFeedbackState>,
     split_assignment_plan: Option<RoundSplitAssignmentPlan>,
+    enumeration_receipts: Option<Arc<super::split_assignment::SplitEnumerationReceipts>>,
     // Closed empty plan metadata stays with the same original until its
     // controlled final destruction; closing it never drops it on a poller.
     closed_split_remainder: Option<RoundSplitAssignmentPlan>,
@@ -1073,6 +1153,14 @@ impl AttemptReady {
             Arc::clone(&self.feedback),
             self.credential_leases.take().unwrap(),
         )
+    }
+
+    /// The original covered attempt can have zero scans. Its empty roster
+    /// still has an execution identity, even when no split pump is created.
+    pub(crate) fn enumeration_receipts(
+        &self,
+    ) -> Option<Arc<super::split_assignment::SplitEnumerationReceipts>> {
+        self.enumeration_receipts.clone()
     }
 
     pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {

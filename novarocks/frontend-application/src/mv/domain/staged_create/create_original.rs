@@ -17,7 +17,10 @@
 
 //! Original Provider custody borrowed by the existing CREATE product transition.
 
-use super::{CurrentProjectionMetadataCpu, CurrentProjectionRegistration};
+use super::{
+    CaptureFailure, CurrentMetadataCapture, CurrentProjectionMetadataCpu,
+    CurrentProjectionRegistration, new_current_metadata_capture,
+};
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind, MvCreateProjectionSeed},
     iceberg_refresh::{IcebergMvCorePorts, IcebergMvCreatePlan},
@@ -36,8 +39,8 @@ use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
     management::{
         CreateIntent, EffectDisposition, EffectIdentity, EffectScope, ManagedMvTarget,
-        ManagementAdmissionError, ManagementEntrance, ManagementEntranceObligation,
-        ManagementRequest,
+        ManagementAdmissionError, ManagementCreateAdmission, ManagementEntrance,
+        ManagementEntranceObligation, ManagementRequest,
     },
     persistence::create_documents::MvCreateDocuments,
     product::{MvCreatePublicationOutcome, MvCreatedTarget, MvStagedTarget, MvTarget},
@@ -56,10 +59,12 @@ use novarocks_spi::connector::{
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorStagedCreateAbortOutcome,
     ConnectorStagedCreateAbortRequest, ConnectorStagedCreateNeededCommitted,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
-    ConnectorStagedCreatePublication, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublication, ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
     ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
-    ConnectorTableIdentity, CreatePolicy, ExternalMutationEffect, ExternalMutationFinalization,
+    ConnectorTableIdentity, ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
+    ConnectorTableResolution, CreatePolicy, ExternalMutationEffect, ExternalMutationFinalization,
     LakePublicationId,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
@@ -84,6 +89,7 @@ pub(crate) struct CreateOriginalInput {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) cancellation: QueryCancellationView,
+    pub(crate) name_metadata_cpu: Arc<CurrentProjectionMetadataCpu>,
     pub(crate) io: Arc<MetadataIoAdmission>,
     pub(crate) cpu: MvRefreshTurnCustody,
 }
@@ -91,6 +97,18 @@ pub(crate) struct CreateOriginalInput {
 pub(crate) struct CreatePhaseFailure {
     pub(crate) service: QueryServiceError,
     pub(crate) domain: Option<MvApplicationError>,
+}
+impl CreatePhaseFailure {
+    pub(crate) fn name_admission(error: ManagementAdmissionError) -> Self {
+        let cause = SharedFailureCause::new(error);
+        Self {
+            domain: Some(
+                MvApplicationError::new(MvApplicationErrorKind::Unavailable, cause.detail())
+                    .with_original_failure(cause.clone()),
+            ),
+            service: QueryServiceError::unavailable_with_cause(cause),
+        }
+    }
 }
 impl From<MvApplicationError> for CreatePhaseFailure {
     fn from(domain: MvApplicationError) -> Self {
@@ -139,7 +157,11 @@ struct State {
     publication: ConnectorStagedCreatePublicationReceiving,
     stage_raw: Mutex<Option<Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>>>,
     abort_raw: Mutex<Option<Result<ConnectorStagedCreateAbortOutcome, ConnectorError>>>,
+    adjudication_raw:
+        Mutex<Option<Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>>>,
     current: CurrentProjectionRegistration,
+    observed_create_receipt: Mutex<Option<novarocks_spi::connector::ConnectorStagedCreateReceipt>>,
+    name_capture: Arc<CurrentMetadataCapture>,
 }
 struct Body {
     input: CreateOriginalInput,
@@ -208,7 +230,7 @@ impl State {
     async fn run(&self, phase: Phase) -> Result<(), CreatePhaseFailure> {
         let mut body = self.loan();
         match phase {
-            Phase::Prepare => body.prepare().await,
+            Phase::Prepare => body.prepare(&self.name_capture).await,
             Phase::Stage => body.stage(self).await,
             Phase::Publish => body.publish(self).await,
             Phase::Abort => body.abort(self).await,
@@ -352,7 +374,10 @@ impl CreateOriginal {
                 publication: ConnectorStagedCreatePublicationReceiving::default(),
                 stage_raw: Mutex::new(None),
                 abort_raw: Mutex::new(None),
+                adjudication_raw: Mutex::new(None),
                 current: CurrentProjectionRegistration::new(),
+                observed_create_receipt: Mutex::new(None),
+                name_capture: new_current_metadata_capture(),
             }),
             call: Mutex::new(OriginalCall::default()),
             poisoned: AtomicBool::new(false),
@@ -502,13 +527,33 @@ impl CreateOriginal {
             staged_operation_id: body.input.operation_id,
         })
     }
-    pub(crate) fn created_target(&self) -> Result<Option<MvCreatedTarget>, MvApplicationError> {
-        if self
+    fn observed_create_publication(&self) -> bool {
+        self.state
+            .observed_create_receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+    pub(crate) fn observed_projection_cpu(
+        &self,
+    ) -> Result<Option<Arc<CurrentProjectionMetadataCpu>>, MvApplicationError> {
+        if !self.observed_create_publication() {
+            return Ok(None);
+        }
+        let body = self
             .state
-            .publication
-            .observation()
-            .applied_receipt()
-            .is_none()
+            .try_loan()
+            .ok_or_else(|| invalid("CREATE Body is still borrowed"))?;
+        Ok(Some(Arc::clone(&body.input.name_metadata_cpu)))
+    }
+    pub(crate) fn created_target(&self) -> Result<Option<MvCreatedTarget>, MvApplicationError> {
+        if !self.observed_create_publication()
+            && self
+                .state
+                .publication
+                .observation()
+                .applied_receipt()
+                .is_none()
         {
             return Ok(None);
         }
@@ -531,6 +576,11 @@ impl CreateOriginal {
     pub(crate) fn product_publication_outcome(
         &self,
     ) -> Result<Option<MvCreatePublicationOutcome>, MvApplicationError> {
+        if self.observed_create_publication() {
+            return self
+                .created_target()
+                .map(|created| created.map(MvCreatePublicationOutcome::Applied));
+        }
         let observation = self.state.publication.observation();
         if observation.validation() != Some(Ok(())) {
             return Ok(None);
@@ -559,12 +609,13 @@ impl CreateOriginal {
         self.state.publication.observation().finalization_context()
     }
     pub(crate) fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
-        if self
-            .state
-            .publication
-            .observation()
-            .applied_receipt()
-            .is_some()
+        if self.observed_create_publication()
+            || self
+                .state
+                .publication
+                .observation()
+                .applied_receipt()
+                .is_some()
         {
             return Some(StatementExternalEffectDisposition::KnownCommitted);
         }
@@ -602,7 +653,12 @@ impl CreateOriginal {
         {
             return Some(health);
         }
-        if let Some(health) = self.state.current.local_health_failure() {
+        if let Some(health) = self
+            .state
+            .current
+            .local_health_failure()
+            .or_else(|| self.state.name_capture.local_health_failure())
+        {
             return Some(health);
         }
         let body = self.state.body.lock().unwrap_or_else(|p| p.into_inner());
@@ -634,7 +690,9 @@ impl CreateOriginal {
         let Some(mut body) = self.state.try_loan() else {
             return Poll::Pending;
         };
-        if body.empty.poll_closed(cx).is_pending() {
+        if self.state.name_capture.poll_closed(cx).is_pending()
+            || body.empty.poll_closed(cx).is_pending()
+        {
             return Poll::Pending;
         }
         if let Some(publication) = body.publication.as_mut()
@@ -742,35 +800,86 @@ impl CreateOriginal {
 }
 
 impl Body {
-    async fn prepare(&mut self) -> Result<(), CreatePhaseFailure> {
+    async fn capture_name_absence(
+        &mut self,
+        name_capture: &Arc<CurrentMetadataCapture>,
+    ) -> Result<bool, CreatePhaseFailure> {
+        match name_capture
+            .capture(
+                &self.input.planning,
+                &self.input.name_metadata_cpu,
+                ConnectorTableObjectCaptureRequest {
+                    table: self.table.clone(),
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: self.input.context.clone(),
+                },
+            )
+            .await
+        {
+            Err(CaptureFailure::Provider(error))
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error.into_application().into()),
+            Ok(binding) if binding.metadata.identity == self.table => Ok(false),
+            Ok(_) => Err(invalid("CREATE name observation returned another target").into()),
+        }
+    }
+
+    async fn prepare(
+        &mut self,
+        name_capture: &Arc<CurrentMetadataCapture>,
+    ) -> Result<(), CreatePhaseFailure> {
         if self.management.is_some() {
             return Err(invalid("CREATE management was already requested").into());
         }
         let entrance = self.entrance.clone();
+        entrance
+            .check_name_startup_grace()
+            .map_err(CreatePhaseFailure::name_admission)?;
+        if let Some(effect) = entrance.unresolved_named_drop(&self.catalog, &self.table)
+            && self.capture_name_absence(name_capture).await?
+        {
+            entrance.observe_named_drop_absence(&self.catalog, &self.table, effect);
+        }
         let cancellation = self.input.cancellation.clone();
-        let mut wait = Box::pin(entrance.acquire_async(
-            ManagementRequest::for_create_intent(
-                self.intent.clone(),
-                EffectScope::CATALOG_AND_OBJECT_DELETION,
-            ),
-            async move {
-                let _ = cancellation.cancelled().await;
-            },
-        ));
-        poll_fn(|cx| match wait.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.management = Some(result);
-                Poll::Ready(())
+        let admission = entrance
+            .acquire_create_async(
+                ManagementRequest::for_create_intent(
+                    self.intent.clone(),
+                    EffectScope::CATALOG_AND_OBJECT_DELETION,
+                ),
+                async move {
+                    let _ = cancellation.cancelled().await;
+                },
+            )
+            .await;
+        self.management = Some(match admission {
+            Ok(ManagementCreateAdmission::Ready(admission)) => Ok(admission),
+            Ok(ManagementCreateAdmission::ObserveName(obligation)) => {
+                if obligation.target().catalog() != &self.catalog
+                    || obligation.target().table() != &self.table
+                {
+                    return Err(invalid("CREATE name observation changed catalog or target").into());
+                }
+                if self.capture_name_absence(name_capture).await? {
+                    obligation.admit_after_observed_absence()
+                } else {
+                    Err(ManagementAdmissionError::TargetAlreadyExists)
+                }
             }
-        })
-        .await;
-        drop(wait);
+            Err(error) => Err(error),
+        });
         self.management
             .as_ref()
             .unwrap()
             .as_ref()
             .map_err(|error| {
+                if error.is_retryable_name_admission() {
+                    return CreatePhaseFailure::name_admission(*error);
+                }
                 MvApplicationError::new(
                     if matches!(
                         error,
@@ -780,8 +889,9 @@ impl Body {
                     } else {
                         MvApplicationErrorKind::Engine
                     },
-                    format!("admit CREATE: {error:?}"),
+                    format!("admit CREATE: {error}"),
                 )
+                .into()
             })?;
         self.admission = Some(
             self.document_storage
@@ -833,17 +943,19 @@ impl Body {
         .await?;
         if !matches!(
             self.cpu_result.as_ref(),
-            Some(Ok(MvWriteActivationOutput::Create(
-                CreatePublicationOutput::StageDeclarations { .. }
-            )))
+            Some(Ok(MvWriteActivationOutput::Create(output)))
+                if matches!(output.as_ref(), CreatePublicationOutput::StageDeclarations { .. })
         ) {
             return Err(invalid("CREATE declaration turn returned another output").into());
         }
-        let Some(Ok(MvWriteActivationOutput::Create(CreatePublicationOutput::StageDeclarations {
+        let Some(Ok(MvWriteActivationOutput::Create(output))) = self.cpu_result.take() else {
+            unreachable!()
+        };
+        let CreatePublicationOutput::StageDeclarations {
             columns,
             storage,
             application_properties,
-        }))) = self.cpu_result.take()
+        } = *output
         else {
             unreachable!()
         };
@@ -861,6 +973,7 @@ impl Body {
                 self.operation,
                 self.table.clone(),
                 columns,
+                storage.stateless_output_declarations,
                 storage.visible_partition_sources,
                 storage.properties,
                 application_properties,
@@ -879,14 +992,38 @@ impl Body {
             .await;
         self.stage_result = Some(result);
         match self.stage_result.as_ref().unwrap() {
-            Ok(ConnectorStagedCreatePrepareOutcome::Prepared {handle,..})=>{self.handle=Some(handle.clone());Ok(())},
-            Ok(ConnectorStagedCreatePrepareOutcome::Conflict {failure}|ConnectorStagedCreatePrepareOutcome::KnownUncommitted {failure})=>{
-                let error=mutation(MvApplicationErrorKind::Engine,failure);self.record_terminal(EffectDisposition::KnownUncommitted)?;Err(error.into())
+            Ok(ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. }) => {
+                self.handle = Some(handle.clone());
+                Ok(())
             }
-            Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {failure,..})=>Err(mutation(MvApplicationErrorKind::CommitUnknown,failure).into()),
-            Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {..})=>Err(MvApplicationError::new(
-                MvApplicationErrorKind::CommitUnknown,"CREATE stage was applied but is unusable; its original responsibility is retained").into()),
-            Err(error)=>Err(MvApplicationError::from_connector(MvApplicationErrorKind::CommitUnknown,error.clone()).into()),
+            Ok(
+                ConnectorStagedCreatePrepareOutcome::Conflict { failure }
+                | ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure },
+            ) => {
+                let error = mutation(MvApplicationErrorKind::Engine, failure);
+                self.record_terminal(EffectDisposition::KnownUncommitted)?;
+                Err(error.into())
+            }
+            Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown { failure, .. }) => {
+                let error = mutation(MvApplicationErrorKind::CommitUnknown, failure);
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
+                Err(error.into())
+            }
+            Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { .. }) => {
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
+                Err(MvApplicationError::new(
+                    MvApplicationErrorKind::CommitUnknown,
+                    "CREATE stage was applied but is unusable; its original responsibility is retained",
+                ).into())
+            }
+            Err(error) => {
+                let error = MvApplicationError::from_connector(
+                    MvApplicationErrorKind::CommitUnknown,
+                    error.clone(),
+                );
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
+                Err(error.into())
+            }
         }
     }
     async fn publish(&mut self, state: &State) -> Result<(), CreatePhaseFailure> {
@@ -912,17 +1049,19 @@ impl Body {
         .await?;
         if !matches!(
             self.cpu_result.as_ref(),
-            Some(Ok(MvWriteActivationOutput::Create(
-                CreatePublicationOutput::Publication { .. }
-            )))
+            Some(Ok(MvWriteActivationOutput::Create(output)))
+                if matches!(output.as_ref(), CreatePublicationOutput::Publication { .. })
         ) {
             return Err(invalid("CREATE publication turn returned another output").into());
         }
-        let Some(Ok(MvWriteActivationOutput::Create(CreatePublicationOutput::Publication {
+        let Some(Ok(MvWriteActivationOutput::Create(output))) = self.cpu_result.take() else {
+            unreachable!()
+        };
+        let CreatePublicationOutput::Publication {
             begin,
             intent,
             documents,
-        }))) = self.cpu_result.take()
+        } = *output
         else {
             unreachable!()
         };
@@ -943,6 +1082,7 @@ impl Body {
             let kind = if self.empty.allows_staged_abort() {
                 MvApplicationErrorKind::Engine
             } else {
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
                 MvApplicationErrorKind::CommitUnknown
             };
             return Err(MvApplicationError::from_connector(kind, error).into());
@@ -1001,7 +1141,49 @@ impl Body {
                 ConnectorStagedCreatePublishOutcome::Conflict { failure, .. }
                 | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, .. },
             ) => Err(mutation(MvApplicationErrorKind::Engine, &failure).into()),
-            Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, .. }) => {
+            Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence }) => {
+                let observed = self
+                    .staged_session
+                    .adjudicate_publication_async(
+                        ConnectorStagedCreatePublicationAdjudicationRequest {
+                            target_operation_id: self
+                                .handle
+                                .as_ref()
+                                .expect("original CREATE stage")
+                                .operation_id(),
+                            evidence,
+                            context: self.input.context.clone().after_external_effect(),
+                        },
+                        &state.adjudication_raw,
+                    )
+                    .await;
+                if let Ok(ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                    receipt,
+                    finalization,
+                }) = observed
+                {
+                    let target = self.exact_staged_target()?;
+                    self.management_mut()?
+                        .late_bind_create_target(target)
+                        .map_err(|e| invalid(format!("bind observed CREATE name: {e}")))?;
+                    self.management_mut()?
+                        .observe_applied_create_name(&receipt)
+                        .map_err(|e| invalid(format!("settle observed CREATE name: {e}")))?;
+                    *state
+                        .observed_create_receipt
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(receipt);
+                    self.terminal = Some(Ok(()));
+                    return match finalization {
+                        ExternalMutationFinalization::Complete => Ok(()),
+                        ExternalMutationFinalization::Failed(failure) => Err(mutation(
+                            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                            &failure,
+                        )
+                        .into()),
+                    };
+                }
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
                 Err(mutation(MvApplicationErrorKind::CommitUnknown, &failure).into())
             }
             Err(error) => {
@@ -1013,6 +1195,9 @@ impl Body {
                 } else {
                     MvApplicationErrorKind::CommitUnknown
                 };
+                if kind == MvApplicationErrorKind::CommitUnknown {
+                    self.record_terminal(EffectDisposition::CommitUnknown)?;
+                }
                 Err(MvApplicationError::from_connector(kind, error).into())
             }
         }
@@ -1039,26 +1224,35 @@ impl Body {
         self.terminal = Some(result.clone());
         result
     }
+    fn exact_staged_target(&self) -> Result<ManagedMvTarget, CreatePhaseFailure> {
+        let object = self
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.document_target())
+            .ok_or_else(|| invalid("applied CREATE has no exact object"))?
+            .object_id()
+            .clone();
+        ManagedMvTarget::try_new(self.catalog.clone(), self.table.clone(), object)
+            .map_err(|error| invalid(format!("bind CREATE actual target: {error:?}")).into())
+    }
     fn record_applied_terminal(&mut self) -> Result<(), CreatePhaseFailure> {
         if let Some(result) = &self.terminal {
             return result.clone();
         }
-        let object = self
-            .handle
-            .as_ref()
-            .and_then(|h| h.document_target())
-            .ok_or_else(|| invalid("applied CREATE has no exact object"))?
-            .object_id()
-            .clone();
-        let target = ManagedMvTarget::try_new(self.catalog.clone(), self.table.clone(), object)
-            .map_err(|e| invalid(format!("bind CREATE actual target: {e:?}")))?;
+        let target = self.exact_staged_target()?;
         self.management_mut()?
             .late_bind_create_target(target)
             .map_err(|e| invalid(format!("late bind CREATE responsibility: {e:?}")))?;
         self.record_terminal(EffectDisposition::KnownCommitted)
     }
     async fn abort(&mut self, state: &State) -> Result<(), CreatePhaseFailure> {
-        if state.publication.observation().applied_receipt().is_some() {
+        if state.publication.observation().applied_receipt().is_some()
+            || state
+                .observed_create_receipt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        {
             return Err(invalid("an applied CREATE cannot abort its original stage").into());
         }
         if self.abort_result.is_some() {
@@ -1109,35 +1303,47 @@ impl Body {
                 Err(mutation(MvApplicationErrorKind::Engine, &failure).into())
             }
             Ok(ConnectorStagedCreateAbortOutcome::CommitUnknown { failure, .. }) => {
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
                 Err(mutation(MvApplicationErrorKind::CommitUnknown, &failure).into())
             }
-            Err(error) => Err(provider(error.clone()).into()),
+            Err(error) => {
+                self.record_terminal(EffectDisposition::CommitUnknown)?;
+                Err(provider(error).into())
+            }
         }
     }
     async fn project(&mut self, state: &State) -> Result<(), CreatePhaseFailure> {
-        let needed = state
-            .publication
-            .observation()
-            .needed_committed()
-            .ok_or_else(|| invalid("CREATE Current requires actual Needed"))?;
-        if needed.effect != ExternalMutationEffect::Applied
-            || state.publication.observation().applied_receipt().is_none()
-        {
-            return Err(invalid("CREATE NoOp or Unknown cannot install Current").into());
+        let observed_publication = state
+            .observed_create_receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        let observation = state.publication.observation();
+        if !observed_publication {
+            let needed = observation
+                .needed_committed()
+                .ok_or_else(|| invalid("CREATE Current requires actual Needed"))?;
+            if needed.effect != ExternalMutationEffect::Applied
+                || observation.applied_receipt().is_none()
+            {
+                return Err(invalid("CREATE NoOp or Unknown cannot install Current").into());
+            }
         }
-        // Management terminal precedes Current. A failed Current may not
-        // leave a committed create masquerading as unsettled/uncommitted.
         self.record_applied_terminal().map_err(committed_failure)?;
-        let context = state
-            .publication
-            .observation()
-            .finalization_context()
-            .ok_or_else(|| invalid("CREATE has no original finite finalization Context"))?
-            .map_err(provider)?;
+        let context = if observed_publication {
+            // Adjudication proves publication. Its subsequent Current read
+            // uses the original live business scope.
+            self.input.context.clone().after_external_effect()
+        } else {
+            observation
+                .finalization_context()
+                .ok_or_else(|| invalid("CREATE has no original finite finalization Context"))?
+                .map_err(provider)?
+        };
         let project = self
             .project
             .as_ref()
-            .ok_or_else(|| invalid("CREATE Current has no existing-obligation borrower"))?;
+            .ok_or_else(|| invalid("CREATE Current has no original observation borrower"))?;
         let view = self
             .input
             .ports
@@ -1293,6 +1499,9 @@ mod original_call_tests {
             stage_raw: Mutex::new(None),
             abort_raw: Mutex::new(None),
             current: CurrentProjectionRegistration::new(),
+            adjudication_raw: Mutex::new(None),
+            observed_create_receipt: Mutex::new(None),
+            name_capture: new_current_metadata_capture(),
         });
         let ready = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -1678,7 +1887,7 @@ mod original_stage_tests {
                 },
                 object_id,
                 Bytes::from_static(b"schema-1"),
-                true,
+                novarocks_spi::connector::MvSourceFormatVersion::V3,
                 Some(1),
                 true,
                 vec![
@@ -1813,6 +2022,7 @@ mod original_stage_tests {
                 CreateStorageDeclarations {
                     visible_partition_sources,
                     properties: staged_properties,
+                    stateless_output_declarations,
                 },
             application_properties,
         } = (CreatePublicationInput::StageDeclarations { plan })
@@ -1822,6 +2032,7 @@ mod original_stage_tests {
             panic!("typed stage declarations");
         };
         assert!(Arc::ptr_eq(&properties, &staged_properties));
+        assert!(stateless_output_declarations.is_none());
         let visible = visible_partition_sources
             .iter()
             .map(AsRef::as_ref)
@@ -2210,6 +2421,14 @@ mod original_stage_tests {
                 session_properties: Arc::default(),
                 operation_id,
                 context,
+                name_metadata_cpu: Arc::new(CurrentProjectionMetadataCpu::business(
+                    cpu.runtime(),
+                    scope.clone(),
+                    window.clone(),
+                    cancellation.clone(),
+                    tokio::runtime::Handle::current(),
+                    wake.clone(),
+                )),
                 cancellation,
                 io: io.clone(),
                 cpu: turn,
@@ -2289,7 +2508,7 @@ mod original_stage_tests {
                 );
                 assert_eq!(
                     next().err().unwrap(),
-                    ManagementAdmissionError::EffectUnsettled
+                    ManagementAdmissionError::NameIsolated
                 );
             } else {
                 assert_eq!(

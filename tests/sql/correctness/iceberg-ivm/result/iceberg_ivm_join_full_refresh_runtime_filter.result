@@ -1,0 +1,15 @@
+-- query 3
+-- types	bigint	varchar
+amount	category
+10	first
+20	first
+
+-- query 5
+-- types	bigint	varchar
+amount	category
+30	second
+
+-- query 7
+-- types	bigint
+rows_visible
+0

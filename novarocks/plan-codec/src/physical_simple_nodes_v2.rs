@@ -37,6 +37,9 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 type Error = SimpleNodeCodecError;
 
+#[path = "physical_content_apply_v2.rs"]
+mod content_apply;
+
 fn expression_encode(
     id: novarocks_expression_contract::RootOrdinal,
     expressions: &EncodedExpressions<'_, '_, '_>,
@@ -93,6 +96,7 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
             spec.inputs.len(),
             bytes::<p::PositionShardInput>(spec.inputs.len())?,
         ),
+        p::NodeKind::ContentApply(spec) => return content_apply::physical_shape(spec),
         p::NodeKind::SystemRelation { .. } | p::NodeKind::Limit { .. } => (0, 0),
         p::NodeKind::GenerateSeries { step, .. } => (2 + usize::from(step.is_some()), 0),
         _ => return Err(invalid("physical node is outside the simple node family")),
@@ -124,6 +128,7 @@ fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
                 v.contribution_group_id.capacity(),
             )?,
         ),
+        Some(wire::physical_node::Kind::ContentApply(v)) => return content_apply::wire_shape(v),
         Some(wire::physical_node::Kind::SystemRelation(_))
         | Some(wire::physical_node::Kind::Limit(_)) => (0, 0),
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
@@ -240,6 +245,10 @@ fn prepare_encode(
             model.request::<u8>(32, 1)?;
             0
         }
+        p::NodeKind::ContentApply(spec) => {
+            content_apply::model_encode(spec, &mut model)?;
+            0
+        }
         p::NodeKind::SystemRelation { .. } | p::NodeKind::Limit { .. } => 0,
         _ => return Err(invalid("prepared physical kind is outside simple family")),
     };
@@ -330,6 +339,11 @@ fn prepare_encode(
                 w.step()?;
             }
             for id in spec.output.columns() {
+                reference(id.get(), values, w)?;
+            }
+        }
+        p::NodeKind::ContentApply(spec) => {
+            for id in content_apply::physical_references(spec) {
                 reference(id.get(), values, w)?;
             }
         }
@@ -469,6 +483,10 @@ fn prepare_decode(
             }
             0
         }
+        Some(wire::physical_node::Kind::ContentApply(v)) => {
+            content_apply::model_decode(v, &mut model)?;
+            0
+        }
         Some(wire::physical_node::Kind::SystemRelation(_))
         | Some(wire::physical_node::Kind::Limit(_)) => 0,
         _ => return Err(invalid("prepared wire kind is outside simple family")),
@@ -558,6 +576,11 @@ fn prepare_decode(
             }
             for id in decode_shard_output(v.output.as_ref(), w)?.columns() {
                 reference(id.get(), values, w)?;
+            }
+        }
+        Some(wire::physical_node::Kind::ContentApply(v)) => {
+            for id in content_apply::wire_references(v, w)? {
+                reference(id, values, w)?;
             }
         }
         Some(wire::physical_node::Kind::SystemRelation(_))
@@ -748,6 +771,9 @@ fn emit_encode(
                 }),
             })
         }
+        p::NodeKind::ContentApply(spec) => {
+            wire::physical_node::Kind::ContentApply(content_apply::emit_wire(spec, w)?)
+        }
         _ => return Err(invalid("prepared physical kind is outside simple family")),
     };
     w.step()?;
@@ -839,6 +865,9 @@ fn emit_decode(
                 inputs: boxed(routes, w)?,
                 output: decode_shard_output(v.output.as_ref(), w)?,
             })
+        }
+        Some(wire::physical_node::Kind::ContentApply(v)) => {
+            p::NodeKind::ContentApply(content_apply::emit_physical(v, w)?)
         }
         _ => return Err(invalid("prepared wire kind is outside simple family")),
     };

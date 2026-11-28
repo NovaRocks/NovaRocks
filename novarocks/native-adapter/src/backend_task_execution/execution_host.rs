@@ -279,6 +279,43 @@ impl fmt::Debug for NativeTaskExecutionHost {
 type NativeInboundCloseFacts =
     Arc<Mutex<Option<Box<[novarocks_execution_contract::ExchangeStreamClose]>>>>;
 
+#[cfg(novarocks_dev_controls)]
+fn drop_content_apply_insert(
+    controls: &crate::test_controls::NativeTestControls,
+    identity: TaskIdentity,
+    task_key: UniqueId,
+    driver_id: i32,
+) -> novarocks_execution::runtime::task::ExecutionResult<bool> {
+    let evidence = |detail: String| {
+        novarocks_functions::KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+            &format!("ContentApply test control: {detail}"),
+        ))
+    };
+    let Some(scope) = controls
+        .claim_task(
+            novarocks_failpoint::QueryLifecycleFaultKind::MvContentApplyDropInsert,
+            identity,
+            false,
+        )
+        .map_err(evidence)?
+    else {
+        return Ok(false);
+    };
+    scope.record_hit().map_err(evidence)?;
+    eprintln!(
+        "{} execution_id={}:{}:{} driver_id={} task_key={:x}:{:x} token={}",
+        novarocks_failpoint::observation_marker::MV_CONTENT_APPLY_INSERT_DROPPED,
+        scope.execution_id.query_id().high(),
+        scope.execution_id.query_id().low(),
+        scope.execution_id.attempt_id().get(),
+        driver_id,
+        task_key.high(),
+        task_key.low(),
+        scope.token,
+    );
+    Ok(true)
+}
+
 /// One task's execution-side state, from `install_receiver` to
 /// `remove_receiver`.
 struct TaskRuntime {
@@ -727,6 +764,7 @@ impl NativeTaskExecutionHost {
         statistics_source_is_unpivot: bool,
         preparation: &novarocks_worker::TaskPreparationContext,
         preparation_child: &Arc<NativePreparationChild>,
+        observation: &novarocks_memory::lane::LaneShards,
     ) -> Result<Option<Arc<NativeRootResultSession>>, HostRejection> {
         let root_session = match sink {
             Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) => {
@@ -790,6 +828,7 @@ impl NativeTaskExecutionHost {
                     &self.root_producer_pool,
                     preparation,
                     preparation_child,
+                    observation,
                 ) {
                     Ok(session) => Some(session),
                     Err(error) => {
@@ -815,6 +854,7 @@ impl NativeTaskExecutionHost {
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
         compiler: &dyn CompiledPackageCompiler,
+        query_context: &Arc<novarocks_execution::runtime::query_context::QueryContext>,
         mut preparation_scope: novarocks_worker::TaskPreparationContext<'_>,
         preparation_child: Arc<NativePreparationChild>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
@@ -836,19 +876,13 @@ impl NativeTaskExecutionHost {
         })?;
 
         let established_query_options = self.participation_facts.query_options(execution)?;
-        let query_context = self.participation_facts.query_context(execution)?;
         let memory = self
             .queries
             .prepare_query_memory_typed(
-                &query_context,
+                query_context,
                 established_query_options.runtime().exec_mem_limit(),
             )
             .map_err(|error| memory_admission_failure_to_host(identity, error))?;
-        memory
-            .binding()
-            .validate_task(identity, self.execution_runtime.memory_authority())
-            .map_err(host_failure)?;
-
         let attempt = SplitQueueKey::new(execution, descriptor_task_key);
         let splits = self.split_queues.open_attempt(
             attempt,
@@ -876,7 +910,7 @@ impl NativeTaskExecutionHost {
         let type_tracker = self
             .queries
             .type_construction_tracker(
-                &query_context,
+                query_context,
                 established_query_options.runtime().exec_mem_limit(),
             )
             .map_err(|error| memory_admission_failure_to_host(identity, error))?;
@@ -982,7 +1016,15 @@ impl NativeTaskExecutionHost {
             program,
             &CompiledScanTaskFacts {
                 runtime: &typed_runtime,
-                scan_sources: preparation_scope.scan_sources(),
+                scan_sources: preparation_scope
+                    .scan_sources()
+                    .with_memory_observation(memory.binding())
+                    .map_err(|error| {
+                        memory_admission_failure_to_host(
+                            identity,
+                            crate::native_query_context::NativeTaskAdmissionError::Binding(error),
+                        )
+                    })?,
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
                 runtime_filters,
@@ -1053,6 +1095,7 @@ impl NativeTaskExecutionHost {
             ),
             &preparation_scope,
             &preparation_child,
+            memory.binding().observation(),
         )?;
         let root_channel = root_session
             .as_ref()
@@ -1142,6 +1185,10 @@ impl NativeTaskExecutionHost {
             context = context.with_join_build_control(Some(Arc::new(
                 crate::join_build_test_control::JoinBuildHold::new(identity, Arc::clone(controls)),
             )));
+            let controls = Arc::clone(controls);
+            context = context.with_content_apply_insert_control(Arc::new(move |driver_id| {
+                drop_content_apply_insert(&controls, identity, descriptor_task_key, driver_id)
+            }));
         }
         #[cfg(novarocks_dev_controls)]
         if let Some(observations) = self.queries.observation_controls()
@@ -1238,6 +1285,7 @@ impl NativeTaskExecutionHost {
                     self.execution_runtime
                         .exchange_flow_limits()
                         .max_unit_payload_bytes() as u64,
+                    Some(project_binding.observation().clone()),
                 )
                 .map_err(host_failure)?;
         }
@@ -1741,18 +1789,30 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 },
             )?;
         }
-        let preparation_child = NativePreparationChild::register(
-            &preparation_scope,
-            self.execution_runtime.execution_health(),
-        )
-        .map_err(|cause| HostRejection::from_failure(failure_category(&cause), cause))?;
-        self.install_compiled_receiver(
-            descriptor,
-            input,
-            self.compiler.as_ref(),
-            preparation_scope,
-            preparation_child,
-        )
+        let query_context = self
+            .participation_facts
+            .query_context(identity.query_execution_id())?;
+        let binding = query_context.memory_binding();
+        binding
+            .validate_task(identity, self.execution_runtime.memory_authority())
+            .map_err(host_failure)?;
+        let observation = binding.observation();
+        observation.run(|| {
+            let preparation_child = NativePreparationChild::register_observed(
+                &preparation_scope,
+                self.execution_runtime.execution_health(),
+                Some(observation.clone()),
+            )
+            .map_err(|cause| HostRejection::from_failure(failure_category(&cause), cause))?;
+            self.install_compiled_receiver(
+                descriptor,
+                input,
+                self.compiler.as_ref(),
+                &query_context,
+                preparation_scope,
+                preparation_child,
+            )
+        })
     }
 
     /// Retires the installed ingress synchronously. The original preparation
@@ -1943,8 +2003,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 drop(unused_exit);
                 host_failure(error)
             })?;
-        completion
-            .bind_action(novarocks_worker::TaskTerminalAction::new(
+        let action = runtime.preparation.observe(|| {
+            novarocks_worker::TaskTerminalAction::new(
                 terminal,
                 Box::new(move |fact, observation| {
                     let completion_worker = completion_worker
@@ -2020,13 +2080,15 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     completion_worker.finish();
                     split_queues.close_attempt(attempt);
                 }),
-            ))
-            .map_err(|(error, action)| {
-                // A refusal returns the original action without disposing it.
-                // Its actual Drop remains inside the preparation scope.
-                drop(action);
-                host_failure(error)
-            })?;
+            )
+            .with_memory_observation(runtime.preparation.memory_observation())
+        });
+        completion.bind_action(action).map_err(|(error, action)| {
+            // A refusal returns the original action without disposing it.
+            // Its actual Drop remains inside the preparation scope.
+            runtime.preparation.observe(|| drop(action));
+            host_failure(error)
+        })?;
 
         // The Worker must make the Live record findable before any driver can
         // start or publish completion. The runnable owns this dormant start
@@ -2358,6 +2420,12 @@ fn validate_native_strict_inputs(
         .filter(|close| strict_nodes.contains(&close.stream.destination_node()))
     {
         if !matches!(close.disposition, ExchangeCloseDisposition::Consumed { .. }) {
+            tracing::warn!(
+                task = %descriptor.identity(),
+                stream = ?close.stream,
+                disposition = ?close.disposition,
+                "required inbound exchange stream was not consumed"
+            );
             return Err(ExecutionFailure::from_domain(
                 NativeInboundCloseFailure::StrictWithdrawn(close.stream),
             ));
@@ -6167,9 +6235,10 @@ pub(crate) mod tests {
             streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
             control: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
             max_bytes: u64,
+            observation: Option<novarocks_memory::lane::LaneShards>,
         ) -> Result<(), novarocks_execution::runtime::exchange::ExchangeFailure> {
             self.inner
-                .bind_unit_receiver(key, streams, control, max_bytes)
+                .bind_unit_receiver(key, streams, control, max_bytes, observation)
         }
         fn register_unit_demand(
             &self,
@@ -6573,7 +6642,7 @@ pub(crate) mod tests {
                 } else {
                     Vec::new()
                 };
-                port.bind_unit_receiver(key,vec![stream],Arc::clone(&control),novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+                port.bind_unit_receiver(key,vec![stream],Arc::clone(&control),novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,None).unwrap();
                 let frame = receiver_unit_frame(stream, payload, true);
                 register_receiver_unit(port.as_ref(), key, &frame);
                 port.receive_unit(key, frame).unwrap();
