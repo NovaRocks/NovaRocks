@@ -249,7 +249,7 @@ fn preflight(
         MaterializationModel::for_composition(headers.as_wire().len(), lookup, source, known);
     // Admit one actual intermediate root per definition before the first
     // namespace lookup, including zero-argument aggregates.
-    model.facts.type_reference_count = headers.as_wire().len();
+    model.facts.type_reference_count = headers.facts().type_reference_count;
     model.request::<(u32, AggregateBinding)>(headers.as_wire().len(), 2)?;
     if observed {
         model.check_admitted(limits, admit)?;
@@ -264,12 +264,14 @@ fn preflight(
         model.check(limits)?;
     }
     for raw in headers.as_wire() {
-        model.request::<u8>(raw.state_format.len(), 1)?;
-        model.request_layouts(
-            AggregateStateFormatId::storage_allocation_layout()
-                .map_err(|_| CompileControlError::ResourceExhausted)?,
-            1,
-        )?;
+        if raw.intermediate_value_type_id.is_some() {
+            model.request::<u8>(raw.state_format.len(), 1)?;
+            model.request_layouts(
+                AggregateStateFormatId::storage_allocation_layout()
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                1,
+            )?;
+        }
         if let Some(receipt) = &raw.state_interpretation {
             model.request::<novarocks_type_contract::AggregateStateOrderKey>(
                 receipt.order_keys.len(),
@@ -323,22 +325,21 @@ fn preflight(
             let source = function(functions, function_id, work)?;
             preflight_scalar_signature_copy(source, &mut model, limits, work)?;
         }
-        let id = completed(
-            raw.intermediate_value_type_id
-                .ok_or_else(|| shape("materialized aggregate intermediate reference is absent")),
-            work,
-        )?;
-        if observed {
-            value_captured(
-                types,
-                id,
-                &mut |source, work| model.count_owned_type_clone_in(source, limits, admit, work),
-                work,
-            )?;
-            model.check_admitted(limits, admit)?;
-        } else {
-            model.count_owned_type_clone(value(types, id, work)?, limits, work)?;
-            model.check(limits)?;
+        if let Some(id) = raw.intermediate_value_type_id {
+            if observed {
+                value_captured(
+                    types,
+                    id,
+                    &mut |source, work| {
+                        model.count_owned_type_clone_in(source, limits, admit, work)
+                    },
+                    work,
+                )?;
+                model.check_admitted(limits, admit)?;
+            } else {
+                model.count_owned_type_clone(value(types, id, work)?, limits, work)?;
+                model.check(limits)?;
+            }
         }
         work.step()?;
     }
@@ -418,17 +419,6 @@ fn materialize_created_core<'loan, 'headers, 'source, H>(
                 construction.creator_reborrow(),
                 work,
             )?;
-            let intermediate_id = completed(
-                raw.intermediate_value_type_id.ok_or_else(|| {
-                    shape("materialized aggregate intermediate reference is absent")
-                }),
-                work,
-            )?;
-            let source = value(types, intermediate_id, work)?;
-            work.flush()?;
-            let intermediate_type = clone_value_type_observed(source, work)?;
-            work.step()?;
-            work.flush()?;
             let phase = completed(
                 raw.phase
                     .as_ref()
@@ -436,31 +426,40 @@ fn materialize_created_core<'loan, 'headers, 'source, H>(
                 work,
             )?;
             let phase = completed(decode_phase_with(phase, shape), work)?;
-            let state_argument_contract = completed(
-                decode_state_argument_contract(raw.state_argument_contract),
-                work,
-            )?;
-            let state_format = construction.state(&raw.state_format, work)?;
+            let merge_state = if let Some(id) = raw.intermediate_value_type_id {
+                let source = value(types, id, work)?;
+                work.flush()?;
+                let intermediate_type = clone_value_type_observed(source, work)?;
+                work.step()?;
+                work.flush()?;
+                let state_argument_contract = completed(
+                    decode_state_argument_contract(raw.state_argument_contract),
+                    work,
+                )?;
+                let state_format = construction.state(&raw.state_format, work)?;
+                let state_interpretation = raw
+                    .state_interpretation
+                    .as_ref()
+                    .map(|value| {
+                        super::decode_state_interpretation_created(value, &mut construction, work)
+                    })
+                    .transpose()?;
+                Some(novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation,
+                    state_argument_contract,
+                    intermediate_type,
+                    state_format,
+                })
+            } else {
+                None
+            };
             definitions.push((
                 raw.id,
                 AggregateBinding {
-                    state_interpretation: raw
-                        .state_interpretation
-                        .as_ref()
-                        .map(|value| {
-                            super::decode_state_interpretation_created(
-                                value,
-                                &mut construction,
-                                work,
-                            )
-                        })
-                        .transpose()?,
-                    state_argument_contract,
                     function,
                     phase,
                     logical_argument_count: raw.logical_argument_count,
-                    intermediate_type,
-                    state_format,
+                    merge_state,
                 },
             ));
             work.step()?;

@@ -43,18 +43,22 @@ REFRESH MATERIALIZED VIEW mv_graph;
 INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 20);
 
 -- query 8
+-- @result_contains=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW mv_graph;
+
+-- query 9
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW mv_graph;
 
--- query 9
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2,slot-changes=0,full-refreshes=1
+-- query 10
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2,slot-changes=0,full-refreshes=2,full-refresh-last=true
 -- @skip_result_check=true
 -- @result_contains=east
 -- @result_contains=10
 -- @result_contains=20
 SELECT k, v FROM mv_graph ORDER BY k, v;
 
--- query 10
+-- query 11
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvgraph_${uuid0}.ns_${uuid0};

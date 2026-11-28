@@ -117,6 +117,16 @@ fn verify_node(
         Operator::PhysicalNestLoopJoin(op) => verify_nested_loop_join(op, &child_outputs, scalars),
         Operator::PhysicalTableFunction(op) => verify_table_function(op, &child_outputs, scalars),
         Operator::PhysicalRepeat(op) => verify_repeat(op, &child_outputs),
+        Operator::PhysicalContentApply(op) => {
+            if child_outputs.len() != 2 {
+                return Err("PhysicalContentApply requires two inputs".to_string());
+            }
+            let outputs = output_ids(op.output_columns.iter().map(|column| column.column_id));
+            for column in &op.output_columns {
+                verify_output_id(column.column_id, "PhysicalContentApply output")?;
+            }
+            Ok(outputs)
+        }
         Operator::PhysicalChangeEventExpand(op) => {
             verify_change_event_expand(op, &child_outputs, scalars)
         }

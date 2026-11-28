@@ -58,9 +58,8 @@ pub struct LakeRebuildContext<'a> {
     pub catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn ConnectorControlResolver,
     pub readiness: &'a MvReadinessPort,
-    /// Closes management on every target rediscovered from a writer this
-    /// process is not. Absent only where there is no management authority at
-    /// all, in which case nothing could reopen the target anyway.
+    /// Receives same-deployment restart evidence and installs the exact
+    /// continuation needed by a rediscovered target.
     pub management_entrance: Option<&'a novarocks_mv_application::management::ManagementEntrance>,
 }
 
@@ -72,6 +71,7 @@ pub struct LakeRebuildContext<'a> {
 /// unavailable to management consumers.
 pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
     let Some(projection) = ctx.catalog_runtime_projection else {
+        note_incomplete_discovery(ctx);
         return Ok(());
     };
     let instance_ids = projection
@@ -121,6 +121,7 @@ fn rebuild_imv_cache_from_catalogs_inner(
         ) {
             Ok(discovered) => discovered,
             Err(error) => {
+                note_incomplete_discovery(ctx);
                 quarantine_catalog_after_discovery_failure(ctx, instance_id, &error)?;
 
                 continue;
@@ -129,6 +130,7 @@ fn rebuild_imv_cache_from_catalogs_inner(
         let targets = match discovered {
             ManagedMvDiscovery::Complete(targets) => targets,
             ManagedMvDiscovery::Incomplete(reason) => {
+                note_incomplete_discovery(ctx);
                 ctx.readiness
                     .quarantine_catalog(
                         instance_id.as_str(),
@@ -155,6 +157,7 @@ fn rebuild_imv_cache_from_catalogs_inner(
             // them missing, and nothing says which.
             if let Err(error) = rediscover_one_target(ctx, &source, &context, &discovered, &target)
             {
+                note_incomplete_discovery(ctx);
                 tracing::warn!(
                     catalog = instance_id.as_str(),
                     mv_target = target.name(),
@@ -166,6 +169,12 @@ fn rebuild_imv_cache_from_catalogs_inner(
     }
 
     audit_retained_lake_mv_base_identities(ctx, &context)
+}
+
+fn note_incomplete_discovery(ctx: &LakeRebuildContext<'_>) {
+    if let Some(entrance) = ctx.management_entrance {
+        entrance.note_incomplete_startup_discovery();
+    }
 }
 
 /// Register one rediscovered MV, or say why it could not be.
@@ -233,14 +242,16 @@ fn rediscover_one_target(
                             &installed_projection(ctx, &target)?,
                         )
                 {
+                    note_incomplete_discovery(ctx);
                     tracing::warn!(
                         catalog = instance_id.as_str(),
                         mv_target = target.name(),
                         %error,
-                        "leaving a rediscovered MV open to management because its recovery barrier could not be installed"
+                        "could not install the rediscovered MV management continuation"
                     );
                 }
                 if let Err(error) = validate_installed_candidate(ctx, &target, context) {
+                    note_incomplete_discovery(ctx);
                     ctx.readiness
                             .quarantine(target.clone(), error.clone())
                             .map_err(|quarantine_error| {
@@ -260,12 +271,11 @@ fn rediscover_one_target(
                 }
             }
             Err(error) => {
-                if let Ok(Some(retired)) =
-                    observe_discovered_retired_mv(ctx.connector_control, discovered, context)
-                {
+                if let Ok(Some(retired)) = observe_discovered_retired_mv(ctx, discovered, context) {
                     ctx.readiness.remember_retired_mv(retired);
                     return Ok(());
                 }
+                note_incomplete_discovery(ctx);
                 ctx.readiness
                     .quarantine(
                         target.clone(),
@@ -404,12 +414,13 @@ struct DiscoveredManagedMvTarget {
 }
 
 fn observe_discovered_retired_mv(
-    controls: &dyn ConnectorControlResolver,
+    ctx: &LakeRebuildContext<'_>,
     discovered: &DiscoveredManagedMvTarget,
     context: &ConnectorRequestContext,
 ) -> Result<Option<novarocks_mv_application::persistence::keyed_documents::RetiredMvStatus>, String>
 {
-    let planning = controls
+    let planning = ctx
+        .connector_control
         .acquire_current(&discovered.target.instance_id)
         .map_err(|e| e.to_string())?;
     let documents = planning
@@ -430,11 +441,26 @@ fn observe_discovered_retired_mv(
     if view.metadata_version != discovered.metadata_version {
         return Ok(None);
     }
-    novarocks_mv_application::persistence::keyed_documents::project_retired_mv_status(
-        &view,
-        discovered.catalog.clone(),
-    )
-    .map_err(|e| e.to_string())
+    use novarocks_mv_application::persistence::keyed_documents::{
+        decode_management_slot, management_slot_name, project_retired_mv_status,
+    };
+    let retired =
+        project_retired_mv_status(&view, discovered.catalog.clone()).map_err(|e| e.to_string())?;
+    if retired.is_some()
+        && let Some(entrance) = ctx.management_entrance
+    {
+        let slot = management_slot_name().map_err(|e| e.to_string())?;
+        let slot = view
+            .slots
+            .get(&slot)
+            .ok_or("retired MV has no management slot")?;
+        let (deployment, incarnation) =
+            decode_management_slot(&slot.value).map_err(|e| e.to_string())?;
+        if &deployment == entrance.owner() {
+            entrance.note_startup_incarnation(&incarnation);
+        }
+    }
+    Ok(retired)
 }
 
 /// Discover a catalog's managed MVs one namespace at a time.

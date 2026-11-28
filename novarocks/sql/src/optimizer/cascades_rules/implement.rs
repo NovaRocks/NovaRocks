@@ -1293,6 +1293,38 @@ impl Rule for ChangeEventExpandToPhysical {
 }
 
 // ---------------------------------------------------------------------------
+// Content application has one exact two-input placement.
+pub(crate) struct ContentApplyToPhysical;
+
+impl Rule for ContentApplyToPhysical {
+    fn name(&self) -> &str {
+        "ContentApplyToPhysical"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalContentApply(_))
+    }
+
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let Operator::LogicalContentApply(op) = &expr.op else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![NewExpr {
+            op: Operator::PhysicalContentApply(op.clone()),
+            children: expr.children.clone(),
+        }])
+    }
+}
+
 // 15. UnionToPhysical
 // ---------------------------------------------------------------------------
 

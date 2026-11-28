@@ -1,5 +1,5 @@
 -- query 4
--- legacy
+-- types	integer	integer	varchar
 id	amount	label
 1	100	old-a
 2	200	old-b

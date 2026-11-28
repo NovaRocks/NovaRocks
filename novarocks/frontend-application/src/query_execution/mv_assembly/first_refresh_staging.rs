@@ -41,6 +41,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
     Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*rewrite.mv_definition).clone(),
         rebuild_layout: rewrite.rebuild_layout.clone(),
+        recovery_publication: rewrite.recovery_publication.clone(),
         base_refs: rewrite
             .base_refs
             .iter()
@@ -48,6 +49,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
             .collect(),
         pin,
         previous: ordered_previous_sources(rewrite)?,
+        equivalent_context_from: rewrite.equivalent_context_from.clone(),
         analysis: rewrite.analysis_facts().clone(),
         target_table_uuid: rewrite.target_table_uuid.clone(),
         affected_partitions,
@@ -85,7 +87,7 @@ fn ordered_previous_sources(
     if rewrite.rebuild_layout.is_some() {
         return Ok(Vec::new());
     }
-    match rewrite.mv_definition.facts.publication() {
+    match rewrite.previous_publication() {
         None if rewrite.previous.is_empty() => Ok(Vec::new()),
         None => Err("never-published MV first-refresh artifact has source history".to_string()),
         Some(published) => published
@@ -229,22 +231,20 @@ pub(crate) fn finish_frozen_mv_rewrite_context_original(
             "MV first-refresh target schema and retained target binding differ",
         ));
     }
-    crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
-        Arc::new(facts.mv_definition.clone()),
-        facts.rebuild_layout.clone(),
-        facts.pin.clone(),
-        facts.previous.clone(),
-        facts.target_table_uuid.clone(),
-        target_binding
-            .physical_write_schema()
-            .map_err(contract_error)?,
-        target_binding
-            .write_input_fields()
-            .map_err(contract_error)?,
-        target_schema.exact_schema().clone(),
-        facts.analysis.clone(),
-    )
-    .map_err(contract_error)
+    let mut rewrite =
+        crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
+            Arc::new(facts.mv_definition.clone()),
+            facts.rebuild_layout.clone(),
+            facts.recovery_publication.clone(),
+            facts.pin.clone(),
+            facts.previous.clone(),
+            target_binding,
+            &target_schema,
+            facts.analysis.clone(),
+        )
+        .map_err(contract_error)?;
+    rewrite.equivalent_context_from = facts.equivalent_context_from.clone();
+    Ok(Arc::new(rewrite))
 }
 
 fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Result<(), String> {

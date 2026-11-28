@@ -44,6 +44,37 @@ impl std::error::Error for CarrierParameterError {
     }
 }
 
+pub(crate) fn validate_arrow_node_shape(ty: &DataType) -> Result<(), &'static str> {
+    let values = match ty {
+        DataType::Dictionary(key, values) if key.is_dictionary_key_type() => values.as_ref(),
+        DataType::Dictionary(..) => {
+            return Err("invalid Arrow dictionary key type");
+        }
+        DataType::RunEndEncoded(ends, values)
+            if !ends.is_nullable() && ends.data_type().is_run_ends_type() =>
+        {
+            values.data_type()
+        }
+        DataType::RunEndEncoded(..) => {
+            return Err("invalid Arrow run-end field");
+        }
+        DataType::Map(entries, _)
+            if entries.is_nullable()
+                || !matches!(entries.data_type(), DataType::Struct(fields) if fields.len() == 2) =>
+        {
+            return Err("invalid Arrow Map entries field");
+        }
+        _ => return Ok(()),
+    };
+    if matches!(
+        values,
+        DataType::Dictionary(..) | DataType::RunEndEncoded(..)
+    ) {
+        return Err("an Arrow value node cannot carry consecutive encodings");
+    }
+    Ok(())
+}
+
 /// Validate one Arrow type node's carrier parameters, observing the node and
 /// each Union type id. The caller owns complete tree traversal, metadata and
 /// depth limits; this function does not recurse or authorize allocation.
@@ -52,6 +83,8 @@ pub fn validate_arrow_carrier_parameters_observed<E: From<CarrierParameterError>
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     observe()?;
+    validate_arrow_node_shape(ty)
+        .map_err(|_| CarrierParameterError::Invalid("invalid Arrow constant carrier parameters"))?;
     let decimal = match ty {
         DataType::Decimal32(p, s) => Some((*p, *s, DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE)),
         DataType::Decimal64(p, s) => Some((*p, *s, DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE)),
@@ -71,28 +104,6 @@ pub fn validate_arrow_carrier_parameters_observed<E: From<CarrierParameterError>
         DataType::Time32(unit) => !matches!(unit, TimeUnit::Second | TimeUnit::Millisecond),
         DataType::Time64(unit) => !matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond),
         DataType::FixedSizeBinary(width) | DataType::FixedSizeList(_, width) => *width < 0,
-        DataType::Dictionary(key, _) => !matches!(
-            key.as_ref(),
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-        ),
-        DataType::RunEndEncoded(ends, _) => {
-            ends.is_nullable()
-                || !matches!(
-                    ends.data_type(),
-                    DataType::Int16 | DataType::Int32 | DataType::Int64
-                )
-        }
-        DataType::Map(entries, _) => {
-            entries.is_nullable()
-                || !matches!(entries.data_type(), DataType::Struct(fields) if fields.len() == 2)
-        }
         DataType::Union(fields, _) => {
             if fields.len() > 128 {
                 return Err(CarrierParameterError::Invalid("too many Union type ids").into());

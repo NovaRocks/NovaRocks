@@ -141,36 +141,12 @@ impl RootOutputSemantics {
         )
     }
 
-    /// First-refresh construction appends one contract-owned key to the payload.
-    pub(crate) fn first_refresh_output(
-        self,
-        columns: &[OutputColumn],
-        snapshot: &super::mv_rewrite::SqlImvRewriteSnapshot,
-    ) -> Result<Self, String> {
-        let mut declared = self.declared_occurrences();
-        declared.push((
-            Some(
-                snapshot
-                    .schema_contract
-                    .target
-                    .hidden_apply_key
-                    .column_name
-                    .clone(),
-            ),
-            FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
-        ));
-        Self::bind_transformed(columns, declared)
-    }
-
     /// An IMV owner replaces the query root with its explicitly declared writer shape.
     pub(crate) fn imv_output(
         self,
         columns: &[OutputColumn],
         snapshot: &super::mv_rewrite::SqlImvRewriteSnapshot,
-        change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
-        locator: bool,
     ) -> Result<Self, String> {
-        use crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource as S;
         use arrow::datatypes::DataType as D;
         if self.domains(columns).is_ok() {
             return Ok(self);
@@ -220,99 +196,47 @@ impl RootOutputSemantics {
                 Some(crate::common::CHANGE_OP_COLUMN.into()),
                 FunctionValueType::new(D::Int8, false),
             ));
-        } else if let Some(join) = &change_stream.join_refresh {
-            if self.occurrences.len() != join.payload_columns.len() {
-                return Err("join root declaration differs from payload width".into());
+        } else if let Some(content) = &snapshot.content_target {
+            if content.len() != self.occurrences.len() {
+                return Err(
+                    "MV content application differs from the definition output width".into(),
+                );
             }
-            if locator {
-                declared = self.declared_occurrences();
+            for (name, field) in self.field_names.iter().zip(content.iter()) {
                 declared.push((
-                    Some(
-                        snapshot
-                            .schema_contract
-                            .target
-                            .hidden_apply_key
-                            .column_name
-                            .clone(),
-                    ),
-                    join.join_apply_key_column.value_type.clone(),
+                    name.clone(),
+                    field
+                        .declared_value_type()
+                        .map_err(|cause| cause.to_string())?,
                 ));
-                append_locator_declarations(
-                    &mut declared,
-                    snapshot.target_file_metadata.as_deref(),
-                )?;
-                declared.push((
-                    Some(crate::common::CHANGE_OP_COLUMN.into()),
-                    join.action_column.value_type.clone(),
-                ));
-            } else {
-                if columns.len() != join.output_mappings.len() {
-                    return Err("join root declaration differs from its output mappings".into());
-                }
-                for (mapping, actual) in join.output_mappings.iter().zip(columns) {
-                    if mapping.mv_output_column.column_id != actual.column_id {
-                        return Err(
-                            "join root output mapping changed its occurrence identity".into()
-                        );
-                    }
-                    let (name, ty) = match mapping.source {
-                        S::Payload(source) => {
-                            let ordinal = join
-                                .payload_columns
-                                .iter()
-                                .position(|field| field.column_id == source)
-                                .ok_or("join root mapping has no payload source")?;
-                            (
-                                self.field_names[ordinal].clone(),
-                                self.occurrences[ordinal].1.clone(),
-                            )
-                        }
-                        S::Action(_) => (
-                            Some(crate::common::CHANGE_OP_COLUMN.into()),
-                            join.action_column.value_type.clone(),
-                        ),
-                        S::JoinApplyKey(_) => (
-                            Some(
-                                snapshot
-                                    .schema_contract
-                                    .target
-                                    .hidden_apply_key
-                                    .column_name
-                                    .clone(),
-                            ),
-                            join.join_apply_key_column.value_type.clone(),
-                        ),
-                    };
-                    declared.push((name, ty));
-                }
             }
+            declared.push((
+                Some(crate::common::ICEBERG_FILE_PATH_COL.into()),
+                FunctionValueType::new(D::Utf8, true),
+            ));
+            declared.push((
+                Some(crate::common::ICEBERG_ROW_POS_COL.into()),
+                FunctionValueType::new(D::Int64, true),
+            ));
+            for field in snapshot
+                .target_file_metadata
+                .as_deref()
+                .ok_or("MV content target metadata was not frozen")?
+            {
+                let ty = field
+                    .declared_value_type()
+                    .map_err(|cause| cause.to_string())?;
+                declared.push((
+                    Some(field.name.clone()),
+                    ty.with_nullable(true).map_err(|cause| cause.to_string())?,
+                ));
+            }
+            declared.push((
+                Some(crate::common::CHANGE_OP_COLUMN.into()),
+                FunctionValueType::new(D::Int8, false),
+            ));
         } else {
             declared = self.declared_occurrences();
-            if snapshot.schema_contract.target.hidden_apply_key.source
-                != crate::planner::vocabulary::ApplyKeySource::BaseRowId
-            {
-                return Err("IMV root declaration has no matching key-source descriptor".into());
-            }
-            // InjectApplyKey derives this column from Iceberg's signed Int64
-            // row-lineage contract. A FastAppend target need not store it.
-            declared.push((
-                Some(
-                    snapshot
-                        .schema_contract
-                        .target
-                        .hidden_apply_key
-                        .column_name
-                        .clone(),
-                ),
-                FunctionValueType::new(D::Int64, false),
-            ));
-            if let Some(branch) = &snapshot.schema_contract.branch {
-                declared.push((
-                    Some(branch.branch_id_column_name.clone()),
-                    FunctionValueType::new(D::Int32, false),
-                ));
-            }
-            append_locator_declarations(&mut declared, snapshot.target_file_metadata.as_deref())?;
             declared.push((
                 Some(crate::common::CHANGE_OP_COLUMN.into()),
                 FunctionValueType::new(D::Int8, false),
@@ -435,7 +359,9 @@ fn append_locator_declarations(
     if let Some(fields) = target_file_metadata {
         for field in fields {
             let value =
-                crate::planner::imv_rewrite::target_locator::nullable_file_metadata_value(field)?;
+                crate::planner::imv_rewrite::position_metadata::nullable_file_metadata_value(
+                    field,
+                )?;
             declared.push((Some(field.name.clone()), value));
         }
     }
@@ -473,7 +399,6 @@ mod tests {
     #[test]
     fn row_delta_root_declares_signed_file_metadata_before_action() {
         use crate::compiler::mv_rewrite::test_incremental_snapshot_handle;
-        use crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
         use novarocks_types::schema::ColumnDef;
 
         let spec = ColumnDef::from_value_type(
@@ -507,11 +432,22 @@ mod tests {
             vec![Some("k".into())].into_boxed_slice(),
         )
         .unwrap();
+        let field_id = snapshot.snapshot().schema_contract.target.visible_columns[0]
+            .target_field_id
+            .clone();
+        let snapshot = snapshot
+            .with_content_target(vec![crate::compiler::SqlImvContentField {
+                storage_field_id: field_id,
+                read_column: novarocks_types::schema::ColumnDef::from_value_type(
+                    visible.name.clone(),
+                    visible.value_type.clone(),
+                    None,
+                )
+                .unwrap(),
+            }])
+            .unwrap();
         let mut output = vec![visible];
         for (name, ty, nullable) in [
-            ("__nova_base_row_id", D::Int64, false),
-            (crate::common::ICEBERG_ROW_ID_COL, D::Int64, true),
-            (crate::common::ICEBERG_LAST_UPDATED_SEQ_COL, D::Int64, true),
             (crate::common::ICEBERG_FILE_PATH_COL, D::Utf8, true),
             (crate::common::ICEBERG_ROW_POS_COL, D::Int64, true),
             ("_spec_id", D::Int32, true),
@@ -525,25 +461,24 @@ mod tests {
             true,
         ));
 
-        let descriptor = ImvChangeStreamDescriptor::default();
         let rewritten = semantics
             .clone()
-            .imv_output(&output, snapshot.snapshot(), &descriptor, true)
+            .imv_output(&output, snapshot.snapshot())
             .unwrap();
         assert_eq!(
-            rewritten.field_names(&output).unwrap()[6..],
+            rewritten.field_names(&output).unwrap()[3..],
             [
                 Some("_spec_id".to_owned()),
                 Some("_partition".to_owned()),
                 Some(crate::common::CHANGE_OP_COLUMN.to_owned()),
             ]
         );
-        output[7].value_type = physical_partition;
+        output[4].value_type = physical_partition;
         assert!(
             semantics
-                .imv_output(&output, snapshot.snapshot(), &descriptor, true)
+                .imv_output(&output, snapshot.snapshot())
                 .unwrap_err()
-                .contains("transformed root declaration type differs at ordinal 7")
+                .contains("transformed root declaration type differs at ordinal 4")
         );
     }
 

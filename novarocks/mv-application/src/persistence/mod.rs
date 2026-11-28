@@ -29,6 +29,7 @@ pub mod identity;
 pub mod keyed_documents;
 pub mod publication_facts;
 pub mod rebuild_classification;
+pub mod resolution;
 pub mod runtime_bindings;
 pub mod schema;
 pub mod semantic;

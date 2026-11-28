@@ -47,9 +47,9 @@ use novarocks_functions::{
     WindowCallOptions,
 };
 use novarocks_local_program::{
-    AnalyticOutputColumn, ProgramCallSite, ProgramNodeId, ProgramNodeKind, StaticLayout,
-    StaticWindowFunction, WindowBoundary, WindowFrame as ProgramWindowFrame, WindowFunctionKind,
-    WindowType,
+    AnalyticOutputColumn, ProgramCallSite, ProgramNodeId, ProgramNodeKind, StaticAggregateOrder,
+    StaticLayout, StaticWindowFunction, WindowBoundary, WindowFrame as ProgramWindowFrame,
+    WindowFunctionKind, WindowType,
 };
 use novarocks_physical_plan::{
     AggregatePhase, FragmentPackage, FunctionArgumentType, NodeId, NodeKind, NullOrdering,
@@ -413,10 +413,29 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
             function_order_by.push(lowered(&key.expr, "missing lowered function sort key")?);
             work.step()?;
         }
+        let aggregate_order = if aggregate_binding.is_some() {
+            let mut is_asc_order = Vec::new();
+            let mut nulls_first = Vec::new();
+            reserve_vec(&mut is_asc_order, item.order_by.len(), work)?;
+            reserve_vec(&mut nulls_first, item.order_by.len(), work)?;
+            for key in &item.order_by {
+                is_asc_order.push(key.direction == SortDirection::Ascending);
+                nulls_first.push(key.null_ordering == NullOrdering::First);
+                work.step()?;
+            }
+            Some(StaticAggregateOrder {
+                is_asc_order,
+                nulls_first,
+                is_distinct: item.distinct,
+            })
+        } else {
+            None
+        };
         let frozen = frozen_frame(package, frame.as_ref(), work)?;
         let state_interpretation = aggregate_binding
             .as_ref()
-            .and_then(|binding| binding.state_interpretation.as_ref())
+            .and_then(|binding| binding.merge_state.as_ref())
+            .and_then(|state| state.state_interpretation.as_ref())
             .map(|facts| facts.clone_observed(work))
             .transpose()?;
         let frozen_aggregate = aggregate_binding
@@ -424,13 +443,15 @@ fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>
             .map(|binding| crate::aggregate::freeze_binding_with_creation(binding, work, creation))
             .transpose()?;
         let aggregate_binding = match aggregate_binding.as_deref() {
-            Some(binding) => Some(aggregate_signature(binding, work)?),
-            None => None,
+            Some(binding) if binding.merge_state.is_some() => {
+                Some(aggregate_signature(binding, work)?)
+            }
+            _ => None,
         };
         work.flush()?;
         functions.push(StaticWindowFunction {
             frozen_aggregate,
-            kind: WindowFunctionKind::Prepared,
+            kind: WindowFunctionKind::Prepared { aggregate_order },
             args: inputs,
             function_order_by,
             state_interpretation,
@@ -552,6 +573,12 @@ fn aggregate_signature(
     binding: &novarocks_physical_plan::AggregateBinding,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Arc<str>, ResolvedAggregateSignature), FragmentCompileError> {
+    let state = binding
+        .merge_state
+        .as_ref()
+        .ok_or(FragmentCompileError::Invalid(
+            "aggregate window has no merge signature",
+        ))?;
     let function = &binding.function;
     let mut argument_types = Vec::new();
     reserve_vec(&mut argument_types, function.argument_types.len(), work)?;
@@ -580,9 +607,9 @@ fn aggregate_signature(
         ResolvedAggregateSignature {
             overload,
             argument_types,
-            intermediate_type: binding.intermediate_type.data_type().clone(),
+            intermediate_type: state.intermediate_type.data_type().clone(),
             output_type: function.result_type.data_type().clone(),
-            state_format: binding.state_format.clone(),
+            state_format: state.state_format.clone(),
         },
     ))
 }
@@ -654,11 +681,13 @@ fn window_selection(
         overload: function.overload.clone(),
         argument_types: function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(function.result_type.clone()),
-        aggregate: binding.map(|binding| AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type: binding.intermediate_type.clone(),
-            state_format: binding.state_format.clone(),
-        }),
+        aggregate: binding
+            .and_then(|binding| binding.merge_state.as_ref())
+            .map(|binding| AggregateBindingSelection {
+                state_argument_contract: binding.state_argument_contract,
+                intermediate_type: binding.intermediate_type.clone(),
+                state_format: binding.state_format.clone(),
+            }),
     }
 }
 
@@ -824,8 +853,7 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         }
         (FunctionKind::Aggregate, Some(binding)) if binding.phase == AggregatePhase::Single => {
             let state_interpretation = binding
-                .state_interpretation
-                .as_ref()
+                .state_interpretation()
                 .map(|facts| facts.clone_observed(work).map(Arc::new))
                 .transpose()?;
             let mut order_keys = Vec::new();

@@ -387,7 +387,7 @@ pub(crate) fn validate_node_output_closure(
         .inputs
         .first()
         .and_then(|input| fragment.nodes().get(input))
-        .map(|input| input.output.columns.as_ref())
+        .map(PhysicalNode::data_output_columns)
         .unwrap_or_default();
     let input_values = indexes
         .visible_input(node.id)
@@ -498,6 +498,7 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ChangeEventExpand { .. }
         | NodeKind::PositionShard(_)
+        | NodeKind::ContentApply(_)
         | NodeKind::WriteLayoutKey { .. } => None,
     };
     if let Some(exact) = exact
@@ -509,6 +510,27 @@ pub(crate) fn validate_node_output_closure(
         ));
     }
     for (ordinal, value) in node.output.columns.iter().enumerate() {
+        if let Some(ValueDef {
+            origin: ValueOrigin::Summary { field },
+            ..
+        }) = fragment.values().get(value)
+        {
+            if ordinal < node.data_output_columns().len()
+                || !fragment.summaries().iter().any(|summary| {
+                    summary.author == crate::SummaryAuthor::Node(node.id)
+                        && summary
+                            .columns
+                            .fields()
+                            .any(|(role, id)| role == *field && id == *value)
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "summary field is outside its exact node author projection",
+                ));
+            }
+            continue;
+        }
         if input_values.contains(value) {
             continue;
         }
@@ -618,8 +640,7 @@ pub(crate) fn validate_join_output_closure(
         if marks != 1
             || !declared_nulls.is_empty()
             || left
-                .output
-                .columns
+                .data_output_columns()
                 .iter()
                 .any(|value| !node.output.columns.contains(value))
         {
@@ -760,13 +781,13 @@ pub(crate) fn value_origin_allowed(
             | NodeKind::TableFunction { .. }
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::PositionShard(_)
+            | NodeKind::ContentApply(_)
             | NodeKind::WriteLayoutKey { .. },
             ValueOrigin::NodeOutput {
                 node: owner,
                 output_ordinal,
             },
         ) => *owner == node.id && usize::try_from(*output_ordinal).ok() == Some(ordinal),
-        (_, ValueOrigin::Summary { field }) => node.kind.summary_authorship() == Some(field.kind()),
         _ => false,
     }
 }
@@ -778,7 +799,9 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
-        NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
+        NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } | NodeKind::ContentApply(_) => {
+            node.inputs.len() == 2
+        }
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
         NodeKind::PositionShard(spec) => {
             !spec.inputs.is_empty() && node.inputs.len() == spec.inputs.len()
@@ -2089,6 +2112,11 @@ pub(crate) fn validate_node_semantics(
                 ));
             }
         }
+        NodeKind::ContentApply(spec) => {
+            super::content_apply::validate_content_apply(
+                fragment, node, spec, indexes, path, errors,
+            );
+        }
         NodeKind::PositionShard(spec) => {
             let output = spec.output;
             let required = |id, data_type| {
@@ -2566,6 +2594,13 @@ pub(crate) fn validate_writer_aggregates(
         }
         require_value(fragment, call.input, path, errors);
         require_value(fragment, call.output, path, errors);
+        if !call.binding.has_valid_phase_contract() {
+            errors.push(ValidationError::new(
+                path,
+                "writer aggregate has no merge contract",
+            ));
+            continue;
+        }
         let expected_input = match call.binding.phase {
             AggregatePhase::Single | AggregatePhase::Partial { .. } => {
                 match call.binding.function.argument_types.first() {
@@ -2580,7 +2615,7 @@ pub(crate) fn validate_writer_aggregates(
                 }
             }
             AggregatePhase::Intermediate { .. } | AggregatePhase::Final { .. } => {
-                Some(&call.binding.intermediate_type)
+                call.binding.intermediate_type()
             }
         };
         // Everything a writer aggregate reads is a column of the write
@@ -2601,13 +2636,8 @@ pub(crate) fn validate_writer_aggregates(
                 ),
             ));
         }
-        let expected_output = match call.binding.phase {
-            AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                &call.binding.function.result_type
-            }
-            AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                &call.binding.intermediate_type
-            }
+        let Some(expected_output) = call.binding.output_type() else {
+            continue;
         };
         // A writer aggregate's output is a column of the write relation, and
         // that relation admits null there because a row which is not an
@@ -3602,15 +3632,7 @@ fn validate_aggregate_contract(
             ));
         }
         if let Some(output) = fragment.values().get(&call.output) {
-            let expected = match call.binding.phase {
-                AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                    &call.binding.function.result_type
-                }
-                AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                    &call.binding.intermediate_type
-                }
-            };
-            if &output.ty != expected {
+            if call.binding.output_type() != Some(&output.ty) {
                 errors.push(ValidationError::new(
                     path,
                     "aggregate output type differs from phase output",

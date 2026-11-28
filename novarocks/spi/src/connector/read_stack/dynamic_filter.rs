@@ -59,6 +59,7 @@ pub enum BoundsMatch {
 pub struct DynamicFilterSnapshot<C: Ord + Clone + Debug> {
     current_predicate: TupleDomain<C>,
     complete: bool,
+    empty_content_demand: bool,
 }
 
 impl<C: Ord + Clone + Debug> DynamicFilterSnapshot<C> {
@@ -66,7 +67,22 @@ impl<C: Ord + Clone + Debug> DynamicFilterSnapshot<C> {
         Self {
             current_predicate,
             complete,
+            empty_content_demand: false,
         }
+    }
+
+    /// Runtime-filter feedback proved that the content application requests
+    /// no target rows. An ordinary contradictory filter cannot author this.
+    pub fn empty_content_demand() -> Self {
+        Self {
+            current_predicate: TupleDomain::none(),
+            complete: true,
+            empty_content_demand: true,
+        }
+    }
+
+    pub const fn is_empty_content_demand(&self) -> bool {
+        self.empty_content_demand
     }
 
     /// The unconstrained, final snapshot used when no feedback exists.

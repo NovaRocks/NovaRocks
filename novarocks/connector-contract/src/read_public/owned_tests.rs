@@ -151,7 +151,10 @@ fn borrowed_read_preserves_original_logical_and_structural_error_categories() {
         Schema::new(vec![bad_label]),
         Schema::new_with_metadata(
             vec![Field::new("v", DataType::Int64, false)],
-            HashMap::from([("large".to_owned(), "x".repeat(16 * 1024 + 1))]),
+            HashMap::from([(
+                "large".to_owned(),
+                "x".repeat(MAX_STATIC_SCAN_RETAINED_BYTES + 1),
+            )]),
         ),
     ];
     for schema in schemas {
@@ -163,9 +166,14 @@ fn borrowed_read_preserves_original_logical_and_structural_error_categories() {
             logical.clone(),
         )
         .unwrap_err();
-        let actual = invoke(&schema, logical, SOURCE, &Control::default(), &mut |_| {
-            Ok(())
-        })
+        let source_bytes = SOURCE + MAX_STATIC_SCAN_RETAINED_BYTES;
+        let actual = invoke(
+            &schema,
+            logical,
+            source_bytes,
+            &Control::default(),
+            &mut |_| Ok(()),
+        )
         .unwrap_err();
         let PureProviderCompileError::Provider(actual) = actual else {
             panic!()
@@ -210,10 +218,9 @@ fn borrowed_read_primitive_requests_match_independent_layout_inventory() {
         + arc(Layout::new::<Schema>())
         + size_of::<ValueLogicalType>() // original logical Vec trim
         + arc(Layout::array::<ValueLogicalType>(1).unwrap())
-        + size_of::<&DataType>() // actual one-node SchemaBudget scratch
         + arc(Layout::new::<Field>())
         + 1; // name "v"
-    assert_eq!(invoice.allocation_requests, 25);
+    assert_eq!(invoice.allocation_requests, 24);
     assert_eq!(invoice.requested_bytes, bytes);
     assert_eq!(invoice.coexistence_bytes, SOURCE + bytes);
     assert!(invoice.source_floor > 0);
@@ -265,13 +272,13 @@ fn borrowed_read_each_request_work_and_coexistence_gate_accepts_exact_and_refuse
 }
 #[test]
 fn borrowed_read_small_success_and_ordinary_failures_preserve_every_control_prefix() {
-    for schema in [
-        primitive(),
-        Schema::new_with_metadata(
-            vec![Field::new("v", DataType::Int64, false)],
-            HashMap::from([("invalid".to_owned(), "x".repeat(16 * 1024 + 1))]),
-        ),
-    ] {
+    let invalid = Schema::new(vec![Field::new("v", DataType::Int64, false).with_metadata(
+        HashMap::from([(
+            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+            "unknown-logical-domain".to_owned(),
+        )]),
+    )]);
+    for (schema, is_valid) in [(primitive(), true), (invalid, false)] {
         let baseline = Control::default();
         let result = invoke(
             &schema,
@@ -280,7 +287,7 @@ fn borrowed_read_small_success_and_ordinary_failures_preserve_every_control_pref
             &baseline,
             &mut |_| Ok(()),
         );
-        if schema.metadata().is_empty() {
+        if is_valid {
             assert!(result.is_ok());
         } else {
             assert!(matches!(result, Err(PureProviderCompileError::Provider(_))));

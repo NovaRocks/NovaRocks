@@ -67,7 +67,13 @@ fn approx_most_frequent_actual_sql_retains_exact_map_binding() {
                         call.binding.function.argument_types.len()
                     );
                     assert_eq!(
-                        call.binding.intermediate_type.data_type().clone(),
+                        call.binding
+                            .merge_state
+                            .as_ref()
+                            .unwrap()
+                            .intermediate_type
+                            .data_type()
+                            .clone(),
                         DataType::Binary
                     );
                     assert!(matches!(

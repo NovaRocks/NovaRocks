@@ -485,3 +485,49 @@ fn last_typed_public_reference_keeps_created_labels_and_original_schema_independ
     drop(independent_execution);
     assert_eq!(original_drops.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn source_field_path_keeps_map_entries_at_maximum_logical_depth() {
+    use crate::MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH;
+    let depth = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+    let mut data_type = DataType::Int64;
+    let mut field_path = vec![0];
+    for _ in 1..depth {
+        let entries = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("value", data_type, true),
+            ]
+            .into(),
+        );
+        data_type = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
+        field_path.extend([0, 1]);
+    }
+    assert_eq!(field_path.len(), 1 + 2 * (depth - 1));
+    assert_eq!(field_path.len(), MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH);
+    let shape = ConnectorSourceSchemaShape::try_new(
+        Arc::new(Schema::new(vec![Field::new("payload", data_type, false)])),
+        pure(),
+    )
+    .unwrap();
+    let leaf = shape.field_at(&field_path).unwrap();
+    assert_eq!(leaf.data_type(), &DataType::Int64);
+    assert!(leaf.is_nullable());
+    let fact = ConnectorSourceFieldFacts::try_new(
+        field_path.clone().into_boxed_slice(),
+        Some(19),
+        None,
+        HashMap::new(),
+        &[],
+        pure(),
+    )
+    .unwrap();
+    let facts = ConnectorSourceSchemaFacts::try_new(
+        shape,
+        HashMap::new(),
+        vec![fact].into_boxed_slice(),
+        pure(),
+    )
+    .unwrap();
+    assert_eq!(facts.field_fact(&field_path).unwrap().field_id(), Some(19));
+}

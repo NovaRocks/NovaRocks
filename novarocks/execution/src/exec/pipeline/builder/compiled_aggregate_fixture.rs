@@ -192,11 +192,6 @@ impl Bound {
         }
     }
     pub(crate) fn binding(&self, phase: AggregatePhase) -> AggregateBinding {
-        let aggregate = self
-            .selected
-            .aggregate
-            .as_ref()
-            .expect("aggregate selection");
         // The plan is published through its original producer facts, as the
         // FE does; the package's frozen calls stay the only effect authority.
         let mut function = BoundFunction::from_exact_signature(
@@ -214,15 +209,17 @@ impl Bound {
             semantic_parameters: Box::default(),
         });
         AggregateBinding {
-            // The physical port owns this small facts projection. Its guarded
-            // order collection shares the original immutable backing.
-            state_interpretation: self.state_interpretation.as_deref().cloned(),
-            state_argument_contract: aggregate.state_argument_contract,
             function,
             phase,
             logical_argument_count: u32::try_from(self.arguments.len()).unwrap(),
-            intermediate_type: aggregate.intermediate_type.clone(),
-            state_format: aggregate.state_format.clone(),
+            merge_state: self.selected.aggregate.as_ref().map(|aggregate| {
+                novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation: self.state_interpretation.as_deref().cloned(),
+                    state_argument_contract: aggregate.state_argument_contract,
+                    intermediate_type: aggregate.intermediate_type.clone(),
+                    state_format: aggregate.state_format.clone(),
+                }
+            }),
         }
     }
 }
@@ -631,10 +628,12 @@ fn freeze(
             overload: binding.function.overload.clone(),
             argument_types: binding.function.argument_types.clone(),
             result_type: FunctionResultType::Scalar(binding.function.result_type.clone()),
-            aggregate: Some(novarocks_functions::AggregateBindingSelection {
-                state_argument_contract: binding.state_argument_contract,
-                intermediate_type: binding.intermediate_type.clone(),
-                state_format: binding.state_format.clone(),
+            aggregate: binding.merge_state.as_ref().map(|state| {
+                novarocks_functions::AggregateBindingSelection {
+                    state_argument_contract: state.state_argument_contract,
+                    intermediate_type: state.intermediate_type.clone(),
+                    state_format: state.state_format.clone(),
+                }
             }),
         });
         let request = binding
@@ -669,7 +668,7 @@ fn freeze(
                 // A call's frozen effects do not depend on DISTINCT; whether
                 // the owner implements DISTINCT is the compiler's preparation.
                 AggregatePreparationOptions {
-                    state_interpretation: binding.state_interpretation.clone().map(Arc::new),
+                    state_interpretation: binding.state_interpretation().cloned().map(Arc::new),
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),
@@ -692,7 +691,7 @@ fn freeze(
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
-                    state_interpretation: binding.state_interpretation.clone().map(Arc::new),
+                    state_interpretation: binding.state_interpretation().cloned().map(Arc::new),
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),

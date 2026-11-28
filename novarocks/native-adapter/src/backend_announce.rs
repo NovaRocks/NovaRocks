@@ -68,6 +68,7 @@ impl BackendAnnounceSupervisor {
         let join = std::thread::Builder::new()
             .name("backend-announce".to_string())
             .spawn(move || {
+                novarocks_memory::attribution::roles::enter_registered_thread_role("native_rpc");
                 let client = NativeRpcClient::new_membership_endpoint(
                     thread_runtime,
                     thread_frontend_endpoint,

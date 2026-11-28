@@ -25,13 +25,11 @@
 use std::collections::HashSet;
 
 use novarocks_parser::Span;
-use novarocks_parser::printer;
 use novarocks_parser::{ast, build};
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
 
 use crate::compiler::SqlMvRelationOccurrenceId;
-use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 
 /// One definition occurrence and its exact first-refresh read facts.
 ///
@@ -185,7 +183,7 @@ pub(super) fn prepare_projection_full_read_sql(
 ) -> Result<ast::Query, String> {
     let mut query = select_query.clone();
     inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
-    append_physical_apply_key(query)
+    Ok(query)
 }
 
 pub(super) fn prepare_union_projection_full_read_sql(
@@ -198,9 +196,6 @@ pub(super) fn prepare_union_projection_full_read_sql(
     if branch_count < 2 {
         return Err("iceberg UNION ALL MV full refresh requires at least 2 branches".to_string());
     }
-    let branch_count_i32 = i32::try_from(branch_count).map_err(|_| {
-        format!("iceberg UNION ALL MV full refresh branch count {branch_count} does not fit in i32")
-    })?;
     let mut query = select_query.clone();
     inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
 
@@ -221,9 +216,6 @@ pub(super) fn prepare_union_projection_full_read_sql(
         ));
     }
 
-    let mut next_branch_id = 0;
-    append_union_projection_hidden_columns(query.body.as_mut(), &mut next_branch_id)?;
-    debug_assert_eq!(next_branch_id, branch_count_i32);
     Ok(query)
 }
 
@@ -263,60 +255,6 @@ pub(super) fn branch_union_queries(
             Ok(branch_query)
         })
         .collect()
-}
-
-fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String> {
-    let ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
-    };
-    validate_reserved_projection_output_names(
-        select,
-        &[(HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key")],
-    )?;
-    for item in &select.projection {
-        if matches!(item, ast::SelectItem::AllColumns(_)) {
-            return Err(
-                "iceberg MV physical SELECT requires explicit projection columns".to_string(),
-            );
-        }
-    }
-    select.projection.push(build::item(
-        build::identifier(build::ident("_row_id", false)),
-        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
-    ));
-    Ok(query)
-}
-
-fn validate_reserved_projection_output_names(
-    select: &ast::Select,
-    reserved: &[(&str, &str)],
-) -> Result<(), String> {
-    for item in &select.projection {
-        let output_name = match item {
-            ast::SelectItem::SingleColumn(column) => Some(
-                column
-                    .alias
-                    .as_ref()
-                    .map_or_else(
-                        || printer::print_expression(&column.expression),
-                        |alias| Ok(alias.value.clone()),
-                    )
-                    .map_err(|error| error.to_string())?,
-            ),
-            ast::SelectItem::AllColumns(_) => None,
-        };
-        let Some(output_name) = output_name else {
-            continue;
-        };
-        for (reserved_name, purpose) in reserved {
-            if output_name.eq_ignore_ascii_case(reserved_name) {
-                return Err(format!(
-                    "Iceberg MV output column name {reserved_name} is reserved for internal {purpose}"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_union_projection_set_expr(
@@ -363,61 +301,13 @@ fn validate_union_projection_set_expr(
             validated_branch_count,
             saw_union_all,
         ),
-        ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(_) => {
             if *validated_branch_count >= branch_count {
                 return Err(format!(
                     "iceberg UNION ALL MV full refresh found more than {branch_count} branches"
                 ));
             }
-            validate_reserved_projection_output_names(
-                select,
-                &[
-                    (HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key"),
-                    (BRANCH_ID_COLUMN_NAME, "branch id"),
-                ],
-            )?;
             *validated_branch_count += 1;
-            Ok(())
-        }
-        _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
-    }
-}
-
-fn append_union_projection_hidden_columns(
-    set_expr: &mut ast::SetExpr,
-    next_branch_id: &mut i32,
-) -> Result<(), String> {
-    match set_expr {
-        ast::SetExpr::SetOperation(operation) => {
-            if operation.corresponding.is_some() {
-                return Err(
-                    "iceberg UNION ALL MV full refresh does not support CORRESPONDING".to_string(),
-                );
-            }
-            for input in &mut operation.inputs {
-                append_union_projection_hidden_columns(input, next_branch_id)?;
-            }
-            Ok(())
-        }
-        ast::SetExpr::Query(query) => {
-            append_union_projection_hidden_columns(query.query.body.as_mut(), next_branch_id)
-        }
-        ast::SetExpr::Select(select) => {
-            let branch_id = *next_branch_id;
-            *next_branch_id = next_branch_id
-                .checked_add(1)
-                .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
-            select.projection.push(build::item(
-                build::identifier(build::ident("_row_id", false)),
-                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
-            ));
-            select.projection.push(build::item(
-                build::cast(
-                    build::integer(i64::from(branch_id)),
-                    build::simple_type("INT"),
-                ),
-                Some(build::ident(BRANCH_ID_COLUMN_NAME, false)),
-            ));
             Ok(())
         }
         _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
@@ -679,7 +569,7 @@ mod tests {
 
         use ast::SyntaxEq;
         assert!(sql.syntax_eq(&parse_query(
-            "SELECT id, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 42",
+            "SELECT id FROM ice.db.fact FOR VERSION AS OF 42",
         )));
         assert_eq!(
             pin.get(SqlMvRelationOccurrenceId::new(7))
@@ -715,7 +605,7 @@ mod tests {
 
         use ast::SyntaxEq;
         assert!(sql.syntax_eq(&parse_query(
-            "SELECT l.id, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 11 AS l JOIN ice.db.fact FOR VERSION AS OF 22 AS r ON l.id = r.id",
+            "SELECT l.id FROM ice.db.fact FOR VERSION AS OF 11 AS l JOIN ice.db.fact FOR VERSION AS OF 22 AS r ON l.id = r.id",
         )));
         assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
         assert_eq!(pin.occurrences()[1].occurrence_id().get(), 42);
@@ -776,24 +666,7 @@ mod tests {
                     .unwrap()
                     .syntax_eq(&build::integer(if index == 0 { 11 } else { 22 }))
             );
-            let ast::SelectItem::SingleColumn(projection_column) =
-                select.projection.last().unwrap()
-            else {
-                panic!("branch id");
-            };
-            let ast::SingleColumn {
-                expression: expr,
-                alias: Some(alias),
-                ..
-            } = projection_column.as_ref()
-            else {
-                panic!("branch id");
-            };
-            assert_eq!(alias.value, BRANCH_ID_COLUMN_NAME);
-            assert!(expr.syntax_eq(&build::cast(
-                build::integer(index as i64),
-                build::simple_type("INT")
-            )));
+            assert_eq!(select.projection, source_select.projection);
         }
         assert_eq!(union, original_union);
         assert_eq!(pin, original_pin);

@@ -3993,7 +3993,7 @@ mod plan_splits_pruning_tests {
             current_source.schema_version,
             current.version.clone().unwrap()
         );
-        assert!(selected_source.format_v3);
+        assert_eq!(selected_source.format_version, FormatVersion::V3);
         assert_eq!(selected_source.selected_snapshot_id, Some(101));
         assert_eq!(
             selected_source.selected_snapshot_has_row_range,
@@ -4236,6 +4236,20 @@ mod plan_splits_pruning_tests {
             Some(ConnectorCanonicalReadPoint::Snapshot(Some(102)))
         );
         let payload = provider.table_payload(&to.table).unwrap();
+        let statistics_pin = |metadata: &ConnectorTableMetadata| {
+            crate::catalog_control::statistics::original_statistics_pin(
+                metadata.source_read_facts().unwrap(),
+                &owner,
+                &payload,
+            )
+            .map(|(snapshot, _)| snapshot)
+        };
+        assert_eq!(statistics_pin(&to).unwrap(), Some(101));
+        assert_eq!(statistics_pin(&current).unwrap(), Some(102));
+        assert_eq!(
+            statistics_pin(&foreign).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
         let info = payload.table_info.unwrap();
         assert_eq!(info.current_snapshot_id, Some(102));
         assert_eq!(info.schema_id, current_schema_id);

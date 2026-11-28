@@ -39,6 +39,11 @@ pub(crate) struct TaskProtocolTestObservation {
     pub observer: std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>,
 }
 
+/// Development-only loan from the Native owner of one exact Task.
+#[cfg(novarocks_dev_controls)]
+pub type ContentApplyInsertControl =
+    std::sync::Arc<dyn Fn(i32) -> crate::runtime::task::ExecutionResult<bool> + Send + Sync>;
+
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
 /// It carries the options and capabilities admitted for this query.
@@ -62,6 +67,8 @@ pub struct RuntimeState {
     #[cfg(novarocks_dev_controls)]
     join_build_control:
         Option<std::sync::Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
+    #[cfg(novarocks_dev_controls)]
+    content_apply_insert_control: Option<ContentApplyInsertControl>,
     #[cfg(novarocks_dev_controls)]
     query_tracker_witness: std::sync::Weak<MemTracker>,
 }
@@ -335,6 +342,8 @@ impl Default for RuntimeState {
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
+            content_apply_insert_control: None,
+            #[cfg(novarocks_dev_controls)]
             query_tracker_witness: std::sync::Weak::new(),
         }
     }
@@ -363,12 +372,27 @@ impl Clone for RuntimeState {
             #[cfg(novarocks_dev_controls)]
             join_build_control: self.join_build_control.clone(),
             #[cfg(novarocks_dev_controls)]
+            content_apply_insert_control: self.content_apply_insert_control.clone(),
+            #[cfg(novarocks_dev_controls)]
             query_tracker_witness: self.query_tracker_witness.clone(),
         }
     }
 }
 
 impl RuntimeState {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_content_apply_insert_control(
+        &mut self,
+        control: Option<ContentApplyInsertControl>,
+    ) {
+        self.content_apply_insert_control = control;
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn content_apply_insert_control(&self) -> Option<ContentApplyInsertControl> {
+        self.content_apply_insert_control.clone()
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn install_query_tracker_witness(&mut self, tracker: std::sync::Weak<MemTracker>) {
         self.query_tracker_witness = tracker;
@@ -479,6 +503,8 @@ impl RuntimeState {
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
+            content_apply_insert_control: None,
+            #[cfg(novarocks_dev_controls)]
             query_tracker_witness: std::sync::Weak::new(),
         }
     }
@@ -492,6 +518,11 @@ impl RuntimeState {
     }
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
+    }
+
+    /// Observation from the binding checked when the original Task was prepared.
+    pub fn memory_observation(&self) -> Option<&novarocks_memory::lane::LaneShards> {
+        self.query_memory().map(|binding| binding.observation())
     }
     pub fn with_runtime_filter_session(mut self, session: Option<RuntimeFilterSessionRef>) -> Self {
         self.runtime_filter_session = session;

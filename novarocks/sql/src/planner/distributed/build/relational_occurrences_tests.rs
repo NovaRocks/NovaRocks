@@ -214,13 +214,15 @@ fn count(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -> Aggreg
     let intermediate_type = selected.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(selected.state_format.as_str()).unwrap();
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract,
         function: scalar(resolved),
         phase: AggregatePhase::Single,
         logical_argument_count: args.len() as u32,
-        intermediate_type,
-        state_format,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract,
+            intermediate_type,
+            state_format,
+        }),
     }
 }
 fn aggregate(
@@ -413,11 +415,22 @@ fn relational_rootless_count_star_has_its_own_value_use_and_unguarded_domain() {
         ty(DataType::Int64, false)
     );
     assert_eq!(
-        calls[0].binding.intermediate_type,
+        calls[0]
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
         ty(DataType::Int64, false)
     );
     assert_eq!(
-        calls[0].binding.state_format.as_str(),
+        calls[0]
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
+            .as_str(),
         "novarocks/count/state-v1"
     );
     assert_eq!(calls[0].binding.logical_argument_count, 0);

@@ -91,12 +91,12 @@ pub use recipe::{
     ConnectorReadRelationRecipeCompileError, ConnectorReadRelationRecipeCompiler,
     ConnectorReadRelationRecipeDraft, ConnectorReadRelationRecipeError, ConnectorRecipeHostAddress,
     MAX_CONNECTOR_RECIPE_ADDRESSES, MAX_CONNECTOR_RECIPE_AFFINITY_BYTES,
-    MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_COLUMNS, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
     MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT, ReadRecipeOwnedError,
 };
 pub use source_schema_facts::{
     ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceInitialDefault,
-    ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+    ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape, MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH,
 };
 pub use type_projection::{
     connector_type_accepts_arrow, connector_type_accepts_value_type, connector_type_for_arrow,
@@ -114,7 +114,7 @@ pub use write_layout::{
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,
-    ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITE_INPUT_FIELDS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    ConnectorWriteRecipeDraft, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 pub use write_schema::*;
 

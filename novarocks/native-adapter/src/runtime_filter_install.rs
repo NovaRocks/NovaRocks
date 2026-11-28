@@ -1243,6 +1243,7 @@ fn decode_frontend_feedback_publication(
         contract_digest,
         max_encoded_domain_bytes,
     )
+    .map(|publication| publication.with_empty_content_demand(wire.publish_empty_content_demand))
     .map_err(|error| invalid(publication_path, error.to_string()))
 }
 

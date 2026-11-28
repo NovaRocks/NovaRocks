@@ -60,7 +60,11 @@ SET SESSION explain_detail = 'VERBOSE';
 
 -- query 7
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable from_snapshot_id=
+-- @result_contains=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 EXPLAIN REFRESH MATERIALIZED VIEW orders_meta_delete_mv;
 
 -- query 8

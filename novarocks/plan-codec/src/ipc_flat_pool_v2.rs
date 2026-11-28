@@ -21,7 +21,6 @@
 //! gate precedes all schema/batch/output construction. No general writer fallback.
 
 use crate::{
-    ipc_schema_v2::{self, IpcSchemaProjectionLimits, SchemaPreflight},
     physical_type_v2::TypeCodecError,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
 };
@@ -43,7 +42,6 @@ pub struct FlatPoolWriteLimits {
     pub max_buffer_descriptors: usize,
     pub max_body_bytes: usize,
     pub max_encoded_stream_bytes: usize,
-    pub schema: IpcSchemaProjectionLimits,
     pub max_new_allocation_request_bytes: usize,
     pub max_coexisting_source_and_request_bytes: usize,
     pub max_cumulative_library_work: usize,
@@ -55,7 +53,6 @@ pub struct FlatPoolWriteFacts {
     pub buffer_descriptors: usize,
     pub variadic_buffers: usize,
     pub body_bytes: usize,
-    pub schema_backing_bytes_upper_bound: usize,
     pub batch_backing_bytes_upper_bound: usize,
     pub encoded_stream_bytes_upper_bound: usize,
     pub new_allocation_request_bytes_upper_bound: usize,
@@ -63,13 +60,39 @@ pub struct FlatPoolWriteFacts {
     pub coexisting_source_and_request_bytes_upper_bound: usize,
     pub cumulative_library_work_upper_bound: usize,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct WriterAdmissionPolicy(pub bool);
+impl WriterAdmissionPolicy {
+    pub(crate) fn numeric<T>(self, result: Result<T, TypeCodecError>) -> Result<T, TypeCodecError> {
+        if self.0 {
+            result.map_err(|_| CompileControlError::ResourceExhausted.into())
+        } else {
+            result
+        }
+    }
+    pub(crate) fn cap(
+        self,
+        actual: usize,
+        maximum: usize,
+        message: &'static str,
+    ) -> Result<(), TypeCodecError> {
+        if actual <= maximum {
+            return Ok(());
+        }
+        if self.0 {
+            Err(CompileControlError::ResourceExhausted.into())
+        } else {
+            Err(TypeCodecError::InvalidShape(message))
+        }
+    }
+}
+
 pub(crate) mod progress;
 
-struct Prepared<'pool> {
+struct Prepared {
     geometry: Geometry,
     facts: Option<FlatPoolWriteFacts>,
     construction: WriterConstruction,
-    schema: Option<ipc_schema_v2::PreparedSchemaWriter<'pool>>,
 }
 fn shape(message: &'static str) -> TypeCodecError {
     TypeCodecError::InvalidShape(message)
@@ -80,12 +103,6 @@ fn cap(actual: usize, maximum: usize, message: &'static str) -> Result<(), TypeC
     } else {
         Ok(())
     }
-}
-pub(crate) fn source_work(source: usize, entries: usize) -> Result<usize, TypeCodecError> {
-    // Two preflight passes scan metadata twice; emission scans once;
-    // verification associates each emitted entry with its original map.
-    // No source attribute is interpreted as a logical type or domain.
-    mul(source, add(entries, 5)?)
 }
 pub(crate) fn metadata_capacity(bytes: usize) -> Result<usize, TypeCodecError> {
     let padded = aligned(bytes)?;
@@ -99,62 +116,38 @@ pub(crate) fn metadata_capacity(bytes: usize) -> Result<usize, TypeCodecError> {
     Ok(padded)
 }
 fn work_bound(
-    source: usize,
-    schema: &SchemaPreflight,
     geometry: &Geometry,
     requests: &allocations::Requests,
 ) -> Result<usize, TypeCodecError> {
-    // Own sorting, duplicate rejection and source association comparison each
-    // visit borrowed source bytes. Four K²*(L+1) covers both operand byte
-    // visits and scalar comparisons, even with empty keys/values.
-    let associations = mul(
-        mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
-        add(schema.string_bytes, 1)?,
-    )?;
-    // At most 18 vtable bytes per operand plus u32 insertion moves, for at
-    // most T² comparisons/moves. Batch adds its two five-slot tables.
-    let tables = add(schema.tables, 2)?;
-    let vtables = mul(40, mul(tables, tables)?)?;
-    // Four visits per requested byte cover initialization, construction/copy,
-    // output copies and teardown. Owned nonaligned bitmap reads additionally
-    // visit at most N source bytes per bitmap, independently for Bool/validity.
+    // Charge the actual batch builder and output backing, bitmap inspection,
+    // and descriptor/row work. Field identity is already owned by the type table.
     let storage = add(mul(4, requests.bytes)?, requests.count)?;
     let elements = add(add(mul(3, geometry.rows)?, 1)?, mul(4, geometry.buffers)?)?;
-    add(
-        add(
-            add(source_work(source, schema.metadata_entries)?, associations)?,
-            vtables,
-        )?,
-        add(storage, elements)?,
-    )
+    add(storage, elements)
 }
-fn prepare<'pool>(
-    pool: &'pool ConstantPool,
+
+fn prepare(
+    pool: &ConstantPool,
     source: usize,
     limits: FlatPoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Prepared<'pool>, TypeCodecError> {
+) -> Result<Prepared, TypeCodecError> {
     prepare_core::<std::convert::Infallible>(pool, source, limits, None, work)
         .map_err(ProjectionFailure::without_host)
 }
 
-fn prepare_core<'pool, H>(
-    pool: &'pool ConstantPool,
+fn prepare_core<H>(
+    pool: &ConstantPool,
     source: usize,
     limits: FlatPoolWriteLimits,
     mut admission: Option<&mut progress::Admission<'_, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Prepared<'pool>, HostError<H>> {
-    let policy = ipc_schema_v2::owner_admission::Policy(admission.is_some());
+) -> Result<Prepared, HostError<H>> {
+    let policy = WriterAdmissionPolicy(admission.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let cap = |a, b, c| policy.cap(a, b, c);
     if let Some(admission) = admission.as_deref_mut() {
         admission.gate()?;
-        admission.schema(&ipc_schema_v2::initial_writer_request_facts(
-            pool.field(),
-            source,
-            limits.schema,
-        )?)?;
     }
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
@@ -192,42 +185,7 @@ fn prepare_core<'pool, H>(
     if geometry.buffers > u32::MAX as usize {
         return Err((shape("flat pool buffer vector is not representable")).into());
     }
-    cap(
-        policy.numeric(source_work(source, pool.field().metadata().len()))?,
-        limits.max_cumulative_library_work,
-        "flat pool source metadata work envelope exceeded",
-    )?;
-    // The sole schema author's source counters use two exact flat walker Vecs.
-    // Admit this explicit source-preflight scratch before that phase starts.
-    let prefix = allocations::prefix_request_bytes();
-    cap(
-        prefix,
-        limits.max_new_allocation_request_bytes,
-        "flat pool source preflight request envelope exceeded",
-    )?;
-    cap(
-        add(source, prefix)?,
-        limits.max_coexisting_source_and_request_bytes,
-        "flat pool source preflight coexistence envelope exceeded",
-    )?;
-    work.flush()?;
-    let schema_token = if let Some(admission) = admission.as_deref_mut() {
-        Some(ipc_schema_v2::prepare_schema_writer_with_host_in(
-            pool.field(),
-            source,
-            limits.schema,
-            limits.max_cumulative_library_work,
-            &mut |facts| admission.schema(facts),
-            work,
-        )?)
-    } else {
-        None
-    };
-    let schema = match &schema_token {
-        Some(token) => token.schema(),
-        None => ipc_schema_v2::preflight_writer(pool.field(), limits.schema, work)?,
-    };
-    let construction = policy.numeric(construction_geometry(&schema, &geometry))?;
+    let construction = policy.numeric(construction_geometry(&geometry))?;
     let batch = construction.batch_backing;
     let capacity = construction.stream_backing;
     cap(
@@ -239,26 +197,16 @@ fn prepare_core<'pool, H>(
         Layout::array::<u8>(capacity)
             .map_err(|_| shape("flat pool output layout is not representable")),
     )?;
-    let pure_requests = if admission.is_some() {
-        Some(policy.numeric(allocations::preflight_core(&schema, batch, capacity, None))?)
-    } else {
-        None
-    };
-    if let (Some(admission), Some(requests)) = (admission.as_deref_mut(), pure_requests.as_ref()) {
-        let bound = policy.numeric(work_bound(source, &schema, &geometry, requests))?;
-        admission.schema(&ipc_schema_v2::SchemaWriterRequestFacts {
-            request_bytes: requests.bytes,
-            request_count: requests.count,
-            work_upper_bound: bound,
-        })?;
-        admission.facts.schema_backing_bytes_upper_bound = schema.backing;
+    if let Some(admission) = admission.as_deref_mut() {
+        let requests = allocations::batch_and_stream_requests_core(batch, capacity, None)?;
+        let bound = policy.numeric(work_bound(&geometry, &requests))?;
         admission.facts.batch_backing_bytes_upper_bound = batch;
         admission.facts.encoded_stream_bytes_upper_bound = capacity;
-        admission.gate()?;
+        admission.construction(requests, bound)?;
     }
-    let requests = allocations::preflight(&schema, batch, capacity, work)?;
+    let requests = allocations::batch_and_stream_requests(batch, capacity, work)?;
     let coexisting = add(source, requests.bytes)?;
-    let library_work = policy.numeric(work_bound(source, &schema, &geometry, &requests))?;
+    let library_work = policy.numeric(work_bound(&geometry, &requests))?;
     cap(
         requests.bytes,
         limits.max_new_allocation_request_bytes,
@@ -283,7 +231,6 @@ fn prepare_core<'pool, H>(
         buffer_descriptors: geometry.buffers,
         variadic_buffers: geometry.variadic,
         body_bytes: geometry.body_bytes,
-        schema_backing_bytes_upper_bound: schema.backing,
         batch_backing_bytes_upper_bound: batch,
         encoded_stream_bytes_upper_bound: capacity,
         new_allocation_request_bytes_upper_bound: requests.bytes,
@@ -302,7 +249,6 @@ fn prepare_core<'pool, H>(
         geometry,
         facts: Some(facts),
         construction,
-        schema: schema_token,
     })
 }
 
@@ -311,12 +257,8 @@ pub(crate) struct WriterConstruction {
     pub(crate) batch_backing: usize,
     pub(crate) stream_backing: usize,
 }
-fn construction_geometry(
-    schema: &SchemaPreflight,
-    geometry: &Geometry,
-) -> Result<WriterConstruction, TypeCodecError> {
+fn construction_geometry(geometry: &Geometry) -> Result<WriterConstruction, TypeCodecError> {
     construction_from_counts(
-        schema,
         1,
         geometry.buffers,
         usize::from(geometry.views),
@@ -324,23 +266,13 @@ fn construction_geometry(
     )
 }
 pub(crate) fn construction_from_counts(
-    schema: &SchemaPreflight,
     nodes: usize,
     buffers: usize,
     views: usize,
     body_bytes: usize,
 ) -> Result<WriterConstruction, TypeCodecError> {
     let batch_backing = header::backing_counts(nodes, buffers, views)?;
-    let stream_backing = add(
-        add(
-            add(
-                metadata_capacity(schema.backing)?,
-                metadata_capacity(batch_backing)?,
-            )?,
-            body_bytes,
-        )?,
-        24,
-    )?;
+    let stream_backing = add(add(metadata_capacity(batch_backing)?, body_bytes)?, 8)?;
     Ok(WriterConstruction {
         batch_backing,
         stream_backing,
@@ -351,7 +283,7 @@ pub(crate) fn construction_from_counts(
 /// exposes no receiving-resource facts or invented retained-source invoice.
 pub(crate) struct PreparedPureFlatPoolWriter<'pool, 'control> {
     pool: &'pool ConstantPool,
-    prepared: Prepared<'pool>,
+    prepared: Prepared,
     control: &'control dyn PureCompileControl,
 }
 impl PreparedPureFlatPoolWriter<'_, '_> {
@@ -362,7 +294,7 @@ impl PreparedPureFlatPoolWriter<'_, '_> {
         if !std::ptr::addr_eq(self.control, work.control()) {
             return Err(shape("pure flat writer belongs to another control"));
         }
-        emit_prepared(self.pool, self.prepared, None, work)
+        emit_prepared(self.pool, self.prepared, work)
     }
 }
 pub(crate) fn prepare_flat_pool_write_pure_in<'pool, 'control>(
@@ -370,15 +302,7 @@ pub(crate) fn prepare_flat_pool_write_pure_in<'pool, 'control>(
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedPureFlatPoolWriter<'pool, 'control>, TypeCodecError> {
     validate_pure_pool_source(pool, work)?;
-    let (prepared, _) = prepare_from_input(
-        pool,
-        |field, work| {
-            ipc_schema_v2::preflight_writer_pure_in(field, work)
-                .map_err(HostError::<std::convert::Infallible>::from)
-        },
-        work,
-    )
-    .map_err(ProjectionFailure::without_host)?;
+    let prepared = prepare_from_input(pool, work)?;
     Ok(PreparedPureFlatPoolWriter {
         pool,
         prepared,
@@ -406,63 +330,57 @@ pub(crate) fn validate_pure_pool_source(
     Ok(())
 }
 
-fn prepare_from_input<'pool, H>(
-    pool: &'pool ConstantPool,
-    preflight_schema: impl FnOnce(
-        &arrow::datatypes::Field,
-        &mut CompileCheckpoints<'_>,
-    ) -> Result<ipc_schema_v2::SchemaPreflight, HostError<H>>,
+fn prepare_from_input(
+    pool: &ConstantPool,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(Prepared<'pool>, ipc_schema_v2::SchemaPreflight), HostError<H>> {
+) -> Result<Prepared, TypeCodecError> {
     work.flush()?;
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
         && cfg!(target_endian = "little"))
     {
-        return Err(shape("flat pool writer source or endian model changed").into());
+        return Err(shape("flat pool writer source or endian model changed"));
     }
     let geometry = geometry::inspect_pure(pool, work)?;
-    let schema = preflight_schema(pool.field(), work)?;
-    let construction = construction_geometry(&schema, &geometry)?;
+    let construction = construction_geometry(&geometry)?;
     Layout::array::<u8>(construction.stream_backing)
         .map_err(|_| shape("flat pool output layout is not representable"))?;
-    Ok((
-        Prepared {
-            geometry,
-            facts: None,
-            construction,
-            schema: None,
-        },
-        schema,
-    ))
+    Ok(Prepared {
+        geometry,
+        facts: None,
+        construction,
+    })
 }
 
 pub(crate) fn encode_flat_pool_input_derived_in<H>(
     pool: &ConstantPool,
-    request: &mut ipc_schema_v2::WriteRequest<'_, H>,
+    request: &mut WriteRequest<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, HostError<H>> {
-    let (prepared, schema) = prepare_from_input(
-        pool,
-        |field, work| ipc_schema_v2::preflight_constant_schema_in(field, request, work),
-        work,
-    )?;
-    let schema =
-        ipc_schema_v2::emit_constant_schema_with_requests_in(pool.field(), schema, request, work)?;
-    emit_record(pool, prepared, schema, Some(request), work)
+    let prepared = prepare_from_input(pool, work)?;
+    emit_record(pool, prepared, Some(request), work)
 }
 
 /// Sealed geometry/model preparation bound to the original checked pool.
 /// The preparation scratch and host authorization remain earlier obligations.
 use crate::host_projection_v2::ProjectionFailure;
 type HostError<H> = ProjectionFailure<TypeCodecError, H>;
-type HostPoolAdmit<'a, H> = dyn FnMut(&FlatPoolWriteFacts) -> Result<(), HostError<H>> + 'a;
+
+/// Requests made by the RecordBatch writer on the active construction scope.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstantWriteRequest {
+    /// The next reserve uses this exact layout.
+    Layout(Layout),
+    /// Aggregate internal FlatBuffer builder requests.
+    OpaqueUpperBound(usize),
+}
+pub(crate) type WriteRequest<'a, H> =
+    dyn FnMut(ConstantWriteRequest) -> Result<(), HostError<H>> + 'a;
 
 pub(crate) struct PreparedFlatPoolWriter<'p, 'control> {
     pool: &'p ConstantPool,
-    limits: FlatPoolWriteLimits,
-    prepared: Prepared<'p>,
+    prepared: Prepared,
     control: Option<&'control dyn PureCompileControl>,
 }
 impl PreparedFlatPoolWriter<'_, '_> {
@@ -502,13 +420,7 @@ impl PreparedFlatPoolWriter<'_, '_> {
                 .as_ref()
                 .expect("receiving writer owns source facts"),
         )?;
-        emit_prepared_core(
-            self.pool,
-            self.prepared,
-            Some(self.limits.schema),
-            Some(admit),
-            work,
-        )
+        emit_record(self.pool, self.prepared, None, work)
     }
     pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
         if self
@@ -518,12 +430,7 @@ impl PreparedFlatPoolWriter<'_, '_> {
             return Err(shape("flat pool writer belongs to another control"));
         }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-        let result = emit_prepared(
-            self.pool,
-            self.prepared,
-            Some(self.limits.schema),
-            &mut work,
-        );
+        let result = emit_prepared(self.pool, self.prepared, &mut work);
         finish_writer(work, result)
     }
 }
@@ -550,7 +457,6 @@ pub(crate) fn prepare_flat_pool_write<'p>(
     let prepared = finish_writer(work, prepared)?;
     Ok(PreparedFlatPoolWriter {
         pool,
-        limits,
         prepared,
         control: None,
     })
@@ -590,7 +496,6 @@ pub(crate) fn prepare_flat_pool_write_with_host_in<'pool, 'control, H>(
     let prepared = prepare_core(pool, source, limits, Some(&mut admission), work)?;
     Ok(PreparedFlatPoolWriter {
         pool,
-        limits,
         prepared,
         control: Some(work.control()),
     })
@@ -681,60 +586,24 @@ pub fn encode_flat_pool(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
         let prepared = prepare(pool, source_retained_bytes, limits, &mut work)?;
-        emit_prepared(pool, prepared, Some(limits.schema), &mut work)
+        emit_prepared(pool, prepared, &mut work)
     })();
     finish_writer(work, result)
 }
 
 fn emit_prepared(
     pool: &ConstantPool,
-    prepared: Prepared<'_>,
-    schema_limits: Option<IpcSchemaProjectionLimits>,
+    prepared: Prepared,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, TypeCodecError> {
-    emit_prepared_core::<std::convert::Infallible>(pool, prepared, schema_limits, None, work)
+    emit_record::<std::convert::Infallible>(pool, prepared, None, work)
         .map_err(ProjectionFailure::without_host)
-}
-
-fn emit_prepared_core<H>(
-    pool: &ConstantPool,
-    prepared: Prepared<'_>,
-    schema_limits: Option<IpcSchemaProjectionLimits>,
-    mut admit: Option<&mut HostPoolAdmit<'_, H>>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<u8>, HostError<H>> {
-    work.flush()?;
-    let schema = if let Some(schema) = &prepared.schema {
-        schema.emit_with_host_in(
-            &mut |_| {
-                if let Some(admit) = admit.as_deref_mut() {
-                    admit(
-                        prepared
-                            .facts
-                            .as_ref()
-                            .expect("receiving writer owns source facts"),
-                    )?;
-                }
-                Ok(())
-            },
-            work,
-        )?
-    } else {
-        match schema_limits {
-            Some(limits) => {
-                ipc_schema_v2::encode_single_field_schema(pool.field(), limits, work.control())?
-            }
-            None => ipc_schema_v2::encode_single_field_schema_pure_in(pool.field(), work)?,
-        }
-    };
-    emit_record(pool, prepared, schema, None, work)
 }
 
 fn emit_record<H>(
     pool: &ConstantPool,
-    prepared: Prepared<'_>,
-    schema: Vec<u8>,
-    mut request: Option<&mut ipc_schema_v2::WriteRequest<'_, H>>,
+    prepared: Prepared,
+    mut request: Option<&mut WriteRequest<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, HostError<H>> {
     work.flush()?;
@@ -756,7 +625,6 @@ fn emit_record<H>(
         request_writer_vec_in(prepared.construction.stream_backing, request, work)?;
     }
     let mut output = reserve(prepared.construction.stream_backing, work)?;
-    frame(&mut output, &schema, work)?;
     frame(&mut output, builder.finished_data(), work)?;
     let body_start = output.len();
     let body_end = add(body_start, prepared.geometry.body_bytes)?;
@@ -767,7 +635,6 @@ fn emit_record<H>(
         &mut output[body_start..body_end],
         work,
     )?;
-    append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], work)?;
     if output.len() > prepared.construction.stream_backing {
         return Err((shape("flat pool encoded result exceeds admitted capacity")).into());
     }
@@ -776,7 +643,7 @@ fn emit_record<H>(
 
 pub(crate) fn request_record_backing_in<H>(
     construction: &WriterConstruction,
-    request: &mut ipc_schema_v2::WriteRequest<'_, H>,
+    request: &mut WriteRequest<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
     let requests = allocations::batch_and_stream_requests(
@@ -790,21 +657,19 @@ pub(crate) fn request_record_backing_in<H>(
         .checked_sub(primary)
         .ok_or_else(|| shape("IPC record allocation model omits primary backing"))?;
     work.flush()?;
-    request(ipc_schema_v2::ConstantWriteRequest::OpaqueUpperBound(
-        auxiliary,
-    ))?;
+    request(ConstantWriteRequest::OpaqueUpperBound(auxiliary))?;
     request_writer_vec_in(construction.batch_backing, request, work)
 }
 
 pub(crate) fn request_writer_vec_in<H>(
     capacity: usize,
-    request: &mut ipc_schema_v2::WriteRequest<'_, H>,
+    request: &mut WriteRequest<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
     let layout = Layout::array::<u8>(capacity)
         .map_err(|_| shape("IPC backing layout is not representable"))?;
     work.flush()?;
-    request(ipc_schema_v2::ConstantWriteRequest::Layout(layout))
+    request(ConstantWriteRequest::Layout(layout))
 }
 
 #[cfg(test)]

@@ -22,10 +22,7 @@
 use super::TypeCodecError;
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
-use novarocks_type_contract::{
-    CarrierParameterError, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
-    validate_arrow_carrier_parameters_observed,
-};
+use novarocks_type_contract::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
 use wire::carrier_type_definition::Kind;
 
 type E = TypeCodecError;
@@ -79,7 +76,7 @@ pub(super) fn encode_scalar_from_source(
 
 fn encode_scalar_core(
     data_type: &DataType,
-    strict: bool,
+    _strict: bool,
     work: Option<&mut novarocks_type_contract::CompileCheckpoints<'_>>,
 ) -> Result<Option<Kind>, E> {
     use plan::ArrowPrimitiveType as P;
@@ -105,25 +102,16 @@ fn encode_scalar_core(
         DataType::Utf8 => Kind::Primitive(P::Utf8 as i32),
         DataType::Utf8View => Kind::Primitive(P::Utf8View as i32),
         DataType::LargeUtf8 => Kind::Primitive(P::LargeUtf8 as i32),
-        DataType::Timestamp(unit, zone) => {
-            if strict
-                && zone
-                    .as_ref()
-                    .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
-            {
-                return Err(E::InvalidShape("timestamp timezone exceeds byte bound"));
-            }
-            Kind::Timestamp(plan::ArrowTimestampType {
-                unit: encode_unit(unit),
-                timezone: match (zone, work) {
-                    (Some(zone), Some(work)) => {
-                        Some(crate::arrow_metadata_v2::copy_string(zone, work)?)
-                    }
-                    (Some(zone), None) => Some(zone.to_string()),
-                    (None, _) => None,
-                },
-            })
-        }
+        DataType::Timestamp(unit, zone) => Kind::Timestamp(plan::ArrowTimestampType {
+            unit: encode_unit(unit),
+            timezone: match (zone, work) {
+                (Some(zone), Some(work)) => {
+                    Some(crate::arrow_metadata_v2::copy_string(zone, work)?)
+                }
+                (Some(zone), None) => Some(zone.to_string()),
+                (None, _) => None,
+            },
+        }),
         DataType::Time32(unit) => Kind::Time32(plan::ArrowTimeType {
             unit: encode_unit(unit),
         }),
@@ -187,7 +175,7 @@ pub(super) fn decode_scalar_in_package(
     decode_scalar_core(kind, strict)
 }
 
-fn decode_scalar_core(kind: &Kind, strict: bool) -> Result<Option<DataType>, E> {
+fn decode_scalar_core(kind: &Kind, _strict: bool) -> Result<Option<DataType>, E> {
     use plan::ArrowPrimitiveType as P;
     let data_type = match kind {
         Kind::Primitive(value) => match P::try_from(*value) {
@@ -216,14 +204,6 @@ fn decode_scalar_core(kind: &Kind, strict: bool) -> Result<Option<DataType>, E> 
         },
         Kind::Timestamp(value) => {
             let unit = decode_unit(value.unit)?;
-            if strict
-                && value
-                    .timezone
-                    .as_ref()
-                    .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
-            {
-                return Err(E::InvalidShape("timestamp timezone exceeds byte bound"));
-            }
             DataType::Timestamp(unit, value.timezone.as_deref().map(Into::into))
         }
         Kind::Time32(value) => DataType::Time32(decode_unit(value.unit)?),
@@ -479,9 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn timezone_byte_bound_is_checked_before_clone_in_both_directions() {
-        for bytes in [0, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES] {
-            let zone = "a".repeat(bytes);
+    fn timezone_spelling_round_trips_beyond_the_old_byte_limit() {
+        for zone in [String::new(), "a".repeat(1024), "é".repeat(1024 / 2 + 1)] {
             let source = DataType::Timestamp(TimeUnit::Nanosecond, Some(zone.as_str().into()));
             let expected = Kind::Timestamp(plan::ArrowTimestampType {
                 unit: 4,
@@ -490,21 +469,6 @@ mod tests {
             assert_eq!(encode_scalar(&source).unwrap(), Some(expected.clone()));
             assert_eq!(decode_scalar(&expected).unwrap(), Some(source));
         }
-        let zone = "é".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES / 2 + 1);
-        assert!(
-            encode_scalar(&DataType::Timestamp(
-                TimeUnit::Second,
-                Some(zone.as_str().into())
-            ))
-            .is_err()
-        );
-        assert!(
-            decode_scalar(&Kind::Timestamp(plan::ArrowTimestampType {
-                unit: 1,
-                timezone: Some(zone)
-            }))
-            .is_err()
-        );
     }
 
     #[test]

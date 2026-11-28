@@ -647,14 +647,17 @@ fn special_fixture_with_rows(
             filter_root: None,
             id,
             binding: AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract:
-                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 function: function(FunctionKind::Aggregate, integer()),
                 phase: AggregatePhase::Single,
                 logical_argument_count: 0,
-                intermediate_type: ValueType::new(DataType::Binary, false),
-                state_format: AggregateStateFormatId::try_new("fixture/count/state-v1").unwrap(),
+                merge_state: Some(crate::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                    intermediate_type: ValueType::new(DataType::Binary, false),
+                    state_format: AggregateStateFormatId::try_new("fixture/count/state-v1")
+                        .unwrap(),
+                }),
             },
             arguments: Box::default(),
             distinct: false,
@@ -838,14 +841,17 @@ fn wide_relation_fixture(count: usize) -> Fixture {
             filter_root: None,
             id: call,
             binding: AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract:
-                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 function: function(FunctionKind::Aggregate, integer()),
                 phase: AggregatePhase::Single,
                 logical_argument_count: 0,
-                intermediate_type: ValueType::new(DataType::Binary, false),
-                state_format: AggregateStateFormatId::try_new("fixture/count/state-v1").unwrap(),
+                merge_state: Some(crate::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                    intermediate_type: ValueType::new(DataType::Binary, false),
+                    state_format: AggregateStateFormatId::try_new("fixture/count/state-v1")
+                        .unwrap(),
+                }),
             },
             arguments: Box::default(),
             distinct: false,

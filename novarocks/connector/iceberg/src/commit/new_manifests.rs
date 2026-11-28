@@ -238,6 +238,13 @@ async fn write_pending(
     let version = view.metadata().format_version();
     let rewrite_sequence = view.rewrite_source_sequence()?;
     let target_bytes = manifest_target_bytes(view)?;
+    let partition_replace = view
+        .partition_replace()
+        .map(|selection| {
+            crate::typed_boundary::ExactMvTargetPartitions::check(&pending.source, selection)
+        })
+        .transpose()
+        .map_err(project_failure)?;
     let ReceivedCompactFiles {
         groups,
         author,
@@ -298,6 +305,7 @@ async fn write_pending(
             snapshot,
             spec,
             content: kind.manifest_content(),
+            partition_replace: partition_replace.as_ref(),
         };
         write_rolled(input, &output, target_bytes, &mut manifests).await?;
     }
@@ -315,6 +323,11 @@ async fn write_registered(
     snapshot: i64,
     mut registered: RegisteredNewFiles,
 ) -> Result<WrittenNewManifests> {
+    if view.partition_replace().is_some() {
+        return Err(invariant(
+            "Partition replacement must use its original compact additions",
+        ));
+    }
     let counts = registered.counts();
     let source = &registered.source;
     let spec = source.default_partition_spec();
@@ -333,6 +346,7 @@ async fn write_registered(
         snapshot,
         spec,
         content: ManifestContentType::Data,
+        partition_replace: None,
     };
     let mut manifests = Vec::new();
     // RegisteredNewFiles still holds the vector's capacity receipt. It
@@ -385,6 +399,7 @@ struct RollingOutput<'a, 'view> {
     snapshot: i64,
     spec: &'a PartitionSpec,
     content: ManifestContentType,
+    partition_replace: Option<&'a crate::typed_boundary::ExactMvTargetPartitions<'a>>,
 }
 
 impl RollingInput<'_> {
@@ -442,7 +457,14 @@ impl RollingInput<'_> {
                         .iter()
                         .map(|entry| {
                             view.artifacts().check_active()?;
-                            decode_addition(output.source, codec, author, entry, *partition_type)
+                            decode_addition(
+                                output.source,
+                                codec,
+                                author,
+                                entry,
+                                *partition_type,
+                                output.partition_replace,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     if let Some(partition_type) = partition_type {
@@ -666,11 +688,22 @@ fn decode_addition(
     author: &ConnectorPayloadRetentionGuard,
     entry: &CompactEntry,
     historical: Option<&StructType>,
+    partition_replace: Option<&crate::typed_boundary::ExactMvTargetPartitions<'_>>,
 ) -> Result<ManifestEntryWrite> {
     let addition = entry.addition.as_ref().expect("grouped data addition");
     let (fragment, _decoded) = decode_compact_file(codec, author, addition)?;
     let written = written_file_with_historical_partition(&fragment, source, historical)
         .map_err(project_failure)?;
+    if let Some(selection) = partition_replace
+        && (written.content != crate::iceberg::spec::DataContentType::Data
+            || selection.matches(written.partition_spec_id, &written.partition_values)
+                != Some(true))
+    {
+        return Err(commit_validation_error_for(
+            CommitOperation::RefreshMaterializedView,
+            "Partition replacement appended a file outside the exact selection",
+        ));
+    }
     drop(fragment);
     finish_addition(written, source, addition, historical, None)
 }

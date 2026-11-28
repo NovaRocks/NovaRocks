@@ -390,8 +390,12 @@ where
             let runner = Arc::clone(&executor.runner);
             match thread::Builder::new()
                 .name(format!("worker-host-{index}"))
-                .spawn(move || worker_entry(shared, runner, index))
-            {
+                .spawn(move || {
+                    novarocks_memory::attribution::roles::enter_registered_thread_role(
+                        "worker_host",
+                    );
+                    worker_entry(shared, runner, index)
+                }) {
                 Ok(thread) => executor.threads.push((index, thread)),
                 Err(error) => {
                     executor

@@ -22,7 +22,7 @@ use crate::{
     physical_type_v2::TypeCodecError,
 };
 use arrow::{array::ArrayData, datatypes::DataType};
-use novarocks_type_contract::{CompileCheckpoints, MAX_VALUE_TYPE_DEPTH};
+use novarocks_type_contract::{CompileCheckpoints, MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH};
 
 pub(super) fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("recursive pool writer geometry is not representable")
@@ -64,7 +64,7 @@ fn profile(
     depth: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    if depth > MAX_VALUE_TYPE_DEPTH {
+    if depth > MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH {
         return Err(invalid());
     }
     work.step()?;
@@ -100,7 +100,7 @@ pub(super) fn node_core<'a, H>(
     capture: &mut Option<&mut NodeCapture<'a, '_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Node<'a>, HostError<H>> {
-    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let policy = crate::ipc_flat_pool_v2::WriterAdmissionPolicy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let mul = |a, b| policy.numeric(mul(a, b));
     let aligned = |a| policy.numeric(aligned(a));
@@ -260,7 +260,7 @@ pub(super) fn walk_core<'a, H>(
     work: &mut CompileCheckpoints<'_>,
     visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), HostError<H>>,
 ) -> Result<(), HostError<H>> {
-    if depth > MAX_VALUE_TYPE_DEPTH {
+    if depth > MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH {
         return Err((invalid()).into());
     }
     let current = node_core(span, count_nulls, capture, work)?;
@@ -344,7 +344,7 @@ fn inspect_policy_core<H>(
     mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, HostError<H>> {
-    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let policy = crate::ipc_flat_pool_v2::WriterAdmissionPolicy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     if receiving.is_some_and(|limits| data.len() > limits.flat.max_rows) {
         return Err((if policy.0 {

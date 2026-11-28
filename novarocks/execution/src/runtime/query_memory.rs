@@ -54,6 +54,7 @@ impl std::error::Error for QueryMemoryBindingError {
     }
 }
 
+// Design: ADR-0278 (docs/adr/ADR-0278-query-memory-follows-original-execution-ownership.md)
 /// Supplied by the exact context owner. Clones reference one account; they
 /// neither duplicate redemption rights nor establish an invocation scope.
 #[derive(Clone)]
@@ -61,6 +62,7 @@ pub struct QueryMemoryBinding {
     execution: QueryExecutionId,
     authority: Arc<MemoryAuthority>,
     account: Account,
+    observation: novarocks_memory::lane::LaneShards,
 }
 impl QueryMemoryBinding {
     pub fn try_new(
@@ -71,10 +73,12 @@ impl QueryMemoryBinding {
         authority
             .validate_account(&account)
             .map_err(QueryMemoryBindingError::Authority)?;
+        let observation = account.create_lane_shards();
         Ok(Self {
             execution,
             authority,
             account,
+            observation,
         })
     }
     pub const fn execution(&self) -> QueryExecutionId {
@@ -85,6 +89,11 @@ impl QueryMemoryBinding {
     }
     pub fn account(&self) -> &Account {
         &self.account
+    }
+    /// Allocation observation for this owner. An uncovered handle still
+    /// shadows the ambient owner and never grants memory or execution rights.
+    pub fn observation(&self) -> &novarocks_memory::lane::LaneShards {
+        &self.observation
     }
     pub fn validate_task(
         &self,

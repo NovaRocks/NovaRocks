@@ -747,11 +747,13 @@ fn window_request_keeps_logical_arguments_separate_from_function_order_channels(
         function: binding.clone(),
         phase: AggregatePhase::Single,
         logical_argument_count: 1,
-        intermediate_type: ty.clone(),
-        state_format: AggregateStateFormatId::try_new("fixture/window/state").unwrap(),
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-        state_interpretation: None,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            intermediate_type: ty.clone(),
+            state_format: AggregateStateFormatId::try_new("fixture/window/state").unwrap(),
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            state_interpretation: None,
+        }),
     };
     let properties = builder.node_output_properties(input).unwrap().clone();
     builder

@@ -103,6 +103,9 @@ fn is_wire_encodable_literal_type(value_type: &FunctionValueType) -> bool {
             | DataType::Date32
             | DataType::Decimal128(..)
             | DataType::Decimal256(..)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
@@ -408,6 +411,8 @@ impl<'a, 'context, 'control> ConstantFolder<'a, 'context, 'control> {
             | Operator::PhysicalAssertOneRow(_)
             | Operator::LogicalImvDelta(_)
             | Operator::LogicalImvVersion(_)
+            | Operator::LogicalContentApply(_)
+            | Operator::PhysicalContentApply(_)
             | Operator::PhysicalDistribution(_) => false,
         })
     }
@@ -479,6 +484,8 @@ fn operator_has_scalars(op: &Operator) -> bool {
         | Operator::PhysicalAssertOneRow(_)
         | Operator::LogicalImvDelta(_)
         | Operator::LogicalImvVersion(_)
+        | Operator::LogicalContentApply(_)
+        | Operator::PhysicalContentApply(_)
         | Operator::PhysicalDistribution(_) => false,
     }
 }

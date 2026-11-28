@@ -387,7 +387,7 @@ impl Fixture {
                     },
                     source: binding,
                     function_binding_id: (spec.calls.len() + ordinal) as u32,
-                    intermediate_value_type_id: 0,
+                    intermediate_value_type_id: Some(0),
                 },
             )
             .collect::<Vec<_>>();
@@ -2374,10 +2374,12 @@ fn relational_window_calls_keep_actual_order_frame_addresses_and_optional_aggreg
             sequence: p::AggregateSequenceId::new(u32::MAX),
         },
         logical_argument_count: 3,
-        intermediate_type: FunctionValueType::new(DataType::Int64, true),
-        state_argument_contract: AggregateStateArgumentContract::ExactSignature,
-        state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
-        state_interpretation: None,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            intermediate_type: FunctionValueType::new(DataType::Int64, true),
+            state_argument_contract: AggregateStateArgumentContract::ExactSignature,
+            state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
+            state_interpretation: None,
+        }),
     }));
     let c = Control::default();
     fixture.with_tokens(

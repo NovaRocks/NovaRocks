@@ -44,7 +44,7 @@ use novarocks_spi::connector::{
     LakePublicationTarget,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
-use source::{PhaseFuture, StepPreparedKind, StepSource};
+use source::{PendingRelease, PhaseFuture, StepPreparedKind, StepSource};
 use std::{
     sync::Arc,
     task::{Context, Poll},
@@ -84,6 +84,13 @@ impl MvStepOriginal {
                 .map(Self::Refresh),
         }
     }
+    pub(super) fn strict_retry_request(&self) -> Option<StepRequest> {
+        let Self::Refresh(step) = self else {
+            return None;
+        };
+        step.strict_retry_request()
+    }
+
     pub(super) fn physical_exit_observed(&self) -> bool {
         match self {
             Self::Refresh(step) => step.execution.closed,
@@ -139,6 +146,10 @@ impl MvStepOriginal {
 pub(super) struct MvRefreshStepOriginal {
     input: Arc<CommandInput>,
     request: Option<StepRequest>,
+    retry_request: Option<(
+        novarocks_sql::planning::mv::SqlMvTarget,
+        crate::mv::domain::application::MvRefreshRequest,
+    )>,
     attempt: MvRefreshAttemptIdentity,
     io: Arc<MetadataIoAdmission>,
     requests: Arc<dyn StateStoreExecutionRequests>,
@@ -151,10 +162,12 @@ pub(super) struct MvRefreshStepOriginal {
     selected: Option<Result<(), MvPhaseFailure>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
     Activate,
     Native,
+    Decide,
+    Retire,
     PreCommit,
     Publish,
     Received,
@@ -169,6 +182,8 @@ struct StepExecution {
     phase_result: Option<Result<(), MvPhaseFailure>>,
     future_busy: bool,
     retained_health: StatementNativeHealthFailure,
+    #[cfg(novarocks_dev_controls)]
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     native: Option<MvNativePhase>,
     publication: Option<StatementPublication>,
     call_context: Option<ConnectorRequestContext>,
@@ -213,10 +228,41 @@ impl MvRefreshStepOriginal {
             .map_err(super::original_error)?
             .root_scope()
             .clone();
+        let retry_request = match &request {
+            StepRequest::Iceberg {
+                target,
+                statement,
+                repartition: None,
+                ..
+            } if !statement.is_full() && !statement.is_explicit_rebuild() => {
+                Some((target.clone(), statement.clone()))
+            }
+            _ => None,
+        };
+        // The statement journal binds one logical execution. Upstream steps
+        // must leave it available for the MV named by the original command.
+        #[cfg(novarocks_dev_controls)]
+        let observation = if matches!(
+            &request,
+            StepRequest::Iceberg { target, .. } if target == input.request.target()
+        ) {
+            input
+                .execution
+                .test_statement_nomination()
+                .and_then(|nomination| {
+                    input
+                        .services
+                        .launcher
+                        .resolve_statement_observation(nomination)
+                })
+        } else {
+            None
+        };
         let attempt = input.product.reserve_refresh_attempt();
         Ok(Self {
             input,
             request: Some(request),
+            retry_request,
             attempt,
             io,
             requests,
@@ -236,6 +282,8 @@ impl MvRefreshStepOriginal {
                     "MV original phase poll or destructor did not return normally",
                     Arc::new(super::MvActionExitUnproven),
                 ),
+                #[cfg(novarocks_dev_controls)]
+                observation,
                 native: None,
                 publication: None,
                 call_context: None,
@@ -249,6 +297,37 @@ impl MvRefreshStepOriginal {
                 terminal_record_failure: None,
                 closed: false,
             },
+        })
+    }
+    fn strict_retry_request(&self) -> Option<StepRequest> {
+        let (target, statement) = self.retry_request.as_ref()?;
+        if self.execution.phase == Phase::Retire
+            || self
+                .execution
+                .publication
+                .as_ref()
+                .and_then(StatementPublication::disposition)
+                .is_some_and(|disposition| {
+                    disposition != LakePublicationDisposition::KnownUncommitted
+                })
+        {
+            return None;
+        }
+        let fence = self.execution.source.as_ref()?.pending_fence()?;
+        if !fence.is_recovery()
+            && !self
+                .execution
+                .native
+                .as_ref()
+                .is_some_and(MvNativePhase::assembly_installed)
+        {
+            return None;
+        }
+        Some(StepRequest::Iceberg {
+            target: target.clone(),
+            statement: statement.clone(),
+            repartition: None,
+            replay: Some(fence),
         })
     }
     pub(super) fn performed_publication(&self) -> bool {
@@ -331,6 +410,14 @@ impl MvRefreshStepOriginal {
             {
                 result = Err(error.into());
             }
+        }
+        if let Err(error) = &result {
+            let class = super::classify_refresh_execution_failure(&error.service);
+            tracing::info!(
+                publication_id = ?self.attempt.publication_id,
+                class = ?class,
+                "MV refresh failed with its original execution disposition"
+            );
         }
         self.selected = Some(result.clone());
         Poll::Ready(result)
@@ -589,7 +676,39 @@ impl StepExecution {
             && self.future.is_none()
             && let Some(source) = &self.source
         {
-            self.future = Some(source.close());
+            let release = if self.failure.is_none() {
+                PendingRelease::None
+            } else if !self
+                .native
+                .as_ref()
+                .is_some_and(|native| native.assembly_installed())
+            {
+                PendingRelease::NotStarted
+            } else if self.phase != Phase::Retire
+                && self.native.as_ref().is_some_and(|native| {
+                    native.verified_coverage()
+                        && native.delete_verification().is_some_and(|counts| {
+                            counts.requested() == counts.matched()
+                                && counts.insufficient_keys() == 0
+                        })
+                })
+            {
+                self.publication
+                    .as_mut()
+                    .and_then(|publication| {
+                        publication.freeze_terminal().ok()?;
+                        publication.attempt.terminal()
+                    })
+                    .filter(|terminal| {
+                        terminal.disposition() == LakePublicationDisposition::KnownUncommitted
+                    })
+                    .map_or(PendingRelease::None, |terminal| {
+                        PendingRelease::Refused(Box::new(terminal.clone()))
+                    })
+            } else {
+                PendingRelease::None
+            };
+            self.future = Some(source.close(release));
             self.closing_started = true;
             if self.poll_phase(cx).is_pending() {
                 pending = true;
@@ -727,7 +846,7 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                             self.input.services.launcher.clone(),
                             assembly,
                             #[cfg(novarocks_dev_controls)]
-                            None,
+                            self.execution.observation.take(),
                         ));
                         self.execution.phase = Phase::Native;
                     } else if matches!(kind, StepPreparedKind::MetadataOnly) {
@@ -753,9 +872,68 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                             self.execution.reject_execution(error);
                             return Poll::Ready(());
                         }
-                        Poll::Ready(Ok(())) => self.execution.phase = Phase::PreCommit,
+                        Poll::Ready(Ok(())) => self.execution.phase = Phase::Decide,
                     }
                 }
+                Phase::Decide => {
+                    use crate::mv::domain::refresh::decision::{
+                        VerificationDecision, verify_native_refresh,
+                    };
+                    let native = self.execution.native.as_ref().unwrap();
+                    let required = match source.requires_delete_verification() {
+                        Ok(required) => required,
+                        Err(error) => {
+                            self.execution.reject_execution(error);
+                            return Poll::Ready(());
+                        }
+                    };
+                    if let Some(counts) = native.delete_verification() {
+                        tracing::info!(
+                            publication_id = ?source.refresh_identity().ok().flatten().map(|(_, attempt)| attempt.publication_id),
+                            requested = counts.requested(),
+                            matched = counts.matched(),
+                            insufficient_keys = counts.insufficient_keys(),
+                            coverage = native.verified_coverage(),
+                            "MV Native reported its independent deletion verification"
+                        );
+                    }
+                    match verify_native_refresh(
+                        required,
+                        native.verified_coverage(),
+                        native.delete_verification(),
+                    ) {
+                        Ok(VerificationDecision::Publish) => {
+                            self.execution.phase = Phase::PreCommit
+                        }
+                        Ok(VerificationDecision::Retire(counts)) => {
+                            self.execution.future = Some(source.retire(counts));
+                            self.execution.phase = Phase::Retire;
+                        }
+                        Err(error) => {
+                            self.execution.reject_execution(QueryServiceError::new(
+                                novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                                error.to_string(),
+                            ));
+                            return Poll::Ready(());
+                        }
+                    }
+                }
+                Phase::Retire => match self.execution.poll_phase(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        self.execution.reject_execution(error);
+                        return Poll::Ready(());
+                    }
+                    Poll::Ready(Ok(())) => {
+                        self.execution.reject_execution(source::domain_error(
+                            crate::mv::domain::application::MvApplicationError::new(
+                                crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
+                                "MV delete verification failed and the target requires an explicit rebuild",
+                            ),
+                        ));
+                        return Poll::Ready(());
+                    }
+                },
                 Phase::PreCommit => {
                     if self.execution.future.is_none() {
                         if let Some(error) = self
@@ -1032,6 +1210,12 @@ pub(super) fn product_failure(error: MvProductError) -> MvPhaseFailure {
 
 fn product_error(error: MvProductError) -> QueryServiceError {
     if let Some(cause) = error.original_failure() {
+        if cause
+            .downcast_ref::<novarocks_mv_application::management::ManagementAdmissionError>()
+            .is_some_and(|error| error.is_retryable_name_admission())
+        {
+            return QueryServiceError::unavailable_with_cause(cause.clone());
+        }
         return QueryServiceError::from_failure_cause(cause.clone())
             .with_compile_control(error.compile_control_error());
     }
@@ -1051,6 +1235,35 @@ mod product_failure_tests {
     use super::*;
     use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
     use novarocks_mv_application::product::MvProductErrorKind;
+
+    #[test]
+    fn retryable_name_admission_retains_its_cause_and_service_class() {
+        use crate::mv::domain::staged_create::create_original::CreatePhaseFailure;
+        use novarocks_mv_application::management::{ManagementAdmissionError, NameStartupGrace};
+        use novarocks_query_application::session_error::QueryServiceErrorKind;
+
+        let original = ManagementAdmissionError::StartupGrace {
+            state: NameStartupGrace::Discovering,
+        };
+        let cause = SharedFailureCause::new(original);
+        let blocked = MvProductError::new(MvProductErrorKind::Unavailable, "MV name unavailable")
+            .with_original_failure(cause.clone());
+        let selected = product_error(blocked);
+        assert_eq!(selected.kind(), QueryServiceErrorKind::Unavailable);
+        assert!(selected.execution_failure().is_none());
+        assert_eq!(selected.failure_cause(), Some(&cause));
+        let create = CreatePhaseFailure::name_admission(original);
+        assert_eq!(create.service.kind(), QueryServiceErrorKind::Unavailable);
+        assert!(create.service.execution_failure().is_none());
+        assert_eq!(
+            create
+                .service
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<ManagementAdmissionError>(),
+            Some(&original),
+        );
+    }
 
     #[test]
     fn product_failure_keeps_its_actual_owner_and_corruption_fact() {

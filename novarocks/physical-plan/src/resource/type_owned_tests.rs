@@ -111,7 +111,7 @@ fn run(
 }
 fn run_raw(
     root: &DataType,
-    source: usize,
+    _source: usize,
     caps: Caps,
     control: &Control,
 ) -> Result<Outcome, ControlResourceError> {
@@ -125,7 +125,6 @@ fn run_raw(
         &mut usage,
         &mut errors,
         &mut CallerTypeValidation {
-            source,
             resources: &mut resources,
             admit: &mut |facts| gate(facts, caps),
             work: &mut work,
@@ -222,7 +221,11 @@ fn metadata_field(reserved: usize, retained: usize) -> (DataType, usize) {
         .sum();
     // This is the original one-reserve fresh-table owner, retained after
     // deletions. The public len/capacity is deliberately not the bucket model.
-    let table = hashmap::fresh_table_layout::<String, String>(reserved).unwrap();
+    let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+        String,
+        String,
+    >(reserved)
+    .unwrap();
     let field = Arc::new(Field::new("", DataType::Int64, false).with_metadata(metadata));
     let source = std::mem::size_of::<ValueType>()
         + novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Field>())
@@ -234,49 +237,22 @@ fn metadata_field(reserved: usize, retained: usize) -> (DataType, usize) {
 }
 
 #[test]
-fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() {
+fn type_cursor_accepts_wide_nodes_without_allocation_requests() {
     let primitive = raw(&DataType::Int64, std::mem::size_of::<ValueType>());
-    assert_eq!(primitive.facts.allocation_requests_upper_bound, 1);
-    assert_eq!(
-        primitive.facts.allocation_request_bytes_upper_bound,
-        Layout::array::<TypePending<'_>>(1).unwrap().size()
-    );
-    let (ty, source) = wide(MAX_DATA_TYPE_NODES - 1);
+    assert_eq!(primitive.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(primitive.facts.allocation_request_bytes_upper_bound, 0);
+
+    let width = 4096;
+    let (ty, source) = wide(width);
     let out = raw(ty.data_type(), source);
     assert!(out.errors.is_empty());
-    assert_eq!(out.items, 2 * MAX_DATA_TYPE_NODES - 1);
-    // The caller policy performs the actual branch reserve_exact(4095),
-    // after the original quota accepts and before any Field observer.
-    assert_eq!(out.facts.allocation_requests_upper_bound, 2);
-    assert_eq!(
-        out.facts.allocation_request_bytes_upper_bound,
-        Layout::array::<TypePending<'_>>(1).unwrap().size()
-            + Layout::array::<TypePending<'_>>(MAX_DATA_TYPE_NODES - 1)
-                .unwrap()
-                .size()
-    );
-    let (over, source) = wide_raw(MAX_DATA_TYPE_NODES);
-    assert!(
-        ValueType::try_with_logical_type(over.clone(), false, ValueLogicalType::Physical).is_err()
-    );
-    let over = raw(&over, source);
-    assert_eq!(over.items, 1);
-    assert_eq!(over.errors.len(), 1);
-    assert_eq!(
-        over.errors[0].category(),
-        ValidationErrorCategory::ResourceLimit
-    );
-    assert_eq!(
-        over.errors[0].message(),
-        format!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes")
-    );
-    // Initial tuple plus the report's String/path/message/collector requests,
-    // and no rejected child backing request.
-    assert_eq!(over.facts.allocation_requests_upper_bound, 5);
+    assert_eq!(out.items, 2 * width + 1);
+    assert_eq!(out.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(out.facts.allocation_request_bytes_upper_bound, 0);
 }
 
 #[test]
-fn original_lifo_decimal_dictionary_and_negative_fixed_size_diagnostics_stay_exact() {
+fn declaration_order_preserves_decimal_dictionary_and_negative_fixed_size_diagnostics() {
     let ty = DataType::Struct(
         vec![
             Arc::new(Field::new("", DataType::Decimal128(0, 0), false)),
@@ -291,8 +267,8 @@ fn original_lifo_decimal_dictionary_and_negative_fixed_size_diagnostics_stay_exa
     assert_eq!(
         out.errors.iter().map(|e| e.message()).collect::<Vec<_>>(),
         [
-            "Arrow fixed-size length -1 is negative",
             "Arrow decimal precision/scale (0, 0) is outside 1..=38 and -38..=38",
+            "Arrow fixed-size length -1 is negative",
         ]
     );
     assert_eq!(
@@ -308,18 +284,16 @@ fn original_lifo_decimal_dictionary_and_negative_fixed_size_diagnostics_stay_exa
             .is_err()
     );
     let out = raw(&dictionary, 4096);
+    assert_eq!(out.errors.len(), 1);
+    assert_eq!(out.errors[0].message(), "invalid Arrow dictionary key type");
     assert_eq!(
-        out.errors[0].message(),
-        "Arrow dictionary key must be an integer type"
-    );
-    assert_eq!(
-        out.errors[1].message(),
-        "Arrow fixed-size length -1 is negative"
+        out.errors[0].category(),
+        ValidationErrorCategory::StructuralInvariant
     );
 }
 
 #[test]
-fn real_deleted_metadata_backing_is_charged_without_len_or_capacity_inference() {
+fn discarded_hashmap_capacity_does_not_affect_arrow_metadata_walk() {
     let (fresh, fresh_source) = metadata_field(1, 1);
     let (deleted, deleted_source) = metadata_field(2048, 1);
     assert!(deleted_source > fresh_source);
@@ -337,8 +311,11 @@ fn real_deleted_metadata_backing_is_charged_without_len_or_capacity_inference() 
         out.facts.allocation_requests_upper_bound,
         fresh.facts.allocation_requests_upper_bound
     );
-    assert!(out.facts.cumulative_work_upper_bound > fresh.facts.cumulative_work_upper_bound);
-    assert_eq!(out.facts.allocation_requests_upper_bound, 1);
+    assert_eq!(
+        out.facts.cumulative_work_upper_bound,
+        fresh.facts.cumulative_work_upper_bound
+    );
+    assert_eq!(out.facts.allocation_requests_upper_bound, 0);
 }
 
 #[test]
@@ -410,105 +387,50 @@ fn every_actual_small_success_and_ordinary_type_callback_preserves_three_causes(
 }
 
 #[test]
-fn known_initial_and_branch_requests_refuse_before_real_late_controls() {
-    use novarocks_type_contract::owned_resources::copy::copy_string;
-    let text = "x".repeat(255);
-    for cause in CAUSES {
-        let control = Control {
-            refusal: Some((3, cause)),
-            ..Control::default()
-        };
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-        let copied = copy_string::<ControlResourceError>(&text, &mut work).unwrap();
-        assert_eq!(copied, text);
-        assert_eq!(control.trace(), [0, 0, 1]);
-        let mut resources = ControlResourceCounter::default();
-        let mut errors = ValidationContext::new();
-        let mut cut = CutResourcePreflight::new();
-        let result = cut.add_value_type_in(
-            &ValueType::new(DataType::Int64, false),
-            "types.actual",
-            &mut errors,
-            4096,
-            &mut resources,
-            &mut |f| {
-                gate(
-                    f,
-                    Caps {
-                        requests: 0,
-                        ..OPEN
-                    },
-                )
-            },
-            &mut work,
-        );
-        assert!(matches!(
-            result,
-            Err(ControlResourceError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        assert_eq!(control.trace(), [0, 0, 1]);
-    }
+fn type_cursor_observes_work_without_allocation_admission() {
     let (ty, source) = wide(3);
-    // Capture the actual branch admission position from the real same core;
-    // no meter/model is preloaded and no future callback is invented.
-    let good = Control::default();
-    let mut work = CompileCheckpoints::try_new(&good, CompilePhase::Validate).unwrap();
-    let mut resources = ControlResourceCounter::default();
-    let mut cut = CutResourcePreflight::new();
-    let mut errors = ValidationContext::new();
-    let mut branch_at = None;
-    cut.add_value_type_in(
+    let control = Control::default();
+    let facts = run(
         &ty,
-        "types.actual",
-        &mut errors,
         source,
-        &mut resources,
-        &mut |f| {
-            if f.allocation_requests_upper_bound == 2 && branch_at.is_none() {
-                branch_at = Some(good.trace().len());
-            }
-            Ok(())
+        Caps {
+            requests: 0,
+            bytes: 0,
+            ..OPEN
         },
-        &mut work,
+        &control,
     )
-    .unwrap();
-    work.finish().unwrap();
-    let at = branch_at.unwrap();
-    let trace = good.trace();
-    for cause in CAUSES {
-        let control = Control {
-            refusal: Some((at, cause)),
-            ..Control::default()
-        };
-        assert!(matches!(
-            run(
-                &ty,
-                source,
-                Caps {
-                    requests: 1,
-                    ..OPEN
-                },
-                &control
-            ),
-            Err(ControlResourceError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        assert_eq!(control.trace(), trace[..at]);
-    }
+    .unwrap()
+    .facts;
+    assert_eq!(facts.allocation_requests_upper_bound, 0);
+    assert_eq!(facts.allocation_request_bytes_upper_bound, 0);
+    assert!(facts.cumulative_work_upper_bound > 0);
+    assert!(matches!(
+        run(&ty, source, Caps { work: 0, ..OPEN }, &Control::default()),
+        Err(ControlResourceError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
 }
 
 #[test]
-fn actual_metadata_take_257_has_real_quantum_and_keeps_original_overlimit_law() {
+fn metadata_past_the_old_limit_is_observed_and_charged_by_actual_entries() {
     let (ty, source) = metadata_field(320, 320);
     let good = Control::default();
     let out = run_raw(&ty, source, OPEN, &good).unwrap();
-    assert_eq!(out.errors.len(), 1);
+    assert!(out.errors.is_empty());
+    let DataType::List(field) = &ty else {
+        unreachable!()
+    };
+    assert_eq!(out.items, 2 + field.metadata().len());
     assert_eq!(
-        out.errors[0].message(),
-        "Arrow field metadata contains more than 256 entries"
+        out.bytes,
+        field.name().len()
+            + field
+                .metadata()
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
     );
     let trace = good.trace();
     let quantum = trace.iter().position(|u| *u == 256).unwrap();
@@ -526,7 +448,7 @@ fn actual_metadata_take_257_has_real_quantum_and_keeps_original_overlimit_law() 
 }
 
 #[test]
-fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
+fn exact_work_replay_and_saturated_original_usage_remain_distinct() {
     let ty = ValueType::new(DataType::Int64, false);
     let source = std::mem::size_of::<ValueType>();
     let measured = run(&ty, source, OPEN, &Control::default()).unwrap();
@@ -538,27 +460,20 @@ fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
     };
     let replay = run(&ty, source, exact, &Control::default()).unwrap();
     assert_eq!(replay.facts, f);
-    for cap in [
-        Caps {
-            requests: exact.requests - 1,
-            ..exact
-        },
-        Caps {
-            bytes: exact.bytes - 1,
-            ..exact
-        },
-        Caps {
-            work: exact.work - 1,
-            ..exact
-        },
-    ] {
-        assert!(matches!(
-            run(&ty, source, cap, &Control::default()),
-            Err(ControlResourceError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-    }
+    assert!(matches!(
+        run(
+            &ty,
+            source,
+            Caps {
+                work: exact.work - 1,
+                ..exact
+            },
+            &Control::default()
+        ),
+        Err(ControlResourceError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut resources = ControlResourceCounter::default();
@@ -581,12 +496,8 @@ fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
     assert_eq!(control.trace(), [0, 0]);
 }
 
-/// Actual semantic visits no longer probe Arrow metadata. The independent
-/// retained Arrow layout's iterator source bound remains affine, so a large
-/// original source invoice cannot make semantic name work quadratic.
 #[test]
-#[cfg(target_pointer_width = "64")]
-fn semantic_walk_is_source_independent_and_layout_header_work_remains_linear() {
+fn field_and_semantic_work_is_independent_of_the_total_source_invoice() {
     let ty = ValueType::new(
         DataType::Struct(
             vec![
@@ -603,25 +514,7 @@ fn semantic_walk_is_source_independent_and_layout_header_work_remains_linear() {
         assert!(out.errors.is_empty());
         out.facts.cumulative_work_upper_bound
     };
-    let key = novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len();
-    let header = |source| hashmap::source_iterator_work_upper_bound(source, 0).unwrap();
-    let step = 1usize << 30;
-    let (one, two, three) = (work(step), work(2 * step), work(3 * step));
-    // Only the physical field header's original opaque iterator source bound
-    // depends on source B; semantic name bytes are the actual retained names.
-    let per_step = 2 * (header(2 * step) - header(step));
-    assert_eq!(two - one, per_step);
-    assert_eq!(three - two, per_step);
-    // A source-sized key length charged about 2 * source^2 per field: two
-    // nested fields under a 2 GiB invoice overflowed the meter.
-    let receiver = 2 * step;
-    assert!(
-        hashmap::string_operations_work_upper_bound(receiver, 1, key, receiver)
-            .unwrap()
-            .checked_mul(2)
-            .is_none()
-    );
-    assert_eq!(two, work(receiver));
+    assert_eq!(work(1), work(usize::MAX));
 }
 
 fn map_type(layers: usize) -> DataType {
@@ -646,8 +539,8 @@ fn map_type(layers: usize) -> DataType {
 }
 
 #[test]
-fn typed_map_logical64_keeps_plan_owned_nodes_names_and_pending_requests() {
-    let ty = ValueType::new(map_type(MAX_DATA_TYPE_DEPTH - 1), false);
+fn typed_map_logical64_keeps_plan_owned_node_and_name_usage() {
+    let ty = ValueType::new(map_type(MAX_VALUE_TYPE_DEPTH - 1), false);
     let out = run(&ty, 1024 * 1024, OPEN, &Control::default()).unwrap();
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert_plain(&ty, &out);
@@ -658,26 +551,66 @@ fn typed_map_logical64_keeps_plan_owned_nodes_names_and_pending_requests() {
         out.bytes,
         63 * ("entries".len() + "key".len() + "value".len())
     );
-    assert_eq!(Layout::new::<TypePending<'_>>().size(), 32);
-    let mut under = OPEN;
-    under.bytes = out.facts.allocation_request_bytes_upper_bound - 1;
-    assert!(matches!(
-        run(&ty, 1024 * 1024, under, &Control::default()),
-        Err(ControlResourceError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
+    assert_eq!(out.facts.allocation_requests_upper_bound, 0);
 }
 
 #[test]
-fn raw_plan_type_policy_retains_physical64_for_constant_or_source_subtrees() {
-    assert!(raw(&map_type(31), 1024 * 1024).errors.is_empty());
-    let over = raw(&map_type(32), 1024 * 1024);
+fn raw_plan_type_uses_logical_depth_for_map_scaffolding() {
+    assert!(
+        raw(&map_type(MAX_VALUE_TYPE_DEPTH - 1), 1024 * 1024)
+            .errors
+            .is_empty()
+    );
+    let over = raw(&map_type(MAX_VALUE_TYPE_DEPTH), 1024 * 1024);
     assert_eq!(
         over.errors[0].category(),
-        ValidationErrorCategory::ResourceLimit
+        ValidationErrorCategory::UnsupportedCapability
     );
-    assert_eq!(over.errors[0].message(), "Arrow data type depth exceeds 64");
+    assert_eq!(
+        over.errors[0].message(),
+        format!("Arrow data type exceeds the nesting depth limit of {MAX_VALUE_TYPE_DEPTH}")
+    );
+}
+
+#[test]
+fn raw_plan_type_accounts_for_wide_parameters_and_actual_field_bytes() {
+    let name = "n".repeat(1025);
+    let key = "k".repeat(1025);
+    let value = "v".repeat(65537);
+    let zone = "z".repeat(1025);
+    let source = DataType::Struct(
+        vec![
+            Arc::new(
+                Field::new(
+                    name.clone(),
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(zone.clone().into())),
+                    true,
+                )
+                .with_metadata(HashMap::from([(key.clone(), value.clone())])),
+            ),
+            Arc::new(Field::new(
+                "bin",
+                DataType::FixedSizeBinary(1_048_577),
+                false,
+            )),
+            Arc::new(Field::new(
+                "list",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Int64, false)),
+                    1_048_577,
+                ),
+                true,
+            )),
+        ]
+        .into(),
+    );
+    let out = raw(&source, 0);
+    assert!(out.errors.is_empty());
+    assert_eq!(
+        out.bytes,
+        name.len() + key.len() + value.len() + zone.len() + "binlistitem".len()
+    );
+    assert_eq!(out.facts.allocation_requests_upper_bound, 0);
 }
 
 // Physical source admission precedes compilation for either float destination.

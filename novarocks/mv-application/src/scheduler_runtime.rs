@@ -431,7 +431,7 @@ where
     }
 }
 
-fn backoff_ms(config: &MvSchedulerConfig, attempt: u32) -> i64 {
+pub(crate) fn backoff_ms(config: &MvSchedulerConfig, attempt: u32) -> i64 {
     let base = config.failure_backoff_ms().max(1);
     let maximum = config.max_failure_backoff_ms().max(base);
     let shift = attempt.saturating_sub(1).min(62);

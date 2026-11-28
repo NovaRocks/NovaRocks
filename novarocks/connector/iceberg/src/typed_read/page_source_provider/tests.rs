@@ -223,15 +223,9 @@ fn staged_small_file() -> (
         sequence_id: 0,
         access_binding: provider.access_binding.clone(),
         context: provider.context.clone(),
-        options: IcebergPageSourceProviderOptions {
-            reader_options: FileReaderOptions {
-                parquet_interpretation_policy:
-                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
-                        preserve_top_level_dictionary: true,
-                    },
-                ..provider.options.reader_options
-            },
-            ..provider.options.clone()
+        options: provider.options.clone(),
+        parquet_policy: ParquetInterpretationPolicy::DerivedByteRepresentation {
+            preserve_top_level_dictionary: true,
         },
         footers: Arc::clone(&provider.footers),
         delete_manager: Arc::clone(&provider.delete_manager),

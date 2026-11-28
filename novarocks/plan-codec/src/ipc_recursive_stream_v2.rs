@@ -26,9 +26,6 @@ use crate::ipc_flat_stream_v2::progress::{
 use crate::{
     ipc_flat_stream_v2::{FlatPoolResourceError, require},
     ipc_recursive_batch_v2::{CheckedRecursiveBatch, preflight_verified_recursive_record_batch},
-    ipc_schema_v2::{
-        IpcSchemaProjectionLimits, verified_message_observed, verify_single_field_schema_with_work,
-    },
     physical_type_v2::TypeCodecError,
 };
 use arrow::{
@@ -36,9 +33,7 @@ use arrow::{
     ipc::reader::read_record_batch,
 };
 use arrow_buffer::Buffer;
-use novarocks_arrow_ipc_frame::{
-    ContinuationPrefix, VerifierOptions, checked_range, continuation_prefix, nonnegative_length,
-};
+use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
@@ -56,7 +51,6 @@ pub use reader_resources::{RecursiveReaderProjectionLimits, RecursiveReaderResou
 #[derive(Clone, Copy, Debug)]
 pub struct RecursiveStreamProjectionLimits {
     pub max_input_bytes: usize,
-    pub schema: IpcSchemaProjectionLimits,
     pub batch: RecursiveBatchProjectionLimits,
 }
 
@@ -419,106 +413,15 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
             work,
         )?;
     }
-    let (schema, schema_end) = crate::ipc_flat_stream_v2::metadata_core(
-        input,
-        0,
-        limits.map(|limits| limits.schema.max_flatbuffer_bytes),
-        verifier.map(|verifier| verifier.max_apparent_size),
-        admission.as_deref_mut(),
-        work,
-    )?;
-    if admission.is_some() {
-        crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
-    }
-    if let Some(a) = admission.as_deref_mut() {
-        let source = a.source();
-        let mut capture = |f: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
-            a.requests(4, f.request_bytes, f.request_count)?;
-            a.schema_work(f.work_upper_bound)
-        };
-        let mut host = |facts: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
-            capture(facts).map_err(crate::host_projection_v2::ProjectionFailure::Host)
-        };
-        let verified = if let (Some(limits), Some(verifier)) = (limits, verifier) {
-            crate::ipc_schema_v2::verify_single_field_schema_with_host_in(
-                schema,
-                expected,
-                limits.schema,
-                verifier,
-                source,
-                usize::MAX,
-                &mut host,
-                work,
-            )
-        } else {
-            crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
-                schema, expected, &mut host, work,
-            )
-            .map(|_| ())
-        };
-        verified.map_err(|error| match error {
-            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
-            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
-        })?;
-    } else {
-        verify_single_field_schema_with_work(
-            schema,
-            expected,
-            limits.expect("fixed plain schema profile").schema,
-            verifier.expect("fixed plain verifier"),
+    let crate::ipc_flat_stream_v2::RecordFrame { body, message, .. } =
+        crate::ipc_flat_stream_v2::record_frame(
+            input,
+            limits.map(|limits| limits.batch.flat.max_metadata_bytes),
+            limits.map(|limits| limits.batch.flat.max_body_bytes),
+            verifier,
+            admission.as_deref_mut(),
             work,
         )?;
-    }
-    let (batch_metadata, body_start) = crate::ipc_flat_stream_v2::metadata_core(
-        input,
-        schema_end,
-        limits.map(|limits| limits.batch.flat.max_metadata_bytes),
-        verifier.map(|verifier| verifier.max_apparent_size),
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let derived;
-    let batch_verifier = if let Some(verifier) = verifier {
-        verifier
-    } else {
-        derived = crate::ipc_flat_stream_v2::input_derived_batch_verifier(batch_metadata.len())?;
-        if let Some(a) = admission.as_deref_mut() {
-            a.batch_work_add(
-                derived
-                    .max_apparent_size
-                    .checked_add(batch_metadata.len())
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
-            )?;
-        }
-        &derived
-    };
-    let message = verified_message_observed(batch_metadata, batch_verifier, work)?;
-    crate::ipc_flat_stream_v2::framing_require(
-        message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
-        "recursive IPC schema must precede exactly one RecordBatch",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let body_length = nonnegative_length(message.bodyLength()).map_err(|_| {
-        TypeCodecError::InvalidShape("recursive IPC body length is negative or unrepresentable")
-    })?;
-    if admission.is_some()
-        && limits.is_some_and(|limits| body_length > limits.batch.flat.max_body_bytes)
-    {
-        return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
-    }
-    crate::ipc_flat_stream_v2::framing_require(
-        limits.is_none_or(|limits| body_length <= limits.batch.flat.max_body_bytes)
-            && body_length % 8 == 0,
-        "recursive IPC body framing exceeds its aligned envelope",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let range = checked_range(input.len(), body_start, body_length)
-        .map_err(|_| TypeCodecError::InvalidShape("recursive IPC body is truncated"))?;
-    crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
-    let body_end = range.end;
-    let body = &input[range];
     let checked = if let Some(a) = admission.as_deref_mut() {
         crate::ipc_recursive_batch_v2::preflight_verified_recursive_record_batch_profile(
             message,
@@ -537,15 +440,6 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
             work,
         )?
     };
-    let end = continuation_prefix(input, body_end);
-    crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
-    let end = end.map_err(|_| TypeCodecError::InvalidShape("recursive IPC EOS is missing"))?;
-    crate::ipc_flat_stream_v2::framing_require(
-        matches!(end, ContinuationPrefix::End { next_offset } if next_offset == input.len()),
-        "recursive IPC EOS has extra messages or trailing data",
-        admission.as_deref_mut(),
-        work,
-    )?;
     let batch = message
         .header_as_record_batch()
         .ok_or(TypeCodecError::InvalidShape(
@@ -855,7 +749,6 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
                 .into());
             }
             if let Some(a) = admission.as_deref_mut() {
-                let scratch = novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound();
                 let header = reader_allocations::initial_header(&field)?;
                 a.requests(
                     2,
@@ -865,11 +758,6 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
                 let body_len = self.body.len();
                 let rounded = a.numeric(reader_resources::capacity(body_len))?;
                 a.requests(1, rounded, usize::from(rounded != 0))?;
-                a.reader_work(
-                    scratch
-                        .checked_mul(3)
-                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
-                )?;
                 a.clone_work(
                     crate::physical_type_v2::value_type_clone_preflight_work_upper_bound(),
                 )?;

@@ -41,7 +41,9 @@ pub use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorReadRelationPayload,
 };
 
-pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
+/// A private type path carries its envelope root in addition to its logical nodes.
+pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize =
+    novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1;
 pub const MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES: usize = 512;
 
@@ -928,7 +930,14 @@ mod tests {
     fn codec_revision_and_limits_are_finite() {
         assert!(ConnectorCodecRevision::try_new(0).is_err());
         assert!(ConnectorDecodeLimits::try_new(0, 1, 1, 1, 1).is_err());
-        assert!(ConnectorDecodeLimits::try_new(1, 1, 1, 1, 65).is_err());
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH)
+                .is_ok()
+        );
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH + 1)
+                .is_err()
+        );
     }
 
     #[test]

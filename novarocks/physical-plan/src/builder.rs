@@ -57,6 +57,7 @@ pub struct FragmentBuilder {
     unit_builders: BTreeMap<NodeId, BoundExprSetBuilder>,
     nodes: BTreeMap<NodeId, PhysicalNode>,
     contains_scan: bool,
+    input_completion: crate::FragmentInputCompletion,
     runtime_filters: BTreeSet<RuntimeFilterId>,
     summaries: Box<[crate::SummaryOutput]>,
 }
@@ -71,6 +72,7 @@ impl FragmentBuilder {
             unit_builders: BTreeMap::new(),
             nodes: BTreeMap::new(),
             contains_scan: false,
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             runtime_filters: BTreeSet::new(),
             summaries: Box::default(),
         }
@@ -80,6 +82,10 @@ impl FragmentBuilder {
     /// Full validation checks unique kinds, exact fields and legal authors.
     pub fn set_summaries(&mut self, summaries: Box<[crate::SummaryOutput]>) {
         self.summaries = summaries;
+    }
+
+    pub fn set_input_completion(&mut self, input_completion: crate::FragmentInputCompletion) {
+        self.input_completion = input_completion;
     }
 
     pub fn contains_scan(&self) -> bool {
@@ -133,7 +139,7 @@ impl FragmentBuilder {
                 .map(|id| {
                     self.nodes
                         .get(id)
-                        .map(|n| n.output.columns.to_vec())
+                        .map(|n| n.data_output_columns().to_vec())
                         .ok_or(BuildError::UndefinedInput { node, input: *id })
                 })
                 .collect::<Result<_, _>>()?,
@@ -1226,6 +1232,7 @@ impl FragmentBuilder {
             summaries: self.summaries,
             dop_domain,
             stage_placement,
+            input_completion: self.input_completion,
             // The author installs the exact ordered references before this
             // unpublished construction input reaches any validator.
             runtime_filters: Box::default(),

@@ -467,9 +467,9 @@ fn project(
             ));
             assert!(std::ptr::eq(
                 encoded
-                    .value_type_observed(input.intermediate_value_type_id, &mut work)?
+                    .value_type_observed(input.intermediate_value_type_id.unwrap(), &mut work)?
                     .unwrap(),
-                &row.source.intermediate_type
+                &row.source.merge_state.as_ref().unwrap().intermediate_type
             ));
         }
         Ok(budget.facts())
@@ -856,6 +856,7 @@ fn wide_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(320),
             root: node_id,
             values: BTreeMap::from([(

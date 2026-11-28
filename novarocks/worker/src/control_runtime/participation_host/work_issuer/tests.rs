@@ -118,6 +118,8 @@ impl ParticipationWorkTestOwner {
                 scan_requested: false,
                 scan_upper: None,
                 scan_after: None,
+                query_memory: None,
+                query_observation: None,
             }),
         }));
         Self {
@@ -213,6 +215,10 @@ impl ParticipationWorkTestOwner {
             .0
             .ledger
             .remove_scope(self.registry.0.scope.id())?;
+        self.registry.retire_memory_after_scope_exit(
+            novarocks_worker_protocol::lease::MonotonicInstant::from_origin(Duration::ZERO),
+        );
+        assert!(!self.registry.has_unsettled_query_memory());
         self.finished = true;
         assert!(self.registry.0.ledger.is_empty());
         Ok(true)

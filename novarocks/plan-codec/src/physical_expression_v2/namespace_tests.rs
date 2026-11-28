@@ -140,16 +140,18 @@ fn function(kind: FunctionKind) -> BoundFunction {
 }
 fn aggregate(function: &BoundFunction) -> AggregateBinding {
     AggregateBinding {
-        state_interpretation: None,
         function: function.clone(),
         phase: AggregatePhase::Partial {
             sequence: AggregateSequenceId::new(u32::MAX),
         },
         logical_argument_count: 1,
-        intermediate_type: int(),
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-        state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: int(),
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
+        }),
     }
 }
 fn definitions(nodes: Vec<ExprNode>) -> Box<[ExprNode]> {
@@ -336,7 +338,7 @@ impl Fixture {
             id: u32::MAX,
             source: &self.aggregate,
             function_binding_id: u32::MAX,
-            intermediate_value_type_id: 0,
+            intermediate_value_type_id: Some(0),
         }];
         let aggregates = encode_aggregate_bindings(
             &types,
@@ -1094,7 +1096,7 @@ fn namespace_original_owned_boxes_cannot_be_hidden_by_inline_source_invoice() {
         id: u32::MAX,
         source: &f.aggregate,
         function_binding_id: u32::MAX,
-        intermediate_value_type_id: 0,
+        intermediate_value_type_id: Some(0),
     }];
     let aggregates = encode_aggregate_bindings(
         &types,

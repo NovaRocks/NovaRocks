@@ -225,6 +225,10 @@ fn aggregate_bindings_match_with(
     charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
 ) -> Result<bool, StateSignatureComparisonError> {
     use novarocks_type_contract::{AggregateStateArgumentContract, FunctionArgumentType};
+    let (Some(expected_state), Some(actual_state)) = (&expected.merge_state, &actual.merge_state)
+    else {
+        return Ok(false);
+    };
     let left = &expected.function;
     let right = &actual.function;
     let identity_work = [
@@ -232,8 +236,8 @@ fn aggregate_bindings_match_with(
         right.function_id.as_str().len(),
         left.overload.as_str().len(),
         right.overload.as_str().len(),
-        expected.state_format.as_str().len(),
-        actual.state_format.as_str().len(),
+        expected_state.state_format.as_str().len(),
+        actual_state.state_format.as_str().len(),
     ]
     .into_iter()
     .try_fold(8usize, usize::checked_add);
@@ -243,15 +247,18 @@ fn aggregate_bindings_match_with(
         || left.kind != right.kind
         || left.argument_types.len() != right.argument_types.len()
         || expected.logical_argument_count != actual.logical_argument_count
-        || expected.state_argument_contract != actual.state_argument_contract
-        || expected.state_format != actual.state_format
+        || expected_state.state_argument_contract != actual_state.state_argument_contract
+        || expected_state.state_format != actual_state.state_format
         || expected.phase.sequence() != actual.phase.sequence()
         || usize::try_from(expected.logical_argument_count)
             .map_or(true, |count| count > left.argument_types.len())
     {
         return Ok(false);
     }
-    let same_state = match (&expected.state_interpretation, &actual.state_interpretation) {
+    let same_state = match (
+        &expected_state.state_interpretation,
+        &actual_state.state_interpretation,
+    ) {
         (None, None) => true,
         (Some(a), Some(b)) => a.matches_observed(b, || charge(1))?,
         _ => false,
@@ -265,7 +272,7 @@ fn aggregate_bindings_match_with(
         .zip(&right.argument_types)
         .enumerate()
     {
-        let ignore_root = expected.state_argument_contract
+        let ignore_root = expected_state.state_argument_contract
             == AggregateStateArgumentContract::ValueRootNullabilityIndependent
             && ordinal < expected.logical_argument_count as usize;
         let matches = match (a, b) {
@@ -302,8 +309,8 @@ fn aggregate_bindings_match_with(
     Ok(
         state_value_types_match(&left.result_type, &right.result_type, false, charge)?
             && state_value_types_match(
-                &expected.intermediate_type,
-                &actual.intermediate_type,
+                &expected_state.intermediate_type,
+                &actual_state.intermediate_type,
                 false,
                 charge,
             )?,
@@ -455,6 +462,9 @@ fn aggregate_topn_grouped_parent_matches_with(
         {
             return Ok(false);
         }
+        let Some(intermediate) = producer.binding.intermediate_type() else {
+            return Ok(false);
+        };
         for call in [producer, consumer] {
             let Some(definition) = fragment.values().get(&call.output) else {
                 return Ok(false);
@@ -464,12 +474,7 @@ fn aggregate_topn_grouped_parent_matches_with(
                     call: call.id,
                     phase: call.binding.phase,
                 })
-                || !state_value_types_match(
-                    &definition.ty,
-                    &call.binding.intermediate_type,
-                    false,
-                    charge,
-                )?
+                || !state_value_types_match(&definition.ty, intermediate, false, charge)?
             {
                 return Ok(false);
             }
@@ -477,12 +482,7 @@ fn aggregate_topn_grouped_parent_matches_with(
         let Some(argument) = fragment.root_expression(topn.id, consumer.arguments[0]) else {
             return Ok(false);
         };
-        if !state_value_types_match(
-            &argument.ty,
-            &producer.binding.intermediate_type,
-            false,
-            charge,
-        )? {
+        if !state_value_types_match(&argument.ty, intermediate, false, charge)? {
             return Ok(false);
         }
     }

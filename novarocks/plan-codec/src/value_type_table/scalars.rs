@@ -16,9 +16,7 @@
 // under the License.
 
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
-use novarocks_type_contract::{
-    CharacterKind, CharacterType, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueKind, ValueLogicalType,
-};
+use novarocks_type_contract::{CharacterKind, CharacterType, ValueKind, ValueLogicalType};
 
 use super::{
     Failure,
@@ -125,13 +123,6 @@ pub(crate) fn validate<H>(value: &wire::ScalarValue) -> Result<S, Failure<H>> {
     }
     if let Some(unit) = value.interval_unit {
         interval::<H>(unit)?;
-    }
-    if value
-        .timezone
-        .as_ref()
-        .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
-    {
-        return Err(invalid("logical timezone exceeds its byte bound"));
     }
     if let (Some(precision), Some(scale)) = (value.precision, value.scale) {
         let maximum = match kind {

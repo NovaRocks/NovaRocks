@@ -191,14 +191,13 @@ pub(crate) fn argument_metadata_geometry(
     control: &dyn KernelEvaluationControl,
 ) -> Result<AllocationGeometry, InvocationPreparationFailure> {
     use novarocks_type_contract::{
-        MAX_VALUE_TYPE_NODES, ValueTypeVisit,
+        ValueTypeVisit,
         owned_resources::{hashmap, vec},
-        validate_value_type_structure_with_scratch_observed,
+        validate_value_type_structure_observed,
     };
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
     let mut work = crate::kernel_input::EvaluationCheckpoints::new(control);
     let mut geometry = AllocationGeometry::default();
-    validate_value_type_structure_with_scratch_observed(ty, &mut scratch, |event| {
+    validate_value_type_structure_observed(ty, |event| {
         work.step()?;
         if let ValueTypeVisit::Field(field) = event {
             let entries = field.metadata().len();
@@ -1096,11 +1095,7 @@ mod tests {
             )
         });
         assert!(equal.unwrap());
-        assert!(actual.0 > 0 && actual.1 > 0);
-        assert!(actual.0 <= bound.requested_bytes, "{actual:?} > {bound:?}");
-        assert!(actual.1 <= bound.requests, "{actual:?} > {bound:?}");
-        assert!(actual.2 <= bound.peak_bytes, "{actual:?} > {bound:?}");
-        assert_eq!(actual.3, 0);
+        assert_eq!(actual, (0, 0, 0, 0));
     }
 
     #[test]

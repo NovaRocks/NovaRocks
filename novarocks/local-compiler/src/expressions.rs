@@ -769,23 +769,20 @@ pub(crate) fn compile_node_unit<H, F: novarocks_type_contract::ValueSchemaCreati
                 }
                 &scan_values
             }
-            _ => {
-                &package
-                    .fragment()
-                    .nodes()
-                    .get(
-                        node.inputs
-                            .get(ordinal)
-                            .ok_or(ExpressionLoweringError::Invalid(
-                                "unit port has no actual node input",
-                            ))?,
-                    )
-                    .ok_or(ExpressionLoweringError::Invalid(
-                        "unit input node is absent",
-                    ))?
-                    .output
-                    .columns
-            }
+            _ => package
+                .fragment()
+                .nodes()
+                .get(
+                    node.inputs
+                        .get(ordinal)
+                        .ok_or(ExpressionLoweringError::Invalid(
+                            "unit port has no actual node input",
+                        ))?,
+                )
+                .ok_or(ExpressionLoweringError::Invalid(
+                    "unit input node is absent",
+                ))?
+                .data_output_columns(),
         };
         let layout = layouts
             .get(ordinal)

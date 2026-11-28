@@ -18,14 +18,69 @@
 //! Same-dispatch facts for a full materialized view refresh.
 
 use super::{
-    model::{AttemptToken, BaseIdentity, FrozenRequest},
+    commit_failure::validation_failure,
+    model::{AttemptToken, BaseIdentity, CommitOperation, FrozenRequest},
     staging::StagedView,
+    write_stack::control::{
+        ICEBERG_WRITE_SESSION_MARKER_PROPERTY, MANAGED_REPARTITION_EFFECT_SUMMARY_KEY,
+    },
 };
-use crate::iceberg::{Error, ErrorKind, Result, TableUpdate, spec::Operation};
+use crate::document_storage::{
+    keyed::keys::{DocumentKey, MARKER_PREFIX, RECORD_PREFIX, parse_key},
+    observation::keyed_read_error,
+};
+use crate::iceberg::{
+    Error, ErrorKind, Result, TableUpdate,
+    spec::{Operation, Snapshot, TableMetadata},
+};
+use novarocks_spi::connector::{
+    ConnectorMarkerKey, ConnectorTableObjectId, KeyedDispatchDeleteStage, KeyedDispatchRecord,
+    KeyedSnapshotDispatch, UnknownCommitEvidence, UnknownCommitIdentity,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub(crate) const FULL_REFRESH_STAGE_SUMMARY_KEY: &str = "novarocks.mv.full-refresh-stage.v1";
+
+/// Read the owning application's marker keys from the current round without
+/// interpreting their values.
+pub(super) fn observed_marker_keys(
+    metadata: &TableMetadata,
+    owner: &str,
+) -> Result<BTreeSet<ConnectorMarkerKey>> {
+    let owner_prefix = format!("{MARKER_PREFIX}{owner}~");
+    metadata
+        .properties()
+        .keys()
+        .filter(|key| key.starts_with(&owner_prefix))
+        .map(|key| {
+            let parsed = parse_key(key, false).map_err(|error| {
+                let error = keyed_read_error(error);
+                Error::new(ErrorKind::DataInvalid, error.message()).with_source(error)
+            })?;
+            let Some(DocumentKey::Marker(marker)) = parsed else {
+                return Err(invalid("Document marker key has an unexpected category"));
+            };
+            Ok(marker)
+        })
+        .collect()
+}
+
+pub(super) fn require_full_refresh_marker_keys(
+    metadata: &TableMetadata,
+    owner: &str,
+    expected: &BTreeSet<ConnectorMarkerKey>,
+    operation: CommitOperation,
+) -> Result<()> {
+    if observed_marker_keys(metadata, owner)? != *expected {
+        let message = "Document marker keys changed since full refresh admission";
+        return Err(Error::new(ErrorKind::CatalogCommitConflicts, message)
+            .with_source(validation_failure(operation, message)));
+    }
+    Ok(())
+}
 
 // Design: ADR-0268 (docs/adr/ADR-0268-iceberg-mv-converges-from-the-original-commit.md)
 /// The private delete witness binds every selected snapshot to one actual
@@ -130,18 +185,6 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 
-use crate::iceberg::spec::{Snapshot, TableMetadata};
-use novarocks_spi::connector::{
-    ConnectorTableObjectId, KeyedDispatchDeleteStage, KeyedDispatchRecord, KeyedSnapshotDispatch,
-    UnknownCommitEvidence, UnknownCommitIdentity,
-};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-
-use super::write_stack::control::{
-    ICEBERG_WRITE_SESSION_MARKER_PROPERTY, MANAGED_REPARTITION_EFFECT_SUMMARY_KEY,
-};
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeyedDeleteSelection {
@@ -178,7 +221,6 @@ pub(crate) enum KeyedSnapshotObservation {
 
 impl KeyedSnapshotSelection {
     pub(crate) fn frozen(request: &FrozenRequest) -> Result<Option<Self>> {
-        use crate::document_storage::keyed::keys::{DocumentKey, RECORD_PREFIX, parse_key};
         let BaseIdentity::Existing { uuid, parent, .. } = request.base() else {
             return Ok(None);
         };
@@ -248,7 +290,6 @@ impl KeyedSnapshotSelection {
         target: ConnectorTableObjectId,
         frames: &BTreeMap<String, String>,
     ) -> Result<UnknownCommitEvidence> {
-        use crate::document_storage::keyed::keys::{DocumentKey, parse_key};
         let mut records = Vec::with_capacity(self.records.len());
         for (key, digest) in &self.records {
             let frame = frames

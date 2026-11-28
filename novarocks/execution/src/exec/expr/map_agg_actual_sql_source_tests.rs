@@ -226,7 +226,7 @@ fn map_agg_actual_original_required_sql_full_signature_source() {
                     DataType::Map(_, false)
                 ));
                 assert_eq!(
-                    call.binding.intermediate_type,
+                    call.binding.merge_state.as_ref().unwrap().intermediate_type,
                     call.binding.function.result_type
                 );
                 eprintln!(

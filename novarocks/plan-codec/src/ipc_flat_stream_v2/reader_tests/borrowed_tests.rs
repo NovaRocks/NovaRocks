@@ -29,7 +29,7 @@ fn table(
     let limits = TypeProjectionLimits {
         max_definitions: 16,
         max_expanded_nodes: 16,
-        max_string_bytes: schema_limits().max_string_bytes,
+        max_string_bytes: 1 << 20,
     };
     let wire = encode_type_table(&[(0, ty.clone())], limits, &FixtureEncodeControl).unwrap();
     let values = decode_type_table(&wire, limits, &Control::good()).unwrap();

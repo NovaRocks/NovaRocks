@@ -134,6 +134,13 @@ pub(crate) fn validate_aggregate_arguments(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    if !binding.has_valid_phase_contract() {
+        errors.push(ValidationError::new(
+            path,
+            "aggregate phase differs from its ordered or mergeable contract",
+        ));
+        return;
+    }
     match binding.phase {
         AggregatePhase::Single | AggregatePhase::Partial { .. } => {
             let logical_count =
@@ -177,11 +184,13 @@ pub(crate) fn validate_aggregate_arguments(
                     path,
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
-            } else if let Some(argument) = fragment.root_expression(node, args[0])
-                && (!super::value_bindings_match_ignoring_root_nullability(
-                    &argument.ty,
-                    &binding.intermediate_type,
-                ) || (binding.intermediate_type.nullable() && !argument.ty.nullable()))
+            } else if let (Some(argument), Some(state)) = (
+                fragment.root_expression(node, args[0]),
+                binding.intermediate_type(),
+            ) && (!super::value_bindings_match_ignoring_root_nullability(
+                &argument.ty,
+                state,
+            ) || (state.nullable() && !argument.ty.nullable()))
             {
                 // The carrier the state travelled in may admit null the
                 // phase before it never wrote -- a state crossing an

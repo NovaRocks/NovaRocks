@@ -656,6 +656,7 @@ impl ConnectorStagedCtasProperties {
 /// Immutable evaluated storage retained through all aliases of one prepare request.
 pub struct ConnectorStagedMvStorageProperties {
     visible_partition_sources: Vec<Arc<str>>,
+    stateless_output_declarations: Option<Vec<novarocks_type_contract::ValueTypeRef>>,
     properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
     application_properties: BTreeMap<Arc<str>, Arc<str>>,
 }
@@ -663,6 +664,12 @@ pub struct ConnectorStagedMvStorageProperties {
 impl ConnectorStagedMvStorageProperties {
     pub fn visible_partition_sources(&self) -> &[Arc<str>] {
         &self.visible_partition_sources
+    }
+
+    pub fn stateless_output_declarations(
+        &self,
+    ) -> Option<&[novarocks_type_contract::ValueTypeRef]> {
+        self.stateless_output_declarations.as_deref()
     }
 
     pub fn properties(&self) -> &[(Arc<str>, DdlPropertyValue)] {
@@ -2277,6 +2284,7 @@ impl ConnectorStagedCreateSession {
         operation_id: ConnectorStagedCreateOperationId,
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
+        stateless_output_declarations: Option<Vec<novarocks_type_contract::ValueTypeRef>>,
         visible_partition_sources: Vec<Arc<str>>,
         storage_properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
         application_properties: BTreeMap<Arc<str>, Arc<str>>,
@@ -2295,6 +2303,7 @@ impl ConnectorStagedCreateSession {
                 admission,
                 storage: Arc::new(ConnectorStagedMvStorageProperties {
                     visible_partition_sources,
+                    stateless_output_declarations,
                     properties: storage_properties,
                     application_properties,
                 }),

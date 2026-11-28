@@ -321,6 +321,13 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                         .transpose()?;
                     let (manageability, reason) =
                         manageability_parts(&state.manageability, state.phase);
+                    let reason = reason.or_else(|| {
+                        use novarocks_mv_application::persistence::keyed_documents::MvCurrentDataEligibility as E;
+                        projection.data_eligibility().and_then(|state| match state {
+                            E::Servable | E::NeverPublished => None,
+                            state => Some(state.as_str()),
+                        })
+                    });
                     let mut bases = Vec::new();
                     if request.requires(10) {
                         let mut seen = std::collections::BTreeSet::new();

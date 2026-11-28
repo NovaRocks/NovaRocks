@@ -287,23 +287,14 @@ impl<H> Model<'_, '_, '_, '_, H> {
         // envelope; no dummy array/to_data packet/second decoder is constructed.
         // This is conservative temporary wrapper/table geometry, not payload.
         let mut nodes = 0usize;
-        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
-        // Stack initialization is real caller work, not an allocation invoice.
-        for _ in 0..scratch.len() {
-            self.step()?;
-        }
-        novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed(
-            ty,
-            &mut scratch,
-            |event| {
-                if matches!(event, novarocks_type_contract::ValueTypeVisit::TypeNode(_)) {
-                    nodes = nodes
-                        .checked_add(1)
-                        .ok_or_else(|| CopyError::arithmetic(None))?;
-                }
-                self.step()
-            },
-        )?;
+        novarocks_type_contract::validate_arrow_layout_structure_observed(ty, |event| {
+            if matches!(event, novarocks_type_contract::ValueTypeVisit::TypeNode(_)) {
+                nodes = nodes
+                    .checked_add(1)
+                    .ok_or_else(|| CopyError::arithmetic(None))?;
+            }
+            self.step()
+        })?;
         let bytes = crate::arrow_result_custody::custody_type_metadata_upper_bound(nodes)
             .map_err(CopyError::Control)?;
         self.opaque(bytes, false)

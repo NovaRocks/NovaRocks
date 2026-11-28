@@ -21,7 +21,9 @@ use arrow_schema::DataType;
 use novarocks_failure_contract::{
     RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
 };
-use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile};
+use novarocks_type_contract::{
+    ArrowTypeProfile, ValueTypeError, visit_arrow_layout_nodes_observed,
+};
 use std::num::NonZeroU16;
 
 /// Stable identifiers; extents use payload bytes (offsets) or one value's bytes
@@ -92,21 +94,9 @@ pub fn validate_engine_carrier_observed<E>(
     ty: &DataType,
     observe: &mut impl FnMut(&DataType) -> Result<(), E>,
 ) -> Result<(), ValueFailure<E>> {
-    fn walk<E>(
-        ty: &DataType,
-        depth: ArrowTypeDepth,
-        nodes: &mut usize,
-        observe: &mut impl FnMut(&DataType) -> Result<(), E>,
-    ) -> Result<(), ValueFailure<E>> {
+    visit_carrier_shape(ty, |ty| {
         observe(ty).map_err(ValueFailure::Caller)?;
-        depth
-            .check(ArrowTypeProfile::Value)
-            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
-        *nodes += 1;
-        if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-            return Err(ValueError::Invariant(ValueViolation::Nodes).into());
-        }
-        match ty {
+        let violation = match ty {
             DataType::Dictionary(keys, values) => {
                 let supported = [
                     ByteLayout::Utf8,
@@ -114,67 +104,47 @@ pub fn validate_engine_carrier_observed<E>(
                     ByteLayout::Utf8View,
                 ]
                 .iter()
-                .filter_map(|l| l.dictionary_value_layout())
-                .any(|v| &v == values.as_ref());
-                if keys.as_ref() != &DataType::Int32 || !supported {
-                    return Err(ValueError::Invariant(ValueViolation::Dictionary).into());
-                }
-                let depth = depth
-                    .encoding_child()
-                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
-                walk(keys, depth, nodes, observe)?;
-                walk(values, depth, nodes, observe)?;
+                .filter_map(|layout| layout.dictionary_value_layout())
+                .any(|value| &value == values.as_ref());
+                (keys.as_ref() != &DataType::Int32 || !supported)
+                    .then_some(ValueViolation::Dictionary)
             }
             DataType::RunEndEncoded(..) | DataType::ListView(_) | DataType::LargeListView(_) => {
-                return Err(ValueError::Invariant(ValueViolation::Carrier).into());
+                Some(ValueViolation::Carrier)
             }
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _) => walk(
-                field.data_type(),
-                depth
-                    .value_child()
-                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
-                nodes,
-                observe,
-            )?,
-            DataType::Map(field, _) => walk(
-                field.data_type(),
-                depth
-                    .map_entries()
-                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
-                nodes,
-                observe,
-            )?,
-            DataType::Struct(fields) => {
-                for field in fields {
-                    walk(
-                        field.data_type(),
-                        depth
-                            .value_child()
-                            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
-                        nodes,
-                        observe,
-                    )?;
-                }
-            }
-            DataType::Union(fields, _) => {
-                for (_, field) in fields.iter() {
-                    walk(
-                        field.data_type(),
-                        depth
-                            .value_child()
-                            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
-                        nodes,
-                        observe,
-                    )?;
-                }
-            }
-            _ => {}
+            _ => None,
+        };
+        match violation {
+            Some(violation) => Err(ValueError::Invariant(violation).into()),
+            None => Ok(()),
         }
-        Ok(())
+    })
+}
+
+pub(crate) fn visit_carrier_shape<E>(
+    ty: &DataType,
+    mut visit: impl FnMut(&DataType) -> Result<(), ValueFailure<E>>,
+) -> Result<(), ValueFailure<E>> {
+    enum VisitError<E> {
+        Type(ValueTypeError),
+        Carrier(ValueFailure<E>),
     }
-    walk(ty, ArrowTypeDepth::ROOT, &mut 0, observe)
+    impl<E> From<ValueTypeError> for VisitError<E> {
+        fn from(error: ValueTypeError) -> Self {
+            Self::Type(error)
+        }
+    }
+
+    visit_arrow_layout_nodes_observed(ty, ArrowTypeProfile::Value, |ty, _| {
+        visit(ty).map_err(VisitError::Carrier)
+    })
+    .map_err(|error| match error {
+        VisitError::Type(ValueTypeError::TooDeep) => {
+            ValueError::Invariant(ValueViolation::Depth).into()
+        }
+        VisitError::Type(_) => ValueError::Invariant(ValueViolation::Carrier).into(),
+        VisitError::Carrier(error) => error,
+    })
 }
 
 #[cfg(test)]

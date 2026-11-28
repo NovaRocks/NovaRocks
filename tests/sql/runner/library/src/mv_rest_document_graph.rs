@@ -25,6 +25,7 @@ pub(crate) struct GraphExpectation<'a> {
     pub(crate) failed_table_commits: usize,
     pub(crate) slot_changes: usize,
     full_refreshes: usize,
+    external_replaces: usize,
     logical_rows: Option<u64>,
     total_records: Option<u64>,
     delete_files_min: Option<u64>,
@@ -112,6 +113,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut failed_table_commits = None;
     let mut slot_changes = None;
     let mut full_refreshes = None;
+    let mut external_replaces = None;
     let mut logical_rows = None;
     let mut total_records = None;
     let mut delete_files_min = None;
@@ -175,6 +177,13 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
                     value["full-refreshes=".len()..]
                         .parse::<usize>()
                         .context("invalid full-refreshes count")?,
+                );
+            }
+            value if value.starts_with("external-replaces=") && external_replaces.is_none() => {
+                external_replaces = Some(
+                    value["external-replaces=".len()..]
+                        .parse::<usize>()
+                        .context("invalid external-replaces count")?,
                 );
             }
             value if value.starts_with("logical-rows=") && logical_rows.is_none() => {
@@ -253,6 +262,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         failed_table_commits: failed_table_commits.unwrap_or_default(),
         slot_changes,
         full_refreshes,
+        external_replaces: external_replaces.unwrap_or_default(),
         logical_rows,
         total_records,
         delete_files_min,
@@ -537,6 +547,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     let mut publications = BTreeMap::<[u8; 16], String>::new();
     let mut retirements = BTreeMap::<[u8; 16], String>::new();
     let mut slots = 0;
+    let mut external_replaces = 0;
     let mut slot_ids = BTreeSet::new();
     let mut interpretations = BTreeSet::new();
     let markers = wire::markers(&properties)?;
@@ -705,6 +716,24 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 "zero-file publication is not append"
             );
             last_publication = Some(*snapshot);
+        } else if expectation.external_replaces > 0
+            && operation == "replace"
+            && files_changed
+            && records.is_empty()
+        {
+            let parent = parent.context("external replace lacks its retained parent")?;
+            ensure!(
+                Some(id) != current
+                    && parent["summary"][wire::PUBLICATION_KEY].is_string()
+                    && parent["manifest-list"] != snapshot["manifest-list"]
+                    && summary_number(&parent["summary"], "total-records")?
+                        == summary_number(&snapshot["summary"], "total-records")?
+                    && [configuration, management]
+                        .iter()
+                        .all(|slot| slot.writer != Some(id)),
+                "external replace must rewrite a published parent without changing records or slots"
+            );
+            external_replaces += 1;
         } else {
             // These isolated fixtures contain only publications and explicit
             // slot changes. Maintenance carries are tested by their own owner.
@@ -755,12 +784,18 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         expectation.publications
     );
     ensure!(
+        external_replaces == expectation.external_replaces,
+        "external REPLACE snapshots {external_replaces}, expected {}",
+        expectation.external_replaces
+    );
+    ensure!(
         snapshots.len()
             == expectation.publications
                 + expectation.slot_changes
                 + expectation.full_refreshes
+                + expectation.external_replaces
                 + retirements.len(),
-        "retained snapshots differ from publications, slot changes, FULL deletes and retirements"
+        "retained snapshots differ from publications, slot changes, FULL deletes, external REPLACE and retirements"
     );
     if let Some(changes) = expectation.binding_changes {
         let actual = ordered_bindings

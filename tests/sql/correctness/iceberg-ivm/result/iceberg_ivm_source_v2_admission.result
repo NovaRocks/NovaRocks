@@ -1,0 +1,12 @@
+-- query 2
+-- types	varchar
+label
+keep
+old
+
+-- query 4
+-- types	varchar
+label
+keep
+new
+old

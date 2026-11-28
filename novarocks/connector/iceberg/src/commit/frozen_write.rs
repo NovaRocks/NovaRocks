@@ -314,8 +314,7 @@ fn preflight_schema_inputs(
     work: &mut SchemaWork<'_>,
 ) -> Result<(), FrozenWriteSchemaError> {
     use novarocks_connector_contract::{
-        MAX_CONNECTOR_WRITE_INPUT_FIELDS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
-        MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, validate_write_field_schema,
+        MAX_CONNECTOR_WRITER_HANDLE_BYTES, charge_write_schema, validate_write_field_schema,
     };
     fn add(bytes: &mut usize, amount: usize) -> Result<(), FrozenWriteSchemaError> {
         *bytes = bytes
@@ -337,11 +336,6 @@ fn preflight_schema_inputs(
         add(bytes, value.len())?;
         work.step()
     }
-    if schema.fields().len() > MAX_CONNECTOR_WRITE_INPUT_FIELDS {
-        return Err(FrozenWriteSchemaError::Source(
-            "Iceberg writer input exceeds the writer field count limit".to_string(),
-        ));
-    }
     let mut schema_bytes = 0;
     for field in schema.fields() {
         work.opaque_source(|| {
@@ -350,15 +344,9 @@ fn preflight_schema_inputs(
         work.step()?;
     }
     for (key, value) in schema.metadata() {
-        schema_bytes = schema_bytes
-            .checked_add(key.len())
-            .and_then(|n| n.checked_add(value.len()))
-            .filter(|n| *n <= MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES)
-            .ok_or_else(|| {
-                FrozenWriteSchemaError::Source(
-                    "Iceberg writer schema metadata exceeds the writer byte envelope".to_string(),
-                )
-            })?;
+        charge_write_schema(&mut schema_bytes, key.len())
+            .and_then(|()| charge_write_schema(&mut schema_bytes, value.len()))
+            .map_err(|error| FrozenWriteSchemaError::Source(error.to_string()))?;
         work.step()?;
     }
     let mut bytes = 0;

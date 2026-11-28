@@ -34,9 +34,10 @@ pub fn wait_for_backend_native_endpoint_ready(
     class: crate::native_transport_admission::TransportClass,
     timeout: Duration,
 ) -> Result<(), String> {
-    let connector = crate::native_client::admitted_connector(runtime, &endpoint, class, None)?;
-    let channel_endpoint = crate::native_client::native_endpoint(runtime, &endpoint)?;
-    runtime.block_on(async move {
+    let owner = runtime.transport_memory_observation().cloned();
+    let call = async move {
+        let connector = crate::native_client::admitted_connector(runtime, &endpoint, class, None)?;
+        let channel_endpoint = crate::native_client::native_endpoint(runtime, &endpoint)?;
         let channel =
             tokio::time::timeout(timeout, channel_endpoint.connect_with_connector(connector))
                 .await
@@ -56,7 +57,8 @@ pub fn wait_for_backend_native_endpoint_ready(
         // follow that connection's IO until it is destroyed.
         drop(channel);
         Ok(())
-    })
+    };
+    runtime.block_on(crate::native_server::observe_native_work(owner, || call))
 }
 
 // This startup probe uses only the typed Native endpoint and IO connector;

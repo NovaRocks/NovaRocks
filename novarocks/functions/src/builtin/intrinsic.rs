@@ -445,10 +445,6 @@ const BUILTIN_DISPOSITIONS: &[(&str, BuiltinDisposition)] = &[
     ("isnotnull", BuiltinDisposition::Unavailable),
     ("isnull", BuiltinDisposition::Unavailable),
     (
-        "join_row_key",
-        BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
-    ),
-    (
         "json_exists",
         BuiltinDisposition::InstalledScalar(FunctionIntrinsicRowError::NoRowError),
     ),

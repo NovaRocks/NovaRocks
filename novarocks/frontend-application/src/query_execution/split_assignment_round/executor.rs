@@ -116,6 +116,10 @@ impl SplitAssignmentExecutor {
             plan.retry_policy,
             plan.initial_dynamic_filter_wait_cap,
         );
+        let assignment = match plan.receipts.take() {
+            Some(receipts) => assignment.with_enumeration_receipts(receipts),
+            None => assignment,
+        };
         let stop = assignment.stop_handle();
         let failure = Arc::new(Mutex::new(None));
         let outcome = Arc::new(Mutex::new(None));

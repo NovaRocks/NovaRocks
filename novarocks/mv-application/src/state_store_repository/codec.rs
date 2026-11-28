@@ -126,6 +126,10 @@ struct StoredMvProjectionAvro {
     current_delete_files: Option<i64>,
     #[serde(default)]
     mapping: Option<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    never_published: Option<bool>,
+    #[serde(default)]
+    data_eligibility: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -341,7 +345,7 @@ where
 {
     decode_record_checked(key, value, |kind, schema_id, payload| {
         if kind == MvRecordKind::Projection {
-            if !matches!(schema_id, 4 | 5) {
+            if !matches!(schema_id, 4..=7) {
                 return Err("MV projection preflight requires a registered schema".into());
             }
             preflight::projection(payload, schema_id)?;
@@ -499,6 +503,10 @@ pub fn encode_keyed_projection(
         mapping: Some(serde_bytes::ByteBuf::from(
             facts.versions.mapping.content().to_vec(),
         )),
+        never_published: facts.never_published,
+        data_eligibility: facts
+            .data_eligibility()
+            .map(|state| state.as_str().to_owned()),
     };
     encode_record(MvRecordKind::Projection, operation_id, &dto)
 }
@@ -535,14 +543,14 @@ pub(super) fn decode_projection_row(
         keyed_documents::*,
     };
     use novarocks_spi::connector::{ConnectorSnapshotRecord, SnapshotFileTotals};
-    let mut retired = false;
+    let mut projection_schema = 0;
     let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
         decode_record_checked(key, value, |kind, schema, payload| {
-            if kind != MvRecordKind::Projection || !matches!(schema, 4 | 5) {
+            if kind != MvRecordKind::Projection || !matches!(schema, 4..=7) {
                 return Err("unsupported MV projection schema".into());
             }
             preflight::projection(payload, schema)?;
-            retired = schema == 4;
+            projection_schema = schema;
             Ok(())
         })?;
     let d = decoded.value;
@@ -556,7 +564,7 @@ pub(super) fn decode_projection_row(
     {
         return Err("MV cache metadata version differs from its source revision".into());
     }
-    if retired {
+    if projection_schema == 4 {
         return Ok(DecodedMvRecord {
             operation_id: decoded.operation_id,
             value: ProjectionRow::Retired {
@@ -635,9 +643,21 @@ pub(super) fn decode_projection_row(
             data_files: d.current_data_files.map(to_unsigned).transpose()?,
             delete_files: d.current_delete_files.map(to_unsigned).transpose()?,
         },
+        never_published: d.never_published,
+        data_eligibility: d
+            .data_eligibility
+            .as_deref()
+            .map(crate::persistence::keyed_documents::MvCurrentDataEligibility::parse)
+            .transpose()?,
     };
-    if facts.publication.is_none() && !facts.never_published() {
-        return Err("keyed MV cache lacks publication without an empty-file witness".into());
+    if projection_schema >= 6 && facts.never_published.is_none() {
+        return Err("keyed MV cache lacks its provider publication-history witness".into());
+    }
+    if facts.never_published()
+        && (facts.publication.is_some()
+            || (facts.metadata_version.snapshot_id().is_some() && !facts.file_totals.is_empty()))
+    {
+        return Err("keyed MV cache first-publication witness conflicts with carrier facts".into());
     }
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,

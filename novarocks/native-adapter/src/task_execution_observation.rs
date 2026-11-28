@@ -378,7 +378,8 @@ impl PreparedTaskValueObservation {
     ) {
         use novarocks_expression_contract::ExprKind;
         use novarocks_failpoint::observation_marker::{
-            TASK_CONSTANT_IPC_RECORD, TASK_VALUES_BACKING, TASK_VALUES_SOURCE,
+            TASK_CONSTANT_IPC_RECORD, TASK_VALUES_BACKING, TASK_VALUES_CAST_SOURCE,
+            TASK_VALUES_SOURCE,
         };
         use novarocks_local_program::ProgramNodeKind;
         use novarocks_physical_plan::{ConstantReference, NodeId, NodeKind};
@@ -412,6 +413,9 @@ impl PreparedTaskValueObservation {
             let NodeKind::Values { rows } = &physical.kind else {
                 continue;
             };
+            let Some(unit) = fragment.unit(source) else {
+                continue;
+            };
             let backing = match values.backing() {
                 novarocks_local_program::StaticValuesBacking::Batch(_) => "batch",
                 novarocks_local_program::StaticValuesBacking::Cells { .. } => "cells",
@@ -433,13 +437,24 @@ impl PreparedTaskValueObservation {
                 let references = rows.iter().map(|row| {
                     let root = fragment.root_expression(source, *row.get(column)?)?;
                     match &root.kind {
-                        ExprKind::Constant(reference) => Some(*reference),
+                        ExprKind::Constant(reference) => Some((*reference, TASK_VALUES_SOURCE)),
+                        // Record the consumed operand without identifying the
+                        // cast result itself as an original pool value.
+                        ExprKind::Cast { expr, .. } => {
+                            let ExprKind::Constant(reference) = &unit.definition(*expr)?.kind
+                            else {
+                                return None;
+                            };
+                            Some((*reference, TASK_VALUES_CAST_SOURCE))
+                        }
                         _ => None,
                     }
                 });
-                let mut run: Option<(ConstantReference, u32)> = None;
+                let mut run: Option<((ConstantReference, &str), u32)> = None;
                 for next in references.chain(std::iter::once(None)) {
-                    if let (Some((first, length)), Some(next)) = (&mut run, next)
+                    if let (Some(((first, marker), length)), Some((next, next_marker))) =
+                        (&mut run, next)
+                        && *marker == next_marker
                         && first.pool == next.pool
                         && first.ordinal.checked_add(*length) == Some(next.ordinal)
                         && let Some(increased) = length.checked_add(1)
@@ -447,9 +462,9 @@ impl PreparedTaskValueObservation {
                         *length = increased;
                         continue;
                     }
-                    if let Some((first, length)) = run.take() {
+                    if let Some(((first, marker), length)) = run.take() {
                         self.emit(
-                            TASK_VALUES_SOURCE,
+                            marker,
                             fragment_id,
                             format_args!(
                                 "node_id={} column={column} pool_id={} first_ordinal={} length={length}",

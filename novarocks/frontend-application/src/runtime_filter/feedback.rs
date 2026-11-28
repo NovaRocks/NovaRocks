@@ -32,6 +32,7 @@ struct ChannelState {
     publishers: BTreeMap<u32, FrontendRuntimeFilterFeedbackPublisherSlot>,
     scan_bindings: BTreeSet<(ScanNodeKey, u32)>,
     wait_eligible: bool,
+    content_demand: bool,
     /// Which authorized publishers reported that they will never produce a
     /// usable domain for this channel.
     ///
@@ -141,6 +142,13 @@ impl RuntimeFilterFeedbackState {
                 // risk.
                 continue;
             };
+            if channel.content_demand
+                && matches!(&domain,
+                RuntimeFilterFeedbackDomain::Exact(values)
+                    if values.values().is_empty() && !values.contains_null())
+            {
+                return ConnectorReadDynamicFilterSnapshot::empty_content_demand();
+            }
             let Some(domain) = connector_domain(&domain) else {
                 continue;
             };
@@ -480,6 +488,7 @@ fn channel_states(
                     channel.wait_eligibility(),
                     FrontendRuntimeFilterFeedbackWaitEligibility::Eligible
                 ),
+                content_demand: channel.content_demand,
                 unavailable: BTreeSet::new(),
                 winner: None,
             },
@@ -692,6 +701,7 @@ mod tests {
                 binding_id: 7,
                 data_type: DataType::Int64,
             }],
+            content_demand: false,
             wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
         }])
         .expect("valid declaration")
@@ -809,6 +819,7 @@ mod tests {
                     binding_id: 7,
                     data_type: DataType::Int64,
                 }],
+                content_demand: false,
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             }])
             .expect("valid declaration");
@@ -1015,6 +1026,7 @@ mod tests {
                     binding_id: 7,
                     data_type: DataType::Int64,
                 }],
+                content_demand: false,
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             },
             FrontendRuntimeFilterFeedbackChannel {
@@ -1032,6 +1044,7 @@ mod tests {
                     binding_id: 8,
                     data_type: DataType::Int64,
                 }],
+                content_demand: false,
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             },
         ])

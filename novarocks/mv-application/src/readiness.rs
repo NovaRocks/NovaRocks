@@ -494,9 +494,11 @@ impl MvKeyedReadinessExecution {
                 observed,
             )
             .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
-        let unchanged = expected
-            .as_ref()
-            .is_some_and(|old| old.projection.facts.source_revision() == facts.source_revision());
+        let unchanged = expected.as_ref().is_some_and(|old| {
+            old.projection.facts.source_revision() == facts.source_revision()
+                && old.projection.facts.never_published == facts.never_published
+                && old.projection.facts.data_eligibility() == facts.data_eligibility()
+        });
         if expected.is_none()
             && let Some(existing) = self
                 .repository
@@ -793,6 +795,34 @@ impl MvKeyedReadinessExecution {
         Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
         MvRepositoryError,
     > {
+        self.wait_for_current_observation(target).await;
+        self.load_ready(target).await
+    }
+
+    /// A retained projection can anchor comparison with the open management
+    /// entrance even after projection installation was interrupted.
+    pub async fn load_renewal_base(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<(
+            crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+            bool,
+        )>,
+        MvRepositoryError,
+    > {
+        self.wait_for_current_observation(target).await;
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let Some(loaded) = self.repository.find_keyed_by_target(target).await? else {
+            return Ok(None);
+        };
+        let ready = matches!(self.runtime.readiness(target), TargetReadiness::Ready)
+            && cell.installed.as_ref() == Some(&loaded.version);
+        Ok(Some((loaded, ready)))
+    }
+
+    async fn wait_for_current_observation(&self, target: &MvTarget) {
         let order = self.runtime.projection_order(target.clone());
         let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
         loop {
@@ -809,7 +839,6 @@ impl MvKeyedReadinessExecution {
                 break;
             }
         }
-        self.load_ready(target).await
     }
     pub async fn projection_inventory(
         &self,
@@ -1095,9 +1124,11 @@ impl MvKeyedReadinessExecution {
                 "keyed read-only observation target changed",
             ));
         }
-        let unchanged = expected
-            .as_ref()
-            .is_some_and(|v| v.projection.facts.source_revision() == facts.source_revision());
+        let unchanged = expected.as_ref().is_some_and(|old| {
+            old.projection.facts.source_revision() == facts.source_revision()
+                && old.projection.facts.never_published == facts.never_published
+                && old.projection.facts.data_eligibility() == facts.data_eligibility()
+        });
         if expected.is_none()
             && let Some(existing) = self
                 .repository

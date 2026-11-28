@@ -20,8 +20,9 @@ use arrow::datatypes::{DataType, Field};
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{
     CharacterKind, CharacterType, CompileCheckpoints, CompileControlError, CompilePhase,
-    FunctionValueType, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, PureCompileControl, ValueField,
-    ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    ExecutionValueTypeError, FunctionValueType, MAX_VALUE_TYPE_DEPTH, PureCompileControl,
+    ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeError, ValueTypeRef,
+    ValueTypeStorageLifetime,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +77,7 @@ pub fn resolve_trino_type(
     let mut work =
         CompileCheckpoints::try_new(control, CompilePhase::Validate).map_err(control_error)?;
     let result = (|| {
-        let (value, carrier) = resolve_parts(syntax, nullable, 1, &mut 0, &mut work)?;
+        let (value, carrier) = resolve_parts(syntax, nullable, 1, &mut work)?;
         let layout = ValueLayout::try_from_normalized_arrow_observed(
             carrier,
             ValueTypeStorageLifetime::pure(),
@@ -95,7 +96,13 @@ pub fn resolve_trino_type(
 
 impl From<novarocks_type_contract::ExecutionValueTypeError> for TypeDeclarationError {
     fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
-        invalid(novarocks_parser::SYNTHETIC, error.to_string())
+        let span = novarocks_parser::SYNTHETIC;
+        match error {
+            ExecutionValueTypeError::Depth => {
+                unsupported(span, ValueTypeError::TooDeep.to_string())
+            }
+            error => invalid(span, error.to_string()),
+        }
     }
 }
 
@@ -103,16 +110,14 @@ fn resolve_parts(
     syntax: &ast::TypeName,
     nullable: bool,
     depth: usize,
-    nodes: &mut usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ValueTypeRef, DataType), TypeDeclarationError> {
     work.step()
         .map_err(|error| TypeDeclarationError::control(syntax.span, error))?;
-    *nodes += 1;
-    if depth > MAX_VALUE_TYPE_DEPTH || *nodes > MAX_VALUE_TYPE_NODES {
-        return Err(invalid(
+    if depth > MAX_VALUE_TYPE_DEPTH {
+        return Err(unsupported(
             syntax.span,
-            "SQL type exceeds the recursive type profile",
+            ValueTypeError::TooDeep.to_string(),
         ));
     }
     let storage = ValueTypeStorageLifetime::pure();
@@ -123,8 +128,7 @@ fn resolve_parts(
                 let args = generic.arguments.as_slice();
                 match (name.as_str(), args) {
                     ("array", [ast::DataTypeParameter::Type(item)]) => {
-                        let (item, layout) =
-                            resolve_parts(&item.data_type, true, depth + 1, nodes, work)?;
+                        let (item, layout) = resolve_parts(&item.data_type, true, depth + 1, work)?;
                         (
                             ValueKind::List(item),
                             DataType::List(Arc::new(Field::new("item", layout, true))),
@@ -138,9 +142,9 @@ fn resolve_parts(
                         ],
                     ) => {
                         let (key, key_layout) =
-                            resolve_parts(&key.data_type, false, depth + 1, nodes, work)?;
+                            resolve_parts(&key.data_type, false, depth + 1, work)?;
                         let (value, value_layout) =
-                            resolve_parts(&value.data_type, true, depth + 1, nodes, work)?;
+                            resolve_parts(&value.data_type, true, depth + 1, work)?;
                         let entries = DataType::Struct(
                             [
                                 Arc::new(Field::new("key", key_layout, false)),
@@ -165,11 +169,17 @@ fn resolve_parts(
             }
         }
         ast::TypeKind::Row(row) => {
-            let mut values = Vec::with_capacity(row.fields.len());
-            let mut fields = Vec::with_capacity(row.fields.len());
+            let control_error = |error| TypeDeclarationError::control(syntax.span, error);
+            work.flush().map_err(control_error)?;
+            let mut values = Vec::new();
+            let mut fields = Vec::new();
+            values
+                .try_reserve_exact(row.fields.len())
+                .and_then(|()| fields.try_reserve_exact(row.fields.len()))
+                .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
+            work.step().map_err(control_error)?;
             for field in row.fields.iter() {
-                let (value, layout) =
-                    resolve_parts(&field.data_type, true, depth + 1, nodes, work)?;
+                let (value, layout) = resolve_parts(&field.data_type, true, depth + 1, work)?;
                 let name = match &field.name {
                     Some(name) => {
                         for _ in name.value.bytes() {

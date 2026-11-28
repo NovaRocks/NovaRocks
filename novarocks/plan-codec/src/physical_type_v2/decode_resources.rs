@@ -220,9 +220,9 @@ impl TypeDecodeModel {
         self.work = add(self.work, add(64, mul(bytes, 8)?)?)?;
         Ok(())
     }
-    /// Summary and Frame are the caller's real topology structs, never mirrors.
+    /// The summary is the caller's real topology value.
     /// All known maps/scratch/Field Arcs are admitted before any source walk.
-    pub(super) fn new<Summary, Frame>(table: &wire::TypeTable, source: usize) -> Result<Self, E> {
+    pub(super) fn new<Summary>(table: &wire::TypeTable, source: usize) -> Result<Self, E> {
         if !LOCKED_TOOLCHAIN || !LOCKED_FAMILY {
             return Err(E::ResourceSource("type decoder library source model drift"));
         }
@@ -265,7 +265,6 @@ impl TypeDecodeModel {
         // Active entries retain false; no removal/rebuild allocation exists.
         model.tree::<Node, bool>(vertices, 2)?;
         model.request(array::<Node>(vertices)?, 1)?;
-        model.request(array::<Frame>(vertices)?, 1)?;
         model.request(Self::field_arc()?, table.fields.len())?;
         // Same original package Field namespace's weak origin records. These
         // are pre-admitted before their Vec and final Arc slice publication.
@@ -462,14 +461,7 @@ impl TypeDecodeModel {
         Ok(())
     }
     pub(super) fn validation(&mut self, nodes: usize) -> Result<(), E> {
-        // Even an erroneous zero summary cannot erase the initial singleton.
-        // Actual Carrier summaries supplied by the original author are >=1.
-        let requests = nodes.max(1);
-        let payload = array::<novarocks_type_contract::TypeTraversalFrame<'_>>(mul(requests, 4)?)?;
-        self.request(payload, 1)?;
-        let remaining = requests - 1;
-        self.requests = add(self.requests, remaining)?;
-        self.work = add(self.work, mul(remaining, 128)?)?;
+        self.work = add(self.work, mul(nodes, 128)?)?;
         self.metadata_validation(nodes)?;
         Ok(())
     }
@@ -591,7 +583,7 @@ mod tests {
         }
     }
     fn model() -> TypeDecodeModel {
-        TypeDecodeModel::new::<u64, [usize; 4]>(&wire::TypeTable::default(), 0).unwrap()
+        TypeDecodeModel::new::<u64>(&wire::TypeTable::default(), 0).unwrap()
     }
     fn facts(model: &TypeDecodeModel) -> PackageTypeProjectionFacts {
         model.facts(unlimited()).unwrap()
@@ -628,8 +620,7 @@ mod tests {
     fn wide_empty_fresh_metadata_uses_actual_buckets_not_whole_source_per_field() {
         let field = field();
         let mut actual =
-            TypeDecodeModel::new::<u64, [usize; 4]>(&wire::TypeTable::default(), 2 * 1024 * 1024)
-                .unwrap();
+            TypeDecodeModel::new::<u64>(&wire::TypeTable::default(), 2 * 1024 * 1024).unwrap();
         let before = facts(&actual);
         for _ in 0..400 {
             actual.field(&field).unwrap();
@@ -673,8 +664,8 @@ mod tests {
             field_ids: vec![source.id],
         });
         let metadata = source_metadata();
-        let mut original = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
-        let mut scoped = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
+        let mut original = TypeDecodeModel::new::<u64>(&table, 4096).unwrap();
+        let mut scoped = TypeDecodeModel::new::<u64>(&table, 4096).unwrap();
         scoped.enable_entity_scopes().unwrap();
         for model in [&mut original, &mut scoped] {
             model.carrier(&kind).unwrap();
@@ -718,7 +709,7 @@ mod tests {
                 logical_type_id: None,
             }],
         };
-        let original = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
+        let original = TypeDecodeModel::new::<u64>(&table, 4096).unwrap();
         let actual = facts(&original);
         assert_eq!(actual.definition_count, 3);
         // C/F/V/Vguard use 1 entry each; summary/active use 2 each. Active
@@ -727,7 +718,7 @@ mod tests {
         // and the final Arc slice of the real metadata origin loans.
         type Loan =
             novarocks_type_contract::owned_resources::metadata_materialization::MetadataFieldLoan;
-        assert_eq!(actual.allocation_requests_upper_bound, 8 + 2 + 1 + 3 + 128);
+        assert_eq!(actual.allocation_requests_upper_bound, 8 + 1 + 1 + 3 + 128);
         let trees = btree::insertion_only::<u32, super::super::Materialized<DataType>>(1)
             .unwrap()
             .request_bytes_upper_bound
@@ -748,7 +739,6 @@ mod tests {
                 .request_bytes_upper_bound;
         let expected = trees
             + 2 * size_of::<Node>()
-            + 2 * size_of::<[usize; 4]>()
             + arc_golden(Layout::new::<Field>())
             + 2 * size_of::<Loan>()
             + arc_golden(Layout::new::<Loan>())
@@ -859,48 +849,22 @@ mod tests {
     }
 
     #[test]
-    fn original_strict_walker_singleton_and_wide_growth_have_hand_counted_requests() {
+    fn topology_validation_counts_work_without_allocating_traversal_backing() {
         let mut actual = model();
         let initial = facts(&actual);
-        actual.validation(1).unwrap();
-        let singleton = facts(&actual);
-        assert_eq!(
-            singleton.allocation_requests_upper_bound - initial.allocation_requests_upper_bound,
-            1
-        );
-        assert_eq!(
-            singleton.allocation_request_bytes_upper_bound
-                - initial.allocation_request_bytes_upper_bound,
-            4 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
-        );
-        assert_eq!(
-            singleton.coexisting_source_and_request_bytes_upper_bound
-                - initial.coexisting_source_and_request_bytes_upper_bound,
-            4 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
-        );
-        // Actual vec![root] initially requests one tuple. For 320 pending
-        // children its later capacities 4..512 sum to 1020 tuples; the closed
-        // upper admits 4*321 tuples and 321 requests before that unchanged walk.
-        actual.validation(321).unwrap();
-        let wide = facts(&actual);
-        assert_eq!(
-            wide.allocation_requests_upper_bound - singleton.allocation_requests_upper_bound,
-            321
-        );
-        assert_eq!(
-            wide.allocation_request_bytes_upper_bound
-                - singleton.allocation_request_bytes_upper_bound,
-            1284 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
-        );
-        // 1284 tuples cover the actual 1+4+8+16+32+64+128+256+512 = 1021.
-        assert_eq!(wide.expanded_node_count, 0);
-        assert_eq!(wide.string_bytes, 0);
-        let mut under = unlimited();
-        under.max_allocation_request_bytes = wide.allocation_request_bytes_upper_bound - 1;
-        assert_eq!(
-            actual.facts(under),
-            Err(CompileControlError::ResourceExhausted)
-        );
+        for occurrences in [1, 321, 4161] {
+            actual.validation(occurrences).unwrap();
+            let checked = facts(&actual);
+            assert_eq!(
+                checked.allocation_requests_upper_bound,
+                initial.allocation_requests_upper_bound
+            );
+            assert_eq!(
+                checked.allocation_request_bytes_upper_bound,
+                initial.allocation_request_bytes_upper_bound
+            );
+            assert!(checked.cumulative_work_upper_bound > initial.cumulative_work_upper_bound);
+        }
         assert!(matches!(
             actual.validation(usize::MAX),
             Err(E::Control(CompileControlError::ResourceExhausted))
@@ -909,8 +873,7 @@ mod tests {
 
     #[test]
     fn graph_replacement_uses_one_union_invoice_and_writer_visit_is_a_distinct_contribution() {
-        let mut actual =
-            TypeDecodeModel::new::<u64, [usize; 4]>(&wire::TypeTable::default(), 1000).unwrap();
+        let mut actual = TypeDecodeModel::new::<u64>(&wire::TypeTable::default(), 1000).unwrap();
         let base = facts(&actual);
         let first = PackageTypeGraphFacts {
             definition_count: 0,
@@ -965,7 +928,7 @@ mod tests {
 
     #[test]
     fn every_projection_axis_accepts_exact_and_refuses_one_under_without_callbacks() {
-        let mut actual = TypeDecodeModel::new::<u64, [usize; 4]>(
+        let mut actual = TypeDecodeModel::new::<u64>(
             &wire::TypeTable {
                 fields: vec![field()],
                 ..Default::default()
@@ -1084,7 +1047,7 @@ mod materialized_metadata_tests {
             dictionary_id: None,
             dictionary_is_ordered: None,
         };
-        let mut model = TypeDecodeModel::new::<u64, [usize; 4]>(
+        let mut model = TypeDecodeModel::new::<u64>(
             &wire::TypeTable {
                 fields: vec![field.clone()],
                 ..Default::default()

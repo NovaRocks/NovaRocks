@@ -4624,9 +4624,7 @@ mod terminal_signal_tests {
         ) -> Arc<dyn InputConstructionFactory> {
             try_runtime_input_construction_factory(
                 InputConstructionProfile {
-                    max_requests: 2048,
                     max_request_bytes: i64::MAX as usize,
-                    max_opaque_requests: 2048,
                     max_opaque_bytes: i64::MAX as usize,
                     max_work: usize::MAX,
                     max_depth: 64,

@@ -364,13 +364,25 @@ pub(crate) fn split_frozen_reads(
     let mut capabilities = BTreeMap::new();
     for (occurrence, read) in reads.into_occurrences() {
         let FrozenProviderRead {
+            #[cfg(novarocks_dev_controls)]
+            content_target,
             access,
             generation,
             catalog,
             encoding,
         } = read.access;
         encodings.insert(occurrence, encoding);
-        capabilities.insert(occurrence, (read.binding, access, generation, catalog));
+        capabilities.insert(
+            occurrence,
+            FrozenReadCapability {
+                binding: read.binding,
+                access,
+                generation,
+                catalog,
+                #[cfg(novarocks_dev_controls)]
+                content_target,
+            },
+        );
     }
     (encodings, capabilities)
 }

@@ -500,6 +500,7 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
         execution_runtime.function_set().clone(),
         runtime_state.error_state(),
         ordered.as_ref(),
+        runtime_state.mem_tracker(),
         execution_runtime.config().local_exchange_buffer_mem_limit_per_driver,
         execution_runtime.config().local_exchange_max_buffered_rows,
         output_batch_rows,

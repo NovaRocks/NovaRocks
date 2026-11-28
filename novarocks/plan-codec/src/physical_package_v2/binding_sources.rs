@@ -79,7 +79,7 @@ pub(crate) struct AggregateRow<'source> {
     pub id: u32,
     pub source: &'source p::AggregateBinding,
     pub function_id: u32,
-    pub intermediate_id: u32,
+    pub intermediate_id: Option<u32>,
 }
 
 /// Only original package objects are borrowed; owned buffers contain IDs,
@@ -711,12 +711,10 @@ impl<'source> BindingSources<'source> {
         });
         work.step()?;
         if let Loan::Aggregate(binding) = loan {
-            let intermediate_id = root(
-                Channel::Intermediate,
-                &binding.intermediate_type,
-                budget,
-                work,
-            )?;
+            let intermediate_id = binding
+                .intermediate_type()
+                .map(|value| root(Channel::Intermediate, value, budget, work))
+                .transpose()?;
             self.aggregates.push(AggregateRow {
                 id: id(self.aggregates.len())?,
                 source: binding,

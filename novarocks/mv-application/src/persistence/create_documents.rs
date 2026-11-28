@@ -56,7 +56,7 @@ pub struct MvCreateDocumentFacts<'a> {
     pub source_observations: &'a [MvCreateRelationObservation],
     pub prepared_target: &'a ConnectorPreparedCreateDocumentTarget,
     pub target_identity: &'a TargetIdentity,
-    pub apply_key_column_name: &'a str,
+    pub apply_key_column_name: Option<&'a str>,
     pub branch_column_name: Option<&'a str>,
     pub configuration: ConfigurationDocument,
 }
@@ -73,7 +73,7 @@ pub struct MvInterpretationFacts<'a> {
     pub runtime_layout: &'a MvAggregateRuntimeLayout,
     pub source_observations: &'a [MvCreateRelationObservation],
     pub target_identity: &'a TargetIdentity,
-    pub apply_key_column_name: &'a str,
+    pub apply_key_column_name: Option<&'a str>,
     pub branch_column_name: Option<&'a str>,
 }
 
@@ -168,18 +168,32 @@ fn build_interpretation(
         targets,
     })?;
     let output_bindings = output_bindings(input.sql_facts, &aggregate.output_identities, targets)?;
-    let (apply_key, apply_fields) = apply_key_bindings(
-        input.target_identity,
-        input.apply_key_column_name,
-        input.sql_facts,
-        &aggregate.output_identities,
-        targets,
-    )?;
-    let branches = branch_bindings(
-        input.sql_facts,
-        &aggregate.output_identities,
-        &aggregate.branch_identities,
-    )?;
+    let (apply_key, apply_fields, definition_branch_identities, branches) =
+        if let Some(column_name) = input.apply_key_column_name {
+            let (apply_key, apply_fields) = apply_key_bindings(
+                input.target_identity,
+                column_name,
+                input.sql_facts,
+                &aggregate.output_identities,
+                targets,
+            )?;
+            let branches = branch_bindings(
+                input.sql_facts,
+                &aggregate.output_identities,
+                &aggregate.branch_identities,
+            )?;
+            let definitions = aggregate.branch_identities.values().cloned().collect();
+            (Some(apply_key), apply_fields, definitions, branches)
+        } else {
+            if !aggregate.aggregate_layout.aggregates.is_empty()
+                || input.branch_column_name.is_some()
+            {
+                return Err(
+                    "content interpretation cannot declare aggregate or branch layout".into(),
+                );
+            }
+            (None, Vec::new(), Vec::new(), Vec::new())
+        };
     let mut target_fields = aggregate.target_fields;
     target_fields.extend(
         output_bindings
@@ -206,17 +220,24 @@ fn build_interpretation(
         }));
     }
     target_facts.fields = target_fields;
-    InterpretationDocument::try_from(RuntimeInterpretationFacts {
+    let interpretation = InterpretationDocument::try_from(RuntimeInterpretationFacts {
         definition_revision: super::keyed_documents::definition_revision(input.definition)
             .map_err(|error| format!("build MV definition semantic revision: {error}"))?,
         output_bindings,
         aggregate_layout: aggregate.aggregate_layout,
         apply_key,
-        definition_branch_identities: aggregate.branch_identities.values().cloned().collect(),
+        definition_branch_identities,
         branches,
         target: target_facts,
     })
-    .map_err(|error| format!("build MV interpretation document: {error}"))
+    .map_err(|error| format!("build MV interpretation document: {error}"))?;
+    // The old planner still authors keyed non-aggregate layouts until the
+    // content layout becomes its only non-aggregate output.
+    if input.apply_key_column_name.is_none() || interpretation.is_aggregate() {
+        super::validation::validate_new_interpretation(&interpretation)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(interpretation)
 }
 
 fn target_observations(

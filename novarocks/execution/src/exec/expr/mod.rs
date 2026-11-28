@@ -77,7 +77,7 @@ mod numeric_unary_state_compile_control_tests;
 mod numeric_unary_ordered_sql_source_tests;
 
 #[cfg(test)]
-mod numeric_unary_typed_ordered_merge_tests;
+mod numeric_unary_typed_ordered_tests;
 
 #[cfg(test)]
 mod sql_published_source_observation_tests;
@@ -168,12 +168,6 @@ mod e08s1_owned_lifecycle_tests;
 
 #[cfg(test)]
 mod late_call_sql_source_tests;
-
-#[cfg(test)]
-mod mv_catalogue_sql_test_source;
-
-#[cfg(test)]
-mod e08s1_mv_catalogue_retention_tests;
 
 #[cfg(test)]
 mod environment_sql_source_tests;

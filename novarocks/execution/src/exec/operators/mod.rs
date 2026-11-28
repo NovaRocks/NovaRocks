@@ -51,6 +51,14 @@ pub(crate) mod compiled_window_geometry;
 pub(crate) mod compiled_writer;
 mod compiled_writer_failure;
 pub(crate) mod compiled_writer_statistics;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The phased ContentApply builder consumes this kernel at the next integration stage."
+    )
+)]
+pub(crate) mod content_apply;
 mod data_stream_sink;
 mod exchange_source;
 #[cfg(test)]

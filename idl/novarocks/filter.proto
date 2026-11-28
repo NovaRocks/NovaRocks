@@ -192,6 +192,8 @@ message RuntimeFilterFrontendFeedbackPublication {
   RuntimeFilterOutboundMaterializationOwner publisher_owner = 1;
   bytes contract_digest = 2;
   uint64 max_encoded_domain_bytes = 3;
+  // Publish a successful empty target demand after all original producers close.
+  bool publish_empty_content_demand = 4;
 }
 
 // The TypeDesc supplies the expression/value type required by the shared plan

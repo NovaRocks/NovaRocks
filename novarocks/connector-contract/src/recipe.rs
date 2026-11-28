@@ -32,7 +32,6 @@ use crate::{
     ConnectorReadBinding, ConnectorReadRelationPayload,
 };
 
-pub const MAX_CONNECTOR_RECIPE_COLUMNS: usize = 4_096;
 pub const MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONNECTOR_RECIPE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CONNECTOR_RECIPE_ADDRESSES: usize = 256;
@@ -46,7 +45,6 @@ pub enum ConnectorReadRelationRecipeError {
     BindingMismatch,
     PublicFactsMismatch,
     InvalidSplitFacts,
-    TooManyColumns,
     PayloadTooLarge,
     RecipeTooLarge,
 }
@@ -60,7 +58,6 @@ impl fmt::Display for ConnectorReadRelationRecipeError {
                 "connector read recipe public facts changed during canonicalization"
             }
             Self::InvalidSplitFacts => "connector read recipe split facts are invalid",
-            Self::TooManyColumns => "connector read recipe has too many columns",
             Self::PayloadTooLarge => "connector read recipe payload exceeds the hard limit",
             Self::RecipeTooLarge => "connector read recipe exceeds the retained byte limit",
         })
@@ -317,7 +314,7 @@ impl ConnectorReadRelationRecipeDraft {
         let identity = preflight_read_recipe_header(binding, &columns, &mut observer)
             .map_err(lift_read_owned_error)?;
         observer.flush().map_err(lift_read_owned_error)?;
-        let header = validate_read_recipe_header(binding, &columns, &mut || {
+        let header = validate_read_recipe_header(binding, &mut || {
             observer.step()?;
             observer.flush()
         });
@@ -441,12 +438,11 @@ fn validate_read_recipe<E>(
     columns: &[ConnectorEncodedPayload],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(usize, usize), ReadRecipeValidationError<E>> {
-    validate_read_recipe_header(binding, columns, observe)?;
+    validate_read_recipe_header(binding, observe)?;
     validate_read_recipe_payloads(binding, relation, columns, observe)
 }
 fn validate_read_recipe_header<E>(
     binding: &ConnectorReadBinding,
-    columns: &[ConnectorEncodedPayload],
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), ReadRecipeValidationError<E>> {
     let same_instance =
@@ -455,13 +451,6 @@ fn validate_read_recipe_header<E>(
     if !same_instance {
         return Err(ReadRecipeValidationError::Contract(
             ConnectorReadRelationRecipeError::BindingMismatch,
-        ));
-    }
-    let too_many = columns.len() > MAX_CONNECTOR_RECIPE_COLUMNS;
-    observe().map_err(ReadRecipeValidationError::Observer)?;
-    if too_many {
-        return Err(ReadRecipeValidationError::Contract(
-            ConnectorReadRelationRecipeError::TooManyColumns,
         ));
     }
     Ok(())

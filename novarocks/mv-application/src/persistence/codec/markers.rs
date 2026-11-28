@@ -15,10 +15,59 @@ use novarocks_spi::connector::{
 use novarocks_type_contract::CanonicalFactWriter;
 use prost::Message;
 use std::collections::BTreeSet;
+use uuid::{Uuid, Variant, Version};
 
 use proto::marker_document::{Body, Scope};
 
 const VERSION: u32 = 1;
+
+/// Frozen admission and evidence requirements for the original ContentLocate window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingVerificationRequirement {
+    estimate_bytes: u64,
+    budget: u64,
+}
+
+impl PendingVerificationRequirement {
+    const ENCODED_LEN: usize = 20;
+    // Version 1, ContentLocate, WriteCounts + DeleteVerification, target coverage.
+    const HEADER: [u8; 4] = [1, 1, 0b11, 1];
+
+    pub fn content_locate(estimate_bytes: u64, budget: u64) -> Result<Self, PersistenceCodecError> {
+        if budget == 0 || estimate_bytes > budget {
+            return Err(invalid("invalid MV pending verification budget"));
+        }
+        Ok(Self {
+            estimate_bytes,
+            budget,
+        })
+    }
+
+    pub const fn estimate_bytes(&self) -> u64 {
+        self.estimate_bytes
+    }
+
+    pub const fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut encoded = [0; Self::ENCODED_LEN];
+        encoded[..4].copy_from_slice(&Self::HEADER);
+        encoded[4..12].copy_from_slice(&self.estimate_bytes.to_be_bytes());
+        encoded[12..].copy_from_slice(&self.budget.to_be_bytes());
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, PersistenceCodecError> {
+        if bytes.len() != Self::ENCODED_LEN || bytes[..4] != Self::HEADER {
+            return Err(invalid("invalid MV pending verification requirement"));
+        }
+        let estimate_bytes = u64::from_be_bytes(bytes[4..12].try_into().expect("fixed length"));
+        let budget = u64::from_be_bytes(bytes[12..].try_into().expect("fixed length"));
+        Self::content_locate(estimate_bytes, budget)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkerScope {
@@ -45,12 +94,12 @@ pub struct SourceVersionWindow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingEvidence {
     pub attempt: [u8; 16],
-    pub refresh_identity: Bytes,
+    pub refresh_identity: Uuid,
     pub source_windows: Vec<SourceVersionWindow>,
     pub storage_uuid: [u8; 16],
     pub baseline_snapshot: i64,
     pub mapping_revision: DocumentRevision,
-    pub verification_requirement: Bytes,
+    pub verification_requirement: PendingVerificationRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,8 +148,8 @@ impl Marker {
     ) -> Result<(ConnectorMarkerKey, ConnectorMarkerValue), PersistenceCodecError> {
         let (name, body, attempt) = match self {
             Self::Pending { evidence, .. } => {
-                if evidence.refresh_identity.is_empty()
-                    || evidence.verification_requirement.is_empty()
+                if evidence.refresh_identity.get_version() != Some(Version::SortRand)
+                    || evidence.refresh_identity.get_variant() != Variant::RFC4122
                     || evidence.source_windows.is_empty()
                     || !evidence
                         .source_windows
@@ -113,7 +162,7 @@ impl Marker {
                     "pending",
                     Body::Pending(proto::PendingMarker {
                         attempt: Some(evidence.attempt.to_vec()),
-                        refresh_identity: Some(evidence.refresh_identity.to_vec()),
+                        refresh_identity: Some(evidence.refresh_identity.as_bytes().to_vec()),
                         source_windows: evidence
                             .source_windows
                             .iter()
@@ -126,7 +175,9 @@ impl Marker {
                         storage_object_id: Some(evidence.storage_uuid.to_vec()),
                         baseline_snapshot: Some(evidence.baseline_snapshot),
                         mapping_revision: Some(evidence.mapping_revision.as_bytes().to_vec()),
-                        verification_requirement: Some(evidence.verification_requirement.to_vec()),
+                        verification_requirement: Some(
+                            evidence.verification_requirement.encode().to_vec(),
+                        ),
                     }),
                     Some(evidence.attempt),
                 )
@@ -269,11 +320,10 @@ impl Marker {
                 publication: publication()?,
                 evidence: PendingEvidence {
                     attempt: exact_16(item.attempt, "marker.pending.attempt")?,
-                    refresh_identity: required(
+                    refresh_identity: Uuid::from_bytes(exact_16(
                         item.refresh_identity,
                         "marker.pending.refresh_identity",
-                    )?
-                    .into(),
+                    )?),
                     source_windows: item
                         .source_windows
                         .into_iter()
@@ -303,11 +353,10 @@ impl Marker {
                         item.mapping_revision,
                         "marker.pending.mapping_revision",
                     )?,
-                    verification_requirement: required(
+                    verification_requirement: PendingVerificationRequirement::decode(&required(
                         item.verification_requirement,
                         "marker.pending.verification_requirement",
-                    )?
-                    .into(),
+                    )?)?,
                 },
             },
             Body::PendingReleased(item) => Self::PendingReleased {
@@ -388,6 +437,7 @@ pub enum PublicationEvidence<'a> {
     Current(&'a PublicationIdentity),
     Unpublished(&'a DocumentRevision),
     Retired(&'a PublicationIdentity),
+    Unattributed,
     Unknown,
 }
 
@@ -395,6 +445,10 @@ pub struct MarkerEligibility<'a> {
     pub active: Vec<&'a Marker>,
     pub inactive: BTreeSet<ConnectorMarkerKey>,
     pub automatic_reuse_blocked: bool,
+    pub automatic_refresh: bool,
+    pub rewrite_serving: bool,
+    pub strict_recovery_required: bool,
+    pub explicit_rebuild_required: bool,
 }
 
 pub fn marker_eligibility<'a>(
@@ -406,8 +460,14 @@ pub fn marker_eligibility<'a>(
         inactive: BTreeSet::new(),
         automatic_reuse_blocked: matches!(
             evidence,
-            PublicationEvidence::Retired(_) | PublicationEvidence::Unknown
+            PublicationEvidence::Retired(_)
+                | PublicationEvidence::Unattributed
+                | PublicationEvidence::Unknown
         ),
+        automatic_refresh: false,
+        rewrite_serving: false,
+        strict_recovery_required: false,
+        explicit_rebuild_required: matches!(evidence, PublicationEvidence::Retired(_)),
     };
     if matches!(evidence, PublicationEvidence::Unknown) {
         return result;
@@ -432,6 +492,9 @@ pub fn marker_eligibility<'a>(
                 PublicationEvidence::Unpublished(expected),
                 MarkerScope::UnpublishedBinding(actual),
             ) => **expected == actual,
+            (PublicationEvidence::Unattributed, _) => {
+                matches!(marker, Marker::Invalid { .. } | Marker::Pending { .. })
+            }
             _ => false,
         };
         let relevant = match marker {
@@ -448,117 +511,25 @@ pub fn marker_eligibility<'a>(
         if in_scope && relevant {
             result.automatic_reuse_blocked = true;
             result.active.push(marker);
-        } else {
+        } else if !matches!(evidence, PublicationEvidence::Unattributed) {
+            // An unowned snapshot proves no scope obsolete.
             result.inactive.insert(key.clone());
         }
     }
+    result.explicit_rebuild_required |= result
+        .active
+        .iter()
+        .any(|m| matches!(m, Marker::Invalid { .. }));
+    result.strict_recovery_required = !result.explicit_rebuild_required
+        && result
+            .active
+            .iter()
+            .any(|m| matches!(m, Marker::Pending { .. }));
+    result.automatic_refresh = !result.explicit_rebuild_required;
+    result.rewrite_serving =
+        matches!(evidence, PublicationEvidence::Current(_)) && !result.automatic_reuse_blocked;
     result
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn publication(identity: u8) -> PublicationIdentity {
-        PublicationIdentity::try_new(vec![identity; 16]).unwrap()
-    }
-
-    fn pending(publication: PublicationIdentity, attempt: u8) -> Marker {
-        Marker::Pending {
-            publication,
-            evidence: PendingEvidence {
-                attempt: [attempt; 16],
-                refresh_identity: Bytes::from_static(b"refresh"),
-                source_windows: vec![SourceVersionWindow {
-                    occurrence: 0,
-                    from: NativeDataVersion::try_new(vec![1]).unwrap(),
-                    to: NativeDataVersion::try_new(vec![2]).unwrap(),
-                }],
-                storage_uuid: [5; 16],
-                baseline_snapshot: 6,
-                mapping_revision: DocumentRevision::from_canonical_bytes(b"mapping"),
-                verification_requirement: Bytes::from_static(b"verification"),
-            },
-        }
-    }
-
-    fn observed(markers: impl IntoIterator<Item = Marker>) -> Vec<(ConnectorMarkerKey, Marker)> {
-        markers
-            .into_iter()
-            .map(|marker| (marker.encode().unwrap().0, marker))
-            .collect()
-    }
-
-    #[test]
-    fn all_marker_kinds_roundtrip_and_check_scope_against_the_key() {
-        let id = publication(1);
-        let revision = DocumentRevision::from_canonical_bytes(b"binding");
-        let markers = [
-            pending(id.clone(), 1),
-            Marker::PendingReleased {
-                publication: id.clone(),
-                attempt: [1; 16],
-            },
-            Marker::NeedsRebuild {
-                scope: MarkerScope::Publication(id.clone()),
-                changes: vec![BindingChange {
-                    kind: BindingChangeKind::Resolution,
-                    observed_revision: revision,
-                    current_revision: DocumentRevision::from_canonical_bytes(b"replacement"),
-                }],
-            },
-            Marker::InvalidDefinition {
-                scope: MarkerScope::UnpublishedBinding(revision),
-                kind: InvalidDefinitionKind::Resolution,
-                diagnostic: "Missing source field".into(),
-            },
-            Marker::Invalid {
-                publication: id,
-                retirement_record_revision: DocumentRevision::from_canonical_bytes(b"retirement"),
-            },
-        ];
-        for marker in markers {
-            let (key, value) = marker.encode().unwrap();
-            let decoded = Marker::decode(&key, &value).unwrap();
-            assert_eq!(decoded, marker);
-            assert_eq!(decoded.encode().unwrap(), (key.clone(), value.clone()));
-            let mut wrong_scope = key;
-            wrong_scope.binding = "another-binding".into();
-            assert!(Marker::decode(&wrong_scope, &value).is_err());
-        }
-    }
-
-    #[test]
-    fn release_matches_only_the_original_publication_and_attempt() {
-        let id = publication(1);
-        let revision = DocumentRevision::from_canonical_bytes(b"unpublished");
-        let markers = observed([
-            pending(id.clone(), 1),
-            pending(id.clone(), 2),
-            Marker::PendingReleased {
-                publication: id.clone(),
-                attempt: [1; 16],
-            },
-            Marker::PendingReleased {
-                publication: publication(9),
-                attempt: [2; 16],
-            },
-            Marker::InvalidDefinition {
-                scope: MarkerScope::UnpublishedBinding(revision),
-                kind: InvalidDefinitionKind::Resolution,
-                diagnostic: "Missing source field".into(),
-            },
-        ]);
-        let current = marker_eligibility(PublicationEvidence::Current(&id), &markers);
-        assert_eq!(current.active, vec![&markers[1].1]);
-        assert!(current.inactive.contains(&markers[0].0));
-        assert!(current.automatic_reuse_blocked);
-        let retired = marker_eligibility(PublicationEvidence::Retired(&id), &markers);
-        assert_eq!(retired.active, current.active);
-        let unpublished = marker_eligibility(PublicationEvidence::Unpublished(&revision), &markers);
-        assert_eq!(unpublished.active, vec![&markers[4].1]);
-        let unknown = marker_eligibility(PublicationEvidence::Unknown, &markers);
-        assert!(unknown.automatic_reuse_blocked);
-        assert!(unknown.inactive.is_empty());
-    }
-}
+mod tests;

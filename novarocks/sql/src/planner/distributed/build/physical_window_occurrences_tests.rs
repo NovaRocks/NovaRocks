@@ -314,13 +314,15 @@ fn count_binding(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -
     let intermediate_type = aggregate.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(aggregate.state_format.as_str()).unwrap();
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract,
         function: scalar(resolved),
         phase: AggregatePhase::Single,
         logical_argument_count: args.len() as u32,
-        intermediate_type,
-        state_format,
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract,
+            intermediate_type,
+            state_format,
+        }),
     }
 }
 // The fixture spells every authored WindowCall field at its call sites.
@@ -890,8 +892,19 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_complet
                     &[]
                 },
             );
-            let intermediate = binding.intermediate_type.clone();
-            let state_format = binding.state_format.as_str().to_owned();
+            let intermediate = binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .clone();
+            let state_format = binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_format
+                .as_str()
+                .to_owned();
             let root = window(
                 &mut builder,
                 leaf,

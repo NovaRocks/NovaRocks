@@ -90,7 +90,10 @@ fn counts_core(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     if admit.is_some() {
-        model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+        model.facts.type_reference_count = add(
+            model.facts.type_reference_count,
+            usize::from(source.merge_state.is_some()),
+        )?;
     }
     model.check(limits)?;
     if let Some(parent) = admit.as_mut() {
@@ -98,7 +101,10 @@ fn counts_core(
     }
     header(source, work)?;
     if admit.is_none() {
-        model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+        model.facts.type_reference_count = add(
+            model.facts.type_reference_count,
+            usize::from(source.merge_state.is_some()),
+        )?;
     }
     model.check(limits)?;
     if let Some(parent) = admit {
@@ -134,11 +140,15 @@ fn types_core(
 ) -> Result<(), BindingCodecError> {
     if let Some(parent) = admit {
         preflight_scalar_signature_copy_types_in(&source.function, model, limits, parent, work)?;
-        model.count_owned_type_clone_in(&source.intermediate_type, limits, parent, work)?;
+        if let Some(intermediate) = source.intermediate_type() {
+            model.count_owned_type_clone_in(intermediate, limits, parent, work)?;
+        }
         model.check_admitted(limits, parent)?;
     } else {
         preflight_scalar_signature_copy_types(&source.function, model, limits, work)?;
-        model.count_owned_type_clone(&source.intermediate_type, limits, work)?;
+        if let Some(intermediate) = source.intermediate_type() {
+            model.count_owned_type_clone(intermediate, limits, work)?;
+        }
     }
     work.step()?;
     model.check(limits)
@@ -153,25 +163,30 @@ pub(crate) fn copy_aggregate_binding_observed(
     header(source, work)?;
     let function = copy_scalar_signature_observed(&source.function, work)?;
     work.flush()?;
-    let intermediate_type = clone_value_type_observed(&source.intermediate_type, work)?;
-    work.step()?;
-    work.flush()?;
-    // A cheap clone retains the original immutable identity creator. It
-    // constructs neither a text Box nor a private backing Arc.
-    let state_format = source.state_format.clone_observed(|| work.step())?;
-    work.flush()?;
+    let merge_state = if let Some(state) = &source.merge_state {
+        let intermediate_type = clone_value_type_observed(&state.intermediate_type, work)?;
+        work.step()?;
+        work.flush()?;
+        let state_format = state.state_format.clone_observed(|| work.step())?;
+        work.flush()?;
+        Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: state
+                .state_interpretation
+                .as_ref()
+                .map(|value| value.clone_observed(work))
+                .transpose()?,
+            state_argument_contract: state.state_argument_contract,
+            intermediate_type,
+            state_format,
+        })
+    } else {
+        None
+    };
     let output = AggregateBinding {
-        state_interpretation: source
-            .state_interpretation
-            .as_ref()
-            .map(|value| value.clone_observed(work))
-            .transpose()?,
         function,
         phase: source.phase,
         logical_argument_count: source.logical_argument_count,
-        intermediate_type,
-        state_format,
-        state_argument_contract: source.state_argument_contract,
+        merge_state,
     };
     work.step()?;
     Ok(output)

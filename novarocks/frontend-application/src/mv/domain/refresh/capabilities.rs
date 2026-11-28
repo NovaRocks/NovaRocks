@@ -34,6 +34,7 @@ pub(crate) enum PartitionPruningPolicy {
 /// The compact row-identity discriminant needed by refresh execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshIdentity {
+    Content,
     BaseRowId,
     JoinRowKey,
     GroupRowId,
@@ -46,8 +47,8 @@ pub struct RefreshCapabilities {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
     pub has_agg_state: bool,
     pub(crate) identity: RefreshIdentity,
-    pub apply_key_column: String,
-    pub(crate) apply_key_value_type: ApplyKeyValueType,
+    pub apply_key_column: Option<String>,
+    pub(crate) apply_key_value_type: Option<ApplyKeyValueType>,
     pub(crate) partition_pruning: PartitionPruningPolicy,
 }
 
@@ -95,14 +96,31 @@ impl RefreshCapabilities {
             BaseSnapshotPolicy::SingleBase
         };
 
-        let kind_identity = apply_key_kind_to_refresh_identity(interpretation.apply_key.kind);
+        if !has_agg && interpretation.apply_key.is_none() {
+            if has_branch || !bindings.apply_key.is_empty() || !bindings.branches.is_empty() {
+                return Err("content MV retains a foreign apply or branch binding".to_string());
+            }
+            return Ok(RefreshCapabilities {
+                snapshot_policy,
+                has_agg_state: false,
+                identity: RefreshIdentity::Content,
+                apply_key_column: None,
+                apply_key_value_type: None,
+                partition_pruning: PartitionPruningPolicy::BestEffort,
+            });
+        }
+
+        let apply_key_kind = interpretation
+            .apply_key_kind()
+            .ok_or("keyed refresh requires an apply key")?;
+        let kind_identity = apply_key_kind_to_refresh_identity(apply_key_kind);
         let identity = if has_branch {
             RefreshIdentity::BranchScoped(Box::new(kind_identity))
         } else {
             kind_identity
         };
 
-        let apply_key_value_type = match (interpretation.apply_key.kind, has_branch) {
+        let apply_key_value_type = match (apply_key_kind, has_branch) {
             (ApplyKeyKind::BaseRowId, false) => ApplyKeyValueType::Int64,
             (ApplyKeyKind::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
             (ApplyKeyKind::JoinRowKey, _) => ApplyKeyValueType::Utf8,
@@ -121,8 +139,8 @@ impl RefreshCapabilities {
             snapshot_policy,
             has_agg_state: has_agg,
             identity,
-            apply_key_column: apply_key.name.clone(),
-            apply_key_value_type,
+            apply_key_column: Some(apply_key.name.clone()),
+            apply_key_value_type: Some(apply_key_value_type),
             partition_pruning: PartitionPruningPolicy::BestEffort,
         })
     }
@@ -175,7 +193,7 @@ mod tests {
     #[test]
     fn single_relation_projection_keeps_one_base_and_its_physical_apply_key() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::BaseRowId;
         interpretation.aggregates.clear();
         interpretation.branches.clear();
 
@@ -190,15 +208,21 @@ mod tests {
         assert_eq!(capabilities.snapshot_policy, BaseSnapshotPolicy::SingleBase);
         assert!(!capabilities.has_agg_state);
         assert_eq!(capabilities.identity, RefreshIdentity::BaseRowId);
-        assert_eq!(capabilities.apply_key_value_type, ApplyKeyValueType::Int64);
+        assert_eq!(
+            capabilities.apply_key_value_type,
+            Some(ApplyKeyValueType::Int64)
+        );
         // The physical name is the provider's, never a persisted one.
-        assert_eq!(capabilities.apply_key_column, "__nova_row_id");
+        assert_eq!(
+            capabilities.apply_key_column.as_deref(),
+            Some("__nova_row_id")
+        );
     }
 
     #[test]
     fn a_join_pair_and_a_fan_in_of_the_same_arity_choose_different_policies() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::JoinRowKey;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::JoinRowKey;
         interpretation.aggregates.clear();
         interpretation.branches.clear();
 
@@ -214,7 +238,7 @@ mod tests {
             BaseSnapshotPolicy::JoinPairPartialInitialSkip
         );
         assert_eq!(join.identity, RefreshIdentity::JoinRowKey);
-        assert_eq!(join.apply_key_value_type, ApplyKeyValueType::Utf8);
+        assert_eq!(join.apply_key_value_type, Some(ApplyKeyValueType::Utf8));
 
         let fan_in = RefreshCapabilities::from_canonical_facts(
             &interpretation,
@@ -233,7 +257,10 @@ mod tests {
     #[test]
     fn branch_union_aggregate_scopes_its_identity_and_requires_every_base() {
         let interpretation = interpretation();
-        assert_eq!(interpretation.apply_key.kind, ApplyKeyKind::GroupRowId);
+        assert_eq!(
+            interpretation.apply_key_kind(),
+            Some(ApplyKeyKind::GroupRowId)
+        );
         assert!(!interpretation.aggregates.is_empty());
         assert!(!interpretation.branches.is_empty());
 
@@ -256,14 +283,14 @@ mod tests {
         );
         assert_eq!(
             capabilities.apply_key_value_type,
-            ApplyKeyValueType::BranchUtf8
+            Some(ApplyKeyValueType::BranchUtf8)
         );
     }
 
     #[test]
     fn join_over_branches_without_aggregate_state_is_rejected() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.apply_key.as_mut().unwrap().kind = ApplyKeyKind::BaseRowId;
         interpretation.aggregates.clear();
 
         let error = RefreshCapabilities::from_canonical_facts(

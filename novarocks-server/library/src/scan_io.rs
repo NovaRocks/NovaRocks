@@ -215,7 +215,16 @@ pub struct ScanIoRuntime {
 }
 
 impl ScanIoRuntime {
+    #[cfg(test)]
     pub fn start(config: &RuntimeConfig) -> anyhow::Result<Self> {
+        Self::start_observed(config, Default::default(), None)
+    }
+
+    pub fn start_observed(
+        config: &RuntimeConfig,
+        observation: novarocks_spi::connector::read_stack::ConnectorWorkObservation,
+        role: Option<novarocks_memory::attribution::ThreadRole>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.scan_io_max_blocking_threads > 0,
             "runtime.scan_io_max_blocking_threads must be nonzero"
@@ -230,6 +239,12 @@ impl ScanIoRuntime {
             .max_blocking_threads(config.scan_io_max_blocking_threads)
             .thread_name("novarocks-scan-io")
             .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
+            .on_thread_start(move || {
+                if let Some(role) = role {
+                    novarocks_memory::attribution::set_current_thread_role(role)
+                        .expect("scan I/O thread can install its process memory role");
+                }
+            })
             .build()
             .map_err(|error| anyhow::anyhow!("build backend scan I/O runtime: {error}"))?;
         let handle = runtime.handle().clone();
@@ -238,7 +253,7 @@ impl ScanIoRuntime {
             inner: TokioFileIoSpawner::new(handle.clone()),
             flight: Arc::clone(&flight),
         });
-        let range_service = FileRangeService::new(
+        let range_service = FileRangeService::new_observed(
             NonZeroUsize::new(config.scan_range_process_window)
                 .ok_or_else(|| anyhow::anyhow!("scan range process window must be nonzero"))?,
             NonZeroUsize::new(config.scan_range_source_window)
@@ -247,6 +262,7 @@ impl ScanIoRuntime {
                 .ok_or_else(|| anyhow::anyhow!("scan range queue capacity must be nonzero"))?,
             Arc::clone(&file_io_spawner),
             handle.clone(),
+            observation,
         );
         Ok(Self {
             runtime,

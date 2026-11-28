@@ -500,17 +500,22 @@ fn actual_graph_unfolding_preserves_depth_and_expanded_node_bounds() {
             }),
         ));
     }
-    assert!(matches!(
-        decode(
-            &definitions,
-            ValueTypeStorageLifetime::pure(),
-            &Control::good(),
-            &mut allow
-        ),
-        Err(Failure::Codec(LogicalTypeCodecError::ValueType(
-            ExecutionValueTypeError::Nodes
-        )))
-    ));
+    let expanded = decode(
+        &definitions,
+        ValueTypeStorageLifetime::pure(),
+        &Control::good(),
+        &mut allow,
+    )
+    .unwrap();
+    assert_eq!(
+        expanded
+            .iter()
+            .find(|(id, _)| *id == 13)
+            .unwrap()
+            .1
+            .expanded_nodes(),
+        16_383
+    );
     let chain: Vec<_> = (0..=64)
         .map(|id| {
             definition(

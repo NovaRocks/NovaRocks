@@ -34,11 +34,12 @@ use novarocks_local_program::{
     JoinDistributionMode, JoinType, LocalProgram, NestedLoopJoinType, ProgramNodeKind,
 };
 use novarocks_physical_plan::{
-    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning,
-    JoinDistribution, JoinKey, JoinKind, JoinSide, NestLoopJoinDistribution, NodeId, NodeKind,
-    PhysicalPlan, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField,
-    ResultPort, RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
+    DeliveryRequirement, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning,
+    EdgeSource, ExprId, FragmentId, FragmentInputCompletion, FragmentPackage,
+    FragmentPackageAdmission, FragmentSink, FrozenFragmentPruning, JoinDistribution, JoinKey,
+    JoinKind, JoinSide, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalPlan, PlanLimits,
+    PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity,
+    ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     ArithmeticOperator, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
@@ -672,7 +673,25 @@ pub(super) fn single_plan_with_dop(
     right: &[Row],
     pipeline_dop: u32,
 ) -> PhysicalPlan {
-    single_plan_with_predicate(spec, left, right, pipeline_dop, false)
+    single_plan_with_predicate(
+        spec,
+        left,
+        right,
+        pipeline_dop,
+        false,
+        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
+    )
+}
+
+pub(super) fn drain_input_join_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
+    single_plan_with_predicate(
+        spec,
+        left,
+        right,
+        1,
+        false,
+        novarocks_physical_plan::FragmentInputCompletion::MustDrain,
+    )
 }
 
 fn single_plan_with_predicate(
@@ -681,6 +700,7 @@ fn single_plan_with_predicate(
     right: &[Row],
     pipeline_dop: u32,
     checked_right: bool,
+    input_completion: novarocks_physical_plan::FragmentInputCompletion,
 ) -> PhysicalPlan {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
 
@@ -689,6 +709,7 @@ fn single_plan_with_predicate(
             SINGLE,
             &fixture_sources,
         );
+    builder.set_input_completion(input_completion);
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
         &mut builder,
@@ -750,7 +771,13 @@ fn single_plan_with_predicate(
 /// `Values(left) -> Stream(Hash[k])` and `Values(right) -> Stream(Broadcast
 /// or Hash[k])` into two join instances, whose outputs are gathered into one
 /// result instance.
-fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) -> PhysicalPlan {
+fn exchange_plan(
+    spec: Spec,
+    placement: Placement,
+    left: &[Row],
+    right: &[Row],
+    input_completion: FragmentInputCompletion,
+) -> PhysicalPlan {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
 
     let source = |id: FragmentId, edge: EdgeId, rows: &[Row]| {
@@ -785,6 +812,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             JOIN,
             &fixture_sources,
         );
+    builder.set_input_completion(input_completion);
     let probe_node = builder.reserve_node_id().unwrap();
     let probe = receive(
         &mut builder,
@@ -866,26 +894,30 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
     plan.add_fragment(right_fragment).unwrap();
     plan.add_fragment(join_fragment).unwrap();
     plan.add_fragment(result_fragment).unwrap();
-    plan.add_edge(edge(
+    let mut probe_edge = edge(
         TO_PROBE,
         (LEFT_SOURCE, &left_columns),
         (JOIN, probe_node, &probe),
         hash(&left_columns[..1]),
         hash(&probe[..1]),
-    ))
-    .unwrap();
+    );
     let (build_source, build_destination) = match placement {
         Placement::Broadcast => (Distribution::Broadcast, Distribution::Broadcast),
         _ => (hash(&right_columns[..1]), hash(&build[..1])),
     };
-    plan.add_edge(edge(
+    let mut build_edge = edge(
         TO_BUILD,
         (RIGHT_SOURCE, &right_columns),
         (JOIN, build_node, &build),
         build_source,
         build_destination,
-    ))
-    .unwrap();
+    );
+    if input_completion == FragmentInputCompletion::MustDrain {
+        probe_edge.delivery = DeliveryRequirement::MustDrain;
+        build_edge.delivery = DeliveryRequirement::MustDrain;
+    }
+    plan.add_edge(probe_edge).unwrap();
+    plan.add_edge(build_edge).unwrap();
     plan.add_edge(edge(
         TO_RESULT,
         (JOIN, &output),
@@ -1030,7 +1062,13 @@ struct ExchangeRun {
 }
 
 fn run_exchanged(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) -> ExchangeRun {
-    let mut packages = packages(&exchange_plan(spec, placement, left, right));
+    let mut packages = packages(&exchange_plan(
+        spec,
+        placement,
+        left,
+        right,
+        FragmentInputCompletion::MayShortCircuit,
+    ));
     let left_source = compile(packages.remove(&LEFT_SOURCE).unwrap(), 1, false);
     let right_source = compile(packages.remove(&RIGHT_SOURCE).unwrap(), 1, false);
     let join = compile(packages.remove(&JOIN).unwrap(), JOIN_DOP, false);
@@ -3616,7 +3654,14 @@ fn nested_loop_left_mark_preserves_a_late_required_error_after_true() {
     let mut rhs = vec![(None, Some(0)); 530];
     rhs.push((None, Some(1)));
     let spec = Spec::nested(JoinKind::LeftMark, true);
-    let plan = single_plan_with_predicate(spec, &[(None, Some(10))], &rhs, 1, true);
+    let plan = single_plan_with_predicate(
+        spec,
+        &[(None, Some(10))],
+        &rhs,
+        1,
+        true,
+        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
+    );
     let mut packages = packages(&plan);
     let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
     let output = ResultSinkBuffer::new();

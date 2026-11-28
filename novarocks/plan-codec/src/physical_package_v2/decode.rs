@@ -1537,6 +1537,7 @@ fn decode_fragment_package_factory_core<
             summaries: envelope.summaries,
             dop_domain: envelope.dop_domain,
             stage_placement: envelope.stage_placement,
+            input_completion: envelope.input_completion,
             runtime_filters: envelope.runtime_filters,
         },
         plan_limits,

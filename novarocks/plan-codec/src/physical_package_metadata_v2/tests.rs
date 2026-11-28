@@ -86,6 +86,7 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(0),
             root: node,
             values: BTreeMap::new(),
@@ -149,7 +150,7 @@ fn raw() -> wire::FragmentPackage {
     wire::FragmentPackage {
         plan_version: vec![19; 16],
         required: Some(wire::RequiredContracts {
-            plan_contract_revision: 73,
+            plan_contract_revision: p::PLAN_CONTRACT_REVISION,
         }),
         annotations: vec![wire::PlanAnnotation {
             subject: Some(wire::AnnotationSubject {
@@ -247,7 +248,10 @@ fn metadata_real_package_and_hand_wire_preserve_local_subjects_and_detach_text()
     });
     let decoded = decode(&wire, &Control::default(), limits()).0.unwrap().0;
     assert_eq!(decoded.version.as_bytes(), &[19; 16]);
-    assert_eq!(decoded.required.plan_contract_revision, 73);
+    assert_eq!(
+        decoded.required.plan_contract_revision,
+        p::PLAN_CONTRACT_REVISION
+    );
     assert_eq!(
         decoded.annotations[1].subject,
         p::AnnotationSubject::Value(p::FragmentId::new(u32::MAX), p::ValueId::new(0))
@@ -317,6 +321,7 @@ fn metadata_publication_rechecks_annotation_references_and_revision() {
     fresh.version = decoded.version;
     fresh.required = decoded.required;
     fresh.annotations = decoded.annotations;
+    fresh.required.plan_contract_revision -= 1;
     assert!(p::FragmentPackage::try_new(fresh, admission(), &Control::default()).is_err());
     let mut missing = input;
     missing.annotations = vec![p::PlanAnnotation {

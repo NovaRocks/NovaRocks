@@ -316,6 +316,7 @@ impl MvRefreshPreparationIo {
         sql: &novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
         bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
         observed: &crate::mv::domain::persistence::source_bindings::MvObservedBinding,
+        replay: Option<&std::collections::BTreeMap<u32, ConnectorExactSemanticRevision>>,
         context: &ConnectorRequestContext,
     ) -> Result<(), PreparationError> {
         let inventory = self.captured_sources();
@@ -334,8 +335,17 @@ impl MvRefreshPreparationIo {
                 .revisions
                 .get(&relation.occurrence_id().get())
                 .ok_or("MV analyzed occurrence has no exact data revision")?;
+            let selected = match replay {
+                Some(targets) => targets
+                    .get(&relation.occurrence_id().get())
+                    .ok_or("MV strict recovery lost an original To occurrence")?,
+                None => exact,
+            };
+            if selected.object_identity() != exact.object_identity() {
+                return Err("MV strict recovery To belongs to a different source object".into());
+            }
             if let Some(previous) = inventory.by_table(&table) {
-                if &previous.revision != exact {
+                if &previous.revision != selected {
                     return Err(
                         "MV occurrences of one table observed different original revisions".into(),
                     );
@@ -360,13 +370,30 @@ impl MvRefreshPreparationIo {
                     "MV source planning and data observations identify different objects".into(),
                 );
             }
+            let (facts, snapshot) = if selected == exact {
+                let snapshot = facts.current_snapshot_id();
+                (facts, snapshot)
+            } else {
+                let Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot))) =
+                    selected.canonical_read_point()
+                else {
+                    return Err("MV strict recovery To has no canonical snapshot read point".into());
+                };
+                let facts = MvRefreshBaseObservation::try_new(
+                    facts.table().clone(),
+                    facts.object_id().clone(),
+                    Some(snapshot),
+                    context,
+                )?;
+                (facts, Some(snapshot))
+            };
             inventory.install(super::captured_sources::CapturedRefreshSource::new(
                 table,
                 lease,
                 metadata.clone(),
-                facts.clone(),
-                facts.current_snapshot_id(),
-                exact.clone(),
+                facts,
+                snapshot,
+                selected.clone(),
             ))?;
         }
         inventory.set_direct_output_sources(observed.direct_output_sources.clone())?;

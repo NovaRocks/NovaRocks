@@ -52,6 +52,7 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::CTEConsumeToPhysical),
         Box::new(implement::RepeatToPhysical),
         Box::new(implement::ChangeEventExpandToPhysical),
+        Box::new(implement::ContentApplyToPhysical),
         Box::new(implement::UnionToPhysical),
         Box::new(implement::IntersectToPhysical),
         Box::new(implement::ExceptToPhysical),

@@ -55,8 +55,10 @@ use std::num::NonZeroU64;
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
 const MAX_STATS_FIELD_COMPARISONS: usize = 1024;
 use sha2::{Digest, Sha256};
+mod nested_size;
 pub(crate) mod rewrite_entries;
 pub(crate) mod scoped_capture;
+use nested_size::{NestedAverageSizeField, manifest_nested_size, nested_average_size_fields};
 use scoped_capture::{CaptureScope, ReadFailure, active as check_scoped_active};
 
 /// Mint exactly once at the provider's pinned handle boundary. Standalone
@@ -187,6 +189,28 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
+    let domain = read_domain_at(table, snapshot_id)?;
+    build_read_snapshot_in_domain(table, domain, control).await
+}
+
+pub(crate) async fn build_statistics_read_snapshot_at(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn ConnectorOperationControl>,
+    average_size_columns: &[&str],
+) -> Result<IcebergReadSnapshot, ConnectorError> {
+    let domain = read_domain_at(table, snapshot_id)?;
+    build_read_snapshot_with_purpose(
+        table,
+        domain,
+        control,
+        None,
+        ReadPurpose::ManifestStatistics(average_size_columns),
+    )
+    .await
+}
+
+fn read_domain_at(table: &Table, snapshot_id: i64) -> Result<Arc<ReadDomain>, ConnectorError> {
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -194,8 +218,38 @@ pub(crate) async fn build_read_snapshot_at_with_control(
     let schema = snapshot
         .schema(metadata)
         .map_err(|e| read_snapshot_error(format!("resolve snapshot schema: {e}")))?;
+    mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)
+}
+
+/// Validate all live delete content before an MV target's predicate,
+/// partition selection or dynamic feedback can narrow the scan.
+pub(crate) async fn validate_mv_content_target_snapshot(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<(), ConnectorError> {
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| read_snapshot_error("Frozen MV content target snapshot is absent"))?;
+    let schema = snapshot.schema(metadata).map_err(|error| {
+        read_snapshot_error(format!("Resolve MV content target schema: {error}"))
+    })?;
     let domain = mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)?;
-    build_read_snapshot_in_domain(table, domain, control).await
+    observe_read_files_original::<DataFile>(
+        table,
+        domain,
+        control,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ReadPurpose::MvContentTarget,
+    )
+    .await
+    .map_err(ReadFailure::into_connector)?;
+    Ok(())
 }
 
 /// The selected snapshot's authorized list, retained for the coordinator's
@@ -401,9 +455,19 @@ pub(crate) async fn build_read_snapshot_with_prepared_list(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     prepared: Option<&PreparedReadManifestList>,
 ) -> Result<IcebergReadSnapshot, ConnectorError> {
+    build_read_snapshot_with_purpose(table, domain, control, prepared, ReadPurpose::Ordinary).await
+}
+
+async fn build_read_snapshot_with_purpose(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn ConnectorOperationControl>,
+    prepared: Option<&PreparedReadManifestList>,
+    purpose: ReadPurpose<'_>,
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let snapshot_id = domain.endpoint().snapshot_id();
     let files = observe_read_files_original::<DataFile>(
-        table, domain, control, None, None, None, None, prepared,
+        table, domain, control, None, None, None, None, prepared, purpose,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -437,6 +501,7 @@ pub(crate) async fn build_rewrite_read_snapshot_at(
         None,
         Some(&mut entries),
         None,
+        ReadPurpose::Ordinary,
     )
     .await
     .map_err(ReadFailure::into_connector)?;
@@ -527,6 +592,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 referenced_specs.as_mut(),
                 None,
                 None,
+                ReadPurpose::Ordinary,
             )
             .await?
         }
@@ -540,6 +606,7 @@ pub(crate) async fn make_scoped_read_snapshot(
                 None,
                 rewrite_entries.as_mut(),
                 None,
+                ReadPurpose::Ordinary,
             )
             .await?
         }
@@ -563,7 +630,18 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     capture: Option<&CaptureScope<'_>>,
 ) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_original::<P>(table, domain, control, capture, None, None, None, None).await
+    observe_read_files_original::<P>(
+        table,
+        domain,
+        control,
+        capture,
+        None,
+        None,
+        None,
+        None,
+        ReadPurpose::Ordinary,
+    )
+    .await
 }
 
 /// Index by physical path, but retain the original descriptor as a borrowed
@@ -584,6 +662,13 @@ impl std::hash::Hash for ManifestReferenceKey<'_> {
 const CONFLICTING_MANIFEST_REFERENCE: &str =
     "Iceberg snapshot repeats one manifest path with conflicting descriptors";
 
+#[derive(Clone, Copy)]
+enum ReadPurpose<'a> {
+    Ordinary,
+    MvContentTarget,
+    ManifestStatistics(&'a [&'a str]),
+}
+
 async fn observe_read_files_original<P: ObservedDataFileProjection>(
     table: &Table,
     domain: Arc<ReadDomain>,
@@ -593,6 +678,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
     mut rewrite_entries: Option<&mut rewrite_entries::RewriteEntries>,
     prepared: Option<&PreparedReadManifestList>,
+    purpose: ReadPurpose<'_>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_scoped_active(capture)?;
@@ -618,6 +704,12 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
+    let nested_sizes = match purpose {
+        ReadPurpose::ManifestStatistics(columns) => {
+            nested_average_size_fields(&schema, columns, control)?
+        }
+        _ => Vec::new(),
+    };
     let loaded_manifest_list;
     let entries = match (prepared, io) {
         (Some(prepared), None) => {
@@ -743,6 +835,13 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 continue;
             }
             let df = entry.raw.data_file();
+            if matches!(purpose, ReadPurpose::MvContentTarget)
+                && df.content_type() == DataContentType::Data
+            {
+                // This preflight validates live delete content. The ordinary
+                // split-opening path still authors all data file facts.
+                continue;
+            }
             let typed_partition = if let Some(capture) = capture {
                 TypedPartition::bind_type_checked(
                     spec,
@@ -787,16 +886,25 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                     ));
                 }
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    delete_entries.push((
-                        Some(entry.ordinal),
-                        observed_raw_delete_entry(
-                            &entry,
-                            manifest.metadata().format_version,
-                            &schema,
-                            typed_partition,
-                            metrics,
-                        )?,
-                    ));
+                    let delete = observed_raw_delete_entry(
+                        &entry,
+                        manifest.metadata().format_version,
+                        &schema,
+                        typed_partition,
+                        metrics,
+                    )?;
+                    if matches!(purpose, ReadPurpose::MvContentTarget)
+                        && !matches!(delete.file.kind, DeleteKind::DeletionVector { .. })
+                    {
+                        return Err(ReadFailure::Original(
+                            ConnectorError::new(
+                                ConnectorErrorKind::CorruptData,
+                                "Iceberg MV content target has a live equality or position delete file",
+                            )
+                            .into(),
+                        ));
+                    }
+                    delete_entries.push((Some(entry.ordinal), delete));
                 }
             }
         }
@@ -848,7 +956,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             }
         })?;
         let deletes = metadata_delete_load_view(&logical);
-        files.push(df.into_file(
+        files.push(df.into_file_with_nested_sizes(
             FinalReadFileFacts {
                 partition_spec_id: data.partition().spec_id(),
                 data_sequence_number: data.sequence().get(),
@@ -858,6 +966,8 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 deletes,
             },
             &field_id_to_name,
+            &nested_sizes,
+            control,
         )?);
     }
     if let Some(inventory) = referenced_specs {
@@ -908,6 +1018,16 @@ trait ObservedDataFileProjection: Sized {
         facts: FinalReadFileFacts,
         field_id_to_name: &HashMap<i32, String>,
     ) -> Result<Self::File, String>;
+
+    fn into_file_with_nested_sizes(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+        _nested_sizes: &[NestedAverageSizeField<'_>],
+        _control: Option<&dyn ConnectorOperationControl>,
+    ) -> Result<Self::File, ReadFailure> {
+        self.into_file(facts, field_id_to_name).map_err(Into::into)
+    }
 }
 
 impl ObservedDataFileProjection for DataFile {
@@ -926,33 +1046,74 @@ impl ObservedDataFileProjection for DataFile {
         facts: FinalReadFileFacts,
         field_id_to_name: &HashMap<i32, String>,
     ) -> Result<Self::File, String> {
-        Ok(IcebergReadFile {
-            path: self.file_path().to_string(),
-            size: i64::try_from(self.file_size_in_bytes())
-                .map_err(|_| format!("file size too large: {}", self.file_path()))?,
-            record_count: Some(
-                i64::try_from(self.record_count()).map_err(|_| "record count too large")?,
-            ),
-            column_stats: column_stats(&self, field_id_to_name),
-            partition_spec_id: Some(facts.partition_spec_id),
-            partition_key: iceberg_partition_key(&facts.partition_values),
-            partition_values: Some(facts.partition_values),
-            manifest_path: Some(facts.manifest_path),
-            first_row_id: facts.first_row_id,
-            data_sequence_number: Some(facts.data_sequence_number),
-            manifest: Arc::new(IcebergDataFileMetadata {
-                file_format: self.file_format(),
-                split_offsets: self.split_offsets().unwrap_or_default().to_vec(),
-                key_metadata: self.key_metadata().unwrap_or_default().to_vec(),
-                value_counts: self.value_counts().clone(),
-                null_value_counts: self.null_value_counts().clone(),
-                nan_value_counts: self.nan_value_counts().clone(),
-                lower_bounds: self.lower_bounds().clone(),
-                upper_bounds: self.upper_bounds().clone(),
-            }),
-            deletes: facts.deletes,
-        })
+        project_read_file(&self, facts, field_id_to_name)
     }
+
+    fn into_file_with_nested_sizes(
+        self,
+        facts: FinalReadFileFacts,
+        field_id_to_name: &HashMap<i32, String>,
+        nested_sizes: &[NestedAverageSizeField<'_>],
+        control: Option<&dyn ConnectorOperationControl>,
+    ) -> Result<Self::File, ReadFailure> {
+        let mut file = project_read_file(&self, facts, field_id_to_name)?;
+        for field in nested_sizes {
+            let size = manifest_nested_size(self.column_sizes(), &field.leaves, control)?;
+            if let Some(stats) = file
+                .column_stats
+                .as_mut()
+                .and_then(|stats| stats.get_mut(field.name))
+            {
+                stats.column_size = size;
+            } else if let Some(size) = size {
+                file.column_stats.get_or_insert_with(HashMap::new).insert(
+                    field.name.to_owned(),
+                    IcebergColumnStats {
+                        field_id: Some(field.id),
+                        column_size: Some(size),
+                        null_count: None,
+                        value_count: None,
+                        lower_bound: None,
+                        upper_bound: None,
+                    },
+                );
+            }
+        }
+        Ok(file)
+    }
+}
+
+fn project_read_file(
+    file: &DataFile,
+    facts: FinalReadFileFacts,
+    field_id_to_name: &HashMap<i32, String>,
+) -> Result<IcebergReadFile, String> {
+    Ok(IcebergReadFile {
+        path: file.file_path().to_string(),
+        size: i64::try_from(file.file_size_in_bytes())
+            .map_err(|_| format!("file size too large: {}", file.file_path()))?,
+        record_count: Some(
+            i64::try_from(file.record_count()).map_err(|_| "record count too large")?,
+        ),
+        column_stats: column_stats(file, field_id_to_name),
+        partition_spec_id: Some(facts.partition_spec_id),
+        partition_key: iceberg_partition_key(&facts.partition_values),
+        partition_values: Some(facts.partition_values),
+        manifest_path: Some(facts.manifest_path),
+        first_row_id: facts.first_row_id,
+        data_sequence_number: Some(facts.data_sequence_number),
+        manifest: Arc::new(IcebergDataFileMetadata {
+            file_format: file.file_format(),
+            split_offsets: file.split_offsets().unwrap_or_default().to_vec(),
+            key_metadata: file.key_metadata().unwrap_or_default().to_vec(),
+            value_counts: file.value_counts().clone(),
+            null_value_counts: file.null_value_counts().clone(),
+            nan_value_counts: file.nan_value_counts().clone(),
+            lower_bounds: file.lower_bounds().clone(),
+            upper_bounds: file.upper_bounds().clone(),
+        }),
+        deletes: facts.deletes,
+    })
 }
 
 /// Only fields consumed by the scoped manifest projection are copied while the
@@ -2693,6 +2854,48 @@ mod tests {
         .await;
         let snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
         assert_eq!(snapshot.files[0].logical_delete_set().member_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn mv_content_target_validates_live_delete_content_without_narrowing_the_scan() {
+        let target = table(
+            vec![
+                vec![(data("a"), 5)],
+                vec![(dv("target.puffin", "a", 4, 2), 5)],
+            ],
+            Some(1),
+            false,
+        )
+        .await;
+        validate_mv_content_target_snapshot(&target, 77, None)
+            .await
+            .unwrap();
+
+        // Legacy deletes lie outside this data file's sequence horizon.
+        // They still describe live storage-side writes and cannot enter the
+        // content target, even if a normal read never applies them.
+        for legacy in [
+            equality("legacy-equality.parquet"),
+            position("legacy-position.parquet", "a"),
+        ] {
+            let target = table(
+                vec![vec![(data("a"), 5)], vec![(legacy, 4)]],
+                Some(1),
+                false,
+            )
+            .await;
+            assert_eq!(
+                build_read_snapshot_at(&target, 77).await.unwrap().files[0]
+                    .logical_delete_set()
+                    .member_count(),
+                0,
+            );
+            let error = validate_mv_content_target_snapshot(&target, 77, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+            assert!(error.message().contains("live equality or position delete"));
+        }
     }
 
     #[tokio::test]

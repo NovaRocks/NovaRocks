@@ -41,8 +41,9 @@ use crate::{
     StaticSinkProgram, StaticValues,
 };
 
-/// Matches the native task-codec preflight, which runs before protobuf decode.
-pub const MAX_PROGRAM_NODE_DEPTH: usize = 64;
+/// Limit for the portion of a LocalProgram path that uses recursive pipeline
+/// construction. Linear projection and aggregate steps use a worklist.
+pub const MAX_RECURSIVE_PIPELINE_BUILD_DEPTH: usize = 64;
 pub const MAX_PROGRAM_NODES: usize = 65_536;
 /// A flat DAG must also bound its expanded execution shape; sharing nodes must
 /// not permit exponential pipeline construction.
@@ -223,7 +224,7 @@ pub struct StaticAggregateCall {
     pub input_is_intermediate: bool,
     pub types: Option<StaticAggregateTypeSignature>,
     pub order: StaticAggregateOrder,
-    pub resolved: ResolvedAggregateSignature,
+    pub resolved: Option<ResolvedAggregateSignature>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,7 +383,9 @@ pub enum WindowFunctionKind {
     /// Compiled programs only: the call is exactly the prepared window kernel
     /// attached at its `ProgramCallSite::Window`. The compiler never derives a
     /// legacy kind from a function name, and the legacy runtime refuses it.
-    Prepared,
+    Prepared {
+        aggregate_order: Option<StaticAggregateOrder>,
+    },
 }
 impl WindowFunctionKind {
     /// Whether IGNORE NULLS can be a fact of this call kind.
@@ -394,7 +397,7 @@ impl WindowFunctionKind {
                 | Self::LastValue
                 | Self::Lead
                 | Self::Lag
-                | Self::Prepared
+                | Self::Prepared { .. }
         )
     }
 }
@@ -558,6 +561,28 @@ pub struct ProgramPositionShardInput {
     pub partition: SlotId,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramContentApplyTarget {
+    pub file: SlotId,
+    pub position: SlotId,
+    pub spec_id: SlotId,
+    pub partition: SlotId,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramContentApply {
+    pub weighted_input: ProgramNodeId,
+    pub target_input: ProgramNodeId,
+    pub weighted_content: Box<[SlotId]>,
+    pub target_content: Box<[SlotId]>,
+    pub route_keys: Box<[u32]>,
+    pub weight: SlotId,
+    pub target: ProgramContentApplyTarget,
+    pub demand_filters: Box<[(usize, crate::StaticFilterProducer)]>,
+    /// The ordered DeleteVerification layout, independent of the data port.
+    pub summary_slots: [SlotId; 4],
+}
+
 #[derive(Clone, Debug)]
 pub enum ProgramNodeKind {
     AssertNumRows {
@@ -625,6 +650,7 @@ pub enum ProgramNodeKind {
         /// File, spec, partition, author driver, high32, container, index, count, bitmap.
         output_slots: [SlotId; 9],
     },
+    ContentApply(ProgramContentApply),
     UnionAll {
         inputs: Vec<ProgramNodeId>,
     },
@@ -738,7 +764,18 @@ pub enum ProgramNodeKind {
 
 impl ProgramNodeKind {
     pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
-        None
+        match self {
+            Self::ContentApply(_) => Some(crate::SummaryKind::DeleteVerification),
+            _ => None,
+        }
+    }
+
+    /// The unary pipeline steps built iteratively by Execution.
+    pub const fn linear_pipeline_input(&self) -> Option<ProgramNodeId> {
+        match self {
+            Self::Project { input, .. } | Self::Aggregate { input, .. } => Some(*input),
+            _ => None,
+        }
     }
 
     fn try_for_each_child<E>(
@@ -777,6 +814,10 @@ impl ProgramNodeKind {
                 for input in inputs {
                     visit(input.input)?;
                 }
+            }
+            Self::ContentApply(spec) => {
+                visit(spec.weighted_input)?;
+                visit(spec.target_input)?;
             }
             Self::Join { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
                 visit(*left)?;
@@ -1000,7 +1041,7 @@ impl ProgramNodeKind {
                     }
                 }
             }
-            Self::PositionShard { .. } | Self::WriteLayoutKey { .. } => {}
+            Self::PositionShard { .. } | Self::ContentApply(_) | Self::WriteLayoutKey { .. } => {}
             Self::Sort { order_by, mode, .. } => {
                 for sort in order_by.iter().chain(mode.partition_by()) {
                     visit(Some(sort.expr), Value)?;
@@ -1501,7 +1542,8 @@ impl LocalProgramGraph {
             if duplicate {
                 return Err(LocalProgramError::DuplicateNativeNode.into());
             }
-            let mut depth = 1usize;
+            let recursive_step = usize::from(node.kind.linear_pipeline_input().is_none());
+            let mut depth = recursive_step;
             let mut expanded = 1usize;
             node.kind.try_for_each_child(|child| {
                 let valid = child.index() < index;
@@ -1509,13 +1551,13 @@ impl LocalProgramGraph {
                 if !valid {
                     return Err(LocalProgramError::InvalidChild.into());
                 }
-                depth = depth.max(depths[child.index()] + 1);
+                depth = depth.max(depths[child.index()] + recursive_step);
                 let next = expanded.checked_add(expansions[child.index()]);
                 work.step()?;
                 expanded = next.ok_or(LocalProgramError::ExpandedLimit)?;
                 Ok::<(), ProgramCompileError>(())
             })?;
-            let too_deep = depth > MAX_PROGRAM_NODE_DEPTH;
+            let too_deep = depth > MAX_RECURSIVE_PIPELINE_BUILD_DEPTH;
             work.step()?;
             if too_deep {
                 return Err(LocalProgramError::TooDeep.into());
@@ -1744,17 +1786,41 @@ impl LocalProgramGraph {
                     let author = nodes
                         .get(id.index())
                         .ok_or(LocalProgramError::InvalidSink)?;
-                    if summary.kind() == crate::SummaryKind::WriteCounts
-                        || author.kind.summary_authorship() != Some(summary.kind())
-                        || !work.projection_matches(
-                            &author.output_layout,
-                            summary.branch().output_columns(),
-                            summary.layout(),
-                        )?
+                    let ProgramNodeKind::ContentApply(spec) = &author.kind else {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    };
+                    if author.kind.summary_authorship() != Some(summary.kind())
+                        || spec.summary_slots.as_slice() != summary.layout().slots()
+                        || !matches!(sink, Some(StaticSinkProgram::ChangeStreamRouter { .. }))
+                        || id == root
                     {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
+                    for slot in spec.summary_slots {
+                        for output in author
+                            .output_layout
+                            .slots()
+                            .iter()
+                            .chain(nodes[root.index()].output_layout.slots())
+                        {
+                            work.step()?;
+                            if slot == *output {
+                                return Err(LocalProgramError::InvalidSink.into());
+                            }
+                        }
+                    }
                 }
+            }
+        }
+        for (ordinal, node) in nodes.iter().enumerate() {
+            work.step()?;
+            if let Some(kind) = node.kind.summary_authorship()
+                && (seen_summaries.get(crate::SummaryKind::WriteCounts).is_none() || !summaries.iter().any(|summary| {
+                    summary.kind() == kind
+                        && matches!(summary.author(), crate::StaticSummaryAuthor::Node(owner) if owner.index() == ordinal)
+                }))
+            {
+                return Err(LocalProgramError::InvalidSink.into());
             }
         }
         if let Some(sink) = &sink {
@@ -2043,6 +2109,11 @@ fn node_filter_ids(
                 add(filter.producer.binding_id())?;
             }
         }
+        ProgramNodeKind::ContentApply(spec) => {
+            for (_, producer) in &spec.demand_filters {
+                add(producer.binding_id())?;
+            }
+        }
         ProgramNodeKind::Join {
             runtime_filters,
             runtime_filter_consumers,
@@ -2092,6 +2163,52 @@ fn validate_relationships(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::ContentApply(spec) => {
+            let weighted = nodes[spec.weighted_input.index()].output_layout();
+            let target = nodes[spec.target_input.index()].output_layout();
+            for (ordinal, producer) in &spec.demand_filters {
+                work.step()?;
+                let ty = spec
+                    .weighted_content
+                    .get(*ordinal)
+                    .and_then(|slot| weighted.value_binding(*slot))
+                    .ok_or(LocalProgramError::LayoutMismatch)?;
+                let crate::StaticFilterContract::Membership {
+                    canonical,
+                    value_type,
+                } = producer.contract()
+                else {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                };
+                if producer.kind() != crate::FilterProducerKind::Membership
+                    || producer.reduction() != crate::FilterReduction::SetUnion
+                    || canonical.null_semantics() != crate::FilterNullSemantics::NullSafeEqual
+                    || ty.value_type() != value_type.value_type()
+                {
+                    return Err(LocalProgramError::InvalidRequirement.into());
+                }
+            }
+            for (layout, content, extra) in [
+                (weighted, spec.weighted_content.as_ref(), &[spec.weight][..]),
+                (
+                    target,
+                    spec.target_content.as_ref(),
+                    &[
+                        spec.target.file,
+                        spec.target.position,
+                        spec.target.spec_id,
+                        spec.target.partition,
+                    ][..],
+                ),
+            ] {
+                for slot in content.iter().chain(extra) {
+                    work.step()?;
+                    if layout.value_binding(*slot).is_none() {
+                        return Err(LocalProgramError::LayoutMismatch.into());
+                    }
+                }
+            }
+        }
         ProgramNodeKind::AssertNumRows { input, mode } => {
             if !layout_matches(nodes, *input, &node.output_layout, work)? {
                 return Err(LocalProgramError::LayoutMismatch.into());
@@ -2218,6 +2335,22 @@ fn validate_shape(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::ContentApply(spec) => {
+            let width = spec.weighted_content.len();
+            if width == 0
+                || width != spec.target_content.len()
+                || width.checked_add(5) != Some(node.output_layout.slots().len())
+                || spec.route_keys.is_empty()
+            {
+                return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+            for &key in &spec.route_keys {
+                work.step()?;
+                if key as usize >= width {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+        }
         ProgramNodeKind::Filter { predicates, .. } => {
             let empty = predicates.is_empty();
             work.step()?;
@@ -2474,7 +2607,7 @@ fn validate_shape(
                 }
             }
             for function in functions {
-                let prepared = matches!(function.kind, WindowFunctionKind::Prepared);
+                let prepared = matches!(function.kind, WindowFunctionKind::Prepared { .. });
                 let bad = (function.ignore_nulls && !function.kind.admits_ignore_nulls())
                     || (prepared && function.frame.is_none());
                 work.step()?;
@@ -2983,6 +3116,60 @@ mod tests {
         assert!(matches!(
             unbound,
             Err(LocalProgramError::InvalidRequirement)
+        ));
+    }
+
+    #[test]
+    fn linear_pipeline_steps_do_not_consume_recursive_depth() {
+        let build = |recursive_steps| {
+            let (values, layout) = values();
+            let mut nodes = vec![ProgramNode::new(
+                1,
+                ProgramNodeKind::Values { values },
+                layout.clone(),
+            )];
+            for _ in 0..recursive_steps {
+                let ordinal = nodes.len();
+                nodes.push(ProgramNode::new(
+                    i32::try_from(ordinal + 1).unwrap(),
+                    ProgramNodeKind::Limit {
+                        input: ProgramNodeId::new(ordinal - 1),
+                        limit: Some(1),
+                        offset: 0,
+                    },
+                    layout.clone(),
+                ));
+            }
+            for _ in 0..2 * MAX_RECURSIVE_PIPELINE_BUILD_DEPTH {
+                let ordinal = nodes.len();
+                nodes.push(ProgramNode::new(
+                    i32::try_from(ordinal + 1).unwrap(),
+                    ProgramNodeKind::Project {
+                        input: ProgramNodeId::new(ordinal - 1),
+                        is_subordinate: false,
+                        validate_final_result_input: false,
+                        exprs: vec![crate::test_support::root(0, 0)],
+                        expr_slot_ids: vec![SlotId::new(1)],
+                        expr_slot_schemas: None,
+                        output_indices: None,
+                    },
+                    layout.clone(),
+                ));
+            }
+            let root = ProgramNodeId::new(nodes.len() - 1);
+            LocalProgramGraph::try_new(
+                nodes,
+                root,
+                &read_units(&layout),
+                profile(&layout),
+                BindingRequirements::try_new(vec![]).unwrap(),
+            )
+        };
+
+        assert!(build(MAX_RECURSIVE_PIPELINE_BUILD_DEPTH - 1).is_ok());
+        assert!(matches!(
+            build(MAX_RECURSIVE_PIPELINE_BUILD_DEPTH),
+            Err(LocalProgramError::TooDeep)
         ));
     }
 

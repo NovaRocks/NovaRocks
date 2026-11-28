@@ -292,7 +292,7 @@ fn assert_writer_via_production_fs(writer: Writer) {
     );
     let request = FileReadRequest {
         file,
-        format: FileFormat::Parquet,
+        format: FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         range: FileReadRange::WholeFile,
         projection: FileProjection::All,
         sizing: ReaderSizing {

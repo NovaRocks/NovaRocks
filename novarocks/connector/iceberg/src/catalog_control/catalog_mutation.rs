@@ -3704,9 +3704,13 @@ fn reconcile_evidence(
             table_uuid,
             operation_id,
             properties,
+            fenced,
         } => {
             if *operation_id != evidence.operation_id().to_bytes() {
                 return Err(invalid("keyed marker evidence has another operation"));
+            }
+            if *fenced {
+                return ambiguous("Fenced marker settlement requires its original journal".into());
             }
             let physical = provider
                 .runtime()
@@ -6558,6 +6562,182 @@ mod tests {
     }
 
     #[test]
+    fn fenced_marker_async_reconciliation_uses_original_scope_and_does_not_republish() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationReceiving, ConnectorMarkerKey, ConnectorMarkerValue,
+            KeyedMarkerWrite, KeyedMutation,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        for (drift, lands) in [(false, false), (false, true), (true, false)] {
+            let markers = KeyedMarkerWrite {
+                markers: BTreeMap::from([(
+                    ConnectorMarkerKey {
+                        owner: "novarocks.mv".into(),
+                        name: "pending".into(),
+                        binding: "original-fenced-attempt".into(),
+                    },
+                    ConnectorMarkerValue {
+                        format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1)
+                            .unwrap(),
+                        content: Bytes::from_static(b"fenced-intent"),
+                    },
+                )]),
+            };
+            let base = test_metadata(HashMap::new());
+            let desired =
+                crate::document_storage::keyed::write::marker_properties(&base, &markers).unwrap();
+            let before = serde_json::json!({
+                "metadata-location": "memory://warehouse/managed/mv/metadata/before.json",
+                "metadata": &base,
+            });
+            let drifted = serde_json::json!({
+                "metadata-location": "memory://warehouse/managed/mv/metadata/concurrent.json",
+                "metadata": &base,
+            });
+            let mut after = serde_json::to_value(&base).unwrap();
+            for (key, value) in &desired {
+                after["properties"][key] = serde_json::Value::String(value.clone());
+            }
+            let after = serde_json::json!({
+                "metadata-location": "memory://warehouse/managed/mv/metadata/after.json",
+                "metadata": after,
+            });
+            let admitted = Arc::new(AtomicBool::new(false));
+            let read_admission = Arc::clone(&admitted);
+            let reads_after_admission = AtomicUsize::new(0);
+            let issued = Arc::new(AtomicBool::new(false));
+            let landing_visible = Arc::new(AtomicBool::new(false));
+            let read_landing = Arc::clone(&landing_visible);
+            let observing = Arc::clone(&issued);
+            let dispatch = Arc::clone(&issued);
+            let table_path = "/v1/namespaces/managed/tables/mv";
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on_fn("GET", table_path, move |_, _| {
+                        let metadata = if lands
+                            && observing.load(Ordering::Acquire)
+                            && read_landing.load(Ordering::Acquire)
+                        {
+                            &after
+                        } else if drift && read_admission.load(Ordering::Acquire)
+                            && reads_after_admission.fetch_add(1, Ordering::AcqRel) > 0
+                        {
+                            &drifted
+                        } else {
+                            &before
+                        };
+                        Reply::json(200, metadata)
+                    })
+                    .on_fn("POST", table_path, move |request, _| {
+                        assert!(!dispatch.swap(true, Ordering::AcqRel), "one original dispatch");
+                        let sent: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        assert!(sent["requirements"].as_array().unwrap().iter().any(|requirement| {
+                            requirement["type"] == "assert-ref-snapshot-id" && requirement["ref"] == "main"
+                                && requirement["snapshot-id"].is_null()
+                        }));
+                        assert_eq!(sent["updates"], serde_json::json!([{"action":"set-properties", "updates":desired}]));
+                        Reply::json(500, &serde_json::json!({
+                            "error": {"message":"publication response lost", "type":"RuntimeException", "code":500}
+                        }))
+                    }),
+            );
+            let (executor, provider) = variant_definition_provider_observed(&server.url(), None);
+            let table = ConnectorTableIdentity {
+                instance_id: provider.descriptor().instance_id.clone(),
+                namespace: "managed".into(),
+                table: "mv".into(),
+            };
+            let request =
+                keyed_channel_request(&provider, &table, KeyedMutation::FencedMarkers(markers));
+            let lease = document_control_planning_pin(&provider)
+                .derive_mutation_lease()
+                .unwrap();
+            let original = ConnectorCatalogMutationReceiving::new();
+            admitted.store(true, Ordering::Release);
+            executor
+                .block_on(lease.execute_async_in(request.clone(), &original))
+                .unwrap();
+            if drift {
+                assert!(matches!(
+                    original.observation().validated_outcome(),
+                    Some(Ok(ExternalMutationOutcome::KnownUncommitted { .. })),
+                ));
+                assert!(server.requests_to("POST", table_path).is_empty());
+                continue;
+            }
+            let exact_evidence = {
+                let observed = original.observation();
+                let Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. })) =
+                    observed.validated_outcome()
+                else {
+                    panic!(
+                        "the original dispatch loses its acknowledgement: {:?}",
+                        observed.validated_outcome()
+                    );
+                };
+                assert!(observed.provider_exited());
+                evidence.clone()
+            };
+            landing_visible.store(true, Ordering::Release);
+            assert!(matches!(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence: exact_evidence.without_process_local_payload(),
+                        context: context(),
+                    })
+                    .unwrap(),
+                ExternalMutationOutcome::CommitUnknown { .. }
+            ));
+            let detached = ConnectorCatalogMutationReceiving::new();
+            executor
+                .block_on(lease.reconcile_async_in(
+                    &request,
+                    ConnectorCatalogMutationReconcileRequest {
+                        evidence: exact_evidence.without_process_local_payload(),
+                        context: context(),
+                    },
+                    &detached,
+                ))
+                .unwrap();
+            assert!(matches!(
+                detached.observation().validated_outcome(),
+                Some(Ok(ExternalMutationOutcome::CommitUnknown { .. }))
+            ));
+            let reconciliation = ConnectorCatalogMutationReceiving::new();
+            executor
+                .block_on(lease.reconcile_async_in(
+                    &request,
+                    ConnectorCatalogMutationReconcileRequest {
+                        evidence: exact_evidence,
+                        context: context(),
+                    },
+                    &reconciliation,
+                ))
+                .unwrap();
+            let result = reconciliation.observation();
+            assert!(result.provider_exited());
+            match result.validated_outcome() {
+                Some(Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    cleanup: ExternalMutationFinalization::Complete,
+                    receipt,
+                    ..
+                })) if lands => assert_eq!(receipt.operation_id(), request.operation_id),
+                Some(Ok(ExternalMutationOutcome::CommitUnknown { .. })) if !lands => {}
+                other => panic!("unexpected exact marker reconciliation: {other:?}"),
+            }
+            assert!(matches!(
+                original.observation().validated_outcome(),
+                Some(Ok(ExternalMutationOutcome::CommitUnknown { .. }))
+            ));
+            assert_eq!(server.requests_to("POST", table_path).len(), 1);
+        }
+    }
+
+    #[test]
     fn keyed_marker_reconcile_checks_every_exact_value_and_mismatch_stays_unknown() {
         use novarocks_spi::connector::{
             ConnectorMarkerKey, ConnectorMarkerValue, KeyedMarkerWrite, KeyedMutation,
@@ -6606,6 +6786,7 @@ mod tests {
                     table_uuid: loaded.table.metadata().uuid().to_string(),
                     operation_id: request.operation_id.to_bytes(),
                     properties,
+                    fenced: false,
                 },
             )
             .unwrap()

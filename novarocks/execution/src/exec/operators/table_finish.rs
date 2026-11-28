@@ -5016,8 +5016,6 @@ mod tests {
                 panic!("any_value returns one scalar")
             };
             AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: aggregate.state_argument_contract,
                 function: BoundFunction {
                     legacy_metadata: None,
                     function_id: bound.function_id,
@@ -5028,8 +5026,12 @@ mod tests {
                 },
                 phase,
                 logical_argument_count: 1,
-                intermediate_type: aggregate.intermediate_type,
-                state_format: aggregate.state_format,
+                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract: aggregate.state_argument_contract,
+                    intermediate_type: aggregate.intermediate_type,
+                    state_format: aggregate.state_format,
+                }),
             }
         }
 
@@ -5874,6 +5876,7 @@ mod tests {
                     operators,
                     &sources,
                     lp::CompiledProgramFacts {
+                        input_completion: novarocks_local_program::InputCompletion::MayShortCircuit,
                         writes: first.write_recipes().clone(),
                         exchange_inputs: first.exchange_inputs().clone(),
                         scan_inputs: first.scan_inputs().clone(),

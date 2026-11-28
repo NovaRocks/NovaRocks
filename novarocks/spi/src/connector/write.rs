@@ -2030,14 +2030,13 @@ impl ConnectorWrite {
     ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
         request.validate(&self.provider_binding_key)?;
         let outcome = self.control.prepare_row_mutation(request)?;
-        if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
-            preparation.validate()?;
-            if preparation.owner() != &self.provider_binding_key {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "row-mutation preparation does not retain the lease generation",
-                ));
-            }
+        if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome
+            && preparation.owner() != &self.provider_binding_key
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "row-mutation preparation does not retain the lease generation",
+            ));
         }
         Ok(outcome)
     }

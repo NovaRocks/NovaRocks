@@ -290,11 +290,24 @@ fn real_theta_writer_partial_canonical_and_final_original_capture_are_distinct()
     );
     assert_argument(&final_call.captured().request().arguments[0], false);
     assert_eq!(
-        final_call.source().binding.intermediate_type,
+        final_call
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
         FunctionValueType::new(DataType::Binary, false)
     );
     assert_eq!(
-        final_call.source().binding.state_format.as_str(),
+        final_call
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
+            .as_str(),
         ICEBERG_THETA_STATE_FORMAT_IDENTITY
     );
     assert_eq!(
@@ -335,7 +348,13 @@ fn writer_update_uses_checked_materialized_input_without_replacing_source_or_cap
         false,
     );
     assert_eq!(
-        partial.source().binding.intermediate_type,
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
         FunctionValueType::new(DataType::Binary, false)
     );
 }

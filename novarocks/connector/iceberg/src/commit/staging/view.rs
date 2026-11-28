@@ -62,6 +62,12 @@ impl<'a> StagedView<'a> {
     pub(crate) const fn round_parent(&self) -> Option<i64> {
         self.round_parent
     }
+
+    pub(crate) fn partition_replace(
+        &self,
+    ) -> Option<&novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection> {
+        self.intent.partition_replace()
+    }
     pub(crate) fn metadata_ref(&self) -> Arc<TableMetadata> {
         Arc::clone(self.metadata)
     }

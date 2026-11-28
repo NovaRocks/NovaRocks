@@ -285,6 +285,14 @@ SQL client
   核对 B 对 D/L/M 的完整引用，历史 P 使用自己的 B 解码源水位。见
   [ADR-0267](docs/adr/ADR-0267-mv-publishes-bound-source-and-storage-facts.md)。
 
+- `novarocks/mv-application/src/persistence/{resolution.rs,keyed_documents.rs}` 从 S 的当前快照记录、
+  表属性标记与 Provider 的初始发布事实解析适用的 P。改写、刷新和 EXPLAIN 读取同一资格。
+  `novarocks/frontend-application/src/mv/domain/refresh/{strategy.rs,decision.rs,recovery.rs}`
+  分别拥有策略、完整覆盖与删除核验决定、按 Pending 指向的旧 P/B 和冻结预算进行的严格恢复。
+  Iceberg 的 `commit/mv_dispatch.rs` 及 `commit/retirement.rs` 核对当轮标记键、固定 main 与退役载体。
+  状态观察、外部效果结论和原清理各自取证。见
+  [ADR-0278](docs/adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)。
+
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
 
@@ -440,13 +448,23 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Router 按原 static branch 绑定 provider route；fragment 级 summary 声明独立保留种类、作者与分支。
   全局分支顺序为原 sink 分支后接声明的 summary；表达式 root 保留原 branch 身份。
   作者在 driver 创建前冻结贡献单位，末尾 Source 创建核对全部单位已领取；各 summary pipeline
-  加入同一 DriverBatch，当前生产作者只有 Router 的 WriteCounts，所有节点作者明确拒绝。
+  加入同一 DriverBatch。Router 出具 WriteCounts，ContentApply 节点出具 DeleteVerification。
   writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
   WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results、
   各种类准确 source-bound summary 和原核心续体，不为同一 summary receiver 构建第二个 Source。
   核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
   冻结放置与装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)，
-  类型化种类、作者单位与逐种类完成见 [ADR-0222](docs/adr/ADR-0222-typed-task-summaries-and-per-kind-completion.md)。
+  类型化种类、作者单位与逐种类完成见 [ADR-0222](docs/adr/ADR-0222-typed-task-summaries-and-per-kind-completion.md)，
+  内容应用节点作者见 [ADR-0278](docs/adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)。
+
+- `novarocks/physical-plan/src/validation/content_apply.rs`、
+  `novarocks/execution/src/exec/pipeline/builder/compiled_content_apply.rs` 与
+  `novarocks/execution/src/exec/operators/content_apply/**`
+  分别核对 ContentApply 的准确内容端口、同路由、节点作者，以及本地 capture、finalize、probe、tail。
+  内容与权重按完整输入归并，匹配 S 的可见副本后经原数据输出进入 writer，核验另走 summary。
+  `novarocks/sql/src/planner/distributed/build/contract_lowering.rs` 核对白名单并冻结维护输入的 MustDrain，
+  `novarocks/spi/src/connector/read_stack/split_source.rs` 保留原自然末批与按依据归属的裁剪。全量、
+  首刷及增量的数据计划共用覆盖合同。当前候选的全域验收见对应执行证据。
 
 - `novarocks/execution/src/exec/operators/{write_layout_key,write_spread}.rs`
   分区亲和边的发送算子向已绑定 Provider 求分区键，Execution 按目的 Task 与发送端实际 DOP 扩散热点。
@@ -1639,4 +1657,8 @@ Server CLI 保留 `novarocks-server`，SQL CLI 保留原 manifest/package；Syst
 场景性质和 fixture 需求见 [System README](tests/system-test-runner/README.md#兼容专项与程序需求)。
 HMS/MySQL 私有完整矩阵缺输入仍记 `NOT_RUN`，局部单测不替代原输入与真实退出。
 
-现有 LNP-3A/LNP-3D、MV storage-contract 与 system MV 资产保留，旧指令/CALL 禁止扩展。7B3 承接非聚合冷恢复、配置/paused、Unknown 与管理接续；7B4 承接 SUM/COUNT、聚合状态和聚合冷恢复；7B5 承接 V/S 身份、发现/CREATE/DROP、路由与 materialized S/fallback；7B11 承接文档格式、独立 graph 与 shared-document-revisions。每个唯一产品 owner 在替代保护实际通过后逐项退役对应旧载体，不在 G2 新增启动期缓存缺失或通用擦除接口。
+RWM-10c 承接 LNP-3A/LNP-3D、MV storage-contract 与 System 中非聚合冷恢复、配置/paused、Unknown、
+迟到效果和管理接续的性质。RWM-10d 拥有剩余的运维声明与明确重建入口，以及旧 CALL/directive 的退役。
+7B4 承接 SUM/COUNT、聚合状态和聚合冷恢复。7B5 承接 V/S 身份、发现/CREATE/DROP、路由与
+materialized S/fallback。7B11 承接文档格式、独立图与 shared-document-revisions。
+唯一产品 owner 在替代保护实际通过后逐项退役旧载体。G2 的授权限于原 MV Accelerator family。

@@ -560,11 +560,15 @@ impl BackendRuntimeFilterSession {
         self.mark_satisfied(install.coverage_witness());
         Ok(match self.availability_progress() {
             BackendCoverageProgress::Satisfied => {
+                let empty_content_demand = self
+                    .channel
+                    .frontend_feedback_publication()
+                    .is_some_and(|publication| publication.publishes_empty_content_demand());
                 let publication = self.reduction.as_ref().and_then(|reduction| {
                     reduction
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
-                        .latest_snapshot()
+                        .completed_membership_snapshot(empty_content_demand)
                 });
                 match publication {
                     Some(snapshot) => {
@@ -1774,6 +1778,134 @@ mod tests {
             session.availability_progress(),
             BackendCoverageProgress::Satisfied
         );
+    }
+
+    #[test]
+    fn only_authorized_content_demand_emits_empty_after_every_producer_closes() {
+        use crate::runtime_filter::domain::{
+            BackendFrontendFeedbackPublication, BackendMaterializationOwner,
+            BackendOutboundMaterializationGroup,
+        };
+        use novarocks_execution::runtime_filter::{
+            RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
+            RuntimeFilterProducerContract, feedback_domain::RuntimeFilterFeedbackDomain,
+        };
+
+        #[derive(Default)]
+        struct Feedback(Mutex<Vec<BackendFrontendFeedbackOutcome>>);
+        impl BackendFrontendFeedbackSink for Feedback {
+            fn try_publish(
+                &self,
+                _channel_id: RuntimeFilterChannelId,
+                _deployment_epoch: u64,
+                _publication: &BackendFrontendFeedbackPublication,
+                outcome: BackendFrontendFeedbackOutcome,
+            ) {
+                self.0.lock().unwrap().push(outcome);
+            }
+        }
+
+        for authorized in [false, true] {
+            let schema = RuntimeFilterMembershipSchema::new(
+                &DataType::Int64,
+                RuntimeFilterNullSemantics::NullSafeEqual,
+            )
+            .unwrap();
+            let id = RuntimeFilterChannelId::new(11);
+            let digest = schema.digest();
+            let schema = RuntimeFilterExecutionContract::Membership(schema);
+            let producer = RuntimeFilterProducerContract::membership(
+                RuntimeFilterBindingId::new(7),
+                id,
+                schema.clone(),
+            )
+            .unwrap();
+            let witness = BackendCoverageWitnessId::new(29);
+            let coverage = BackendCoverage::all_of([BackendCoverage::witness(witness)]).unwrap();
+            let profile =
+                ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::EmptyDomain]), None)
+                    .unwrap();
+            let channel = BackendChannelInstall::new(
+                id,
+                schema,
+                BackendChannelLifecycle::CompleteOnce,
+                coverage.clone(),
+                coverage,
+                BackendMaterializationPolicy::new(8, 3, 5, 1, 1024, 1024, 1).unwrap(),
+                1024,
+                1024,
+                [BackendProducerInstall::new(
+                    producer.clone(),
+                    witness,
+                    [instance(37), instance(41)],
+                    1024,
+                )
+                .unwrap()],
+                [],
+                [BackendOutboundMaterializationGroup::new(
+                    BackendMaterializationOwner::Aggregator,
+                    profile,
+                    [BackendRouteEdgeId::new(101)],
+                )
+                .unwrap()],
+            )
+            .unwrap()
+            .with_frontend_feedback_publication(
+                BackendFrontendFeedbackPublication::new(
+                    BackendMaterializationOwner::Aggregator,
+                    digest,
+                    1024,
+                )
+                .unwrap()
+                .with_empty_content_demand(authorized),
+            )
+            .unwrap();
+            let session = Arc::new(
+                BackendRuntimeFilterSession::from_channel_install(
+                    BackendRuntimeFilterFixture::membership().identity(),
+                    channel,
+                    Arc::new(CollectingBackendRuntimeFilterEventObserver::default()),
+                )
+                .unwrap(),
+            );
+            let feedback = Arc::new(Feedback::default());
+            let sink: Arc<dyn BackendFrontendFeedbackSink> = feedback.clone();
+            session.set_frontend_feedback_sink(Arc::downgrade(&sink));
+            for (position, task) in [instance(37), instance(41)].into_iter().enumerate() {
+                let RuntimeFilterBindOutcome::Bound(local) = session
+                    .open_producer(
+                        task,
+                        RuntimeFilterProducerOpenRequest::new(producer.clone(), 1),
+                    )
+                    .unwrap()
+                else {
+                    panic!("the authorized producer binds")
+                };
+                local
+                    .close_partition(PartitionId::new(0), ProducerSequence::new(0))
+                    .unwrap();
+                if position == 0 {
+                    assert!(feedback.0.lock().unwrap().is_empty());
+                }
+            }
+            let outcomes = feedback.0.lock().unwrap();
+            if authorized {
+                let [BackendFrontendFeedbackOutcome::CanonicalDomain(bytes)] = outcomes.as_slice()
+                else {
+                    panic!("the completed empty demand must have a canonical domain")
+                };
+                assert!(
+                    matches!(RuntimeFilterFeedbackDomain::decode(bytes, &DataType::Int64, 1024).unwrap(),
+                    RuntimeFilterFeedbackDomain::Exact(domain)
+                        if domain.values().is_empty() && !domain.contains_null())
+                );
+            } else {
+                assert!(matches!(
+                    outcomes.as_slice(),
+                    [BackendFrontendFeedbackOutcome::ReductionUnavailable]
+                ));
+            }
+        }
     }
 
     #[test]

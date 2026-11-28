@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 const CATALOG: &str = "uea7_mv_storage";
 const NAMESPACE: &str = "ns";
 const VIEW: &str = "orders_mv";
+const WRITE_SESSION_MARKER: &str = "novarocks.write.session.v1";
 
 #[derive(Default)]
 pub(super) struct MvStorageContract {
@@ -509,10 +510,6 @@ fn assert_full_refresh_pair(
     after: &DocumentGraph,
     rows: u64,
 ) -> Result<()> {
-    use super::mv_uea7_documents::wire::RECORD;
-    const SESSION_MARKER: &str = "novarocks.write.session.v1";
-    const STAGE: &str = "novarocks.mv.full-refresh-stage.v1";
-
     let retained = before.snapshots.len();
     ensure!(
         after.snapshots.len() == retained + 2 && after.snapshots.starts_with(&before.snapshots),
@@ -521,11 +518,50 @@ fn assert_full_refresh_pair(
     let delete = &after.snapshots[retained];
     let append = &after.snapshots[retained + 1];
     ensure!(
+        before.table_uuid == after.table_uuid && append["snapshot-id"].as_i64() == after.current,
+        "FULL did not advance main on the original table"
+    );
+    assert_full_refresh_snapshots(&after.table_uuid, before.current, delete, append)?;
+    let append_summary = &append["summary"];
+    let session = append_summary[WRITE_SESSION_MARKER].as_str();
+    ensure!(
+        after
+            .snapshots
+            .iter()
+            .filter(|s| s["summary"][WRITE_SESSION_MARKER].as_str() == session)
+            .count()
+            == 1
+            && before.publications.len() + 1 == after.publications.len()
+            && after.publications.starts_with(&before.publications),
+        "FULL did not add one exact document publication and one uniquely marked append"
+    );
+    ensure!(
+        append_summary["total-records"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(rows)
+            && after.logical_rows == Some(rows)
+            && append["first-row-id"].as_u64() == Some(before.next_row_id)
+            && append["added-rows"].as_u64() == Some(rows)
+            && before.next_row_id.checked_add(rows) == Some(after.next_row_id),
+        "FULL append did not project the exact logical and physical row totals and lineage"
+    );
+    Ok(())
+}
+
+pub(super) fn assert_full_refresh_snapshots(
+    table_uuid: &str,
+    previous: Option<i64>,
+    delete: &Value,
+    append: &Value,
+) -> Result<()> {
+    use super::mv_uea7_documents::wire::RECORD;
+    const STAGE: &str = "novarocks.mv.full-refresh-stage.v1";
+    ensure!(
         delete["summary"]["operation"] == "delete"
             && append["summary"]["operation"] == "append"
-            && delete["parent-snapshot-id"].as_i64() == before.current
+            && delete["parent-snapshot-id"].as_i64() == previous
             && append["parent-snapshot-id"] == delete["snapshot-id"]
-            && append["snapshot-id"].as_i64() == after.current
             && delete["sequence-number"]
                 .as_i64()
                 .and_then(|seq| seq.checked_add(1))
@@ -545,7 +581,7 @@ fn assert_full_refresh_pair(
         "FULL delete must be empty and carry only its private stage witness"
     );
     let append_summary = &append["summary"];
-    let session = append_summary[SESSION_MARKER]
+    let session = append_summary[WRITE_SESSION_MARKER]
         .as_str()
         .context("FULL append session missing")?;
     let witness: Value = serde_json::from_str(
@@ -563,40 +599,16 @@ fn assert_full_refresh_pair(
     ensure!(
         witness["version"] == 1
             && witness.as_object().is_some_and(|fields| fields.len() == 8)
-            && before.table_uuid == after.table_uuid
-            && witness["table_uuid"].as_str() == Some(after.table_uuid.as_str())
-            && witness["asserted_parent"].as_i64() == before.current
+            && witness["table_uuid"].as_str() == Some(table_uuid)
+            && witness.get("asserted_parent") == Some(&serde_json::json!(previous))
             && witness["delete_snapshot"] == delete["snapshot-id"]
             && witness["append_snapshot"] == append["snapshot-id"]
             && u32::try_from(witness["attempt_ordinal"].as_u64().unwrap_or(u64::MAX)).is_ok()
             && nonce[6] >> 4 == 7
             && nonce[8] >> 6 == 2
-            && operation_hex == session.replace('-', ""),
+            && operation_hex == session.replace('-', "")
+            && append_summary[RECORD].as_str().is_some(),
         "FULL delete stage witness does not bind the exact dispatch"
-    );
-    ensure!(
-        !session.is_empty()
-            && after
-                .snapshots
-                .iter()
-                .filter(|s| s["summary"][SESSION_MARKER].as_str() == Some(session))
-                .count()
-                == 1
-            && append_summary[RECORD].as_str().is_some()
-            && before.publications.len() + 1 == after.publications.len()
-            && after.publications.starts_with(&before.publications),
-        "FULL did not add one exact document publication and one uniquely marked append"
-    );
-    ensure!(
-        append_summary["total-records"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            == Some(rows)
-            && after.logical_rows == Some(rows)
-            && append["first-row-id"].as_u64() == Some(before.next_row_id)
-            && append["added-rows"].as_u64() == Some(rows)
-            && before.next_row_id.checked_add(rows) == Some(after.next_row_id),
-        "FULL append did not project the exact logical and physical row totals and lineage"
     );
     Ok(())
 }

@@ -1933,10 +1933,7 @@ mod tests {
             ),
             false,
         );
-        for length in [
-            1,
-            novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1,
-        ] {
+        for length in [1, (16 * 1024) + 1] {
             let source = arrow::datatypes::Field::new("nested", DataType::Int32, false)
                 .with_metadata(std::collections::HashMap::<String, String>::from([(
                     "provider.attribute".into(),

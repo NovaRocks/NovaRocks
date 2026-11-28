@@ -55,7 +55,7 @@ pub enum ArrayAggKind<'a> {
 pub struct ArrayAggConfig<'a> {
     pub kind: ArrayAggKind<'a>,
     pub output_type: &'a DataType,
-    pub intermediate_type: &'a DataType,
+    pub intermediate_type: Option<&'a DataType>,
     pub input_arg_type: Option<&'a DataType>,
 }
 #[derive(Debug)]
@@ -1241,9 +1241,10 @@ pub fn build_array<
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure> {
     let target_type = if output_intermediate {
-        &spec.intermediate_type
+        spec.intermediate_type
+            .ok_or_else(|| failure::contract("array_agg has no merge state"))?
     } else {
-        &spec.output_type
+        spec.output_type
     };
     match target_type {
         DataType::List(list_field) => {

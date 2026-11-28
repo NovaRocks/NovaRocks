@@ -1,0 +1,204 @@
+{
+  "type": "record",
+  "name": "StoredMvProjectionV3",
+  "namespace": "org.apache.novarocks.mv.accelerator",
+  "fields": [
+    {
+      "name": "mv_id",
+      "type": "long"
+    },
+    {
+      "name": "definition",
+      "type": "bytes"
+    },
+    {
+      "name": "interpretation",
+      "type": "bytes"
+    },
+    {
+      "name": "configuration",
+      "type": "bytes"
+    },
+    {
+      "name": "publication",
+      "type": [
+        "null",
+        "bytes"
+      ]
+    },
+    {
+      "name": "metadata_version",
+      "type": {
+        "type": "record",
+        "name": "ProviderVersionV3",
+        "fields": [
+          {
+            "name": "payload",
+            "type": "bytes"
+          },
+          {
+            "name": "snapshot_id",
+            "type": [
+              "null",
+              "long"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "output_version",
+      "type": [
+        "null",
+        "ProviderVersionV3"
+      ]
+    },
+    {
+      "name": "storage_rows",
+      "type": [
+        "null",
+        "long"
+      ]
+    },
+    {
+      "name": "source_revision",
+      "type": {
+        "type": "record",
+        "name": "MvAcceleratorSourceRevisionV3",
+        "fields": [
+          {
+            "name": "target_catalog",
+            "type": "string"
+          },
+          {
+            "name": "target_namespace",
+            "type": "string"
+          },
+          {
+            "name": "target_table",
+            "type": "string"
+          },
+          {
+            "name": "target_object_id",
+            "type": "bytes"
+          },
+          {
+            "name": "metadata_version",
+            "type": {
+              "type": "record",
+              "name": "MvAcceleratorMetadataVersionV3",
+              "fields": [
+                {
+                  "name": "digest",
+                  "type": "string"
+                },
+                {
+                  "name": "snapshot_id",
+                  "type": [
+                    "null",
+                    "long"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "name": "definition_revision",
+            "type": "string"
+          },
+          {
+            "name": "interpretation_revision",
+            "type": "string"
+          },
+          {
+            "name": "publication_revision",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          {
+            "name": "publication_output_version",
+            "type": [
+              "null",
+              {
+                "type": "record",
+                "name": "MvAcceleratorPublicationOutputVersionV3",
+                "fields": [
+                  {
+                    "name": "digest",
+                    "type": "string"
+                  },
+                  {
+                    "name": "snapshot_id",
+                    "type": [
+                      "null",
+                      "long"
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "configuration_revision",
+            "type": "string"
+          },
+          {
+            "name": "deployment_owner",
+            "type": "string"
+          },
+          {
+            "name": "process_incarnation",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "binding",
+      "type": [
+        "null",
+        "bytes"
+      ],
+      "default": null
+    },
+    {
+      "name": "current_data_files",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "current_delete_files",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "mapping",
+      "type": [
+        "null",
+        "bytes"
+      ],
+      "default": null
+    },
+    {
+      "name": "never_published",
+      "type": [
+        "null",
+        "boolean"
+      ],
+      "default": null
+    },
+    {
+      "name": "data_eligibility",
+      "type": ["null", "string"],
+      "default": null
+    }
+  ]
+}

@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_type_contract::{
-    ExecutionValueTypeError, MAX_ARROW_FIELD_NAME_BYTES, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES,
-};
+use novarocks_type_contract::{ExecutionValueTypeError, MAX_VALUE_TYPE_DEPTH};
 
 use super::{
     Failure, LogicalTypeTableLimits,
@@ -44,9 +42,6 @@ fn name<H>(
 ) -> Result<(), Failure<H>> {
     context.step()?;
     required::<H>(field.value_type_id)?;
-    if field.name.len() > MAX_ARROW_FIELD_NAME_BYTES {
-        return Err(invalid("logical field name exceeds its byte bound"));
-    }
     add(strings, field.name.len(), limits.max_string_bytes)
 }
 pub(super) fn validate_definition<H>(
@@ -210,7 +205,7 @@ pub(super) fn prepare<'a, H>(
     };
     let mut states = context.vector(definitions.len())?;
     let mut summaries = context.vector(definitions.len())?;
-    let mut frames: Vec<Frame> = context.vector(definitions.len())?;
+    let mut frames: [Option<Frame>; MAX_VALUE_TYPE_DEPTH] = std::array::from_fn(|_| None);
     for _ in definitions {
         states.push(0u8);
         summaries.push(Summary { depth: 0, nodes: 0 });
@@ -223,13 +218,17 @@ pub(super) fn prepare<'a, H>(
             continue;
         }
         states[start] = 1;
-        frames.push(Frame {
+        frames[0] = Some(Frame {
             position: start,
             next_child: 0,
             summary: Summary { depth: 1, nodes: 1 },
         });
-        while let Some(frame) = frames.last() {
+        let mut depth = 1;
+        while depth != 0 {
             context.step()?;
+            let frame = frames[depth - 1]
+                .as_mut()
+                .expect("active logical type cursor");
             let position = frame.position;
             let next_child = frame.next_child;
             let definition = &definitions[position];
@@ -244,7 +243,6 @@ pub(super) fn prepare<'a, H>(
                 match states[child] {
                     1 => return Err(invalid("cyclic logical type references")),
                     2 => {
-                        let frame = frames.last_mut().unwrap();
                         frame.next_child += 1;
                         frame.summary.depth = frame.summary.depth.max(summaries[child].depth + 1);
                         frame.summary.nodes = frame
@@ -258,24 +256,23 @@ pub(super) fn prepare<'a, H>(
                             )
                             .into());
                         }
-                        if frame.summary.nodes > MAX_VALUE_TYPE_NODES {
-                            return Err(super::LogicalTypeCodecError::ValueType(
-                                ExecutionValueTypeError::Nodes,
-                            )
-                            .into());
-                        }
                     }
                     _ => {
                         states[child] = 1;
-                        frames.push(Frame {
+                        let slot = frames.get_mut(depth).ok_or(
+                            super::LogicalTypeCodecError::ValueType(ExecutionValueTypeError::Depth),
+                        )?;
+                        *slot = Some(Frame {
                             position: child,
                             next_child: 0,
                             summary: Summary { depth: 1, nodes: 1 },
                         });
+                        depth += 1;
                     }
                 }
             } else {
-                let frame = frames.pop().unwrap();
+                depth -= 1;
+                let frame = frames[depth].take().expect("active logical type cursor");
                 add(
                     &mut expanded,
                     frame.summary.nodes,

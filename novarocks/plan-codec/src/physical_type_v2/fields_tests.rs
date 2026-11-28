@@ -248,14 +248,11 @@ fn explicit_root_counts_and_utf8_bytes_have_exact_independent_envelopes() {
 }
 
 #[test]
-fn explicit_root_attributes_and_carrier_depth_use_actual_type_owner_bounds() {
-    let too_long = field(
-        &"x".repeat(novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES + 1),
-        DataType::Utf8,
-    );
+fn long_root_name_is_preserved_and_logical_depth_is_checked() {
+    let long_name = field(&"x".repeat(1024 + 1), DataType::Utf8);
     assert!(
-        encode_type_table_with_fields(&[], &[(0, too_long)], envelope(), &Scope::default())
-            .is_err()
+        encode_type_table_with_fields(&[], &[(0, long_name)], envelope(), &Scope::default())
+            .is_ok()
     );
     let mut ty = DataType::Int32;
     for _ in 0..64 {

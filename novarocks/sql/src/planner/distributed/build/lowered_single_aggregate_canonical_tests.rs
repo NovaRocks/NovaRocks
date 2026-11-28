@@ -372,7 +372,15 @@ fn assert_nullable_value_signature(
     assert_eq!(value(&captured.request().arguments[0]).0, ty);
     let result = ty.with_nullable(true).unwrap();
     assert_eq!(source.binding.function.result_type, result);
-    assert_eq!(source.binding.intermediate_type, result);
+    assert_eq!(
+        source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        result
+    );
     assert_eq!(
         canonical
             .selected()
@@ -389,7 +397,7 @@ fn assert_nullable_value_signature(
             .as_ref()
             .unwrap()
             .state_format,
-        source.binding.state_format
+        source.binding.merge_state.as_ref().unwrap().state_format
     );
     assert!(canonical.request().expected_result_type.is_none());
 }
@@ -545,10 +553,7 @@ fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy(
             nulls_first: true,
         }]
     );
-    assert_eq!(
-        entry.source().binding.state_interpretation.as_ref(),
-        Some(state_source)
-    );
+    assert!(entry.source().binding.merge_state.is_none());
     let canonical = entry.canonical().unwrap();
     assert_eq!(canonical.request().logical_argument_count, 1);
     assert_eq!(canonical.request().arguments.len(), 2);

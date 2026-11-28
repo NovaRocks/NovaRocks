@@ -984,8 +984,8 @@ fn standalone_writer_source_law_preserves_wide_carrier_but_does_not_author_execu
                 field.is_nullable(),
                 novarocks_type_contract::ValueLogicalType::Physical
             )
-            .is_err(),
-            "source law cannot mint an unfreezable complete value author"
+            .is_ok(),
+            "wide legal types must also be representable as values"
         );
     }
     let baseline = control.trace();

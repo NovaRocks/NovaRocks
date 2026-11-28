@@ -96,6 +96,7 @@ pub(crate) enum WriteSessionCommitProtocol {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvRefreshMode {
     Full,
+    PartitionReplace,
     Repartition,
     Incremental,
     MetadataOnly,
@@ -258,11 +259,25 @@ impl CommitProtocol {
             }
             | Self::MvRetirement { .. } => Some(MV_MAIN_ADVANCED),
             Self::MvRefresh {
+                mode: MvRefreshMode::PartitionReplace,
+                ..
+            } => Some("Materialized view storage table changed during partition replacement"),
+            Self::MvRefresh {
                 mode: MvRefreshMode::Repartition,
                 ..
             } => Some("Materialized view storage table changed during repartition"),
             _ => None,
         }
+    }
+
+    pub(crate) const fn is_partition_replace(&self) -> bool {
+        matches!(
+            self,
+            Self::MvRefresh {
+                mode: MvRefreshMode::PartitionReplace,
+                ..
+            }
+        )
     }
 }
 

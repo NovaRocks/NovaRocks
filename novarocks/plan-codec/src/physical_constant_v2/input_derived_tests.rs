@@ -51,7 +51,6 @@ struct NullSource {
     invoice: usize,
 }
 fn null_source(rows: i64) -> NullSource {
-    use crate::ipc_schema_v2::{IpcSchemaProjectionLimits, encode_single_field_schema};
     let semantic_request = ValueTypeRef::storage_allocation_layout().unwrap();
     let semantic = ValueTypeRef::try_new(
         ValueKind::Scalar(DataType::Null),
@@ -69,22 +68,6 @@ fn null_source(rows: i64) -> NullSource {
     let field = Arc::new(Field::new("source", DataType::Null, true));
     let namespace_request = arc_layout(Layout::array::<MetadataFieldLoan>(0).unwrap()).unwrap();
     let metadata = MaterializedFieldNamespace::from_original_loans(Arc::from([]));
-    let control = Control(AtomicBool::new(false));
-    let mut source_work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
-    let source_facts =
-        crate::ipc_schema_v2::preflight_writer_pure_in(&field, &mut source_work).unwrap();
-    source_work.finish().unwrap();
-    let schema = encode_single_field_schema(
-        &field,
-        IpcSchemaProjectionLimits {
-            max_field_occurrences: source_facts.field_occurrences,
-            max_type_occurrences: source_facts.type_occurrences,
-            max_string_bytes: source_facts.string_bytes,
-            max_flatbuffer_bytes: source_facts.backing,
-        },
-        &control,
-    )
-    .unwrap();
     // A safe official FlatBuffer writer authors the actual batch header. NULL
     // rows have no payload buffers; no byte-derived row estimate is involved.
     let mut builder = flatbuffers::FlatBufferBuilder::new();
@@ -111,16 +94,12 @@ fn null_source(rows: i64) -> NullSource {
         },
     );
     arrow::ipc::finish_message_buffer(&mut builder, message);
-    let mut ipc = Vec::new();
-    for bytes in [schema.as_slice(), builder.finished_data()] {
-        let padded = bytes.len().checked_add(7).unwrap() & !7;
-        ipc.extend_from_slice(&u32::MAX.to_le_bytes());
-        ipc.extend_from_slice(&i32::try_from(padded).unwrap().to_le_bytes());
-        ipc.extend_from_slice(bytes);
-        ipc.resize(ipc.len() + padded - bytes.len(), 0);
-    }
-    ipc.extend_from_slice(&u32::MAX.to_le_bytes());
-    ipc.extend_from_slice(&0i32.to_le_bytes());
+    let bytes = builder.finished_data();
+    let padded = bytes.len().next_multiple_of(8);
+    let mut ipc = vec![0xff; 4];
+    ipc.extend_from_slice(&i32::try_from(padded).unwrap().to_le_bytes());
+    ipc.extend_from_slice(bytes);
+    ipc.resize(8 + padded, 0);
     let record = wire::IpcConstantPool {
         id: 0,
         value_type_id: Some(0),

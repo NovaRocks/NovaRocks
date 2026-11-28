@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0278 (docs/adr/ADR-0278-scalar-effects-and-relational-evaluation-demand-govern-sql-rewrites.md)
+// Design: ADR-0280 (docs/adr/ADR-0280-scalar-effects-and-relational-evaluation-demand-govern-sql-rewrites.md)
 use crate::binding::SqlFunctionBinding;
 use crate::common::BinOp;
 use crate::compiler::selected_scalar_call::{

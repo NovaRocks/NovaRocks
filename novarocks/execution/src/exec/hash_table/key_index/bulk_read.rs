@@ -235,6 +235,16 @@ impl IndexView {
         }
         Ok(())
     }
+    pub(crate) fn key_at(&self, partition: usize, index: usize) -> ExecutionResult<BulkKey> {
+        if index >= self.key_count(partition)? {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        Ok(BulkKey {
+            partition,
+            id: KeyId(index),
+        })
+    }
+
     /// Caller order and duplicate occurrences are retained. Direct does not
     /// inspect saved hashes and never computes an otherwise-unused hash batch.
     pub(crate) fn probe(

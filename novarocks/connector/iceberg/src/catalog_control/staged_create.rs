@@ -155,9 +155,14 @@ struct PreparedStagedTable {
 fn build_staged_schema(
     columns: &[ConnectorColumnDefinition],
     format_version: FormatVersion,
+    output_declarations: Option<&[novarocks_type_contract::ValueTypeRef]>,
 ) -> Result<Schema, ConnectorError> {
     Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns, format_version)?)
+        .with_fields(super::type_mapping::schema_fields_with_output_declarations(
+            columns,
+            format_version,
+            output_declarations,
+        )?)
         .build()
         .map_err(|error| invalid(format!("build staged Iceberg schema: {error}")))
 }
@@ -184,7 +189,7 @@ fn prepare_ctas_definition(
         control,
     )?;
     validate_staged_columns(table, columns)?;
-    bind_typed_staged_table(columns, control, storage, None, None)
+    bind_typed_staged_table(columns, control, storage, None, None, None)
 }
 
 fn validate_staged_columns(
@@ -270,6 +275,7 @@ fn prepare_mv_staged_table(
         storage_facts,
         Some(&visible_sources),
         final_metadata_path,
+        storage.stateless_output_declarations(),
     )
 }
 
@@ -279,8 +285,13 @@ fn bind_typed_staged_table(
     storage_facts: crate::table_properties::PreparedCreateTableProperties,
     visible_sources: Option<&HashSet<String>>,
     final_metadata_path: Option<StagedMetadataPath>,
+    output_declarations: Option<&[novarocks_type_contract::ValueTypeRef]>,
 ) -> Result<PreparedStagedTable, ConnectorError> {
-    let schema = Arc::new(build_staged_schema(columns, storage_facts.format_version)?);
+    let schema = Arc::new(build_staged_schema(
+        columns,
+        storage_facts.format_version,
+        output_declarations,
+    )?);
     crate::schema_capability::admit_schema(&schema)?;
     let spec = if let Some(visible_sources) = visible_sources {
         crate::table_properties::bind_mv_create_table_partitioning(

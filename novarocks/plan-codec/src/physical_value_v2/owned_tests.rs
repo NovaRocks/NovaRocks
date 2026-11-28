@@ -602,10 +602,7 @@ fn observed_normalized_binding_clones_allocate_nothing_and_real_containers_prese
     let control = Control::default();
     let ty = ty(DataType::Dictionary(
         Box::new(DataType::Int8),
-        Box::new(DataType::Dictionary(
-            Box::new(DataType::Int16),
-            Box::new(DataType::Utf8),
-        )),
+        Box::new(DataType::Utf8),
     ));
     let roots = [(u32::MAX, ty.clone())];
     let types = encode_type_table_sources(&roots, &[], type_limits(), &control).unwrap();

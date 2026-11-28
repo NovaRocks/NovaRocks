@@ -1001,7 +1001,10 @@ impl ConnectorSplitSource for SystemManifestSplitSource {
         if max_size == 0 {
             return Err(invalid("connector split batch size must be positive"));
         }
-        if self.closed || self.exhausted {
+        if self.closed {
+            return Ok(ConnectorSplitBatch::closed());
+        }
+        if self.exhausted {
             return Ok(ConnectorSplitBatch::finished());
         }
         // A `$files` scan has no Iceberg column statistics to prune against.

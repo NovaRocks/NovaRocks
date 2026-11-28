@@ -376,9 +376,6 @@ mod validation_error_tests {
     #[test]
     fn aggregate_sequence_index_builds_once_for_many_distinct_lookups_and_ambiguity() {
         let binding = |sequence| crate::AggregateBinding {
-            state_interpretation: None,
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: crate::BoundFunction {
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     semantic_parameters: Box::default(),
@@ -401,8 +398,13 @@ mod validation_error_tests {
             },
             phase: AggregatePhase::Partial { sequence },
             logical_argument_count: 1,
-            intermediate_type: ValueType::new(DataType::Binary, false),
-            state_format: crate::AggregateStateFormatId::try_new("test_sum/state-v1").unwrap(),
+            merge_state: Some(crate::AggregateMergeBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                intermediate_type: ValueType::new(DataType::Binary, false),
+                state_format: crate::AggregateStateFormatId::try_new("test_sum/state-v1").unwrap(),
+            }),
         };
         let mut calls = (1..=4096)
             .map(|id| crate::AggregateCall {

@@ -53,12 +53,15 @@ SELECT k1, v1 FROM orders_mv ORDER BY k1;
 SELECT 1;
 
 -- query 5
--- SHOW must reflect source-backed desired facts, never durable runtime.
+-- The replacement FE readmits this nonaggregate view without a resume command.
+-- Its desired scheduling facts must survive this readmission.
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=orders_mv
--- @result_contains=READ_ONLY
 -- @result_rows_where=name=orders_mv
 -- @result_rows_count=1
+-- @result_rows_expect=manageability=MANAGEABLE
 -- @result_rows_expect=refresh_policy=INTERVAL
 -- @result_rows_expect=refresh_interval_ms=3600000
 -- @result_rows_expect=refresh_paused=false
@@ -66,18 +69,20 @@ USE lnp3d_runtime_${uuid0}.ns_${uuid0};
 SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_runtime_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
--- Runtime was forgotten, but management remains closed until the old FE's
--- possible effects are declared settled.
+-- No old nonaggregate effect barrier survives automatic readmission.
+-- @skip_result_check=true
 -- @retry_count=40
 -- @retry_interval_ms=250
--- @skip_result_check=true
--- @result_contains=AWAITING_EFFECT_SETTLEMENT
+-- @result_rows_where=Property=UnsettledEffects
+-- @result_rows_count=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('lnp3d_runtime_${uuid0}', 'ns_${uuid0}', 'orders_mv');
 
 -- query 7
--- @mv_resume_management=orders_mv,catalog=lnp3d_runtime_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW lnp3d_runtime_${uuid0}.ns_${uuid0}.orders_mv;
 
 -- query 8
 -- The resulting data proves the fresh attempt is not a restored old slot.

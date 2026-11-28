@@ -341,22 +341,24 @@ fn visit_table(
             let metadata = opaque_source(work, || table.mutation_metadata())?
                 .ok_or_else(|| invalid("Iceberg table did not declare mutation file metadata"))?;
 
-            let (declaration, carrier) = if column.base_field_id() == mutation_partition::SPEC_ID {
-                (metadata.spec_field(), DataType::Int32)
+            let declaration = opaque(work, || {
+                metadata.read_field(column.base_field_id(), !column.nullable())
+            })?;
+            let carrier = if column.base_field_id() == mutation_partition::SPEC_ID {
+                DataType::Int32
             } else {
-                let carrier = opaque_source(work, || {
+                opaque_source(work, || {
                     mutation_partition::partition_carrier(metadata.partition_type())
-                })?;
-                (metadata.partition_field(), carrier)
+                })?
             };
-            let expected = opaque_source(work, || IcebergColumnHandle::base_column(declaration))?;
+            let expected = opaque_source(work, || IcebergColumnHandle::base_column(&declaration))?;
             compare_handle(column, &expected, work)?;
             let field = Field::new(&declaration.name, carrier, !declaration.required);
             visit(
                 ordinal,
                 &field,
                 column.nullable(),
-                Some(declaration),
+                Some(&declaration),
                 column.type_json().len(),
                 work,
             )?;

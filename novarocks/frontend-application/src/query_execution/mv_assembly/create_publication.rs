@@ -72,6 +72,7 @@ pub(crate) enum CreatePublicationInput {
 pub(crate) struct CreateStorageDeclarations {
     pub(crate) visible_partition_sources: Vec<Arc<str>>,
     pub(crate) properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    pub(crate) stateless_output_declarations: Option<Vec<novarocks_type_contract::ValueTypeRef>>,
 }
 
 #[expect(
@@ -104,6 +105,14 @@ impl CreatePublicationInput {
                 storage: CreateStorageDeclarations {
                     visible_partition_sources: plan.storage.visible_partition_sources.clone(),
                     properties: plan.storage.properties.clone(),
+                    stateless_output_declarations: plan.stateless_output_declarations().map(
+                        |outputs| {
+                            outputs
+                                .iter()
+                                .map(|output| output.value_type().clone())
+                                .collect()
+                        },
+                    ),
                 },
                 application_properties: plan
                     .application_properties

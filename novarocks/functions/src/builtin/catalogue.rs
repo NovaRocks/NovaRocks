@@ -329,7 +329,7 @@ struct BuiltinAggregateDecision<'a> {
     declaration: AggregateDeclaration,
     request: FunctionBindingRequest<'a>,
     output: crate::aggregate_types::AggregateTypeRecipe<'a>,
-    intermediate: crate::aggregate_types::AggregateTypeRecipe<'a>,
+    intermediate: Option<crate::aggregate_types::AggregateTypeRecipe<'a>>,
 }
 
 impl BuiltinAggregateDecision<'_> {
@@ -379,6 +379,9 @@ impl BuiltinAggregateDecision<'_> {
         )? {
             return Ok(false);
         }
+        let Some(intermediate) = &self.intermediate else {
+            return Ok(selected.aggregate.is_none());
+        };
         let Some(state) = &selected.aggregate else {
             return Ok(false);
         };
@@ -396,7 +399,7 @@ impl BuiltinAggregateDecision<'_> {
         )? {
             return Ok(false);
         }
-        self.intermediate.matches_value_observed(
+        intermediate.matches_value_observed(
             state.intermediate_type.typed_binding().borrowed(),
             builtin_aggregate_intermediate_nullable(name),
             ValueLogicalType::Physical,
@@ -415,12 +418,26 @@ impl BuiltinAggregateDecision<'_> {
             ValueLogicalType::Physical,
         )?;
         work.step()?;
-        let intermediate = self.intermediate.materialize_value_pure(
-            builtin_aggregate_intermediate_nullable(name),
-            ValueLogicalType::Physical,
-        )?;
+        let aggregate = if let Some(recipe) = &self.intermediate {
+            let intermediate_type = recipe.materialize_value_pure(
+                builtin_aggregate_intermediate_nullable(name),
+                ValueLogicalType::Physical,
+            )?;
+            binding_control::value_type(&intermediate_type, work)?;
+            Some(crate::AggregateBindingSelection {
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    self.declaration.operation(),
+                ),
+                intermediate_type,
+                state_format: AggregateStateFormatIdentity::try_from_boxed(
+                    self.declaration.state_format().into_boxed_str(),
+                )
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            })
+        } else {
+            None
+        };
         binding_control::value_type(&output, work)?;
-        binding_control::value_type(&intermediate, work)?;
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_from_boxed(
                 self.declaration.overload().into_boxed_str(),
@@ -428,16 +445,7 @@ impl BuiltinAggregateDecision<'_> {
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
             argument_types: binding_control::argument_types(self.request, work)?,
             result_type: FunctionResultType::Scalar(output),
-            aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract: builtin_aggregate_state_argument_contract(
-                    self.declaration.operation(),
-                ),
-                intermediate_type: intermediate,
-                state_format: AggregateStateFormatIdentity::try_from_boxed(
-                    self.declaration.state_format().into_boxed_str(),
-                )
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            }),
+            aggregate,
         })
     }
 }
@@ -597,7 +605,8 @@ impl BuiltinAggregateResolver {
             declaration,
             request,
             output,
-            intermediate,
+            intermediate: (arguments.len() == request.logical_argument_count)
+                .then_some(intermediate),
         })
     }
 
@@ -1125,8 +1134,6 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "bar",
     "width_bucket",
     "strpos",
-    // The join key hashes every non-null pair and propagates null inputs.
-    "join_row_key",
     // Case folding is defined for every string.
     "lcase",
     "lower",
@@ -4806,24 +4813,29 @@ mod tests {
             Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
 
-        let resolved = resolve_bound_aggregate(
-            &catalog,
-            "array_agg",
-            &[DataType::Utf8],
-            &[DataType::Utf8, DataType::Int64],
-            false,
-            crate::binding_test_control(),
-        )
-        .expect("selected array_agg overload accepts one physical ORDER BY channel");
+        let arguments =
+            [DataType::Utf8, DataType::Int64].map(|data_type| FunctionArgument::Value {
+                value_type: FunctionValueType::new(data_type, true),
+                constant: None,
+            });
+        let resolved = catalog
+            .resolve_bound_user(
+                "array_agg",
+                FunctionKind::Aggregate,
+                FunctionBindingRequest {
+                    logical_argument_count: 1,
+                    arguments: &arguments,
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .expect("selected array_agg overload accepts one physical ORDER BY channel");
         assert_eq!(
-            resolved.overload.as_str(),
+            resolved.selected.overload.as_str(),
             "builtin.aggregate/array_agg/derived-v1"
         );
-        assert_eq!(resolved.argument_types, [DataType::Utf8, DataType::Int64]);
-        let DataType::Struct(fields) = resolved.intermediate_type else {
-            panic!("ordered array_agg must expose a Struct intermediate");
-        };
-        assert_eq!(fields.len(), 2);
+        assert_eq!(resolved.selected.argument_types.len(), 2);
+        assert!(resolved.selected.aggregate.is_none());
 
         assert!(matches!(
             resolve_bound_aggregate(
@@ -5463,7 +5475,7 @@ mod aggregate_recipe_tests {
         }
     }
     #[test]
-    fn ordered_array_state_and_topk_preserve_complete_nominal_argument_children() {
+    fn ordered_array_result_and_topk_preserve_complete_nominal_argument_children() {
         let json = FunctionValueType::try_with_logical_type(
             DataType::LargeBinary,
             false,
@@ -5486,13 +5498,12 @@ mod aggregate_recipe_tests {
         resolver
             .validate_selected(&selected, request, &Control)
             .unwrap();
-        let state = &selected.aggregate.as_ref().unwrap().intermediate_type;
-        let ValueKind::Struct(fields) = state.value_type().kind() else {
-            panic!("ordered state is a struct");
+        assert!(selected.aggregate.is_none());
+        let FunctionResultType::Scalar(output) = &selected.result_type else {
+            panic!("array_agg selects a scalar result");
         };
-        assert_eq!(fields[0].name(), "c0");
-        let ValueKind::List(item) = fields[0].value_type().kind() else {
-            panic!("each order channel is a list");
+        let ValueKind::List(item) = output.value_type().kind() else {
+            panic!("ordered array_agg selects a list");
         };
         assert_eq!(item.domain(), Some(ValueLogicalType::Json));
         assert!(item.nullable());
@@ -5558,8 +5569,7 @@ mod aggregate_recipe_tests {
             expected_result_type: None,
         };
         let other = resolver.resolve(drift, &Control).unwrap();
-        selected.aggregate.as_mut().unwrap().intermediate_type =
-            other.aggregate.unwrap().intermediate_type;
+        selected.result_type = other.result_type;
         assert!(
             resolver
                 .validate_selected(&selected, request, &Control)

@@ -667,22 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn infer_scalar_return_type_for_join_row_key_is_utf8() {
-        assert_eq!(
-            infer_scalar_return_type(
-                "join_row_key",
-                &[
-                    DataType::Binary,
-                    DataType::Int64,
-                    DataType::LargeBinary,
-                    DataType::Int64,
-                ],
-            ),
-            DataType::Utf8
-        );
-    }
-
-    #[test]
     fn count_state_scalar_functions_require_binary_inputs() {
         assert_eq!(
             infer_scalar_return_type("count_state_union", &[DataType::Binary, DataType::Binary]),

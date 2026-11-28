@@ -28,7 +28,6 @@ use novarocks_plan_codec::{
     host_projection_v2::{AdmissionRefusal, ProjectionFailure},
     ipc_flat_pool_v2::{FlatPoolWriteFacts, FlatPoolWriteLimits},
     ipc_recursive_pool_v2::RecursivePoolWriteLimits,
-    ipc_schema_v2::IpcSchemaProjectionLimits,
     physical_constant_v2::{
         ConstantWriteProjectionLimits, PhysicalConstantCodecError,
         prepare_constant_record_write_in, prepare_constant_record_write_with_host_in,
@@ -77,12 +76,6 @@ fn limits() -> ConstantWriteProjectionLimits {
         max_buffer_descriptors: 4096,
         max_body_bytes: 8 * 1024 * 1024,
         max_encoded_stream_bytes: 16 * 1024 * 1024,
-        schema: IpcSchemaProjectionLimits {
-            max_field_occurrences: 4096,
-            max_type_occurrences: 4096,
-            max_string_bytes: 65536,
-            max_flatbuffer_bytes: 4 * 1024 * 1024,
-        },
         max_new_allocation_request_bytes: 128 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
         max_cumulative_library_work: usize::MAX,

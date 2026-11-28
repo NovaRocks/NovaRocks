@@ -24,7 +24,6 @@ use arrow::{
     datatypes::{DataType, Schema, TimeUnit},
     ipc::{
         self,
-        reader::StreamReader,
         writer::{IpcWriteOptions, StreamWriter},
     },
     record_batch::RecordBatch,
@@ -33,7 +32,6 @@ use flatbuffers::FlatBufferBuilder;
 use novarocks_type_contract::{CompileControlError, NR_LOGICAL_TYPE_KEY};
 use std::{
     collections::HashMap,
-    io::Cursor,
     sync::{Arc, Mutex},
 };
 
@@ -82,12 +80,7 @@ impl PureCompileControl for Control {
 fn limits() -> FlatStreamProjectionLimits {
     FlatStreamProjectionLimits {
         max_input_bytes: 1024 * 1024,
-        schema: IpcSchemaProjectionLimits {
-            max_field_occurrences: 4096,
-            max_type_occurrences: 4096,
-            max_string_bytes: 1024 * 1024,
-            max_flatbuffer_bytes: 1024 * 1024,
-        },
+
         batch: FlatBatchProjectionLimits {
             max_metadata_bytes: 1024 * 1024,
             max_body_bytes: 1024 * 1024,
@@ -139,7 +132,7 @@ fn ordinary(input: &[u8], field: &Field, bound: FlatStreamProjectionLimits) {
     assert!(trace.len() >= 2, "ordinary refusal omitted its tail");
     prefixes(input, field, bound, &trace, 0..trace.len());
 }
-fn stream(array: ArrayRef, field: &Field, alignment: usize) -> Vec<u8> {
+fn standard_stream(array: ArrayRef, field: &Field, alignment: usize) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![field.clone()]));
     let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
     let options = IpcWriteOptions::try_new(alignment, false, ipc::MetadataVersion::V5).unwrap();
@@ -151,12 +144,21 @@ fn stream(array: ArrayRef, field: &Field, alignment: usize) -> Vec<u8> {
     }
     output
 }
-fn read(input: &[u8]) -> RecordBatch {
-    // Reader entry is only used after a complete successful stream preflight.
-    let mut reader = StreamReader::try_new(Cursor::new(input), None).unwrap();
-    let batch = reader.next().unwrap().unwrap();
-    assert!(reader.next().is_none());
-    batch
+fn stream(array: ArrayRef, field: &Field, alignment: usize) -> Vec<u8> {
+    frames(&standard_stream(array, field, alignment)).1.to_vec()
+}
+fn read(input: &[u8], field: &Field) -> RecordBatch {
+    let metadata_end = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+    let message = ipc::root_as_message(&input[8..metadata_end]).unwrap();
+    ipc::reader::read_record_batch(
+        &arrow_buffer::Buffer::from(&input[metadata_end..]),
+        message.header_as_record_batch().unwrap(),
+        Arc::new(Schema::new(vec![field.clone()])),
+        &HashMap::new(),
+        None,
+        &message.version(),
+    )
+    .unwrap()
 }
 fn frame(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     let padded = metadata.len().next_multiple_of(8);
@@ -167,9 +169,6 @@ fn frame(metadata: &[u8], body: &[u8]) -> Vec<u8> {
     result.resize(8 + padded, 0);
     result.extend_from_slice(body);
     result
-}
-fn assembled(schema: &[u8], batch: &[u8], end: &[u8]) -> Vec<u8> {
-    [schema, batch, end].concat()
 }
 fn frames(input: &[u8]) -> (&[u8], &[u8], &[u8]) {
     // Independently split the actual writer fixture using its declared frame
@@ -300,7 +299,7 @@ fn actual_writer_alignments_preserve_borrowed_input_field_and_scalar_bits() {
             (projected.geometry().rows, projected.geometry().null_count),
             (3, 1)
         );
-        let decoded = read(&input);
+        let decoded = read(&input, &field);
         let actual = decoded
             .column(0)
             .as_any()
@@ -376,12 +375,7 @@ fn verified_header_reuse_preserves_present_empty_timezone_on_original_field_arc(
     let array: ArrayRef = Arc::new(
         TimestampNanosecondArray::from(vec![Some(-1), None, Some(71)]).with_timezone_opt(zone),
     );
-    let standard = stream(array, &field, 8);
-    let (_, batch, eos) = frames(&standard);
-    let schema =
-        crate::ipc_schema_v2::encode_single_field_schema(&field, limits().schema, &Control::good())
-            .unwrap();
-    let input = assembled(&frame(&schema, &[]), batch, eos);
+    let input = stream(array, &field, 8);
     let projected = preflight(&input, &field, &Control::good()).unwrap();
     let decoded = read_checked_header(&projected, Arc::clone(&field));
     assert_eq!(decoded.column(0).data_type(), field.data_type());
@@ -396,7 +390,7 @@ fn verified_header_reuse_preserves_present_empty_timezone_on_original_field_arc(
 }
 
 #[test]
-fn exact_schema_replacement_preserves_none_and_present_empty_timezone() {
+fn borrowed_source_preserves_none_and_present_empty_timezone() {
     for zone in [None, Some(Arc::<str>::from(""))] {
         let ty = DataType::Timestamp(TimeUnit::Nanosecond, zone.clone());
         let field = Field::new("source", ty, true);
@@ -404,22 +398,11 @@ fn exact_schema_replacement_preserves_none_and_present_empty_timezone() {
             TimestampNanosecondArray::from(vec![Some(-1), None, Some(71)])
                 .with_timezone_opt(zone.clone()),
         );
-        let standard = stream(array, &field, 8);
-        let (_, batch, eos) = frames(&standard);
-        if zone.is_some() {
-            ordinary(&standard, &field, limits());
-        }
-        let schema = crate::ipc_schema_v2::encode_single_field_schema(
-            &field,
-            limits().schema,
-            &Control::good(),
-        )
-        .unwrap();
-        let input = assembled(&frame(&schema, &[]), batch, eos);
+        let input = stream(array, &field, 8);
         let control = Control::good();
         let projected = preflight(&input, &field, &control).unwrap();
         assert_eq!(projected.field().data_type(), field.data_type());
-        let decoded = read(&input);
+        let decoded = read(&input, &field);
         assert_eq!(decoded.schema().field(0).data_type(), field.data_type());
         let values = decoded
             .column(0)
@@ -450,7 +433,7 @@ fn complete_source_fields_are_exact_without_fabricating_logical_identity() {
         assert!(std::ptr::eq(projected.field(), source));
         assert_eq!(projected.field().metadata(), source.metadata());
         assert_eq!(
-            read(&input)
+            read(&input, source)
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -460,19 +443,12 @@ fn complete_source_fields_are_exact_without_fabricating_logical_identity() {
         );
         let trace = control.trace();
         prefixes(&input, source, limits(), &trace, 0..trace.len());
-        for wrong in [
-            Field::new("alias", DataType::Utf8, true),
-            Field::new("source", DataType::Utf8, false),
-            Field::new("source", DataType::Binary, true),
-            source
-                .clone()
-                .with_metadata(HashMap::from([("provider_id".to_owned(), "8".to_owned())])),
-        ] {
-            ordinary(&input, &wrong, limits());
-        }
+        ordinary(
+            &input,
+            &Field::new("source", DataType::Int64, false),
+            limits(),
+        );
     }
-    ordinary(&stream(array.clone(), &plain, 8), &json, limits());
-    ordinary(&stream(array, &json, 8), &plain, limits());
     let binary: ArrayRef =
         Arc::new(FixedSizeBinaryArray::try_from(vec![b"0123456789abcdef".as_slice()]).unwrap());
     let field = Field::new("source", DataType::FixedSizeBinary(16), true);
@@ -492,48 +468,35 @@ fn complete_source_fields_are_exact_without_fabricating_logical_identity() {
 }
 
 #[test]
-fn required_schema_batch_eos_order_rejects_eof_trailing_and_extra_messages() {
+fn only_one_record_batch_is_accepted() {
     let field = Field::new("source", DataType::Int64, true);
-    let input = stream(Arc::new(Int64Array::from(vec![7])), &field, 8);
-    let (schema, batch, eos) = frames(&input);
+    let legacy = standard_stream(Arc::new(Int64Array::from(vec![7])), &field, 8);
+    let (schema, batch, eos) = frames(&legacy);
     assert_eq!(eos, &EOS);
+    preflight(batch, &field, &Control::good()).unwrap();
     for malformed in [
         Vec::new(),
         EOS.to_vec(),
         schema.to_vec(),
-        assembled(schema, batch, &[]),
-        assembled(batch, schema, eos),
-        assembled(schema, schema, eos),
-        assembled(schema, &[], eos),
-        assembled(schema, batch, &[EOS.as_slice(), &[71]].concat()),
-        assembled(schema, &[batch, batch].concat(), eos),
-        assembled(schema, batch, &[schema, eos].concat()),
+        legacy.clone(),
+        [batch, eos].concat(),
+        [batch, batch].concat(),
+        [batch, schema].concat(),
+        [batch, &[71]].concat(),
     ] {
         ordinary(&malformed, &field, limits());
     }
-    // Bare EOF is accepted by the general reader, but it is not this complete
-    // constant stream profile's explicit terminal fact.
-    let no_eos = assembled(schema, batch, &[]);
-    let mut reader = StreamReader::try_new(Cursor::new(&no_eos), None).unwrap();
-    assert!(reader.next().unwrap().is_ok());
-    assert!(reader.next().is_none());
 }
 
 #[test]
 fn independent_batch_header_compression_body_extents_and_ranges_refuse() {
     let field = Field::new("source", DataType::Int64, true);
-    let original = stream(Arc::new(Int64Array::from(vec![7])), &field, 8);
-    let (schema, _, _) = frames(&original);
     let base = BatchProfile::ordinary();
-    let good = assembled(
-        schema,
-        &frame(&batch_metadata(base), &7i64.to_le_bytes()),
-        &EOS,
-    );
+    let good = frame(&batch_metadata(base), &7i64.to_le_bytes());
     let control = Control::good();
     preflight(&good, &field, &control).unwrap();
     assert_eq!(
-        read(&good)
+        read(&good, &field)
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -570,11 +533,7 @@ fn independent_batch_header_compression_body_extents_and_ranges_refuse() {
         BatchProfile { offset: 1, ..base },
         BatchProfile { offset: -1, ..base },
     ] {
-        ordinary(
-            &assembled(schema, &frame(&batch_metadata(profile), &[0; 8]), &EOS),
-            &field,
-            limits(),
-        );
+        ordinary(&frame(&batch_metadata(profile), &[0; 8]), &field, limits());
     }
 }
 
@@ -582,7 +541,6 @@ fn independent_batch_header_compression_body_extents_and_ranges_refuse() {
 fn continuation_signed_lengths_alignment_and_truncation_refuse_before_reader() {
     let field = Field::new("source", DataType::Int64, true);
     let input = stream(Arc::new(Int64Array::from(vec![7])), &field, 8);
-    let (schema, batch, _) = frames(&input);
     let mut wrong_marker = input.clone();
     wrong_marker[0] = 0;
     ordinary(&wrong_marker, &field, limits());
@@ -592,24 +550,14 @@ fn continuation_signed_lengths_alignment_and_truncation_refuse_before_reader() {
         bytes[4..8].copy_from_slice(&length.to_le_bytes());
         ordinary(&bytes, &field, limits());
     }
-    for cutoff in [
-        1,
-        7,
-        schema.len() - 1,
-        schema.len() + 7,
-        schema.len() + batch.len() - 1,
-        input.len() - 1,
-    ] {
+    let metadata_end = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+    for cutoff in [1, 7, metadata_end - 1, metadata_end, input.len() - 1] {
         ordinary(&input[..cutoff], &field, limits());
     }
-    let schema_len = schema.len();
-    let mut wrong_second = input;
-    wrong_second[schema_len + 4..schema_len + 8].copy_from_slice(&0x80000000u32.to_le_bytes());
-    ordinary(&wrong_second, &field, limits());
 }
 
 #[test]
-fn explicit_input_schema_batch_envelopes_have_near_and_one_over_boundaries() {
+fn explicit_input_and_batch_envelopes_have_near_and_one_over_boundaries() {
     let field = Field::new("source", DataType::Int64, true);
     let input = stream(Arc::new(Int64Array::from(vec![Some(7), None])), &field, 8);
     let control = Control::good();
@@ -623,7 +571,6 @@ fn explicit_input_schema_batch_envelopes_have_near_and_one_over_boundaries() {
             max_buffer_descriptors: 2,
             max_view_validation_bytes: 0,
         },
-        ..limits()
     };
     let control = Control::good();
     preflight_flat_constant_stream(&input, &field, exact, &verifier(), &control).unwrap();
@@ -662,27 +609,6 @@ fn explicit_input_schema_batch_envelopes_have_near_and_one_over_boundaries() {
             },
             ..exact
         },
-        FlatStreamProjectionLimits {
-            schema: IpcSchemaProjectionLimits {
-                max_field_occurrences: 0,
-                ..exact.schema
-            },
-            ..exact
-        },
-        FlatStreamProjectionLimits {
-            schema: IpcSchemaProjectionLimits {
-                max_type_occurrences: 0,
-                ..exact.schema
-            },
-            ..exact
-        },
-        FlatStreamProjectionLimits {
-            schema: IpcSchemaProjectionLimits {
-                max_string_bytes: 5,
-                ..exact.schema
-            },
-            ..exact
-        },
     ] {
         ordinary(&input, &field, bound);
     }
@@ -701,7 +627,7 @@ fn zero_row_and_compact_null_streams_keep_exact_row_facts_without_payload() {
         assert_eq!(projected.geometry().rows, array.len());
         assert_eq!(projected.geometry().null_count, array.logical_null_count());
         assert_eq!(projected.batch_body().len(), 0);
-        assert_eq!(read(&input).column(0).len(), array.len());
+        assert_eq!(read(&input, &field).column(0).len(), array.len());
         let trace = control.trace();
         prefixes(&input, &field, limits(), &trace, 0..trace.len());
         if !array.is_empty() {
@@ -730,7 +656,7 @@ fn real_view_stream_has_repeated_work_extent_and_original_quantum_control() {
     assert_eq!(projected.geometry().rows, 300);
     assert_eq!(projected.geometry().view_validation_bytes, 3900);
     assert_eq!(
-        read(&input)
+        read(&input, &field)
             .column(0)
             .as_any()
             .downcast_ref::<StringViewArray>()
@@ -1011,14 +937,7 @@ fn pool_projection_includes_synthesized_empty_offset_backing_and_inspection() {
     use novarocks_type_contract::FunctionValueType;
     for (ty, width) in [(DataType::Utf8, 4), (DataType::LargeBinary, 8)] {
         let field = Arc::new(Field::new("exact", ty.clone(), true));
-        let schema = crate::ipc_schema_v2::encode_single_field_schema(
-            &field,
-            limits().schema,
-            &Control::good(),
-        )
-        .unwrap();
-        let batch = raw_flat_batch(0, 0, &[(0, 0), (0, 0), (0, 0)], &[]);
-        let input = assembled(&frame(&schema, &[]), &batch, &EOS);
+        let input = raw_flat_batch(0, 0, &[(0, 0), (0, 0), (0, 0)], &[]);
         let checked = preflight(&input, &field, &Control::good()).unwrap();
         let ty = FunctionValueType::new(ty, true);
         let control = Control::good();
@@ -1080,17 +999,7 @@ fn pool_projection_covers_full_unaligned_typed_descriptor_and_utf8_fallback() {
         ),
     ] {
         let field = Arc::new(Field::new("exact", ty.clone(), true));
-        let schema = crate::ipc_schema_v2::encode_single_field_schema(
-            &field,
-            limits().schema,
-            &Control::good(),
-        )
-        .unwrap();
-        let input = assembled(
-            &frame(&schema, &[]),
-            &raw_flat_batch(1, 0, &buffers, &body),
-            &EOS,
-        );
+        let input = raw_flat_batch(1, 0, &buffers, &body);
         let checked = preflight(&input, &field, &Control::good()).unwrap();
         let ty = FunctionValueType::new(ty, true);
         let control = Control::good();

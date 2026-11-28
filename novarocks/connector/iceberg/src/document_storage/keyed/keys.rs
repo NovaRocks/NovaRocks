@@ -22,6 +22,7 @@ use novarocks_spi::connector::{
 
 pub(crate) const PREFIX: &str = "novarocks.doc.";
 pub(crate) const V2_PREFIX: &str = "novarocks.doc.v2.";
+pub(crate) const MARKER_PREFIX: &str = "novarocks.doc.v2.mark.";
 pub(crate) const RECORD_PREFIX: &str = "novarocks.doc.v2.record.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,7 +131,7 @@ pub(crate) fn slot_key(name: &ConnectorSlotName) -> String {
     format!("{V2_PREFIX}slot.{}~{}", name.owner, name.name)
 }
 pub(crate) fn marker_key(key: &ConnectorMarkerKey) -> String {
-    format!("{V2_PREFIX}mark.{}~{}~{}", key.owner, key.name, key.binding)
+    format!("{MARKER_PREFIX}{}~{}~{}", key.owner, key.name, key.binding)
 }
 pub(crate) fn root_key(owner: &str) -> String {
     format!("{V2_PREFIX}root.{owner}")

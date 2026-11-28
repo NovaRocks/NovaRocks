@@ -264,6 +264,7 @@ fn drive_ordinary_write_emission(
     auxiliary: &WriterAuxiliaryPlan,
     mut targets: FinalizedWriteTargetSet,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
+    visitor.input_completion = write.input_completion;
     // A write states the runtime filters it can name, for the same reason a
     // read does: a filter whose probe is not one value of one type is a filter
     // the plan cannot say anything exact about.
@@ -294,6 +295,7 @@ fn drive_ordinary_write_emission(
 }
 
 pub(crate) struct FinalChangeStreamWriteLowering<'a> {
+    pub(crate) input_completion: novarocks_physical_plan::FragmentInputCompletion,
     pub(crate) reads: Option<FinalizedProviderReadSet>,
     pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) auxiliary: &'a WriterAuxiliaryPlan,
@@ -312,6 +314,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
+        input_completion,
         reads,
         dag,
         auxiliary,
@@ -327,6 +330,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
         constant_policy,
         control,
     )?;
+    visitor.input_completion = input_completion;
     dag.validate().map_err(invalid_write)?;
     if !matches!(plan.kind, PhysicalPlanKind::ChangeEventExpand(_)) {
         return Err(invalid_write(
@@ -511,6 +515,8 @@ struct ContractLoweringVisitor<'a> {
     control: &'a dyn PureCompileControl,
     work: CompileCheckpoints<'a>,
     current_fragment: FragmentId,
+    delete_verification: Option<(FragmentId, novarocks_physical_plan::SummaryOutput)>,
+    input_completion: novarocks_physical_plan::FragmentInputCompletion,
     next_fragment: u32,
     constant_emission: constant_emission::SqlConstantEmission,
     /// The one hash partition space each destination fragment receives in.
@@ -686,6 +692,13 @@ enum PendingRuntimeFilterBuild {
         direction: SortDirection,
         null_ordering: NullOrdering,
     },
+    ContentDemand {
+        fragment: FragmentId,
+        node: NodeId,
+        content_ordinal: u32,
+        weighted: ValueId,
+        target_edge: EdgeId,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -716,6 +729,7 @@ fn runtime_filter_placement(
     let (producer_fragment, join) = match build {
         PendingRuntimeFilterBuild::Join { fragment, .. } => (*fragment, true),
         PendingRuntimeFilterBuild::AggregateTopN { fragment, .. } => (*fragment, false),
+        PendingRuntimeFilterBuild::ContentDemand { fragment, .. } => (*fragment, false),
     };
     let mut consumers = Vec::new();
     let mut seen = BTreeSet::new();
@@ -906,6 +920,7 @@ const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::TableWriter { .. } => "TableWriter",
         NodeKind::TableFinish(_) => "TableFinish",
         NodeKind::ChangeEventExpand { .. } => "ChangeEventExpand",
+        NodeKind::ContentApply(_) => "ContentApply",
         NodeKind::PositionShard(_) => "PositionShard",
         NodeKind::WriteLayoutKey { .. } => "WriteLayoutKey",
     }
@@ -1184,7 +1199,7 @@ fn materialize_runtime_filter(
     let witness = RuntimeFilterWitnessId::new(id.get());
     let policy = RuntimeFilterPolicy {
         max_contribution_bytes: 1024,
-        max_artifact_bytes: 4096,
+        max_artifact_bytes: crate::planner::distributed::RUNTIME_FILTER_ARTIFACT_BYTES,
         deadline_ms: 30_000,
         max_retries: 3,
     };
@@ -1194,6 +1209,86 @@ fn materialize_runtime_filter(
     };
 
     match build {
+        PendingRuntimeFilterBuild::ContentDemand {
+            fragment,
+            node,
+            content_ordinal,
+            weighted,
+            target_edge,
+        } => {
+            let [PendingRuntimeFilterConsumerPlacement::Scan(target)] =
+                placement.consumers.as_slice()
+            else {
+                return Err(invalid(
+                    "content demand has no exact target scan field".into(),
+                ));
+            };
+            let producer = &fragments[fragment];
+            let weighted_input = producer.nodes()[node].inputs[0];
+            let build_edges = subtree_inbound_edges(producer, weighted_input);
+            let non_build_edges = fragment_inbound_edges(producer)
+                .difference(&build_edges)
+                .copied()
+                .collect();
+            let coverage = all_of_runtime_filter_witness(witness);
+            Ok(RuntimeFilter {
+                id,
+                kind: RuntimeFilterKind::InList,
+                domain: RuntimeFilterDomain::Membership {
+                    ty: producer.values()[weighted].ty.clone(),
+                    null_semantics: RuntimeFilterNullSemantics::NullSafeEqual,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                reduction: RuntimeFilterReduction::SetUnion,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                equality_witnesses: Box::default(),
+                producers: Box::new([RuntimeFilterProducer {
+                    witness,
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: *fragment,
+                        node: *node,
+                        values: Box::new([*weighted]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                        input_ordinal: 0,
+                    },
+                    contribution_kinds: Box::new([
+                        RuntimeFilterContributionKind::ValueDomainDelta,
+                        RuntimeFilterContributionKind::ProducerClosed,
+                    ]),
+                    completion: RuntimeFilterCompletion::ProducerClosed,
+                    progress: RuntimeFilterProducerProgress {
+                        build_edges: build_edges.into_iter().collect(),
+                        non_build_edges,
+                    },
+                    target: RuntimeFilterProducerTarget::ContentDemand {
+                        content_ordinal: *content_ordinal,
+                    },
+                }]),
+                consumers: Box::new([RuntimeFilterConsumer {
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: target.fragment,
+                        node: target.node,
+                        values: Box::new([target.value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource,
+                    capabilities: Box::new([
+                        RuntimeFilterArtifactCapability::Membership,
+                        RuntimeFilterArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                    target: RuntimeFilterConsumerTarget::ContentDemandScanField {
+                        producer: witness,
+                        lineage: Box::new([RuntimeFilterLineageStep::ExchangeMapping {
+                            edge: *target_edge,
+                            mapping_ordinal: *content_ordinal,
+                        }]),
+                    },
+                }]),
+                policy,
+            })
+        }
         PendingRuntimeFilterBuild::Join {
             fragment,
             node,
@@ -1626,6 +1721,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             control,
             work,
             current_fragment: ROOT_FRAGMENT_ID,
+            delete_verification: None,
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
             next_fragment: 1,
             constant_emission: constant_emission::SqlConstantEmission::new(),
             exchange_hash_schemes: BTreeMap::new(),
@@ -2253,6 +2350,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 };
                 let transferred = requests.remove(&fragment_id).unwrap_or_default();
                 let authored = self.seal_node_units(&mut builder, &parameters, transferred)?;
+                builder.set_input_completion(self.input_completion);
                 let fragment = builder.finish_structure(
                     root,
                     sink,
@@ -2451,11 +2549,22 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(filters)
     }
 
+    fn relational_delivery(&self) -> novarocks_physical_plan::DeliveryRequirement {
+        use novarocks_physical_plan::{DeliveryRequirement, FragmentInputCompletion};
+        match self.input_completion {
+            FragmentInputCompletion::MayShortCircuit => DeliveryRequirement::DemandDriven,
+            FragmentInputCompletion::MustDrain => DeliveryRequirement::MustDrain,
+        }
+    }
+
     fn lower_node(
         &mut self,
         plan: &PhysicalPlanNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         self.work.step()?;
+        if self.input_completion == novarocks_physical_plan::FragmentInputCompletion::MustDrain {
+            check_maintenance_input(&plan.kind)?;
+        }
         let lowered = match &plan.kind {
             PhysicalPlanKind::Scan(scan) => self.lower_scan(plan, scan),
             PhysicalPlanKind::Values(values) => self.lower_values(plan, values),
@@ -2490,6 +2599,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             PhysicalPlanKind::ChangeEventExpand(expand) => {
                 self.lower_change_event_expand(plan, expand)
             }
+            PhysicalPlanKind::ContentApply {
+                route_keys,
+                demand_keys,
+            } => self.lower_content_apply(plan, route_keys, demand_keys),
         }?;
         self.record_runtime_filter_probes(plan, &lowered)?;
         self.annotate_node(plan, &lowered)?;
@@ -2660,6 +2773,199 @@ impl<'a> ContractLoweringVisitor<'a> {
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("fragment"))?;
         self.fragments.insert(id, FragmentBuilder::new(id));
         Ok(id)
+    }
+
+    fn lower_content_apply(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        route_keys: &[u32],
+        demand_keys: &[u32],
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        use novarocks_physical_plan::{
+            ContentApplySpec, ContentApplyTarget, SummaryAuthor, SummaryKind, SummaryOutput,
+        };
+
+        expect_children(plan, 2)?;
+        let [weighted, target] = plan.children.as_slice() else {
+            unreachable!("validated ContentApply arity");
+        };
+        let width = plan
+            .output_columns
+            .len()
+            .checked_sub(5)
+            .filter(|width| *width != 0)
+            .ok_or_else(|| invalid_write("content application requires visible columns".into()))?;
+        if weighted.output_columns.len() != width + 1 || target.output_columns.len() != width + 4 {
+            return Err(invalid_write(
+                "content application has unexpected input widths".into(),
+            ));
+        }
+        if self.input_completion != novarocks_physical_plan::FragmentInputCompletion::MustDrain {
+            return Err(invalid_write(
+                "content application requires full input coverage".into(),
+            ));
+        }
+        if self.delete_verification.is_some() {
+            return Err(invalid_write(
+                "a refresh has more than one deletion verification author".into(),
+            ));
+        }
+
+        let scheme = self.allocate_hash_scheme()?;
+        let mut lower_input = |input: &PhysicalPlanNode| {
+            let keys = route_keys
+                .iter()
+                .map(|&ordinal| {
+                    input
+                        .output_columns
+                        .get(ordinal as usize)
+                        .filter(|_| (ordinal as usize) < width)
+                        .map(|column| column.column_id)
+                        .ok_or_else(|| {
+                            invalid_write(
+                                "content routing ordinal exceeds the visible layout".into(),
+                            )
+                        })
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            let source = self.lower_exchange_source(input, "ContentApply")?;
+            let exact_source = (source.fragment, source.node, source.output.clone());
+            let exchange = self.append_exchange(
+                source,
+                &input.output_columns,
+                ExchangeLayout::Hash {
+                    keys,
+                    scheme: scheme.clone(),
+                },
+            )?;
+            Ok::<_, ContractLoweringError>((exchange, exact_source))
+        };
+        let (weighted, _) = lower_input(weighted)?;
+        let (target, (target_fragment, target_scan, source_values)) = lower_input(target)?;
+        let node = self.fragment_mut().reserve_node_id()?;
+        for &content_ordinal in demand_keys {
+            self.work.step()?;
+            let ordinal = content_ordinal as usize;
+            if ordinal >= width {
+                return Err(invalid_write(
+                    "content demand ordinal exceeds the visible layout".into(),
+                ));
+            }
+            let value = self.fragment_mut().value(target.output[ordinal]).ok_or(
+                ContractLoweringError::IdentitySpaceExhausted("content target value"),
+            )?;
+            let ValueOrigin::ExchangeImport {
+                edge: target_edge, ..
+            } = value.origin
+            else {
+                return Err(invalid_write(
+                    "content demand target requires its original exchange".into(),
+                ));
+            };
+            let filter_id = self
+                .runtime_filter_builds
+                .last_key_value()
+                .map_or(Some(0), |(id, _)| id.checked_add(1))
+                .ok_or(ContractLoweringError::IdentitySpaceExhausted(
+                    "content demand channel",
+                ))?;
+            self.runtime_filter_builds.insert(
+                filter_id,
+                PendingRuntimeFilterBuild::ContentDemand {
+                    fragment: self.current_fragment,
+                    node,
+                    content_ordinal,
+                    weighted: weighted.output[ordinal],
+                    target_edge,
+                },
+            );
+            self.runtime_filter_probes.insert(
+                filter_id,
+                vec![PendingRuntimeFilterProbe {
+                    fragment: target_fragment,
+                    node: target_scan,
+                    value: source_values[ordinal],
+                    scan_source: true,
+                }],
+            );
+        }
+        let mut data = Vec::with_capacity(plan.output_columns.len());
+        let mut columns = BTreeMap::new();
+        for (ordinal, column) in plan.output_columns.iter().enumerate() {
+            self.work.step()?;
+            let value = self.fragment_mut().add_value(
+                value_type(column),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: checked_ordinal("ContentApply output", ordinal)?,
+                },
+            )?;
+            if columns.insert(column.column_id, value).is_some() {
+                return Err(ContractLoweringError::DuplicateColumnDefinition {
+                    node: "ContentApply",
+                    column: column.column_id,
+                });
+            }
+            data.push(value);
+        }
+        let [requested, matched, insufficient, fingerprint] =
+            SummaryKind::DeleteVerification.fields()
+        else {
+            unreachable!("fixed deletion verification fields");
+        };
+        let mut summary_value = |field| {
+            self.fragment_mut()
+                .add_value(summary_value_type(field), ValueOrigin::Summary { field })
+        };
+        let summary_columns = novarocks_physical_plan::SummaryColumns::delete_verification(
+            summary_value(*requested)?,
+            summary_value(*matched)?,
+            summary_value(*insufficient)?,
+            summary_value(*fingerprint)?,
+        );
+        let summary = SummaryOutput {
+            edge: self.plan_builder.reserve_edge_id()?,
+            columns: summary_columns,
+            author: SummaryAuthor::Node(node),
+        };
+        let mut physical_output = data.clone();
+        physical_output.extend_from_slice(summary_columns.values());
+        self.fragment_mut().add_row_consuming(
+            node,
+            Box::new([weighted.node, target.node]),
+            RequiredInputs::AsProduced,
+            Distribution::Unconstrained,
+            physical_output.into_boxed_slice(),
+            NodeKind::ContentApply(ContentApplySpec {
+                weighted_content: weighted.output[..width].into(),
+                target_content: target.output[..width].into(),
+                route_keys: route_keys.into(),
+                weight: weighted.output[width],
+                target: ContentApplyTarget {
+                    file: target.output[width],
+                    position: target.output[width + 1],
+                    spec_id: target.output[width + 2],
+                    partition: target.output[width + 3],
+                },
+            }),
+        )?;
+        self.delete_verification = Some((self.current_fragment, summary));
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output: data.into_boxed_slice(),
+            columns,
+            properties: PhysicalProperties {
+                distribution: Distribution::Unconstrained,
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            },
+            display_names: plan
+                .output_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+        })
     }
 
     fn lower_change_event_expand(
@@ -3722,7 +4028,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         let edge_contract = Edge {
             id: edge,
             role: novarocks_physical_plan::OutputRole::Relational,
-            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            delivery: self.relational_delivery(),
             kind: EdgeKind::Stream,
             source: EdgeSource {
                 port: novarocks_physical_plan::FragmentOutputPort::Root,
@@ -3959,13 +4265,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     phase,
                 )?;
                 let output_type = self.value_declared_type_in(self.current_fragment, output)?;
-                let domain_matches = binding
-                    .intermediate_type
-                    .same_value_domain_observed(&output_type, || {
-                        self.work.step().map_err(ContractLoweringError::from)
-                    })?;
-                let nullable_matches =
-                    !binding.intermediate_type.nullable() || output_type.nullable();
+                let state = binding
+                    .intermediate_type()
+                    .ok_or_else(|| invalid_write("writer aggregate has no state".into()))?;
+                let domain_matches = state.same_value_domain_observed(&output_type, || {
+                    self.work.step().map_err(ContractLoweringError::from)
+                })?;
+                let nullable_matches = !state.nullable() || output_type.nullable();
                 self.work.step()?;
                 if !domain_matches || !nullable_matches {
                     return Err(invalid_write(
@@ -4966,7 +5272,17 @@ impl<'a> ContractLoweringVisitor<'a> {
             ),
             author: novarocks_physical_plan::SummaryAuthor::RouterSink,
         };
-        self.fragment_mut().set_summaries(Box::new([summary]));
+        let mut summaries = vec![summary];
+        if let Some((fragment, verification)) = self.delete_verification {
+            if fragment != source_fragment {
+                return Err(invalid_write(
+                    "deletion verification author must share the router fragment".into(),
+                ));
+            }
+            summaries.push(verification);
+        }
+        self.fragment_mut()
+            .set_summaries(summaries.into_boxed_slice());
         self.complete_fragment(
             source_fragment,
             router_root,
@@ -4999,6 +5315,76 @@ impl<'a> ContractLoweringVisitor<'a> {
             None,
             count_mode,
         )
+    }
+
+    fn lower_finish_summary_input(
+        &mut self,
+        source_fragment: FragmentId,
+        summary: novarocks_physical_plan::SummaryOutput,
+    ) -> Result<(NodeId, novarocks_physical_plan::SummaryColumns), ContractLoweringError> {
+        use novarocks_physical_plan::{FragmentOutputPort, OutputRole, SummaryColumns};
+
+        let exchange = self.fragment_mut().reserve_node_id()?;
+        let mut imported = Vec::with_capacity(summary.columns.values().len());
+        let mut mapping = Vec::with_capacity(imported.capacity());
+        for (field, source_value) in summary.columns.fields() {
+            let destination = self.fragment_mut().add_value(
+                summary_value_type(field),
+                ValueOrigin::ExchangeImport {
+                    edge: summary.edge,
+                    source_value,
+                },
+            )?;
+            imported.push(destination);
+            mapping.push((source_value, destination));
+            self.work.step()?;
+        }
+        self.fragment_mut().add_exchange_source(
+            exchange,
+            summary.edge,
+            mapping.clone().into_boxed_slice(),
+            imported.clone().into_boxed_slice(),
+            Distribution::Singleton,
+            RowMultiplicity::SingleCopy,
+        )?;
+        let edge = Edge {
+            id: summary.edge,
+            role: OutputRole::Summary(summary.kind()),
+            delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
+            kind: EdgeKind::Stream,
+            source: EdgeSource {
+                fragment: source_fragment,
+                port: FragmentOutputPort::Summary(summary.kind()),
+                projection: summary.columns.values().into(),
+            },
+            destination: EdgeDestination {
+                fragment: self.current_fragment,
+                node: exchange,
+                receive_mapping: mapping.into_boxed_slice(),
+            },
+            partitioning: EdgePartitioning {
+                source: Distribution::Singleton,
+                destination: Distribution::Singleton,
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
+            },
+        };
+        self.work.flush()?;
+        self.plan_builder.add_edge(edge.clone())?;
+        self.edges.insert(edge.id, edge);
+        self.work.step()?;
+        let columns = match (summary.kind(), imported.as_slice()) {
+            (novarocks_physical_plan::SummaryKind::WriteCounts, &[insert, replace, delete]) => {
+                SummaryColumns::write_counts(insert, replace, delete)
+            }
+            (
+                novarocks_physical_plan::SummaryKind::DeleteVerification,
+                &[request, matched, insufficient, fingerprint],
+            ) => SummaryColumns::delete_verification(request, matched, insufficient, fingerprint),
+            _ => unreachable!("summary fields and kind share one declaration"),
+        };
+        Ok((exchange, columns))
     }
 
     fn lower_writer_finish(
@@ -5379,70 +5765,29 @@ impl<'a> ContractLoweringVisitor<'a> {
             )
             .transpose()?;
         let mut finish_inputs = vec![finish_input];
-        let logical_summary = if let Some((source_fragment, summary)) = summary {
-            let exchange = self.fragment_mut().reserve_node_id()?;
-            let mut imported = Vec::with_capacity(3);
-            let mut mapping = Vec::with_capacity(3);
-            for source_value in summary.columns.values().iter().copied() {
-                let destination = self.fragment_mut().add_value(
-                    ValueType::new(DataType::Int64, false),
-                    ValueOrigin::ExchangeImport {
-                        edge: summary.edge,
-                        source_value,
-                    },
-                )?;
-                imported.push(destination);
-                mapping.push((source_value, destination));
-                self.work.step()?;
-            }
-            self.fragment_mut().add_exchange_source(
-                exchange,
-                summary.edge,
-                mapping.clone().into_boxed_slice(),
-                imported.clone().into_boxed_slice(),
-                Distribution::Singleton,
-                RowMultiplicity::SingleCopy,
-            )?;
-            let edge = Edge {
-                id: summary.edge,
-                role: novarocks_physical_plan::OutputRole::Summary(
-                    novarocks_physical_plan::SummaryKind::WriteCounts,
-                ),
-                delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
-                kind: EdgeKind::Stream,
-                source: EdgeSource {
-                    fragment: source_fragment,
-                    port: novarocks_physical_plan::FragmentOutputPort::Summary(
-                        novarocks_physical_plan::SummaryKind::WriteCounts,
-                    ),
-                    projection: summary.columns.values().into(),
-                },
-                destination: EdgeDestination {
-                    fragment: finish_fragment,
-                    node: exchange,
-                    receive_mapping: mapping.into_boxed_slice(),
-                },
-                partitioning: EdgePartitioning {
-                    source: Distribution::Singleton,
-                    destination: Distribution::Singleton,
-                    source_multiplicity: RowMultiplicity::SingleCopy,
-                    destination_multiplicity: RowMultiplicity::SingleCopy,
-                    routing_only: Box::default(),
-                },
-            };
-            self.work.flush()?;
-            self.plan_builder.add_edge(edge.clone())?;
-            self.edges.insert(edge.id, edge);
-            self.work.step()?;
-            finish_inputs.push(exchange);
-            Some(novarocks_physical_plan::SummaryColumns::write_counts(
-                imported[0],
-                imported[1],
-                imported[2],
-            ))
-        } else {
-            None
+        let mut summary_inputs = novarocks_physical_plan::PerKind {
+            write_counts: None,
+            delete_verification: None,
         };
+        let mut summary_columns = novarocks_physical_plan::PerKind {
+            write_counts: None,
+            delete_verification: None,
+        };
+        for (source, summary) in summary.into_iter().chain(self.delete_verification) {
+            let (exchange, columns) = self.lower_finish_summary_input(source, summary)?;
+            let ordinal = checked_ordinal("TableFinish summary input", finish_inputs.len())?;
+            finish_inputs.push(exchange);
+            match summary.kind() {
+                novarocks_physical_plan::SummaryKind::WriteCounts => {
+                    summary_inputs.write_counts = Some(ordinal);
+                    summary_columns.write_counts = Some(columns);
+                }
+                novarocks_physical_plan::SummaryKind::DeleteVerification => {
+                    summary_inputs.delete_verification = Some(ordinal);
+                    summary_columns.delete_verification = Some(columns);
+                }
+            }
+        }
         self.fragment_mut().add_row_consuming(
             finish,
             finish_inputs.into_boxed_slice(),
@@ -5453,15 +5798,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 count_mode,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    summaries: novarocks_physical_plan::PerKind {
-                        write_counts: logical_summary.map(|_| 1),
-                        delete_verification: None,
-                    },
+                    summaries: summary_inputs,
                 },
-                summaries: novarocks_physical_plan::PerKind {
-                    write_counts: logical_summary,
-                    delete_verification: None,
-                },
+                summaries: summary_columns,
                 expected_target_ordinals: ordinals,
                 input_schema,
                 output_schema,
@@ -5732,7 +6071,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         let edge_contract = Edge {
             role: novarocks_physical_plan::OutputRole::Relational,
-            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            delivery: self.relational_delivery(),
             id: edge,
             kind: EdgeKind::Stream,
             source: EdgeSource {
@@ -7360,7 +7699,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // an ordinal that lines up against the wrong column is caught
                 // here rather than reaching the backend as a merge of another
                 // aggregate's state.
-                if state_type.data_type() != original_binding.intermediate_type.data_type() {
+                if original_binding
+                    .intermediate_type()
+                    .is_none_or(|state| state_type.data_type() != state.data_type())
+                {
                     return Err(ContractLoweringError::InvalidAggregate {
                         detail: "state-consuming aggregate reads a state of another type",
                     });
@@ -7376,11 +7718,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )?);
             }
             let call_id = self.allocate_aggregate_call()?;
-            let original_output_type = if phase.produces_final_result() {
-                original_binding.function.result_type.clone()
-            } else {
-                original_binding.intermediate_type.clone()
-            };
+            let original_output_type = original_binding
+                .output_type()
+                .ok_or(ContractLoweringError::InvalidAggregate {
+                    detail: "state-producing aggregate has no state contract",
+                })?
+                .clone();
             // The column may admit null this phase's output never produces
             // -- a count standing where the statement types a nullable
             // integer is sound. It may not claim the reverse, and the type
@@ -7416,11 +7759,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )?,
                 None => original_binding,
             };
-            let expected_output_type = if phase.produces_final_result() {
-                binding.function.result_type.clone()
-            } else {
-                binding.intermediate_type.clone()
-            };
+            let expected_output_type = binding
+                .output_type()
+                .ok_or(ContractLoweringError::InvalidAggregate {
+                    detail: "state-producing aggregate has no state contract",
+                })?
+                .clone();
             if canonical.is_some() {
                 let published = published_value_type(&original_output_type, &expected_output_type);
                 self.work.flush()?;
@@ -9973,9 +10317,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .to_string(),
                     });
                 }
-                if aggregate.selected.aggregate.is_none() {
+                if aggregate.selected.aggregate.is_some() != window.function_order_by.is_empty() {
                     return Err(ContractLoweringError::InvalidWindow {
-                        detail: "aggregate window binding lacks state metadata".into(),
+                        detail: "aggregate window ordering and state capability differ".into(),
                     });
                 }
                 Some(aggregate)
@@ -11517,13 +11861,15 @@ fn lower_writer_aggregate_binding_from_selection(
         .as_ref()
         .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
     Ok(AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved, selected, result),
         phase,
         logical_argument_count: 1,
-        intermediate_type: aggregate.intermediate_type.clone(),
-        state_format: aggregate.state_format.clone(),
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract: aggregate.state_argument_contract,
+            intermediate_type: aggregate.intermediate_type.clone(),
+            state_format: aggregate.state_format.clone(),
+        }),
     })
 }
 
@@ -12542,22 +12888,33 @@ fn lower_captured_aggregate_binding(
             detail: "aggregate binding has a relation result",
         });
     };
-    let aggregate = selected
+    if selected.aggregate.is_some() != (order_count == 0)
+        || (order_count != 0 && phase != AggregatePhase::Single)
+    {
+        return Err(ContractLoweringError::InvalidAggregate {
+            detail: "ordered call and aggregate state capability differ",
+        });
+    }
+    let merge_state = selected
         .aggregate
         .as_ref()
-        .ok_or(ContractLoweringError::InvalidAggregate {
-            detail: "aggregate binding has no intermediate state contract",
-        })?;
+        .map(|state| {
+            Ok::<_, ContractLoweringError>(novarocks_physical_plan::AggregateMergeBinding {
+                state_interpretation: resolved
+                    .aggregate_state_source()
+                    .map(|facts| facts.clone_observed(work))
+                    .transpose()?,
+                state_argument_contract: state.state_argument_contract,
+                intermediate_type: full_source_type(&state.intermediate_type),
+                state_format: state.state_format.clone(),
+            })
+        })
+        .transpose()?;
     // A call's own `result_type` is the type its phase's carrier column has,
     // not the aggregate's SQL result -- a partial `avg` carries its state
     // there. The phase carrier is checked against this binding where the
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
-        state_interpretation: resolved
-            .aggregate_state_source()
-            .map(|facts| facts.clone_observed(work))
-            .transpose()?,
-        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved.resolved(), selected, result_type),
         phase,
         logical_argument_count: u32::try_from(resolved.logical_argument_count).map_err(|_| {
@@ -12565,8 +12922,7 @@ fn lower_captured_aggregate_binding(
                 detail: "logical argument count exceeds u32",
             }
         })?,
-        intermediate_type: full_source_type(&aggregate.intermediate_type),
-        state_format: aggregate.state_format.clone(),
+        merge_state,
     })
 }
 
@@ -13305,6 +13661,44 @@ fn parse_decimal128(value: &str, scale: i8) -> Result<i128, ContractLoweringErro
     Ok(unscaled)
 }
 
+fn check_maintenance_input(kind: &PhysicalPlanKind) -> Result<(), ContractLoweringError> {
+    use PhysicalPlanKind::*;
+    match kind {
+        // These sources and transforms run until upstream EOS. Values may
+        // represent a compiler-proved empty input after simplification.
+        Scan(_)
+        | Values(_)
+        | Filter(_)
+        | Project(_)
+        | Unpivot(_)
+        | Sort(_)
+        | TopN(_)
+        | Window(_)
+        | Repeat(_)
+        | HashAggregate(_)
+        | SetOp(_)
+        | Redistribute(_)
+        | ChangeEventExpand(_)
+        | ContentApply { .. } => Ok(()),
+        // Both probes consume the frozen local drain policy for empty builds.
+        HashJoin(_) | NestLoopJoin(_) => Ok(()),
+        _ => Err(ContractLoweringError::UnsupportedMaintenanceInput(
+            physical_kind_name(kind),
+        )),
+    }
+}
+
+fn summary_value_type(field: novarocks_physical_plan::SummaryField) -> ValueType {
+    use novarocks_physical_plan::SummaryWireType;
+    ValueType::new(
+        match field.wire_type() {
+            SummaryWireType::Int64 => DataType::Int64,
+            SummaryWireType::FixedSizeBinary(width) => DataType::FixedSizeBinary(i32::from(width)),
+        },
+        false,
+    )
+}
+
 fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
     match kind {
         PhysicalPlanKind::Scan(_) => "Scan",
@@ -13326,6 +13720,7 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::NestLoopJoin(_) => "NestLoopJoin",
         PhysicalPlanKind::SetOp(_) => "SetOp",
         PhysicalPlanKind::ChangeEventExpand(_) => "ChangeEventExpand",
+        PhysicalPlanKind::ContentApply { .. } => "ContentApply",
         PhysicalPlanKind::CTEAnchor(_) => "CTEAnchor",
         PhysicalPlanKind::CTEProduce(_) => "CTEProduce",
         PhysicalPlanKind::CTEConsume(_) => "CTEConsume",
@@ -13407,6 +13802,7 @@ pub(crate) enum ContractLoweringError {
     UnsupportedSetOp {
         detail: &'static str,
     },
+    UnsupportedMaintenanceInput(&'static str),
     InvalidSetOp {
         detail: &'static str,
     },
@@ -13579,6 +13975,12 @@ impl fmt::Display for ContractLoweringError {
             }
             Self::AmbiguousInputColumn { node, column } => {
                 write!(formatter, "{node} input column {column} is ambiguous")
+            }
+            Self::UnsupportedMaintenanceInput(node) => {
+                write!(
+                    formatter,
+                    "MV maintenance cannot prove full input coverage for {node}"
+                )
             }
             Self::UnsupportedSetOp { detail } => {
                 write!(formatter, "unsupported final SetOp: {detail}")
@@ -13858,6 +14260,13 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
     fn from(error: ContractLoweringError) -> Self {
         match error {
             ContractLoweringError::Control(error) => Self::from(error),
+            error @ ContractLoweringError::UnsupportedMaintenanceInput(_) => {
+                crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                    error.to_string(),
+                    novarocks_parser::SYNTHETIC,
+                )
+                .into()
+            }
             ContractLoweringError::FunctionBinding(error) => Self::from(error),
             ContractLoweringError::Semantics(error) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(error))
@@ -15285,6 +15694,73 @@ mod tests {
     }
 
     #[test]
+    fn writer_edge_alone_does_not_author_local_join_draining() {
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+        use novarocks_physical_plan::{FragmentInputCompletion, OutputRole};
+
+        let probe = column(1, "order_id", DataType::Int64, false);
+        let build = column(2, "key", DataType::Int64, false);
+        let input = hash_join(
+            crate::common::JoinKind::Inner,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![probe.clone()], vec![vec![literal_int(7)]]),
+            values(vec![build], vec![]),
+            vec![probe],
+        );
+        for policy in [
+            FragmentInputCompletion::MayShortCircuit,
+            FragmentInputCompletion::MustDrain,
+        ] {
+            let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+            let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
+            let targets = FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap();
+            let mut write =
+                simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
+            write.input_completion = policy;
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let plan = lower_final_physical_write_plan(
+                &input,
+                version(),
+                dop(),
+                FinalWriteLowering {
+                    reads: None,
+                    write,
+                    write_target_ordinal: ordinal,
+                    auxiliary: &auxiliary,
+                    targets,
+                },
+                crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+                false,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap()
+            .finish_observed(&control)
+            .unwrap();
+
+            let plan = plan.plan();
+            assert_eq!(plan.edges().len(), 1);
+            let edge = plan.edges().values().next().unwrap();
+            assert_eq!(edge.role, OutputRole::WriterResults);
+            assert_eq!(
+                edge.delivery,
+                novarocks_physical_plan::DeliveryRequirement::MustDrain
+            );
+            let fragment = &plan.fragments()[&edge.source.fragment];
+            assert!(
+                fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::HashJoin { .. }))
+            );
+            assert_eq!(fragment.input_completion(), policy);
+        }
+    }
+
+    #[test]
     fn ordinary_writer_does_not_require_the_hash_layout_of_a_grouped_source() {
         use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
         use crate::planner::physical::{
@@ -15790,6 +16266,7 @@ mod tests {
             version(),
             dop(),
             FinalChangeStreamWriteLowering {
+                input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                 reads: None,
                 dag: ChangeStreamWriteDagSpec::for_test(5, routes),
                 auxiliary: &auxiliary,
@@ -15985,6 +16462,8 @@ mod tests {
                 version(),
                 dop(),
                 FinalChangeStreamWriteLowering {
+                    input_completion:
+                        novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                     reads: None,
                     dag: ChangeStreamWriteDagSpec::for_test(1, routes),
                     auxiliary: &auxiliary,
@@ -16256,6 +16735,7 @@ mod tests {
             version(),
             dop(),
             FinalChangeStreamWriteLowering {
+                input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                 reads: None,
                 dag: ChangeStreamWriteDagSpec::for_test(1, vec![route]),
                 auxiliary: &auxiliary,

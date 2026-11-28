@@ -101,7 +101,7 @@ pub(crate) struct MvSourceSchemaObservation {
     object_id: ConnectorTableObjectId,
     schema_version: bytes::Bytes,
     fields: Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
-    format_v3: bool,
+    format_version: novarocks_spi::connector::MvSourceFormatVersion,
     selected_snapshot_id: Option<i64>,
     selected_snapshot_has_row_range: bool,
 }
@@ -120,8 +120,8 @@ impl MvSourceSchemaObservation {
     ) -> &[novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts] {
         &self.fields
     }
-    pub(crate) fn is_format_v3(&self) -> bool {
-        self.format_v3
+    pub(crate) fn format_version(&self) -> novarocks_spi::connector::MvSourceFormatVersion {
+        self.format_version
     }
     pub(crate) fn selected_snapshot_id(&self) -> Option<i64> {
         self.selected_snapshot_id
@@ -178,7 +178,7 @@ pub(crate) fn source_schema_from_spi(
         object_id: observation.object_id().clone(),
         schema_version: observation.schema_version().clone(),
         fields,
-        format_v3: observation.is_format_v3(),
+        format_version: observation.format_version(),
         selected_snapshot_id: observation.selected_snapshot_id(),
         selected_snapshot_has_row_range: observation.selected_snapshot_has_row_range(),
     })
@@ -1032,7 +1032,7 @@ mod tests {
                 table(),
                 object_id(b"source-object"),
                 Bytes::from_static(b"source-schema"),
-                true,
+                novarocks_spi::connector::MvSourceFormatVersion::V3,
                 Some(42),
                 has_row_range,
                 vec![field],
@@ -1042,7 +1042,10 @@ mod tests {
             let projected = super::source_schema_from_spi(source, &context).unwrap();
             assert_eq!(projected.selected_snapshot_id(), Some(42));
             assert_eq!(projected.selected_snapshot_has_row_range(), has_row_range);
-            assert!(projected.is_format_v3());
+            assert_eq!(
+                projected.format_version(),
+                novarocks_spi::connector::MvSourceFormatVersion::V3
+            );
             assert_eq!(projected.fields()[0].name, "value");
         }
     }

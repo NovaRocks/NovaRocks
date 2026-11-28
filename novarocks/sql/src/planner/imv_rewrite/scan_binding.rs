@@ -43,6 +43,7 @@ pub(crate) struct ImvSnapshotWindow {
     pub(crate) from_snapshot_id: i64,
     pub(crate) to_snapshot_id: i64,
     pub(crate) table_object_id: ConnectorTableObjectId,
+    context_from_snapshot_id: i64,
 }
 
 pub(crate) struct BindIcebergScanRule;
@@ -153,7 +154,7 @@ fn bind_version_scan(
     let mut source = sql_base_scan_source(&scan.table.source)?;
     let window = resolve_snapshot_window(snapshot, &source)?;
     let snapshot_id = match role {
-        ImvVersionRole::From => window.from_snapshot_id,
+        ImvVersionRole::From => window.context_from_snapshot_id,
         ImvVersionRole::To => window.to_snapshot_id,
     };
     source.kind = SqlScanKind::FrozenInputSet {
@@ -205,11 +206,17 @@ fn resolve_snapshot_window(
         })?;
     let to_snapshot_id = base.snapshot_id;
     let pin_object_id = &base.table_object_id;
+    let context_from_snapshot_id = if base.equivalent_context_from == Some(from_snapshot_id) {
+        to_snapshot_id
+    } else {
+        from_snapshot_id
+    };
     Ok(ImvSnapshotWindow {
         base_fqn,
         from_snapshot_id,
         to_snapshot_id,
         table_object_id: pin_object_id.clone(),
+        context_from_snapshot_id,
     })
 }
 
@@ -504,6 +511,59 @@ mod tests {
             }
             other => panic!("expected frozen SQL source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn net_zero_join_context_uses_to_and_preserves_the_delta_window() {
+        let mut snapshot = crate::compiler::mv_rewrite::test_join_snapshot(false);
+        let bases = &mut std::sync::Arc::make_mut(&mut snapshot).base_snapshots;
+        let bases = std::sync::Arc::make_mut(bases);
+        bases[1].equivalent_context_from = Some(33);
+        let scan_for = |base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot| {
+            let mut scan = iceberg_scan();
+            scan.table.source = ScanSource::Sql(
+                base_identity(&base.table.table).with_mv_occurrence(base.occurrence_id),
+            );
+            scan
+        };
+        let changed = scan_for(&bases[0]);
+        let net_zero = scan_for(&bases[1]);
+
+        let context = bind_version_scan(net_zero.clone(), &snapshot, ImvVersionRole::From)
+            .expect("version scan should bind to the equivalent To");
+        let changed_context = bind_version_scan(changed, &snapshot, ImvVersionRole::From)
+            .expect("a different occurrence should bind to its original From");
+        let delta = bind_delta_scan(net_zero, &snapshot)
+            .expect("NetZero delta scan should bind to its original window");
+
+        assert!(matches!(
+            context.table.source,
+            ScanSource::Sql(SqlScanSource {
+                kind: SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(44),
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            changed_context.table.source,
+            ScanSource::Sql(SqlScanSource {
+                kind: SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(11),
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            delta.table.source,
+            ScanSource::Sql(SqlScanSource {
+                kind: SqlScanKind::Delta {
+                    from_snapshot_id: 33,
+                    to_snapshot_id: 44,
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -55,35 +55,24 @@ pub struct ExecutionTypeTableLimits {
     pub max_layout_string_bytes: usize,
 }
 impl ExecutionTypeTableLimits {
-    /// Finite grammar envelope for an actual owner with this many validated
-    /// roots. This is neither a memory quota nor an allocation/grant receipt.
-    /// Every definition contributes its unfolded subtree: summed across a
-    /// root's occurrences this is at most nodes * ancestor-depth, not nodes².
+    /// One binding per validated root. Definitions, occurrences, and string
+    /// storage follow their actual source and renderer/creator admission.
     pub fn for_validated_root_count(roots: usize) -> Result<Self, CompileControlError> {
-        use novarocks_type_contract::{
-            MAX_ARROW_FIELD_NAME_BYTES as NAME, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES as ZONE,
-            MAX_VALUE_TYPE_DEPTH as D, MAX_VALUE_TYPE_NODES as N,
-        };
-        let arithmetic = || CompileControlError::ResourceExhausted;
-        let definitions = roots.checked_mul(N).ok_or_else(arithmetic)?;
-        let expanded = definitions.checked_mul(D).ok_or_else(arithmetic)?;
-        let strings_per_root = N
-            .checked_mul(NAME.checked_add(ZONE).ok_or_else(arithmetic)?)
-            .ok_or_else(arithmetic)?;
-        let logical_strings = roots.checked_mul(strings_per_root).ok_or_else(arithmetic)?;
-        // Independently decoded schemas also copy their root column names.
-        let layout_strings = roots
-            .checked_mul(strings_per_root.checked_add(NAME).ok_or_else(arithmetic)?)
-            .ok_or_else(arithmetic)?;
+        if roots
+            .checked_sub(1)
+            .is_some_and(|last| u32::try_from(last).is_err())
+        {
+            return Err(CompileControlError::ResourceExhausted);
+        }
         Ok(Self {
             logical: crate::value_type_table::LogicalTypeTableLimits {
-                max_definitions: definitions,
-                max_expanded_nodes: expanded,
-                max_string_bytes: logical_strings,
+                max_definitions: usize::MAX,
+                max_expanded_nodes: usize::MAX,
+                max_string_bytes: usize::MAX,
             },
             max_bindings: roots,
-            max_layout_nodes: definitions,
-            max_layout_string_bytes: layout_strings,
+            max_layout_nodes: usize::MAX,
+            max_layout_string_bytes: usize::MAX,
         })
     }
 }

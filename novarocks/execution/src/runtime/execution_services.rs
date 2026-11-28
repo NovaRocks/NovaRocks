@@ -261,6 +261,16 @@ impl<F> Drop for LiveFuture<F> {
     }
 }
 
+pub(crate) fn run_with_memory_observation<T>(
+    observation: Option<&novarocks_memory::lane::LaneShards>,
+    work: impl FnOnce() -> T,
+) -> T {
+    match observation {
+        Some(owner) => owner.run(work),
+        None => work(),
+    }
+}
+
 /// A uniform handle to one execution service. Cloneable; cheap to pass around.
 #[derive(Clone)]
 pub struct IoExecutor {
@@ -318,6 +328,25 @@ impl IoExecutor {
             active: true,
             destroying: false,
         }))
+    }
+
+    pub(crate) fn spawn_with_memory_observation<F>(
+        &self,
+        owner: &TaskExecutionControl,
+        observation: Option<&novarocks_memory::lane::LaneShards>,
+        make: impl FnOnce() -> F,
+    ) -> Result<JoinHandle<F::Output>, IoSpawnRefused>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match observation {
+            Some(memory) => self.spawn(
+                owner,
+                novarocks_memory::attribution::future::AttributedFuture::new(memory.clone(), make),
+            ),
+            None => self.spawn(owner, make()),
+        }
     }
 
     pub(crate) fn close_admission(&self) {
@@ -443,6 +472,23 @@ fn build_runtime(
 pub(crate) fn test_io_control() -> TaskExecutionControl {
     crate::runtime::task_control::test_support::Owner::new()
         .view(novarocks_execution_contract::TaskFailurePhase::Execution)
+}
+
+#[cfg(test)]
+pub(crate) fn test_attributed_allocation() -> novarocks_memory::lane::RecordRef {
+    use novarocks_memory::attribution::AttributingAllocator;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    let allocator = AttributingAllocator::new(System);
+    let layout = Layout::from_size_align(600, 8).unwrap();
+    // This request is in the tagged band with an 8-byte aligned tail.
+    unsafe {
+        let block = allocator.alloc(layout);
+        assert!(!block.is_null());
+        let origin = novarocks_memory::lane::RecordRef::read(block.add(layout.size()));
+        allocator.dealloc(block, layout);
+        origin
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +642,82 @@ mod tests {
         executor.wait_live_exit(Duration::from_secs(5)).unwrap();
         assert!(destroyed.load(Ordering::Acquire));
         futures::executor::block_on(handle).unwrap();
+    }
+
+    #[test]
+    fn m03a_sink_io_observes_actual_construction_poll_and_unstarted_drop() {
+        use novarocks_memory::lane::RecordRef;
+        use novarocks_memory::{
+            AccountKind, AuthorityConfig, ExternalRef, LaneShards, MemoryAuthority,
+        };
+        struct Captures {
+            seen: Arc<Mutex<Vec<(RecordRef, RecordRef)>>>,
+            owner: LaneShards,
+        }
+        impl Captures {
+            fn observe(&self) {
+                let actual = test_attributed_allocation();
+                let expected = self.owner.explicit_owner().reference().unwrap();
+                self.seen.lock().unwrap().push((actual, expected));
+            }
+        }
+        impl Drop for Captures {
+            fn drop(&mut self) {
+                self.observe();
+            }
+        }
+
+        let authority =
+            MemoryAuthority::new(AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29)).unwrap();
+        let account = || {
+            authority
+                .create_account(AccountKind::Work, ExternalRef::NONE)
+                .unwrap()
+        };
+        let a = account().create_lane_shards();
+        let b = account().create_lane_shards();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let services = services();
+        let executor = services.sink_io();
+        let task = test_io_control();
+        let capture = || Captures {
+            seen: seen.clone(),
+            owner: a.clone(),
+        };
+        let handle = b
+            .run(|| {
+                executor.spawn_with_memory_observation(&task, Some(&a), || {
+                    let captured = capture();
+                    captured.observe();
+                    async move { captured.observe() }
+                })
+            })
+            .unwrap();
+        futures::executor::block_on(handle).unwrap();
+        executor.wait_live_exit(Duration::ZERO).unwrap();
+
+        executor.close_admission();
+        b.run(|| {
+            assert_eq!(
+                executor
+                    .spawn_with_memory_observation(&task, Some(&a), || {
+                        let captured = capture();
+                        async move {
+                            std::hint::black_box(&captured);
+                            unreachable!("closed service cannot poll the new actor");
+                        }
+                    })
+                    .unwrap_err(),
+                IoSpawnRefused
+            );
+            assert_eq!(
+                test_attributed_allocation(),
+                b.explicit_owner().reference().unwrap()
+            );
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen.iter().all(|(actual, expected)| actual == expected));
     }
 
     #[test]

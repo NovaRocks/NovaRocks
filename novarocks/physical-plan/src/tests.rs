@@ -29,6 +29,7 @@ use super::*;
 
 mod aggregate_sequence_contract;
 pub(crate) mod constant_fixture;
+pub(crate) mod content_apply_contract;
 mod contract_regressions;
 mod exchange_occurrence_contract;
 mod guarantee_admission;
@@ -2138,12 +2139,13 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
 
 #[test]
 fn arrow_data_type_depth_is_bounded_iteratively() {
+    use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
     use std::sync::Arc;
 
     use arrow_schema::Field;
 
     let mut data_type = DataType::Int64;
-    for _ in 0..MAX_DATA_TYPE_DEPTH {
+    for _ in 0..MAX_VALUE_TYPE_DEPTH {
         data_type = DataType::List(Arc::new(Field::new_list_field(data_type, true)));
     }
     assert_eq!(
@@ -2158,23 +2160,22 @@ fn arrow_data_type_depth_is_bounded_iteratively() {
 }
 
 #[test]
-fn arrow_data_type_node_count_is_bounded_before_stack_growth() {
+fn wide_arrow_data_type_has_no_recursive_node_budget() {
     use std::sync::Arc;
 
     use arrow_schema::{Field, Fields};
 
-    let fields = (0..MAX_DATA_TYPE_NODES)
+    let width = 4096;
+    let fields = (0..width)
         .map(|index| Arc::new(Field::new(index.to_string(), DataType::Int64, true)))
         .collect::<Vec<_>>();
-    assert_eq!(
-        ValueType::try_with_logical_type(
-            DataType::Struct(Fields::from(fields)),
-            true,
-            novarocks_type_contract::ValueLogicalType::Physical
-        )
-        .unwrap_err(),
-        novarocks_type_contract::ValueTypeError::TooManyNodes
-    );
+    let value = ValueType::try_with_logical_type(
+        DataType::Struct(Fields::from(fields)),
+        true,
+        novarocks_type_contract::ValueLogicalType::Physical,
+    )
+    .unwrap();
+    assert_eq!(value.value_type().expanded_nodes(), width + 1);
 }
 
 #[test]
@@ -2197,28 +2198,24 @@ fn declared_value_type_author_rejects_invalid_carrier_parameters() {
 }
 
 #[test]
-fn declared_value_names_are_bounded_and_provider_metadata_is_not_execution_semantics() {
+fn declared_value_names_are_exact_and_provider_metadata_is_not_execution_semantics() {
     use arrow_schema::Field;
     use std::{collections::HashMap, sync::Arc};
     let mut metadata = HashMap::new();
-    metadata.insert(
-        "key".to_owned(),
-        "v".repeat(MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES + 1),
-    );
-    let field = Field::new(
-        "n".repeat(MAX_DATA_TYPE_FIELD_NAME_BYTES + 1),
-        DataType::Int64,
+    metadata.insert("key".to_owned(), "v".repeat((16 * 1024) + 1));
+    let name = "n".repeat(1025);
+    let field = Field::new(name.clone(), DataType::Int64, true).with_metadata(metadata.clone());
+    let structure = ValueType::try_with_logical_type(
+        DataType::Struct(vec![Arc::new(field)].into()),
         true,
+        novarocks_type_contract::ValueLogicalType::Physical,
     )
-    .with_metadata(metadata.clone());
-    assert!(
-        ValueType::try_with_logical_type(
-            DataType::Struct(vec![Arc::new(field)].into()),
-            true,
-            novarocks_type_contract::ValueLogicalType::Physical
-        )
-        .is_err()
-    );
+    .unwrap();
+    let DataType::Struct(fields) = structure.data_type() else {
+        unreachable!()
+    };
+    assert_eq!(fields[0].name(), &name);
+    assert!(fields[0].metadata().is_empty());
     let list = ValueType::new(
         DataType::List(Arc::new(
             Field::new("role", DataType::Int64, true).with_metadata(metadata),

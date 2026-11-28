@@ -2107,6 +2107,7 @@ impl OperatorLifecycle for DataStreamSinkOperator {
             self.transmitter.clone(),
             runtime.exchange_unit_scheduler(),
             gates,
+            state.memory_observation(),
         )?;
         Ok(())
     }

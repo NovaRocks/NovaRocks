@@ -18,6 +18,14 @@
 //! The original three M/R properties share the fresh production Node fixture.
 //! Only foreign materialization is held; protocol, rows and cleanup stay real.
 use super::*;
+use novarocks_execution::runtime::query_memory::QueryMemoryBinding;
+use novarocks_memory::{
+    AuthorityConfig, MemoryAuthority,
+    attribution::{AttributingAllocator, binding},
+    lane::{RecordRef, ResponsibilityClass},
+};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::ptr::NonNull;
 use std::sync::atomic::AtomicBool;
 
 type BoundaryScene = Scenario<ColdNotificationPool>;
@@ -548,11 +556,46 @@ pub(super) fn queued_materialization_withdraws_without_factory() {
 
 struct SenderExitBoundary {
     runtime: tokio::runtime::Handle,
+    memory_authority: Arc<MemoryAuthority>,
+    retained_query_bytes: Mutex<Option<(QueryMemoryBinding, Arc<RetainedQueryBytes>)>>,
     polled: AtomicBool,
     drop_entered: AtomicBool,
     dropped: AtomicBool,
     allow_drop: Mutex<bool>,
     changed: Condvar,
+}
+
+struct RetainedQueryBytes {
+    block: NonNull<u8>,
+    origin: RecordRef,
+}
+impl RetainedQueryBytes {
+    const REQUEST: usize = 600;
+    const TAGGED_BYTES: i64 = (Self::REQUEST + size_of::<u64>()) as i64;
+
+    fn layout() -> Layout {
+        Layout::from_size_align(Self::REQUEST, align_of::<u64>()).unwrap()
+    }
+
+    fn allocate() -> Self {
+        let allocator = AttributingAllocator::new(System);
+        // This request is in the tagged allocation band. Its original token
+        // is stored in the aligned tail before the allocator returns.
+        let block = NonNull::new(unsafe { allocator.alloc(Self::layout()) }).unwrap();
+        let origin = unsafe { RecordRef::read(block.as_ptr().add(Self::REQUEST)) };
+        Self { block, origin }
+    }
+}
+// The pointer is never used to access mutable storage after allocation. The
+// last Arc frees the exact original allocation, on whichever thread owns it.
+unsafe impl Send for RetainedQueryBytes {}
+unsafe impl Sync for RetainedQueryBytes {}
+impl Drop for RetainedQueryBytes {
+    fn drop(&mut self) {
+        unsafe {
+            AttributingAllocator::new(System).dealloc(self.block.as_ptr(), Self::layout());
+        }
+    }
 }
 impl SenderExitBoundary {
     fn open_drop(&self) {
@@ -669,6 +712,22 @@ impl ParticipationHostInstance for SenderInstance {
             .calls
             .materializations
             .fetch_add(1, Ordering::SeqCst);
+        let binding = captures
+            .issuer
+            .open_query_memory_binding(&captures.boundary.memory_authority)
+            .expect("the original materialization creates its query account");
+        let retained = binding
+            .observation()
+            .run(|| Arc::new(RetainedQueryBytes::allocate()));
+        assert!(
+            captures
+                .boundary
+                .retained_query_bytes
+                .lock()
+                .unwrap()
+                .replace((binding, retained))
+                .is_none()
+        );
         let (work, panic, wake) = captures
             .issuer
             .runtime_filter_sender()
@@ -725,6 +784,10 @@ pub(super) fn sender_exit_wakes_original_node_after_holder_disposal() {
             .unwrap();
         let boundary = Arc::new(SenderExitBoundary {
             runtime: runtime.handle().clone(),
+            memory_authority: Arc::new(
+                MemoryAuthority::new(AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29)).unwrap(),
+            ),
+            retained_query_bytes: Mutex::new(None),
             polled: AtomicBool::new(false),
             drop_entered: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
@@ -870,24 +933,60 @@ pub(super) fn sender_exit_wakes_original_node_after_holder_disposal() {
         assert!(!boundary.dropped.load(Ordering::Acquire));
         assert!(scope.gates().is_ok());
         assert_eq!(scene.clock.now(), clock_origin);
+        let (binding, backing) = boundary
+            .retained_query_bytes
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        assert_eq!(binding.execution(), participation.query_execution_id());
+        let source = backing.origin;
+        let source_shard = || {
+            binding
+                .observation()
+                .snapshot()
+                .records
+                .into_iter()
+                .flatten()
+                .find(|shard| shard.reference == source)
+                .expect("the backing uses the original Work account's exact shard")
+        };
+        let late_alias = backing.clone();
+        assert!(!binding.account().is_closed_to_growth());
+        assert_eq!(source_shard().class, ResponsibilityClass::Query);
+        assert_eq!(
+            source_shard().record.tagged_bytes,
+            RetainedQueryBytes::TAGGED_BYTES
+        );
 
         // Critical boundary: no more RPC, manual host/ledger progress, clock
         // advance or notify_pollers. Only the actual sender Drop can emit its
         // original header readiness and WorkWake to the original Node Actor.
         boundary.open_drop();
         if !wait_until(|| {
-            matches!(
-                scope.gates(),
-                Err(novarocks_control_runtime::transaction::RuntimeError::UnknownScope)
-            )
+            binding.account().is_retired()
+                && matches!(
+                    scope.gates(),
+                    Err(novarocks_control_runtime::transaction::RuntimeError::UnknownScope)
+                )
         }) {
             scene.fail(
-                "actual RF exit did not wake original two-level retirement and Scope removal",
+                "actual RF exit did not wake original Scope and memory retirement",
                 blocked,
             );
         }
         assert!(boundary.dropped.load(Ordering::Acquire));
         assert_eq!(scene.clock.now(), clock_origin);
+        assert_eq!(source_shard().class, ResponsibilityClass::Residual);
+        drop(backing);
+        assert_eq!(
+            source_shard().record.tagged_bytes,
+            RetainedQueryBytes::TAGGED_BYTES
+        );
+        drop(late_alias);
+        binding::flush_current();
+        assert_eq!(source_shard().record.tagged_bytes, 0);
+        assert_eq!(source_shard().record.outstanding, 0);
         if !wait_until(|| {
             scene
                 .node

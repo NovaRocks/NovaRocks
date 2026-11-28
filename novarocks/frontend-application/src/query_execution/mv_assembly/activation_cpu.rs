@@ -454,11 +454,11 @@ pub(crate) enum MvWriteActivationRequest {
     Create(super::create_publication::CreatePublicationInput),
 }
 pub(crate) enum MvWriteActivationOutput {
-    Analyzed(MvWriteAnalysis),
-    ProviderNeeds(MvWriteProviderNeeds),
-    Static(PreparedMvNativeWriteParts),
+    Analyzed(Box<MvWriteAnalysis>),
+    ProviderNeeds(Box<MvWriteProviderNeeds>),
+    Static(Box<PreparedMvNativeWriteParts>),
     PublicationPrepared,
-    Create(super::create_publication::CreatePublicationOutput),
+    Create(Box<super::create_publication::CreatePublicationOutput>),
 }
 struct Body {
     request: MvWriteActivationRequest,
@@ -512,7 +512,7 @@ impl MvWriteActivationOriginal {
                 .expect("original MV analysis input")
                 .analyze()
                 .map_err(MvApplicationError::from_compile)
-                .map(MvWriteActivationOutput::Analyzed),
+                .map(|analysis| MvWriteActivationOutput::Analyzed(Box::new(analysis))),
             MvWriteActivationRequest::Optimize {
                 analysis,
                 statistics,
@@ -522,16 +522,16 @@ impl MvWriteActivationOriginal {
                 .expect("original MV analyzed input")
                 .optimize(statistics, control.clone())
                 .map_err(MvApplicationError::from_compile)
-                .map(MvWriteActivationOutput::ProviderNeeds),
-            MvWriteActivationRequest::Finish(input) => {
-                input.finish().map(MvWriteActivationOutput::Static)
-            }
+                .map(|needs| MvWriteActivationOutput::ProviderNeeds(Box::new(needs))),
+            MvWriteActivationRequest::Finish(input) => input
+                .finish()
+                .map(|parts| MvWriteActivationOutput::Static(Box::new(parts))),
             MvWriteActivationRequest::PreparePublication(input) => input
                 .prepare()
                 .map(|()| MvWriteActivationOutput::PublicationPrepared),
-            MvWriteActivationRequest::Create(input) => {
-                input.run().map(MvWriteActivationOutput::Create)
-            }
+            MvWriteActivationRequest::Create(input) => input
+                .run()
+                .map(|output| MvWriteActivationOutput::Create(Box::new(output))),
         };
         body.result = Some(result);
         drop(loan);

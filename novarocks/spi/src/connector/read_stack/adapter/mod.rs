@@ -216,6 +216,7 @@ pub struct ProviderPreparedSourceRead<T> {
     source: T,
     window_facts: Option<crate::connector::ConnectorChangeWindowFacts>,
     to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+    exact_partition_slice: Option<super::ConnectorExactPartitionSliceOutcome>,
 }
 
 impl<T> ProviderPreparedSourceRead<T> {
@@ -227,6 +228,20 @@ impl<T> ProviderPreparedSourceRead<T> {
             source,
             window_facts: None,
             to_metadata,
+            exact_partition_slice: None,
+        }
+    }
+
+    pub const fn exact_partition_slice(
+        source: T,
+        to_metadata: Arc<crate::connector::ConnectorTableMetadata>,
+        outcome: super::ConnectorExactPartitionSliceOutcome,
+    ) -> Self {
+        Self {
+            source,
+            window_facts: None,
+            to_metadata,
+            exact_partition_slice: Some(outcome),
         }
     }
 
@@ -239,6 +254,7 @@ impl<T> ProviderPreparedSourceRead<T> {
             source,
             window_facts: Some(window_facts),
             to_metadata,
+            exact_partition_slice: None,
         }
     }
 }
@@ -456,6 +472,7 @@ pub struct ProviderReadSplitOpenRequest<P: ProviderReadRuntime> {
     pub dynamic_filter_columns: BTreeSet<P::Column>,
     pub constraint: Constraint<P::Column>,
     pub preparation: Option<super::runtime::ConnectorReadSplitPreparation>,
+    pub enumeration_coverage: bool,
 }
 
 /// Driver returned after the original split-open source has been installed.
@@ -478,6 +495,12 @@ pub trait ProviderReadSplitManager: ProviderReadRuntime {
             return Err(ConnectorError::new(
                 crate::connector::ConnectorErrorKind::InvalidRequest,
                 "split opening owner is occupied",
+            ));
+        }
+        if request.enumeration_coverage {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "Provider has no complete split enumeration author",
             ));
         }
         Ok(Box::pin(async move {
@@ -876,11 +899,19 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
                     "provider source preparation window facts differ from its selection",
                 ));
             }
+            if request.exact_partition_slice().is_some() != prepared.exact_partition_slice.is_some()
+            {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "provider source preparation did not prove its exact partition slice",
+                ));
+            }
             Ok(super::runtime::ConnectorPreparedSourceRead::new(
                 self.binding.clone(),
                 request.clone(),
                 prepared.window_facts,
                 prepared.to_metadata,
+                prepared.exact_partition_slice,
                 BoundSourcePreparation::<P> {
                     facts: prepared.source,
                 },
@@ -1319,8 +1350,15 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
                     "split opening owner is occupied",
                 ));
             }
-            let (session, table, columns, dynamic_filter_columns, constraint, preparation) =
-                request.into_parts();
+            let (
+                session,
+                table,
+                columns,
+                dynamic_filter_columns,
+                constraint,
+                preparation,
+                enumeration_coverage,
+            ) = request.into_parts();
             adapter.table(&table)?;
             let table =
                 super::runtime::shared_table_value::<P::Table>(&table).ok_or_else(type_error)?;
@@ -1331,6 +1369,7 @@ impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapt
                 dynamic_filter_columns: adapter.typed_columns(&dynamic_filter_columns)?,
                 constraint: adapter.typed_constraint(&constraint)?,
                 preparation,
+                enumeration_coverage,
             };
             Arc::clone(&adapter.provider).begin_get_splits(request, original_owner)
         })();
@@ -1361,23 +1400,17 @@ impl<P: ProviderReadRuntime> ConnectorReadSplitSource for AdapterSplitSource<P> 
         max_size: usize,
         dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
     ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
-        let domain = map_tuple_domain(dynamic_filter.current_predicate(), |column| {
-            self.adapter.column(column).cloned()
-        })?;
-        let dynamic_filter = DynamicFilterSnapshot::new(domain, dynamic_filter.is_complete());
+        let dynamic_filter = if dynamic_filter.is_empty_content_demand() {
+            DynamicFilterSnapshot::empty_content_demand()
+        } else {
+            let domain = map_tuple_domain(dynamic_filter.current_predicate(), |column| {
+                self.adapter.column(column).cloned()
+            })?;
+            DynamicFilterSnapshot::new(domain, dynamic_filter.is_complete())
+        };
         self.source
             .next_batch(max_size, &dynamic_filter)
-            .map(|batch| {
-                let no_more_splits = batch.no_more_splits();
-                ConnectorSplitBatch::new(
-                    batch
-                        .into_splits()
-                        .into_iter()
-                        .map(|split| self.adapter.wrap_split(split))
-                        .collect(),
-                    no_more_splits,
-                )
-            })
+            .map(|batch| batch.map_splits(|split| self.adapter.wrap_split(split)))
     }
 
     fn is_finished(&self) -> bool {
@@ -1992,10 +2025,13 @@ mod tests {
                         .map(|v| v.map(|v| (v, None))),
                     K::RowMutationCurrent(_)
                     | K::RowMutationMatch { .. }
-                    | K::FrozenMvTarget { .. } => Err(crate::connector::ConnectorError::new(
-                        crate::connector::ConnectorErrorKind::Unsupported,
-                        "fixture has no original write-target observation",
-                    )),
+                    | K::FrozenMvTarget { .. }
+                    | K::FrozenMvContentTarget { .. } => {
+                        Err(crate::connector::ConnectorError::new(
+                            crate::connector::ConnectorErrorKind::Unsupported,
+                            "fixture has no original write-target observation",
+                        ))
+                    }
                     K::MvTarget {
                         object_id,
                         snapshot_id,
@@ -2416,6 +2452,7 @@ mod tests {
             request,
             window_facts,
             prepared_source_metadata(adapter),
+            None,
             BoundSourcePreparation::<Probe> { facts },
         )
     }
@@ -2483,6 +2520,54 @@ mod tests {
     }
 
     #[test]
+    fn unaligned_partition_replacement_never_projects_an_unrestricted_source() {
+        use super::super::ConnectorReadSourceProjection as P;
+        use super::super::{
+            ConnectorExactPartitionSliceOutcome, ConnectorExactSourcePartitionField,
+            ConnectorExactSourcePartitionSlice,
+        };
+        use crate::connector::{ConnectorChangePartitionTransform, ConnectorChangePartitionValue};
+
+        let provider = Arc::new(Probe::new());
+        let adapter = ReadRuntimeAdapter::new(Arc::clone(&provider));
+        let original = prepared_source(&adapter, None);
+        let request = original
+            .request()
+            .clone()
+            .with_exact_partition_slice(
+                ConnectorExactSourcePartitionSlice::try_new(
+                    vec![ConnectorExactSourcePartitionField {
+                        source_field_id: bytes::Bytes::from_static(b"field"),
+                        transform: ConnectorChangePartitionTransform::Identity,
+                    }],
+                    vec![vec![ConnectorChangePartitionValue::Null]].into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let unaligned = super::super::ConnectorPreparedSourceRead::new(
+            adapter.binding.clone(),
+            request,
+            None,
+            prepared_source_metadata(&adapter),
+            Some(ConnectorExactPartitionSliceOutcome::NotAligned),
+            BoundSourcePreparation::<Probe> {
+                facts: ProbeSourceFacts {
+                    ordinal: 41,
+                    _retention: None,
+                },
+            },
+        );
+        assert!(unaligned.exact_partition_slice_volume().is_none());
+        let before = provider.created_calls.load(Ordering::SeqCst);
+        let error = adapter
+            .project_prepared_source_read(&session(), &unaligned, P::To)
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(provider.created_calls.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
     fn prepared_source_rejects_foreign_bindings_and_payloads_before_projection() {
         use crate::connector::read_stack::ConnectorReadSourceProjection as P;
         let provider = Arc::new(Probe::new());
@@ -2504,6 +2589,7 @@ mod tests {
             source.request().clone(),
             None,
             prepared_source_metadata(&adapter),
+            None,
             41_usize,
         );
         assert!(

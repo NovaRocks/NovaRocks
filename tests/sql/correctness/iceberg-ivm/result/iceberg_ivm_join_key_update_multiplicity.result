@@ -1,5 +1,5 @@
 -- query 4
--- legacy
+-- types	bigint	integer	bigint	varchar
 order_id	amount	dim_id	label
 1	100	101	A1
 2	200	201	B1
@@ -8,7 +8,7 @@ order_id	amount	dim_id	label
 3	300	202	B2
 
 -- query 7
--- legacy
+-- types	bigint	integer	bigint	varchar
 order_id	amount	dim_id	label
 1	100	202	B2x
 1	100	203	B3
@@ -28,7 +28,7 @@ order_id	amount	dim_id	label
 3	300	203	B3
 
 -- query 11
--- legacy
+-- types	bigint	integer	bigint	varchar
 order_id	amount	dim_id	label
 1	100	202	B2x
 3	90	202	B2x

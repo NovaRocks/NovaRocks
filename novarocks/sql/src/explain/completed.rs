@@ -2351,6 +2351,9 @@ fn runtime_filter_producer_target(
         novarocks_physical_plan::RuntimeFilterProducerTarget::JoinBuildKey { equality } => {
             format!("JoinBuildKey(equality={})", equality.get())
         }
+        novarocks_physical_plan::RuntimeFilterProducerTarget::ContentDemand { content_ordinal } => {
+            format!("ContentDemand(content_ordinal={content_ordinal})")
+        }
         novarocks_physical_plan::RuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal,
             topn,
@@ -2395,6 +2398,15 @@ impl fmt::Display for RuntimeFilterConsumerTargetDisplay<'_> {
             } => write!(
                 formatter,
                 "AggregateTopNScanField(producer={}, lineage=[{}])",
+                producer.get(),
+                format_runtime_filter_lineage(lineage)
+            ),
+            novarocks_physical_plan::RuntimeFilterConsumerTarget::ContentDemandScanField {
+                producer,
+                lineage,
+            } => write!(
+                formatter,
+                "ContentDemandScanField(producer={}, lineage=[{}])",
                 producer.get(),
                 format_runtime_filter_lineage(lineage)
             ),
@@ -3314,6 +3326,13 @@ condition,
             format_value_ids(key_inputs),
             output_key.get(),
         )),
+        NodeKind::ContentApply(spec) => lines.push(format_args!(
+            "{pad}  weighted-content=[{}], target-content=[{}], route-keys={:?}, weight=v{}",
+            format_value_ids(&spec.weighted_content),
+            format_value_ids(&spec.target_content),
+            spec.route_keys,
+            spec.weight.get(),
+        )),
         NodeKind::PositionShard(spec) => lines.push(format_args!(
             "{pad}  target={}, contribution-routes={}",
             spec.target.get(),
@@ -3899,6 +3918,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
             NodeKind::AssertOneRow(_) => formatter.write_str("ASSERT ONE ROW")?,
             NodeKind::ChangeEventExpand { .. } => formatter.write_str("CHANGE EVENT EXPAND")?,
             NodeKind::WriteLayoutKey { .. } => formatter.write_str("WRITE LAYOUT KEY")?,
+            NodeKind::ContentApply(_) => formatter.write_str("CONTENT APPLY")?,
             NodeKind::PositionShard(_) => formatter.write_str("POSITION SHARD AGGREGATION")?,
             NodeKind::ExchangeSource { edge, .. } => {
                 let label = context.plan.edges().get(edge).map_or("EXCHANGE", |edge| {

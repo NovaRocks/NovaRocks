@@ -467,13 +467,17 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         let aggregate_binding = (call.kind == FunctionKind::Aggregate).then(|| {
             let aggregate = bound.selected.aggregate.as_ref().unwrap();
             Box::new(AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: aggregate.state_argument_contract,
                 function: function.clone(),
                 phase: AggregatePhase::Single,
                 logical_argument_count: u32::try_from(call.args.len()).unwrap(),
-                intermediate_type: aggregate.intermediate_type.clone(),
-                state_format: aggregate.state_format.clone(),
+                merge_state: (!call.function_order).then(|| {
+                    novarocks_physical_plan::AggregateMergeBinding {
+                        state_interpretation: None,
+                        state_argument_contract: aggregate.state_argument_contract,
+                        intermediate_type: aggregate.intermediate_type.clone(),
+                        state_format: aggregate.state_format.clone(),
+                    }
+                }),
             })
         });
         let frame = call.frame.map(|(units, start, end)| {
@@ -618,13 +622,14 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                     .into_boxed_slice(),
             ),
             result_type: FunctionResultType::Scalar(function.result_type.clone()),
-            aggregate: aggregate_binding.as_deref().map(|binding| {
-                novarocks_functions::AggregateBindingSelection {
-                    state_argument_contract: binding.state_argument_contract,
-                    intermediate_type: binding.intermediate_type.clone(),
-                    state_format: binding.state_format.clone(),
-                }
-            }),
+            aggregate: aggregate_binding
+                .as_deref()
+                .and_then(|binding| binding.merge_state.as_ref())
+                .map(|state| novarocks_functions::AggregateBindingSelection {
+                    state_argument_contract: state.state_argument_contract,
+                    intermediate_type: state.intermediate_type.clone(),
+                    state_format: state.state_format.clone(),
+                }),
         });
         let argument_uses = args
             .iter()
@@ -639,7 +644,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 )
             })
             .collect::<Vec<_>>();
-        if call.uninstalled {
+        if call.uninstalled || call.function_order {
             frozen.push(FrozenPhysicalCall {
                 materialized_writer_input: None,
                 site,
@@ -891,7 +896,7 @@ fn every_window_call_lowers_to_a_prepared_call_with_its_own_explicit_frame() {
     assert!(
         functions
             .iter()
-            .all(|call| matches!(call.kind, WindowFunctionKind::Prepared))
+            .all(|call| matches!(call.kind, WindowFunctionKind::Prepared { .. }))
     );
     assert_eq!(
         functions
@@ -1169,7 +1174,7 @@ fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
     let calls = program.resolved_calls().calls();
     for (call, name) in ["sum", "min", "max", "sum"].into_iter().enumerate() {
         let function = &functions[call];
-        assert!(matches!(function.kind, WindowFunctionKind::Prepared));
+        assert!(matches!(function.kind, WindowFunctionKind::Prepared { .. }));
         assert!(function.aggregate_binding.is_some());
         let resolved = &calls[&ProgramCallSite::Window {
             node,

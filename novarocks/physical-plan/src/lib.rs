@@ -80,12 +80,8 @@ pub use pruning_structure::*;
 pub use relation::*;
 pub use resource::{
     MAX_ANNOTATION_BYTES, MAX_ANNOTATION_KEY_BYTES, MAX_ANNOTATION_VALUE_BYTES, MAX_ANNOTATIONS,
-    MAX_DATA_TYPE_DEPTH, MAX_DATA_TYPE_FIELD_METADATA_BYTES, MAX_DATA_TYPE_FIELD_METADATA_ENTRIES,
-    MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES, MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES,
-    MAX_DATA_TYPE_FIELD_NAME_BYTES, MAX_DATA_TYPE_NODES, MAX_FIXED_SIZE_LENGTH,
     MAX_FRAGMENT_DYNAMIC_BYTES, MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_PLAN_DERIVED_CUT_BYTES,
     MAX_PLAN_DERIVED_CUT_ITEMS, MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS,
-    MAX_TIMESTAMP_TIMEZONE_BYTES,
 };
 pub use runtime_filter_binding::*;
 pub use structure_input::FragmentStructureInput;
@@ -104,6 +100,48 @@ pub fn grouped_state_topn_key_supported(
 ) -> bool {
     comparator.supports_value_type(ty)
         && PartitionHashAlgorithm::NativeExchangeV1.supports_partition_value_type(ty)
+}
+
+/// Data layouts accepted for exact content identity, including nested values.
+/// Exchange placement can use a smaller subset of those columns.
+pub fn supports_result_content_key(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::{DataType::*, TimeUnit};
+    match data_type {
+        Null
+        | Boolean
+        | Int8
+        | Int16
+        | Int32
+        | Int64
+        | UInt8
+        | UInt16
+        | UInt32
+        | UInt64
+        | Float32
+        | Float64
+        | Date32
+        | Date64
+        | Timestamp(_, _)
+        | Duration(_)
+        | Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        | Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
+        | Decimal128(_, _)
+        | Decimal256(_, _)
+        | Utf8
+        | LargeUtf8
+        | Utf8View
+        | Binary
+        | LargeBinary
+        | BinaryView => true,
+        FixedSizeBinary(width) => *width > 0,
+        List(item) => supports_result_content_key(item.data_type()),
+        Struct(fields) => fields
+            .iter()
+            .all(|field| supports_result_content_key(field.data_type())),
+        Map(entries, _) => matches!(entries.data_type(), Struct(fields)
+            if fields.len() == 2 && fields.iter().all(|field| supports_result_content_key(field.data_type()))),
+        _ => false,
+    }
 }
 
 /// Exact revision of the semantic plan contract implemented by this crate.
@@ -129,7 +167,11 @@ pub fn grouped_state_topn_key_supported(
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
 /// Revision 47 retires package and call-request constant quota fields.
-pub const PLAN_CONTRACT_REVISION: u32 = 47;
+/// Revision 48 installs content application and its demand filter placement
+/// on main. The earlier F9 branch used revisions 48 and 49 for its own formats.
+/// Revision 50 combines content application with single-message RecordBatch
+/// constants and the explicit ordered aggregate Single contract.
+pub const PLAN_CONTRACT_REVISION: u32 = 50;
 
 #[cfg(test)]
 mod tests;

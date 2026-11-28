@@ -136,7 +136,10 @@ impl StagingState {
                 )
             }
         };
-        if intent.shape() == RequestShape::SnapshotProducing {
+        if matches!(
+            intent.shape(),
+            RequestShape::SnapshotProducing | RequestShape::FencedMarkers
+        ) {
             requirements.push(TableRequirement::RefSnapshotIdMatch {
                 r#ref: intent.target_ref().to_owned(),
                 snapshot_id: base
@@ -201,6 +204,9 @@ impl StagingState {
         let mut updates = self.updates.clone();
         let mut metadata = Arc::clone(&self.metadata);
         for update in change.updates {
+            if intent.shape() == RequestShape::FencedMarkers {
+                crate::commit::model::validate_fenced_marker_update(&update)?;
+            }
             if intent.shape() == RequestShape::DocumentExpiry {
                 crate::commit::model::validate_document_expiry_update(&update)?;
             }

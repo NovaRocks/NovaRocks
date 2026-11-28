@@ -246,7 +246,12 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
             );
             assert!(!value_context.is_call());
             assert_eq!(
-                call.binding.state_format.as_str(),
+                call.binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .state_format
+                    .as_str(),
                 ICEBERG_THETA_STATE_FORMAT_IDENTITY
             );
             let frozen = &result.calls.entries()[&site];

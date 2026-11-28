@@ -21,8 +21,6 @@ use std::sync::Arc;
 
 fn binding(ty: crate::ValueType) -> crate::AggregateBinding {
     crate::AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract: AggregateStateArgumentContract::ValueRootNullabilityIndependent,
         function: crate::BoundFunction {
             function_id: novarocks_type_contract::FunctionId::try_new("test/state-argument-owner")
                 .unwrap(),
@@ -45,11 +43,16 @@ fn binding(ty: crate::ValueType) -> crate::AggregateBinding {
             sequence: crate::AggregateSequenceId::new(9),
         },
         logical_argument_count: 1,
-        intermediate_type: crate::ValueType::new(arrow_schema::DataType::Int64, false),
-        state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
-            "test/domain-state-v1",
-        )
-        .unwrap(),
+        merge_state: Some(crate::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+            intermediate_type: crate::ValueType::new(arrow_schema::DataType::Int64, false),
+            state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
+                "test/domain-state-v1",
+            )
+            .unwrap(),
+        }),
     }
 }
 fn matches(a: &crate::AggregateBinding, b: &crate::AggregateBinding) -> bool {
@@ -90,8 +93,16 @@ fn state_contract_only_relaxes_logical_value_root_nullability() {
     );
     let mut exact_a = a.clone();
     let mut exact_b = b.clone();
-    exact_a.state_argument_contract = AggregateStateArgumentContract::ExactSignature;
-    exact_b.state_argument_contract = AggregateStateArgumentContract::ExactSignature;
+    exact_a
+        .merge_state
+        .as_mut()
+        .unwrap()
+        .state_argument_contract = AggregateStateArgumentContract::ExactSignature;
+    exact_b
+        .merge_state
+        .as_mut()
+        .unwrap()
+        .state_argument_contract = AggregateStateArgumentContract::ExactSignature;
     assert!(!matches(&exact_a, &exact_b));
     assert!(!matches(&a, &exact_b));
     let mut nominal = b.clone();
@@ -135,11 +146,19 @@ fn state_contract_only_relaxes_logical_value_root_nullability() {
         let mut changed = b.clone();
         match mutation {
             0 => {
-                changed.state_format =
+                changed.merge_state.as_mut().unwrap().state_format =
                     novarocks_type_contract::AggregateStateFormatId::try_new("test/other-state-v1")
                         .unwrap()
             }
-            1 => changed.intermediate_type = changed.intermediate_type.with_nullable(true).unwrap(),
+            1 => {
+                changed.merge_state.as_mut().unwrap().intermediate_type = changed
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .with_nullable(true)
+                    .unwrap()
+            }
             2 => {
                 changed.function.result_type =
                     changed.function.result_type.with_nullable(true).unwrap()

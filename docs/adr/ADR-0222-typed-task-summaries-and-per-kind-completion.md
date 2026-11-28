@@ -5,6 +5,10 @@ domain: [pipeline-execution, distributed-query-lifecycle, frontend-dml]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0278
+    scope: "Ruling 2 production summary authors also include ContentApply for DeleteVerification."
+    link: "ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md"
 date: 2026-11-06
 related:
   - "ADR-0206-frozen-write-placement-and-task-completion-assembly.md"

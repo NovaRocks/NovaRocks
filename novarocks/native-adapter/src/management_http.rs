@@ -86,6 +86,9 @@ impl MetricsHttpServer {
         let join_handle = std::thread::Builder::new()
             .name("backend-management-http".to_string())
             .spawn(move || {
+                novarocks_memory::attribution::roles::enter_registered_thread_role(
+                    "management_http",
+                );
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()

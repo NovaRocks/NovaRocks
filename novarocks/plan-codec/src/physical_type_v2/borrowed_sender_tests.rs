@@ -395,10 +395,7 @@ fn borrowed_actual_success_and_ordinary_callback_prefixes_preserve_original_caus
         Field::new("v", DataType::Int8, true)
             .with_metadata(HashMap::from([("key".into(), "x\0雪".into())])),
     );
-    let invalid = Arc::new(
-        Field::new("v", DataType::Int8, true)
-            .with_metadata(HashMap::from([("key".into(), "x".repeat(16 * 1024 + 1))])),
-    );
+    let invalid = Arc::new(Field::new("v", DataType::FixedSizeBinary(-1), true));
     let values = [(u32::MAX, &value)];
     for field in [&valid, &invalid] {
         let fields = [(0, field)];
@@ -407,12 +404,7 @@ fn borrowed_actual_success_and_ordinary_callback_prefixes_preserve_original_caus
         if std::ptr::eq(field, &valid) {
             assert!(outcome.is_ok());
         } else {
-            assert!(matches!(
-                outcome,
-                Err(TypeCodecError::InvalidShape(
-                    "Arrow field metadata entry exceeds its owner bound"
-                ))
-            ));
+            assert!(matches!(outcome, Err(TypeCodecError::Carrier(_))));
         }
         let trace = control.trace();
         assert!(trace.len() > 2);

@@ -22,8 +22,8 @@ use crate::sql_error_codes::{SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error
 use crate::types::*;
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_failpoint::{
-    cleanup_fault_directive_names, parse_cleanup_fault_directive, parse_runner_rfo_kind,
-    runner_rfo_kind_names,
+    QueryLifecycleFaultKind, cleanup_fault_directive_names, parse_cleanup_fault_directive,
+    parse_runner_rfo_kind, runner_rfo_kind_names,
 };
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -433,17 +433,27 @@ fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultD
     let (kind, index) = raw.split_once(',').ok_or_else(|| {
         anyhow::anyhow!("@query_lifecycle_fault requires <kind>,<be_index>; received {raw:?}")
     })?;
-    let kind = parse_runner_rfo_kind(kind.trim()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid query_lifecycle_fault kind {:?}; expected one of {}",
-            kind.trim(),
-            runner_rfo_kind_names().collect::<Vec<_>>().join(", ")
-        )
-    })?;
+    let content_target_close = QueryLifecycleFaultKind::MvContentTargetEnumerationClose;
+    let kind = parse_runner_rfo_kind(kind.trim())
+        .or_else(|| (kind.trim() == content_target_close.as_str()).then_some(content_target_close))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid query_lifecycle_fault kind {:?}; expected one of {}",
+                kind.trim(),
+                runner_rfo_kind_names()
+                    .chain(std::iter::once(content_target_close.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
     let be_index = index
         .trim()
         .parse::<usize>()
         .with_context(|| format!("invalid query_lifecycle_fault BE index {:?}", index.trim()))?;
+    ensure!(
+        kind != content_target_close || be_index == 0,
+        "the exact FE content-target fault uses index 0"
+    );
     Ok(QueryLifecycleFaultDirective { kind, be_index })
 }
 

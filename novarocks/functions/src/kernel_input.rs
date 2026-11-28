@@ -295,8 +295,8 @@ pub(crate) fn logical_is_null(
 }
 
 /// Validate a complete pure function value type in the caller's existing work
-/// scope. Local compilation uses the same signature/logical/metadata limits as
-/// kernel preparation, without reconstructing a second type resource policy.
+/// scope. Local compilation and runtime share the type grammar and observe
+/// the actual nodes and authored bytes.
 pub fn validate_type_observed(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -311,38 +311,29 @@ pub fn validate_type_observed(
         ArrowTypeProfile::CanonicalValue,
         |visit| {
             work.step().map_err(compile_failure)?;
+            let mut observe_text = |text: &str| {
+                for _ in text.as_bytes().chunks(1024) {
+                    work.step().map_err(compile_failure)?;
+                }
+                Ok::<(), KernelFailure>(())
+            };
             match visit {
                 ValueTypeVisit::TypeNode(ty) => {
-                    if let DataType::Timestamp(_, Some(zone)) = ty
-                        && zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-                    {
-                        return Err(KernelFailure::ResourceExhausted);
+                    if let DataType::Timestamp(_, Some(zone)) = ty {
+                        observe_text(zone)?;
                     }
                     validate_arrow_carrier_parameters_observed::<KernelFailure>(ty, || {
                         work.step().map_err(compile_failure)
                     })?;
                 }
                 ValueTypeVisit::Field(field) => {
-                    if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES
-                        || field.metadata().len() > MAX_ARROW_FIELD_METADATA_ENTRIES
-                    {
-                        return Err(KernelFailure::ResourceExhausted);
-                    }
-                    let mut bytes = 0usize;
+                    observe_text(field.name())?;
                     for (key, value) in field.metadata() {
-                        work.step().map_err(compile_failure)?;
-                        if key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
-                            || value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES
-                        {
-                            return Err(KernelFailure::ResourceExhausted);
-                        }
-                        bytes += key.len() + value.len();
-                        if bytes > MAX_ARROW_FIELD_METADATA_BYTES {
-                            return Err(KernelFailure::ResourceExhausted);
-                        }
+                        observe_text(key)?;
+                        observe_text(value)?;
                     }
                 }
-                _ => {}
+                ValueTypeVisit::ChildEdge(_) => {}
             }
             Ok(())
         },

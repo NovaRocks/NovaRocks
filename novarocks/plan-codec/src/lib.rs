@@ -34,7 +34,6 @@ pub mod ipc_flat_stream_v2;
 pub(crate) mod ipc_recursive_batch_v2;
 pub mod ipc_recursive_pool_v2;
 pub mod ipc_recursive_stream_v2;
-pub mod ipc_schema_v2;
 mod library_profile_v2;
 pub mod physical_aggregate_binding_v2;
 pub mod physical_aggregate_node_v2;

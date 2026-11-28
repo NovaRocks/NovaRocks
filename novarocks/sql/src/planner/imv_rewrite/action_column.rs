@@ -44,11 +44,9 @@ use crate::planner::imv_rewrite::join_delta_shape::{
 };
 use crate::planner::imv_rewrite::opt_expr_to_plan;
 use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
-use crate::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanScanNode;
 use crate::planner::table::{ScanSource, SqlScanKind, SqlScanSource};
-use crate::planner::vocabulary::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct ImvActionColumn;
@@ -229,21 +227,9 @@ fn validate_with_change_stream(
                 .to_string(),
         );
     }
-    // V6: if a delta subtree exists, root output must carry the apply key.
-    if contains_join_delta_union(plan) {
-        if !output_has_join_apply_key(plan) {
-            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
-            return Err(format!(
-                "join refresh plan above delta-bound scan {fqn} is missing join apply-key column \
-                 {JOIN_APPLY_KEY_COLUMN_NAME}"
-            ));
-        }
-    } else if subtree_has_delta(plan) && !output_has_apply_key(plan) {
-        let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
-        return Err(format!(
-            "plan above delta-bound scan {fqn} is missing apply key column \
-             {HIDDEN_APPLY_KEY_COLUMN_NAME}"
-        ));
+    if subtree_has_delta(plan) {
+        let output = super::join_delta::plan_output_columns(plan)?;
+        validate_required_delta_action_columns("MV root", ImvActionColumn::declared(&output))?;
     }
     Ok(())
 }
@@ -282,10 +268,6 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             Err(format!(
                 "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
-        }
-        LogicalPlanKind::Join(_) if is_target_locator_join(plan) => {
-            validate_node(plan.left())?;
-            validate_node(plan.right())
         }
         LogicalPlanKind::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
@@ -371,6 +353,7 @@ fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
 /// Ordinary SQL Delta reads do not enter the IMV rewrite entrypoint.
 pub(crate) fn validate_delta_producer_scans(
     plan: &LogicalPlanNode,
+    require_row_id: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), SqlCompileError> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -395,6 +378,12 @@ pub(crate) fn validate_delta_producer_scans(
                 .map_err(SqlCompileError::from)?;
             validate_required_delta_action_columns(&scan_fqn(scan), declaration)
                 .map_err(SqlCompileError::Compilation)?;
+            if require_row_id && !scan.columns.iter().any(ImvRowIdColumn::matches) {
+                return Err(SqlCompileError::Compilation(format!(
+                    "Delta-bound scan {} missing _row_id column",
+                    scan_fqn(scan)
+                )));
+            }
         }
         pending.push(node.children.iter());
         work.step().map_err(SqlCompileError::from)?;
@@ -432,11 +421,6 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
     match sql_scan_source(&scan.table.source).map(|source| &source.kind) {
         Some(SqlScanKind::Delta { .. }) => {
             validate_required_delta_action_columns(&fqn, ImvActionColumn::declared(&scan.columns))?;
-            // Preserve the original rule's row-identity check. The mandatory
-            // producer exit only enforces the action declaration contract.
-            if !scan.columns.iter().any(ImvRowIdColumn::matches) {
-                return Err(format!("Delta-bound scan {fqn} missing _row_id column"));
-            }
             Ok(())
         }
         Some(_) if is_version_bound_scan_source(&scan.table.source) => {
@@ -449,36 +433,6 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
         }
         _ => Ok(()),
     }
-}
-
-fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
-            i.output_name
-                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-        }),
-        LogicalPlanKind::Filter(_) => output_has_apply_key(plan.unary_input()),
-        _ => false,
-    }
-}
-
-fn output_has_join_apply_key(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
-            i.output_name
-                .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
-        }),
-        LogicalPlanKind::Union(u) => u
-            .output_columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)),
-        LogicalPlanKind::Filter(_) => output_has_join_apply_key(plan.unary_input()),
-        _ => false,
-    }
-}
-
-fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
-    is_supported_join_delta_union(plan) || plan.children.iter().any(contains_join_delta_union)
 }
 
 fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
@@ -520,12 +474,6 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
         LogicalPlanKind::Project(node) => node.items.iter().any(|item| {
             !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
                 && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
-                && !item
-                    .output_name
-                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                && !item
-                    .output_name
-                    .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
         }),
         LogicalPlanKind::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
         LogicalPlanKind::Join(_) => {
@@ -553,6 +501,7 @@ mod tests {
     use crate::planner::table::{
         SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
+    use crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
     use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -589,7 +538,7 @@ mod tests {
         // A wide ordinary subtree still observes each original child edge;
         // it neither copies all siblings at once nor invents a fanout cap.
         assert_eq!(
-            validate_delta_producer_scans(&plan, &Stop),
+            validate_delta_producer_scans(&plan, false, &Stop),
             Err(SqlCompileError::Cancelled)
         );
     }
@@ -1158,11 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_missing_apply_key_above_delta() {
-        let project = project_without_apply_key_above_delta();
-        let err = validate(&project).expect_err("missing apply key must fail");
-        assert!(err.contains("apply key"), "got: {err}");
-        assert!(err.contains("ice.db.b"), "got: {err}");
+    fn signed_weighted_tuple_needs_no_hidden_apply_key() {
+        let plan = project_without_apply_key_above_delta();
+        validate(&plan).unwrap();
     }
 
     #[test]
@@ -1176,7 +1123,6 @@ mod tests {
                 target_state: TargetStateProof { present: false },
                 signed_state_aggregate: SignedStateAggregateProof { present: false },
             }),
-            ..Default::default()
         };
 
         validate_with_change_stream(&project, &descriptor)
@@ -1189,7 +1135,11 @@ mod tests {
         let plan = scan_plan(delta_scan_with(Some(ImvActionColumn::output_column(
             ColumnId(100),
         ))));
-        let err = validate(&plan).expect_err("missing _row_id must fail");
+        let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+        validate_delta_producer_scans(&plan, false, control).unwrap();
+        let err = validate_delta_producer_scans(&plan, true, control)
+            .expect_err("aggregate delta scan requires _row_id")
+            .to_string();
         assert!(err.contains("_row_id"), "got: {err}");
     }
 }

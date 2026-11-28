@@ -566,6 +566,7 @@ pub struct FunctionBindingSelection {
     pub overload: FunctionOverloadId,
     pub argument_types: novarocks_type_contract::FunctionArgumentTypes,
     pub result_type: FunctionResultType,
+    /// Merge contract. A bound aggregate with ORDER BY has no merge contract.
     pub aggregate: Option<AggregateBindingSelection>,
 }
 
@@ -1937,9 +1938,12 @@ fn validate_selection(
             "selected result shape differs from the function kind",
         ));
     }
+    let ordered = declaration.kind == FunctionKind::Aggregate
+        && request.logical_argument_count < request.arguments.len();
     match (&overload.aggregate, &selected.aggregate) {
         (None, None) => {}
-        (Some(declared), Some(resolved)) => {
+        (Some(_), None) if ordered => {}
+        (Some(declared), Some(resolved)) if !ordered => {
             if resolved.state_format != declared.state_format
                 || resolved.state_argument_contract != declared.state_argument_contract
             {

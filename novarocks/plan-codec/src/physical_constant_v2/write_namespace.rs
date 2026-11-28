@@ -24,9 +24,10 @@ use super::{
     finish, prepare_constant_record_write, prepare_constant_record_write_in, recursive,
 };
 use crate::{
-    host_projection_v2::ProjectionFailure, ipc_flat_pool_v2::encode_flat_pool_input_derived_in,
+    host_projection_v2::ProjectionFailure, ipc_flat_pool_v2::ConstantWriteRequest,
+    ipc_flat_pool_v2::encode_flat_pool_input_derived_in,
     ipc_recursive_pool_v2::encode_recursive_pool_input_derived_in,
-    ipc_schema_v2::ConstantWriteRequest, physical_type_v2::EncodedTypeTable,
+    physical_type_v2::EncodedTypeTable,
 };
 use arrow::datatypes::Field;
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools};

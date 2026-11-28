@@ -102,6 +102,13 @@ fn encoded(
     )
 }
 
+pub(crate) fn runtime_filter_test_column()
+-> novarocks_spi::connector::read_stack::ConnectorReadColumnHandle {
+    fixture().1.values().next().unwrap().assignments[0]
+        .column()
+        .clone()
+}
+
 fn fixture() -> (
     PhysicalPlan,
     BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,

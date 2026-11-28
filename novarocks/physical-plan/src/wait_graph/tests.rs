@@ -36,6 +36,29 @@ use crate::{
 };
 use arrow_schema::DataType;
 
+#[test]
+fn content_apply_target_input_waits_for_weighted_input_completion() {
+    let fragment = crate::tests::content_apply_contract::content_apply_wait_fixture();
+    let id = fragment.id();
+    let apply = fragment.nodes()[&fragment.root()].inputs[0];
+    let inputs = &fragment.nodes()[&apply].inputs;
+    let operator = |node| OperatorRef { fragment: id, node };
+    let gate = WaitNode::Input {
+        operator: operator(apply),
+        ordinal: 1,
+    };
+    let target = WaitNode::Backpressure(operator(inputs[1]));
+    let weighted = WaitNode::Completion(operator(inputs[0]));
+    let graph = WaitGraph::build(
+        &BTreeMap::from([(id, fragment.clone())]),
+        &BTreeMap::new(),
+        &[],
+    )
+    .unwrap();
+    assert!(graph.dependencies[&target][&gate].contains(&WaitEdgeKind::Backpressure));
+    assert!(graph.dependencies[&gate][&weighted].contains(&WaitEdgeKind::DataWait));
+}
+
 fn properties() -> PhysicalProperties {
     PhysicalProperties {
         distribution: Distribution::Singleton,

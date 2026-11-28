@@ -589,12 +589,14 @@ fn special_fixture_with_rows(input_rows: usize) -> RelationFixture {
                 function: function(FunctionKind::Aggregate, integer()),
                 phase: AggregatePhase::Single,
                 logical_argument_count: 0,
-                intermediate_type: ValueType::new(DataType::Binary, false),
-                state_format: AggregateStateFormatId::try_new("fixture/semantics-state-v1")
-                    .unwrap(),
-                state_argument_contract:
-                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-                state_interpretation: None,
+                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                    intermediate_type: ValueType::new(DataType::Binary, false),
+                    state_format: AggregateStateFormatId::try_new("fixture/semantics-state-v1")
+                        .unwrap(),
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                    state_interpretation: None,
+                }),
             },
             arguments: Box::default(),
             distinct: false,

@@ -50,6 +50,7 @@ impl From<OperationAuthority> for Authority {
 enum Shape {
     SnapshotProducing,
     MetadataOnly,
+    FencedMarkers,
     RefRetention,
     DocumentExpiry,
     Create,
@@ -135,6 +136,7 @@ impl FrozenPublicationFacts {
         let expected_shape = match shape {
             RequestShape::SnapshotProducing => Shape::SnapshotProducing,
             RequestShape::MetadataOnly => Shape::MetadataOnly,
+            RequestShape::FencedMarkers => Shape::FencedMarkers,
             RequestShape::RefRetention => Shape::RefRetention,
             RequestShape::DocumentExpiry => Shape::DocumentExpiry,
             RequestShape::Create => Shape::Create,
@@ -187,6 +189,7 @@ impl FrozenPublicationFacts {
             shape: match request.shape() {
                 RequestShape::SnapshotProducing => Shape::SnapshotProducing,
                 RequestShape::MetadataOnly => Shape::MetadataOnly,
+                RequestShape::FencedMarkers => Shape::FencedMarkers,
                 RequestShape::RefRetention => Shape::RefRetention,
                 RequestShape::DocumentExpiry => Shape::DocumentExpiry,
                 RequestShape::Create => Shape::Create,
@@ -220,6 +223,7 @@ impl FrozenPublicationFacts {
                 },
                 Shape::SnapshotProducing
                 | Shape::MetadataOnly
+                | Shape::FencedMarkers
                 | Shape::RefRetention
                 | Shape::DocumentExpiry,
             ) if !metadata_location.is_empty() => {}

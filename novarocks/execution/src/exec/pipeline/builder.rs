@@ -54,6 +54,8 @@ pub(crate) use compiled::family_fixture::{
     values_chunk_program,
 };
 #[cfg(test)]
+pub(crate) use compiled::observe_int64_membership_producer;
+#[cfg(test)]
 pub(crate) use compiled::ordered_scan_with_numeric_membership_fixture;
 #[cfg(test)]
 pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};
@@ -144,6 +146,7 @@ struct PipelineBuildContext {
     compiled_writers: crate::runtime::task::CompiledWriterBindings,
     summary_authors:
         crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
+    task_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,

@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use novarocks_fs::{
     BoundFile, CacheOptions, DataCachePolicy, FileIdentity, FileReadContext, FileReadRange,
-    FileReaderOptions, ParquetMetadataInspection, PreparedFileInput, ReaderSizing,
-    inspect_parquet_metadata_from_prepared, parquet_footer_range,
+    FileReaderOptions, ParquetInterpretationPolicy, ParquetMetadataInspection, PreparedFileInput,
+    ReaderSizing, inspect_parquet_metadata_from_prepared, parquet_footer_range,
 };
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::adapter::{
@@ -113,6 +113,7 @@ struct IcebergPreparedPageSource {
     access_binding: IcebergReadBinding,
     context: FileReadContext,
     options: IcebergPageSourceProviderOptions,
+    parquet_policy: ParquetInterpretationPolicy,
     sizing: ReaderSizing,
     output_layout: super::runtime::IcebergReadLayout,
     footers: Arc<ParquetFooterCache>,
@@ -171,7 +172,7 @@ impl IcebergPreparedPageSource {
             file.clone(),
             input.clone(),
             self.context.clone(),
-            self.options.reader_options.parquet_interpretation_policy,
+            self.parquet_policy,
         )
         .map_err(map_file_error)?;
         self.footers.remember(inspection.clone())?;
@@ -208,6 +209,7 @@ impl IcebergPreparedPageSource {
             )),
             budget: self.sizing,
             reader_options: self.options.reader_options,
+            parquet_policy: self.parquet_policy,
             row_group_ordinal: None,
         })?;
         let Some(planned) = planned else {
@@ -494,6 +496,7 @@ impl IcebergPreparedPageSource {
             )),
             budget: self.sizing,
             reader_options: self.options.reader_options,
+            parquet_policy: self.parquet_policy,
             scheduled_split_sequence_id: self.sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: input,
@@ -592,8 +595,6 @@ where
             .collect::<Vec<_>>();
         let binding = self.access_binding.clone();
         let footers = Arc::clone(&self.footers);
-        let mut options = self.options.clone();
-        options.reader_options = settings.options;
         if self.context.range.is_none() {
             return Ok(ProviderPreparationStart::Unsupported);
         }
@@ -605,7 +606,8 @@ where
                 sequence_id: scheduled_split_sequence_id,
                 access_binding: binding,
                 context: self.context.clone(),
-                options,
+                options: self.options.clone(),
+                parquet_policy: settings.parquet_policy,
                 sizing: settings.sizing,
                 output_layout: settings.layout,
                 footers,
@@ -693,7 +695,7 @@ fn reader_sizing(execution: &IcebergReadExecution) -> Result<ReaderSizing, Conne
 
 struct ReaderSettings {
     sizing: ReaderSizing,
-    options: FileReaderOptions,
+    parquet_policy: ParquetInterpretationPolicy,
     layout: IcebergReadLayout,
 }
 
@@ -703,16 +705,11 @@ impl IcebergPageSourceProvider {
         execution: &IcebergReadExecution,
     ) -> Result<ReaderSettings, ConnectorError> {
         let sizing = reader_sizing(execution)?;
-        let options = FileReaderOptions {
-            parquet_interpretation_policy:
-                novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
-                    preserve_top_level_dictionary: execution.preserve_top_level_dictionary,
-                },
-            ..self.options.reader_options
-        };
         Ok(ReaderSettings {
             sizing,
-            options,
+            parquet_policy: ParquetInterpretationPolicy::DerivedByteRepresentation {
+                preserve_top_level_dictionary: execution.preserve_top_level_dictionary,
+            },
             layout: execution.layout,
         })
     }
@@ -738,7 +735,8 @@ impl IcebergPageSourceProvider {
                 self.options.cache_options.clone(),
             )),
             budget: settings.sizing,
-            reader_options: settings.options,
+            reader_options: self.options.reader_options,
+            parquet_policy: settings.parquet_policy,
             output_layout: settings.layout,
             scheduled_split_sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
@@ -767,7 +765,8 @@ impl IcebergPageSourceProvider {
                 self.options.cache_options.clone(),
             )),
             budget: settings.sizing,
-            reader_options: settings.options,
+            reader_options: self.options.reader_options,
+            parquet_policy: settings.parquet_policy,
             scheduled_split_sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: None,

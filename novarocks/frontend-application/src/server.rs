@@ -335,25 +335,36 @@ async fn build_frontend_role_products(
 
     // The role composition root owns construction of the MV process product.
     // Frontend adapters receive only its already-created readiness service.
-    let mv_management_entrance = Arc::new(
-        novarocks_mv_application::management::ManagementEntrance::new(
-            novarocks_mv_application::management::DeploymentOwner::parse(
-                host.native_deployment_id(),
-            )
+    use novarocks_mv_application::management::{
+        ManagementEntrance, ManagementTimestamp, SystemManagementClock,
+    };
+    let (seconds, nanos) = process
+        .as_uuid()
+        .get_timestamp()
+        .expect("Frontend process identity is minted at startup as UUIDv7")
+        .to_unix();
+    let mv_start_time =
+        ManagementTimestamp::from_unix_millis(seconds * 1000 + u64::from(nanos / 1_000_000));
+    let mv_effect_policy = host.mv_remote_effect_policy();
+    let mv_management_entrance = Arc::new(ManagementEntrance::new_starting(
+        novarocks_mv_application::management::DeploymentOwner::parse(host.native_deployment_id())
             .map_err(FrontendApplicationError::server)?,
-            novarocks_mv_application::management::ProcessIncarnation::parse(
-                uuid::Uuid::now_v7().to_string(),
-            )
-            .expect("UUIDv7 process incarnation is a valid management identity"),
-        ),
-    );
+        novarocks_mv_application::management::ProcessIncarnation::parse(
+            uuid::Uuid::now_v7().to_string(),
+        )
+        .expect("UUIDv7 process incarnation is a valid management identity"),
+        mv_start_time,
+        mv_effect_policy.clone(),
+        Arc::new(SystemManagementClock),
+    ));
+    crate::mv::domain::startup_continuation::log_name_startup_transition(&mv_management_entrance);
     let mv_product_service = Arc::new(
         MvKeyedProductService::new_with_keyed_management_continuation(
             host.mv_scheduler_config(),
             mv_repository,
             Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
             mv_management_entrance,
-            host.mv_remote_effect_policy(),
+            mv_effect_policy,
         ),
     );
     let mv_readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
@@ -434,10 +445,20 @@ async fn build_frontend_role_products(
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_readiness),
-        mv_management_entrance_for_restore,
+        Arc::clone(&mv_management_entrance_for_restore),
     );
+    let catalog_at_sweep_start = host.serving_lifecycle().frontend_serving_snapshot().catalog;
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
+    let catalog_at_sweep_end = host.serving_lifecycle().frontend_serving_snapshot().catalog;
+    mv_management_entrance_for_restore.finish_startup_discovery(
+        catalog_at_sweep_start.bootstrap_complete
+            && catalog_at_sweep_start.counts.unavailable == 0
+            && catalog_at_sweep_start == catalog_at_sweep_end,
+    );
+    crate::mv::domain::startup_continuation::log_name_startup_transition(
+        &mv_management_entrance_for_restore,
+    );
 
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
         Arc::clone(&function_catalog),
@@ -526,6 +547,7 @@ async fn build_frontend_role_products(
     // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
     let mv_execution_services = crate::query::mv_action::MvExecutionServices {
+        query_memory_budget_bytes: host.optimizer_query_mem_limit_bytes(),
         client: host.logical_execution_client(),
         launcher: logical_execution_launcher.clone(),
         completion: crate::query_execution::completion_facts::CompletionFactOwners::new(

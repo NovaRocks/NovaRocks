@@ -199,7 +199,7 @@ fn all_small_actual_metadata_copy_and_comparison_callbacks_keep_three_primary_ca
 }
 
 #[test]
-fn empty_metadata_observes_actual_final_none_and_zero_capacity_reservations() {
+fn empty_metadata_checks_the_output_reservation() {
     let c = Control::default();
     let source = arrow::datatypes::Metadata::new();
     let out = run(&c, |w| encode_metadata(&source, w)).unwrap();
@@ -207,7 +207,7 @@ fn empty_metadata_observes_actual_final_none_and_zero_capacity_reservations() {
     assert_eq!(out.capacity(), 0);
     // Entry; scratch reserve; iterator construction; final None; output reserve;
     // caller footer. Each real successful opaque operation contributes one.
-    assert_eq!(c.trace(), [0, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
+    assert_eq!(c.trace(), [0, 0, 1, 0]);
     prefixes(|w| encode_metadata(&source, w));
 }
 

@@ -28,9 +28,13 @@ CREATE CATALOG pir8_mv_cut_${uuid0} USING iceberg WITH ("iceberg.catalog.type" =
 CREATE SCHEMA pir8_mv_cut_${uuid0}.ns_${uuid0};
 CREATE TABLE pir8_mv_cut_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
-  v2 BIGINT
+  v2 BIGINT,
+  unused_payload VARCHAR
 ) WITH (format_version = 3);
-INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES
+INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders
+SELECT -id, 0, to_hex(sha256(to_utf8(CAST(id AS VARCHAR))))
+FROM TABLE(sequence(1, 4096)) AS cold(id);
+INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders (k1, v2) VALUES
   ROW(1, 10),
   ROW(1, 20),
   ROW(2, 40),
@@ -47,15 +51,16 @@ REFRESH MATERIALIZED VIEW pir8_pf_mv_${uuid0};
 -- Create both delete and insert deltas before inspecting refresh-time shape.
 -- @skip_result_check=true
 DELETE FROM pir8_mv_cut_${uuid0}.ns_${uuid0}.orders WHERE k1 = 2;
-INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES ROW(4, 7);
+INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders (k1, v2) VALUES ROW(4, 7);
 
 -- query 4
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=CONTENT APPLY
 -- @result_contains=predicate: v2 > CAST(0 AS Int64)
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=LEFT OUTER JOIN
+-- @result_not_contains=__nova_base_row_id
 -- @result_contains=source: IcebergDeltaTable
--- @result_contains=source: IcebergMvTargetLocator
+-- @result_contains=source: IcebergMvContentTarget
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW pir8_pf_mv_${uuid0}

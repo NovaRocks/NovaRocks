@@ -76,6 +76,7 @@ fn source(rows: usize) -> Fragment {
             requires_power_of_two: false,
         },
         stage_placement: StagePlacementPolicy::Singleton,
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         runtime_filters: Box::default(),
         call_requests: FragmentCallRequests::unpublished_empty(id),
         calls: FrozenFragmentCalls::unpublished_empty(id),

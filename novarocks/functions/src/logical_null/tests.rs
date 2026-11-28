@@ -58,21 +58,23 @@ fn plain_dictionary_selected_nulls_include_referenced_values_and_ignore_unused_n
     );
 }
 #[test]
-fn nested_dictionary_refusal_is_first_and_never_allocates_a_null_bitmap() {
+fn consecutive_dictionary_is_rejected_and_keeps_the_original_refusal() {
     let (_, values) = representations();
     let nested: ArrayRef = Arc::new(
         DictionaryArray::<Int16Type>::try_new(Int16Array::from(vec![Some(0), Some(1)]), values)
             .unwrap(),
     );
     let mut units = 0;
-    assert!(
+    assert_eq!(
         logical_is_null_observed(nested.as_ref(), 0, 1, &mut || {
             units += 1;
             Ok::<(), &'static str>(())
-        })
-        .unwrap()
+        }),
+        Err(NullVisitError::Invalid(
+            super::NullAddressViolation::NestedAddress
+        ))
     );
-    assert_eq!(units, 3);
+    assert_eq!(units, 2);
     for stop in 1..=units {
         let mut seen = 0;
         let result = logical_is_null_observed(nested.as_ref(), 0, 1, &mut || {

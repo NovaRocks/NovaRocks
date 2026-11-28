@@ -1576,7 +1576,8 @@ fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() 
     match &mut filter.consumers[0].target {
         RuntimeFilterConsumerTarget::JoinProbeKey { equality }
         | RuntimeFilterConsumerTarget::ScanField { equality, .. } => *equality = second.id,
-        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+        | RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => {
             panic!("null-safe join fixture must use a join equality target")
         }
     }
@@ -2845,12 +2846,12 @@ fn table_writer_rejects_a_relabelled_fixed_relation_field() {
 }
 
 #[test]
-fn table_writer_provider_name_is_complete_and_bounded() {
+fn table_writer_provider_name_accepts_wide_nonempty_names() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     invalid_table_writer_fragment(TableWriterFixture::ProviderName(1), &mut fixture_constants)
         .unwrap();
     invalid_table_writer_fragment(
-        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES),
+        TableWriterFixture::ProviderName(1024),
         &mut fixture_constants,
     )
     .unwrap();
@@ -2858,12 +2859,11 @@ fn table_writer_provider_name_is_complete_and_bounded() {
         invalid_table_writer_fragment(TableWriterFixture::ProviderName(0), &mut fixture_constants)
             .unwrap_err();
     assert!(empty.to_string().contains("empty provider name"));
-    let oversized = invalid_table_writer_fragment(
-        TableWriterFixture::ProviderName(MAX_DATA_TYPE_FIELD_NAME_BYTES + 1),
+    invalid_table_writer_fragment(
+        TableWriterFixture::ProviderName(1025),
         &mut fixture_constants,
     )
-    .unwrap_err();
-    assert!(oversized.to_string().contains("field-name byte limit"));
+    .unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -3174,9 +3174,6 @@ fn grouped_writer_fragment_with_sources(
             shared_state_input
         },
         binding: AggregateBinding {
-            state_interpretation: None,
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     semantic_parameters: Box::default(),
@@ -3210,8 +3207,13 @@ fn grouped_writer_fragment_with_sources(
             } else {
                 1
             },
-            intermediate_type: ty(DataType::Binary, true),
-            state_format: AggregateStateFormatId::try_new("test_statistics/state-v1").unwrap(),
+            merge_state: Some(crate::AggregateMergeBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                intermediate_type: ty(DataType::Binary, true),
+                state_format: AggregateStateFormatId::try_new("test_statistics/state-v1").unwrap(),
+            }),
         },
         output: shared_final_output,
     };

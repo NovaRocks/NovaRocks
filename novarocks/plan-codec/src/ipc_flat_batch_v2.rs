@@ -25,8 +25,8 @@
 
 use crate::ipc_flat_stream_v2::progress::{Admission, ReaderGeometryFailure};
 use crate::{
-    ipc_schema_v2::verified_message_observed,
-    physical_type_v2::{TypeCodecError, validate_field, validate_type},
+    ipc_flat_stream_v2::verified_record_message_observed,
+    physical_type_v2::{TypeCodecError, validate_field, validate_type_visit},
 };
 use arrow::datatypes::{DataType, Field};
 use novarocks_arrow_ipc_frame::{VerifierOptions, nonnegative_length};
@@ -55,6 +55,13 @@ impl<E: From<TypeCodecError>> From<neutral::GeometryError> for CallerGeometryFai
 impl<E: From<CompileControlError>> From<CompileControlError> for CallerGeometryFailure<E> {
     fn from(cause: CompileControlError) -> Self {
         Self(E::from(cause))
+    }
+}
+impl<E: From<TypeCodecError>> From<novarocks_type_contract::ValueTypeError>
+    for CallerGeometryFailure<E>
+{
+    fn from(cause: novarocks_type_contract::ValueTypeError) -> Self {
+        Self(E::from(TypeCodecError::from(cause)))
     }
 }
 pub(crate) struct GeometryAdapter<'a, 'b, 'c, 'd, 'e, E> {
@@ -106,42 +113,16 @@ impl<E: ReaderGeometryFailure> GeometryWork for GeometryAdapter<'_, '_, '_, '_, 
     fn validate_root(&mut self, expected: &Field) -> Result<(), Self::Error> {
         validate_field(expected, self.work)
             .map_err(|cause| CallerGeometryFailure(E::from(cause)))?;
-        if let Some(a) = self.admission.as_deref_mut() {
-            let shared = std::cell::RefCell::new(a);
-            let scratch =
-                |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
-            let capture = |visit| {
-                let mut a = shared.borrow_mut();
-                let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
-                    a.source()
-                        .checked_add(1)
-                        .ok_or(CompileControlError::ResourceExhausted)?
-                } else {
-                    1
-                };
-                a.batch_work_add(upper)
-            };
-            crate::physical_type_v2::validate_type_with_scratch_host_observed(
-                expected.data_type(),
-                &mut |layout| {
-                    scratch(layout).map_err(crate::host_projection_v2::ProjectionFailure::Host)
-                },
-                &mut |visit| {
-                    capture(visit).map_err(crate::host_projection_v2::ProjectionFailure::Host)
-                },
-                self.work,
-            )
-            .map_err(|error| {
-                CallerGeometryFailure(match error {
-                    crate::host_projection_v2::ProjectionFailure::Host(error) => error,
-                    crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
-                })
-            })?;
-        } else {
-            validate_type(expected.data_type(), self.work)
-                .map_err(|cause| CallerGeometryFailure(E::from(cause)))?;
-        }
-        Ok(())
+        novarocks_type_contract::validate_arrow_layout_structure_observed(
+            expected.data_type(),
+            |visit| {
+                if let Some(admission) = self.admission.as_deref_mut() {
+                    admission.batch_work_add(1).map_err(CallerGeometryFailure)?;
+                }
+                validate_type_visit(visit, self.work)
+                    .map_err(|cause| CallerGeometryFailure(E::from(cause)))
+            },
+        )
     }
 }
 fn add(left: usize, right: usize) -> Result<usize, TypeCodecError> {
@@ -247,7 +228,7 @@ fn preflight(
         work,
     )?;
     let layout = source_layout(expected, work)?;
-    let message = verified_message_observed(metadata, verifier, work)?;
+    let message = verified_record_message_observed(metadata, verifier, work)?;
     preflight_message(message, body, limits, layout, work)
 }
 

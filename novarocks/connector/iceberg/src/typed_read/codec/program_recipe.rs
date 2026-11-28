@@ -261,7 +261,7 @@ fn decode<T>(
         MAX_PRIVATE_RETAINED_BYTES,
         MAX_PRIVATE_READ_BYTES,
         1_000_000,
-        64,
+        novarocks_spi::connector::MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
     )
     .expect("Iceberg recipe decode limits are finite");
     let mut ledger = ConnectorDecodeLedger::new(limits);

@@ -124,6 +124,13 @@ impl CapturedRefreshSource {
     pub(crate) fn metadata(&self) -> Result<ConnectorTableMetadata, PreparationError> {
         Ok(self.to_receipt()?.to_metadata().clone())
     }
+    pub(crate) fn sql_metadata(&self) -> Result<ConnectorTableMetadata, PreparationError> {
+        if self.snapshot.is_some() {
+            self.metadata()
+        } else {
+            Ok(self.observed.clone())
+        }
+    }
     pub(crate) fn receipts(&self) -> Vec<ConnectorPreparedSourceRead> {
         self.receipts
             .lock()
@@ -146,6 +153,12 @@ pub(crate) struct CapturedRefreshSources {
     aliases: Mutex<Vec<(TableIdentity, Arc<CapturedRefreshSource>)>>,
     direct_output_sources:
         std::sync::OnceLock<crate::mv::domain::persistence::source_bindings::MvDirectOutputSources>,
+    replacement_output_sources: std::sync::OnceLock<
+        std::collections::BTreeMap<
+            u32,
+            crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
+        >,
+    >,
 }
 impl CapturedRefreshSources {
     pub(crate) fn set_analyzed_fields(
@@ -185,9 +198,25 @@ impl CapturedRefreshSources {
                 Ok((occurrence.occurrence_id, fields))
             })
             .collect::<Result<_, &'static str>>()?;
+        if let Some(sources) = &binding.replacement_output_sources {
+            self.replacement_output_sources
+                .set(sources.clone())
+                .map_err(|_| "MV replacement output sources were already frozen")?;
+        }
         self.analyzed_fields
             .set(fields)
             .map_err(|_| "MV analyzed source fields were already frozen".into())
+    }
+
+    pub(crate) fn replacement_output_sources(
+        &self,
+    ) -> Option<
+        &std::collections::BTreeMap<
+            u32,
+            crate::mv::domain::persistence::source_bindings::MvDirectOutputSources,
+        >,
+    > {
+        self.replacement_output_sources.get()
     }
 
     pub(crate) fn analyzed_fields(

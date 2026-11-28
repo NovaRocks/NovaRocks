@@ -498,13 +498,10 @@ impl Harness {
                 max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
                 max_read_bytes: 8 * 1024 * 1024,
             },
-            reader_options: FileReaderOptions {
-                parquet_interpretation_policy:
-                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
-                        preserve_top_level_dictionary: false,
-                    },
-                ..Default::default()
+            parquet_policy: novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                preserve_top_level_dictionary: false,
             },
+            reader_options: FileReaderOptions::default(),
             scheduled_split_sequence_id: 0,
             dynamic_filter: Arc::new(
                 novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
@@ -697,13 +694,10 @@ impl Harness {
                 max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
                 max_read_bytes: 8 * 1024 * 1024,
             },
-            reader_options: FileReaderOptions {
-                parquet_interpretation_policy:
-                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
-                        preserve_top_level_dictionary: false,
-                    },
-                ..Default::default()
+            parquet_policy: novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                preserve_top_level_dictionary: false,
             },
+            reader_options: FileReaderOptions::default(),
             scheduled_split_sequence_id,
             dynamic_filter,
             prepared_input: None,
@@ -1591,13 +1585,11 @@ impl Harness {
                     max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
                     max_read_bytes: 8 * 1024 * 1024,
                 },
-                reader_options: FileReaderOptions {
-                    parquet_interpretation_policy:
-                        novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
-                            preserve_top_level_dictionary: false,
-                        },
-                    ..Default::default()
-                },
+                parquet_policy:
+                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                        preserve_top_level_dictionary: false,
+                    },
+                reader_options: FileReaderOptions::default(),
                 scheduled_split_sequence_id: 0,
                 dynamic_filter,
                 prepared_input: None,

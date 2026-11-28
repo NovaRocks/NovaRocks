@@ -42,11 +42,11 @@ enum ContractReason {
     RecipeBinding = 110,
     RecipeFacts = 111,
     RecipeSplits = 112,
-    RecipeColumns = 113,
+    // Code 113 was the retired fixed read-recipe column count.
     RecipePayload = 114,
     RecipeBytes = 115,
     ScanEmpty = 120,
-    ScanAssignments = 121,
+    // Code 121 was the retired fixed scan assignment count.
     ScanColumns = 122,
     ScanVariable = 123,
     ScanDuplicateVariable = 124,
@@ -96,13 +96,6 @@ impl FailureProjection for ConnectorReadRelationRecipeError {
             Self::BindingMismatch => ContractReason::RecipeBinding,
             Self::PublicFactsMismatch => ContractReason::RecipeFacts,
             Self::InvalidSplitFacts => ContractReason::RecipeSplits,
-            Self::TooManyColumns => {
-                return bound(
-                    ContractReason::RecipeColumns,
-                    ResourceDimension::Items,
-                    MAX_CONNECTOR_RECIPE_COLUMNS,
-                );
-            }
             Self::PayloadTooLarge => {
                 return bound(
                     ContractReason::RecipePayload,
@@ -125,13 +118,6 @@ impl FailureProjection for StaticConnectorScanError {
     fn failure_fact(&self) -> FailureFact {
         let reason = match self {
             Self::EmptyAssignments => ContractReason::ScanEmpty,
-            Self::TooManyAssignments => {
-                return bound(
-                    ContractReason::ScanAssignments,
-                    ResourceDimension::Items,
-                    MAX_CONNECTOR_RECIPE_COLUMNS,
-                );
-            }
             Self::RecipeColumnMismatch => ContractReason::ScanColumns,
             Self::InvalidVariable => ContractReason::ScanVariable,
             Self::DuplicateVariable => ContractReason::ScanDuplicateVariable,

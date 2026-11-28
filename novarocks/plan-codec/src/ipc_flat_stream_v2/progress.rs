@@ -40,7 +40,6 @@ pub(crate) struct Admission<'a, 'b, E = CompileControlError> {
     constant: (usize, usize, usize),
     reader_work: usize,
     geometry_work: usize,
-    schema_work: usize,
     count_work: [usize; 5],
     clone_work: usize,
     sealed: Option<IpcReaderProgressFacts>,
@@ -59,7 +58,6 @@ impl<'a, 'b, E: From<CompileControlError>> Admission<'a, 'b, E> {
             constant: (0, 0, 0),
             reader_work: 0,
             geometry_work: 0,
-            schema_work: 0,
             count_work: [0; 5],
             clone_work: 0,
             sealed: None,
@@ -119,10 +117,6 @@ impl<'a, 'b, E: From<CompileControlError>> Admission<'a, 'b, E> {
     }
     pub(crate) fn clone_work(&mut self, upper: usize) -> Result<(), E> {
         self.clone_work = self.clone_work.max(upper);
-        self.check()
-    }
-    pub(crate) fn schema_work(&mut self, upper: usize) -> Result<(), E> {
-        self.schema_work = self.schema_work.max(upper);
         self.check()
     }
     pub(crate) fn batch_work_add(&mut self, upper: usize) -> Result<(), E> {
@@ -200,10 +194,7 @@ impl<'a, 'b, E: From<CompileControlError>> Admission<'a, 'b, E> {
             .try_fold(0usize, |sum, &n| add(sum, n))?;
         self.facts.cumulative_library_work_upper_bound = add(
             add(self.clone_work, count_work)?,
-            add(
-                add(self.geometry_work, self.schema_work)?,
-                self.reader_work.max(self.constant.2),
-            )?,
+            add(self.geometry_work, self.reader_work.max(self.constant.2))?,
         )?;
         let coexist = add(
             self.facts.source_retained_bytes,

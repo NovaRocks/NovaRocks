@@ -1,0 +1,43 @@
+-- query 2
+-- types	bigint	bigint	bigint
+id	leaf	sequence_number
+1	7	1
+2	19	1
+3	NULL	1
+
+-- query 4
+-- types	bigint	bigint	bigint
+id	leaf	sequence_number
+1	11	2
+2	19	1
+3	NULL	1
+
+-- query 6
+-- types	bigint	bigint	bigint
+id	leaf	sequence_number
+1	11	2
+2	23	3
+3	NULL	1
+4	31	3
+
+-- query 7
+-- types	bigint	bigint	boolean
+id	original_leaf	same_row
+1	7	true
+2	19	true
+3	NULL	true
+
+-- query 8
+-- types	bigint	bigint
+total_rows	distinct_row_ids
+4	4
+
+-- query 9
+-- types	bigint
+snapshots
+3
+
+-- query 10
+-- types	boolean	boolean
+has_data	has_deletion_vector
+true	true

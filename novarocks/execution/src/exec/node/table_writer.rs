@@ -147,6 +147,14 @@ pub(crate) fn materialize_target_value(
     {
         return Err(target_value_contract(ValueViolation::Layout));
     }
+    novarocks_value_arrays::carrier::validate_engine_carrier_observed(
+        array.data_type(),
+        &mut |_| observed_work(1),
+    )
+    .map_err(|failure| match failure {
+        ValueFailure::Caller(cause) => cause,
+        ValueFailure::Value(cause) => ExecutionFailure::from_domain(cause),
+    })?;
     let mut growth = |layout| owner.request(layout).map_err(ExecutionFailure::from);
     validate_target_requiredness(array, &target, &mut growth, &mut observed_work)?;
     if array.data_type() == target.output.data_type() {
@@ -435,6 +443,8 @@ fn validate_target_requiredness(
         .transpose()?;
     let callback = std::cell::RefCell::new(work);
     let observed_work = |units| (callback.borrow_mut())(units);
+    // Requiredness names one step per logical binding edge. Map entries and
+    // encoding wrappers are handled by the reachability and NULL owners.
     let mut path = [RequirementPathStep::Item; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
     for row in 0..array.len() {
         validate_target_row(

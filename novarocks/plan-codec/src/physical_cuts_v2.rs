@@ -709,7 +709,8 @@ fn count_filters(
                 match &p.target {
                     p::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => (),
                     p::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-                    | p::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+                    | p::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. }
+                    | p::RuntimeFilterConsumerTarget::ContentDemandScanField { lineage, .. } => {
                         count_lineage(c, Some(lineage), None, w)?
                     }
                 }
@@ -810,6 +811,10 @@ fn count_filters(
                         count_lineage(c, None, Some(&t.lineage), w)?;
                     }
                     T::AggregateTopnScanField(t) => {
+                        req(t.producer_witness_id)?;
+                        count_lineage(c, None, Some(&t.lineage), w)?;
+                    }
+                    T::ContentDemandScanField(t) => {
                         req(t.producer_witness_id)?;
                         count_lineage(c, None, Some(&t.lineage), w)?;
                     }
@@ -1641,6 +1646,9 @@ fn encode_producer_target(p: &p::RuntimeFilterProducerTarget) -> wire::RuntimeFi
             p::RuntimeFilterProducerTarget::JoinBuildKey { equality } => {
                 K::JoinBuildEqualityId(equality.get())
             }
+            p::RuntimeFilterProducerTarget::ContentDemand { content_ordinal } => {
+                K::ContentDemandOrdinal(content_ordinal)
+            }
             p::RuntimeFilterProducerTarget::AggregateTopNKey {
                 group_key_ordinal,
                 topn,
@@ -1670,6 +1678,9 @@ fn read_producer_target(
     Ok(match req(p.kind.as_ref())? {
         K::JoinBuildEqualityId(id) => p::RuntimeFilterProducerTarget::JoinBuildKey {
             equality: p::RuntimeFilterEqualityWitnessId::new(*id),
+        },
+        K::ContentDemandOrdinal(content_ordinal) => p::RuntimeFilterProducerTarget::ContentDemand {
+            content_ordinal: *content_ordinal,
         },
         K::AggregateTopnKey(p) => p::RuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal: p.group_key_ordinal,
@@ -1844,6 +1855,12 @@ fn encode_consumer_target(
                     lineage: vec_map(lineage, w, |p, _| Ok(encode_lineage(p)))?,
                 })
             }
+            p::RuntimeFilterConsumerTarget::ContentDemandScanField { producer, lineage } => {
+                K::ContentDemandScanField(wire::RuntimeFilterContentDemandScanField {
+                    producer_witness_id: Some(producer.get()),
+                    lineage: vec_map(lineage, w, |p, _| Ok(encode_lineage(p)))?,
+                })
+            }
         }),
     })
 }
@@ -1861,6 +1878,10 @@ fn decode_consumer_target(
             lineage: box_map(&p.lineage, w, read_lineage)?,
         },
         K::AggregateTopnScanField(p) => p::RuntimeFilterConsumerTarget::AggregateTopNScanField {
+            producer: p::RuntimeFilterWitnessId::new(req(p.producer_witness_id)?),
+            lineage: box_map(&p.lineage, w, read_lineage)?,
+        },
+        K::ContentDemandScanField(p) => p::RuntimeFilterConsumerTarget::ContentDemandScanField {
             producer: p::RuntimeFilterWitnessId::new(req(p.producer_witness_id)?),
             lineage: box_map(&p.lineage, w, read_lineage)?,
         },

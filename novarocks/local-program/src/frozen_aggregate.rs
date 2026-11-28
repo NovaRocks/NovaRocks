@@ -55,7 +55,8 @@ impl FrozenAggregateSelection {
         logical_argument_count: usize,
         storage: ValueTypeStorageLifetime,
     ) -> Result<Self, FrozenAggregateSelectionError> {
-        if selected.aggregate.is_none() {
+        if selected.aggregate.is_some() != (logical_argument_count == selected.argument_types.len())
+        {
             return Err(FrozenAggregateSelectionError::MissingAggregate);
         }
         if !matches!(selected.result_type, FunctionResultType::Scalar(_)) {
@@ -180,6 +181,7 @@ impl FrozenAggregateSelection {
                     .intermediate_type
                     .exactly_equals_observed(&expected.intermediate_type, &mut observe)
             }
+            (None, None) => Ok(true),
             _ => Ok(false),
         }
     }

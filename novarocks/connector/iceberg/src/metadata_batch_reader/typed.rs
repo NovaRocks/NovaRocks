@@ -66,28 +66,23 @@ fn declaration(
     ty: &DataType,
     nullable: bool,
     depth: usize,
-    nodes: &mut usize,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<(DataType, ValueTypeRef), Failure> {
     creation.work(1)?;
-    *nodes = nodes.checked_add(1).ok_or_else(extent)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        || *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-    {
-        return Err(extent());
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
+        )
+        .into());
     }
     let (layout, kind) = match ty {
         DataType::Struct(fields) => {
             let mut layouts = creation.reserve(fields.len())?;
             let mut values = creation.reserve(fields.len())?;
             for field in fields {
-                let (ty, value) = declaration(
-                    field.data_type(),
-                    field.is_nullable(),
-                    depth + 1,
-                    nodes,
-                    creation,
-                )?;
+                let (ty, value) =
+                    declaration(field.data_type(), field.is_nullable(), depth + 1, creation)?;
                 let name = creation.text(field.name())?;
                 layouts.push(creation.arc(Field::new(name, ty, field.is_nullable()))?);
                 let name = creation.text(field.name())?.into_boxed_str();
@@ -101,13 +96,8 @@ fn declaration(
             )
         }
         DataType::List(field) => {
-            let (ty, value) = declaration(
-                field.data_type(),
-                field.is_nullable(),
-                depth + 1,
-                nodes,
-                creation,
-            )?;
+            let (ty, value) =
+                declaration(field.data_type(), field.is_nullable(), depth + 1, creation)?;
             let name = creation.text("item")?;
             let field = creation.arc(Field::new(name, ty, field.is_nullable()))?;
             (DataType::List(field), ValueKind::List(value))
@@ -119,13 +109,11 @@ fn declaration(
             if fields.len() != 2 {
                 return Err(bad());
             }
-            let (key_ty, key) =
-                declaration(fields[0].data_type(), false, depth + 2, nodes, creation)?;
+            let (key_ty, key) = declaration(fields[0].data_type(), false, depth + 1, creation)?;
             let (value_ty, value) = declaration(
                 fields[1].data_type(),
                 fields[1].is_nullable(),
-                depth + 2,
-                nodes,
+                depth + 1,
                 creation,
             )?;
             let mut fields = creation.reserve(2)?;
@@ -158,7 +146,7 @@ pub(super) fn value(
     nullable: bool,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<FunctionValueType, Failure> {
-    let (layout, value) = declaration(ty, nullable, 1, &mut 0, creation)?;
+    let (layout, value) = declaration(ty, nullable, 1, creation)?;
     creation.request(ValueLayout::storage_allocation_layout().map_err(|_| extent())?)?;
     let layout =
         ValueLayout::try_from_normalized_arrow_observed(layout, creation.storage(), |units| {

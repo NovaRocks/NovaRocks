@@ -666,10 +666,7 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         Arc::new(AggregateResolver),
         declaration(FunctionKind::Aggregate, vec![overload]),
     );
-    let args = [
-        argument(DataType::Int64, true),
-        argument(DataType::Utf8, true),
-    ];
+    let args = [argument(DataType::Int64, true)];
     let request = FunctionBindingRequest {
         expected_result_type: None,
         arguments: &args,

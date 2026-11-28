@@ -55,7 +55,8 @@ mod writer_preparation;
 
 pub use compiled::{
     CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledExchangeRouting,
-    CompiledProgramFacts, CompiledScanInput, LocalProgram, LocalProgramCompileError,
+    CompiledProgramFacts, CompiledScanInput, InputCompletion, LocalProgram,
+    LocalProgramCompileError,
 };
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{
@@ -79,11 +80,12 @@ pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
     JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph, LocalSortMode,
-    MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
+    MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODES, MAX_RECURSIVE_PIPELINE_BUILD_DEPTH,
     NestedLoopJoinType, PartitionRank, ProgramAssertionApplicability, ProgramCompileError,
-    ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput,
-    ProgramScanSource, ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots,
-    RowAssertion, SetOpKind, SortExpression, StaticAggregateCall, StaticAggregateOrder,
+    ProgramContentApply, ProgramContentApplyTarget, ProgramJoinCondition, ProgramJoinKey,
+    ProgramNode, ProgramNodeKind, ProgramPositionShardInput, ProgramScanSource,
+    ProgramWriteLayoutEffects, ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion,
+    SetOpKind, SortExpression, StaticAggregateCall, StaticAggregateOrder,
     StaticAggregateTypeSignature, StaticWindowFunction, StaticWriterProjection,
     StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping,
     UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind, WindowType,

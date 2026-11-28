@@ -136,7 +136,7 @@ fn metric(text: &str, name: &str, label: Option<(&str, &str)>) -> Result<u64> {
 pub(super) fn flow_snapshots(context: &mut ScenarioContext) -> Result<Option<Vec<FlowSnapshot>>> {
     let mut snapshots = Vec::new();
     for index in 0..context.handle().be_count() {
-        let text = context.handle().backend_exchange_flow_metrics(index)?;
+        let text = context.handle().backend_metrics_text(index)?;
         match metric(
             &text,
             "novarocks_backend_exchange_flow_snapshot_available",

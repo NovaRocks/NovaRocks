@@ -34,7 +34,12 @@ use crate::common::{Fixture, collect};
 #[test]
 fn parquet_metadata_inspection_reports_stable_footer_facts() {
     let fixture = Fixture::parquet();
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     let expected = {
         let file = std::fs::File::open(fixture.file.location().path()).expect("open fixture");
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("read fixture footer");
@@ -128,7 +133,12 @@ fn parquet_metadata_inspection_rejects_corrupt_footer() {
     let mut bytes = std::fs::read(path).expect("read fixture");
     *bytes.last_mut().expect("Parquet fixture is non-empty") ^= 0xff;
     std::fs::write(path, bytes).expect("corrupt footer marker");
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
 
     let error = inspect_parquet_metadata(
         fixture.file.clone(),
@@ -150,7 +160,12 @@ fn parquet_metadata_inspection_rejects_corrupt_footer() {
 #[test]
 fn parquet_metadata_inspection_honors_cancel_and_deadline_before_footer_io() {
     let fixture = Fixture::parquet();
-    let cancelled = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let cancelled = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     cancelled.context.cancellation.cancel();
     assert_eq!(
         inspect_parquet_metadata(
@@ -164,7 +179,12 @@ fn parquet_metadata_inspection_honors_cancel_and_deadline_before_footer_io() {
         FileErrorKind::Cancelled
     );
 
-    let mut expired = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut expired = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     expired.context.deadline = Some(Instant::now() - Duration::from_millis(1));
     assert_eq!(
         inspect_parquet_metadata(
@@ -183,7 +203,7 @@ fn parquet_metadata_inspection_honors_cancel_and_deadline_before_footer_io() {
 fn parquet_projects_all_root_columns() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::All,
         1024,
         1024 * 1024,
@@ -207,7 +227,12 @@ fn parquet_decoder_consumes_prepared_whole_file_without_source_io() {
     let bytes = std::fs::read(path).expect("read fixture backing");
     let prepared = PreparedFileInput::new(&fixture.file, 0, BytesMut::from(bytes.as_slice()))
         .expect("prepared whole file");
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.prepared_input = Some(prepared);
     std::fs::remove_file(path).expect("remove source to prove decoder needs no GET");
     let mut reader = open_file_reader(request).expect("open from prepared input");
@@ -237,7 +262,12 @@ fn parquet_decoder_promotes_partial_backing_and_reads_only_its_gap() {
         fixture.io.clone(),
         fixture.io.handle(),
     );
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.prepared_input = Some(prepared);
     request.context.range = Some(service.bind(
         FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
@@ -261,7 +291,7 @@ fn parquet_decoder_promotes_partial_backing_and_reads_only_its_gap() {
 fn parquet_projects_root_names() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::RootNames(vec!["name".to_string()]),
         1024,
         1024 * 1024,
@@ -276,7 +306,7 @@ fn parquet_projects_root_names() {
 fn parquet_projects_root_indices() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::RootIndices(vec![0]),
         1024,
         1024 * 1024,
@@ -290,7 +320,7 @@ fn parquet_projects_root_indices() {
 fn parquet_projects_field_ids() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::FieldIds(vec![20]),
         1024,
         1024 * 1024,
@@ -321,7 +351,12 @@ fn parquet_range_selects_row_group_by_physical_offset() {
         .dictionary_page_offset()
         .unwrap_or_else(|| second.columns()[0].data_page_offset())
         .min(second.columns()[0].data_page_offset()) as u64;
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.range = FileReadRange::bounded(start, fixture.file.identity().file_size() - start)
         .expect("bounded range");
     let mut reader = open_file_reader(request).expect("open reader");
@@ -342,7 +377,12 @@ fn parquet_range_selects_row_group_by_physical_offset() {
 #[test]
 fn parquet_predicate_prunes_row_groups() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.predicates.push(ScanPredicate::new(
         "id",
         ScanPredicateDomain::Range {
@@ -376,7 +416,12 @@ fn parquet_predicate_prunes_row_groups() {
 fn parquet_predicate_keeps_row_groups_when_literal_type_outgrew_statistics() {
     let fixture = Fixture::parquet();
 
-    let baseline = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let baseline = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     let mut reader = open_file_reader(baseline).expect("open reader");
     let unfiltered: usize = collect(reader.as_mut())
         .expect("read Parquet")
@@ -388,7 +433,12 @@ fn parquet_predicate_keeps_row_groups_when_literal_type_outgrew_statistics() {
         "fixture must produce rows for this test to mean anything"
     );
 
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.predicates.push(ScanPredicate::new(
         "id",
         ScanPredicateDomain::Range {
@@ -415,7 +465,12 @@ fn parquet_predicate_keeps_row_groups_when_literal_type_outgrew_statistics() {
 #[test]
 fn parquet_predicate_binds_field_id_before_column_name() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.predicates.push(
         ScanPredicate::new(
             "renamed_id",
@@ -445,7 +500,12 @@ fn parquet_predicate_binds_field_id_before_column_name() {
 #[test]
 fn parquet_honors_explicit_page_selection_and_positions() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.predicates.push(ScanPredicate::new(
         "id",
         ScanPredicateDomain::Range {
@@ -479,7 +539,12 @@ fn parquet_honors_explicit_page_selection_and_positions() {
 #[test]
 fn parquet_predicate_page_index_prunes_rows_and_records_effect() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.options.enable_parquet_reader_page_index = true;
     request.pruning.row_groups = Some(vec![0]);
     request.predicates.push(ScanPredicate::new(
@@ -514,7 +579,12 @@ fn parquet_predicate_page_index_prunes_rows_and_records_effect() {
 #[test]
 fn parquet_predicate_page_index_falls_back_for_incomparable_bounds() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.options.enable_parquet_reader_page_index = true;
     request.pruning.row_groups = Some(vec![0]);
     request.predicates.push(ScanPredicate::new(
@@ -546,7 +616,12 @@ fn parquet_predicate_page_index_falls_back_for_incomparable_bounds() {
 #[test]
 fn parquet_predicate_page_index_uses_name_when_the_requested_field_id_is_missing() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.options.enable_parquet_reader_page_index = true;
     request.pruning.row_groups = Some(vec![0]);
     request.predicates.push(
@@ -591,7 +666,12 @@ fn parquet_page_index_read_does_not_reuse_a_footer_only_metadata_cache_entry() {
         datacache_ttl_seconds: 0,
         datacache_sharing_work_period: None,
     });
-    let inspection = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let inspection = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     inspect_parquet_metadata(
         fixture.file.clone(),
         Some(cache.clone()),
@@ -600,7 +680,12 @@ fn parquet_page_index_read_does_not_reuse_a_footer_only_metadata_cache_entry() {
     )
     .expect("populate footer-only metadata cache entry");
 
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.cache = Some(cache);
     request.options.enable_parquet_reader_page_index = true;
     request.pruning.row_groups = Some(vec![0]);
@@ -644,13 +729,23 @@ fn parquet_exact_ranges_use_foundation_page_cache() {
         datacache_ttl_seconds: 0,
         datacache_sharing_work_period: None,
     });
-    let mut first = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut first = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     first.cache = Some(cache.clone());
     first.options.coalesce_reads = false;
     let mut first = open_file_reader(first).expect("first reader");
     collect(first.as_mut()).expect("first read");
 
-    let mut second = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut second = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     second.cache = Some(cache);
     second.options.coalesce_reads = false;
     let mut second = open_file_reader(second).expect("second reader");
@@ -688,15 +783,23 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     });
 
     let prewarmed = Fixture::parquet();
-    let mut warm_request =
-        prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut warm_request = prewarmed.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     warm_request.cache = Some(read_write_cache);
     warm_request.options.coalesce_reads = false;
     let mut warm_reader = open_file_reader(warm_request).expect("open cache-warming reader");
     collect(warm_reader.as_mut()).expect("warm cache");
 
-    let mut cached_request =
-        prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut cached_request = prewarmed.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     cached_request.cache = Some(read_only_cache.clone());
     cached_request.options.coalesce_reads = false;
     let mut cached_reader = open_file_reader(cached_request).expect("open read-only cached reader");
@@ -707,8 +810,12 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     );
 
     let uncached = Fixture::parquet();
-    let mut first_miss =
-        uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut first_miss = uncached.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     first_miss.cache = Some(read_only_cache.clone());
     first_miss.options.coalesce_reads = false;
     let mut first_reader = open_file_reader(first_miss).expect("open first read-only miss");
@@ -716,8 +823,12 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     assert_eq!(first_reader.metrics_snapshot().cache_hits, 0);
     assert!(first_reader.metrics_snapshot().cache_misses > 0);
 
-    let mut second_miss =
-        uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut second_miss = uncached.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     second_miss.cache = Some(read_only_cache);
     second_miss.options.coalesce_reads = false;
     let mut second_reader = open_file_reader(second_miss).expect("open second read-only miss");
@@ -849,7 +960,7 @@ fn parquet_float_statistics_pruning_preserves_nan_and_signed_zero_results() {
     writer.close().unwrap();
     let fixture = Fixture::from_path(directory, path);
     let mut baseline = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::All,
         1024,
         1024 * 1024,
@@ -931,8 +1042,12 @@ fn parquet_float_statistics_pruning_preserves_nan_and_signed_zero_results() {
                 "unpruned oracle: {column} {op:?}"
             );
             for page_index in [false, true] {
-                let mut request =
-                    fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+                let mut request = fixture.request(
+                    FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+                    FileProjection::All,
+                    1024,
+                    1024 * 1024,
+                );
                 request.options.enable_parquet_reader_page_index = page_index;
                 request.predicates.push(ScanPredicate::new(
                     column,

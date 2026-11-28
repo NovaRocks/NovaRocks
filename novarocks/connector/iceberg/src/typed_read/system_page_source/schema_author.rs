@@ -777,9 +777,6 @@ fn publish_read_schema_inner(
     author: impl FnOnce(&mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, Failure>,
 ) -> Result<ConnectorReadPublicSchema, Failure> {
     creation.work(1)?;
-    if requested.len() > novarocks_connector_contract::MAX_CONNECTOR_RECIPE_COLUMNS {
-        return Err(extent());
-    }
     let authored = if requested.is_empty() {
         Vec::new()
     } else {

@@ -45,7 +45,6 @@ impl ConnectorWriteLayoutRecipeDraft {
             || header.category() != ConnectorCodecCategory::WriteLayout
             || payload.payload().is_empty()
             || inputs.is_empty()
-            || inputs.len() > crate::MAX_CONNECTOR_WRITE_INPUT_FIELDS
             || inputs
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()

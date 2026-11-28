@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::{
-    CompileCheckpoints, CompileControlError, CompilePhase, MAX_VALUE_TYPE_NODES,
-    NR_LOGICAL_TYPE_KEY, PureCompileControl, ValueLogicalType, ValueTypeError, ValueTypeVisit,
+    CompileCheckpoints, CompileControlError, CompilePhase, NR_LOGICAL_TYPE_KEY, PureCompileControl,
+    ValueLogicalType, ValueTypeError, ValueTypeVisit,
     owned_resources::type_validation::TypeValidationScratch,
 };
 use std::{
@@ -94,7 +94,7 @@ fn shared_nested_fields_keep_original_law_and_exact_borrowed_occurrence_events()
                 original.push(event(v));
                 Ok(())
             });
-        let mut scratch: TypeValidationScratch<'_> = [None; MAX_VALUE_TYPE_NODES];
+        let mut scratch: TypeValidationScratch<'_> = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
         let mut actual = Vec::new();
         let result = ty.validate_with_scratch_observed::<Error>(&mut scratch, |v| {
             actual.push(event(v));
@@ -135,7 +135,7 @@ fn run(ty: &FunctionValueType, control: &Control) -> Result<(), Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     // This caller owns the actual scratch initialization; no allocation or
     // resource admission certificate is inferred from this test harness.
-    let mut scratch: TypeValidationScratch<'_> = [None; MAX_VALUE_TYPE_NODES];
+    let mut scratch: TypeValidationScratch<'_> = [None; crate::MAX_ARROW_TYPE_PATH_DEPTH];
     let result =
         ty.validate_with_scratch_observed(&mut scratch, |_| work.step().map_err(Error::from));
     if matches!(result, Err(Error::Control(_))) {

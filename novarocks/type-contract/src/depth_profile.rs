@@ -20,12 +20,20 @@
 use crate::{MAX_VALUE_TYPE_DEPTH, ValueTypeError};
 use arrow_schema::DataType;
 
+/// A logical path can contain one Map entries node per edge and one encoding
+/// wrapper per logical node, including the leaf.
+pub const MAX_ARROW_TYPE_PATH_DEPTH: usize = 3 * MAX_VALUE_TYPE_DEPTH - 1;
+
+/// A canonical path has its logical nodes and at most one Map scaffold per
+/// edge. It contains no runtime encoding wrappers.
+pub const MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH: usize = 2 * MAX_VALUE_TYPE_DEPTH - 1;
+
 /// A boundary selects its existing policy explicitly. Value profiles do not
 /// grant support for a particular encoding; that stays with its real consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArrowTypeProfile {
-    /// The original physical-tree policy. Constant/root/provider owners keep
-    /// their existing separately selected format and encoding limits.
+    /// Physical consumers use the same logical depth and its derived carrier
+    /// path. Each format owner still validates its own representation.
     Physical,
     /// A complete value declaration; runtime wrappers retain physical visits.
     /// Existing type-node and metadata admission remains with the type owner.
@@ -34,12 +42,11 @@ pub enum ArrowTypeProfile {
     CanonicalValue,
 }
 impl ArrowTypeProfile {
-    /// Only the original physical-tree consumer has a physical depth policy.
-    /// Value declarations keep their inherited logical/node contracts; a
-    /// derived physical depth is stack-test geometry, never another quota.
+    /// Derived path length for callers that separately track physical steps.
+    /// A checked traversal still validates the logical coordinate and grammar.
     pub const fn physical_depth_limit(self) -> Option<usize> {
         match self {
-            Self::Physical => Some(MAX_VALUE_TYPE_DEPTH),
+            Self::Physical => Some(MAX_ARROW_TYPE_PATH_DEPTH),
             Self::Value | Self::CanonicalValue => None,
         }
     }
@@ -80,7 +87,7 @@ impl ArrowTypeDepth {
     }
     pub fn check(self, profile: ArrowTypeProfile) -> Result<(), ValueTypeError> {
         profile.check_physical_depth(self.physical)?;
-        if profile != ArrowTypeProfile::Physical && self.logical > MAX_VALUE_TYPE_DEPTH {
+        if self.logical > MAX_VALUE_TYPE_DEPTH {
             return Err(ValueTypeError::TooDeep);
         }
         match profile {
@@ -135,12 +142,14 @@ impl ArrowTypeDepth {
 pub struct TypeTraversalFrame<'a> {
     pub(crate) data_type: &'a DataType,
     pub(crate) depth: ArrowTypeDepth,
+    pub(crate) next_child: usize,
 }
 impl<'a> TypeTraversalFrame<'a> {
     pub const fn root(data_type: &'a DataType) -> Self {
         Self {
             data_type,
             depth: ArrowTypeDepth::ROOT,
+            next_child: 0,
         }
     }
 }

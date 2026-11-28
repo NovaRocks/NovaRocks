@@ -338,11 +338,14 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
         binding: &'a p::AggregateBinding,
     ) -> Result<(), E> {
         self.function(occurrence, &binding.function)?;
-        self.value(
-            PackageTypeOwner::Binding(occurrence),
-            PackageTypeChannel::Intermediate,
-            &binding.intermediate_type,
-        )
+        if let Some(intermediate) = binding.intermediate_type() {
+            self.value(
+                PackageTypeOwner::Binding(occurrence),
+                PackageTypeChannel::Intermediate,
+                intermediate,
+            )?;
+        }
+        Ok(())
     }
     fn writer_schema(
         &mut self,
@@ -605,6 +608,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::GenerateSeries { .. }
             | p::NodeKind::AssertOneRow(_)
             | p::NodeKind::PositionShard(_)
+            | p::NodeKind::ContentApply(_)
             | p::NodeKind::WriteLayoutKey { .. }
             | p::NodeKind::ExchangeSource { .. } => {}
         }

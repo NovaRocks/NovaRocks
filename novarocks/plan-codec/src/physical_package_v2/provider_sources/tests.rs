@@ -184,6 +184,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(71),
             root: scan,
             values: BTreeMap::from([(

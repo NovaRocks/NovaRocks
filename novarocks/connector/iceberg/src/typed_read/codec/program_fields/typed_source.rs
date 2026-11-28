@@ -22,7 +22,7 @@ use crate::iceberg::spec::{PrimitiveType, Type};
 use novarocks_connector_contract::{
     ConnectorErrorKind, ConnectorReadExecutionSchema, ConnectorSourceFieldFacts,
     ConnectorSourceInitialDefault, ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
-    MAX_CONNECTOR_RECIPE_COLUMNS,
+    MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
 use std::{alloc::Layout, collections::HashMap};
@@ -48,9 +48,6 @@ pub(super) fn publish(
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadPublicSchema, CreationFailure> {
     creation.work(1)?;
-    if columns.len() > MAX_CONNECTOR_RECIPE_COLUMNS {
-        return Err(resource_creation());
-    }
     let (schema, nominal, table, source_bytes) = match relation {
         IcebergRuntimeRelation::Table(table) => {
             creation.work(table.table_schema_json().len())?;
@@ -106,7 +103,7 @@ pub(super) fn publish(
             .ok_or_else(resource_creation)?;
     }
     let mut facts = creation.reserve::<ConnectorSourceFieldFacts>(facts_count)?;
-    let mut path = creation.reserve::<u32>(novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1)?;
+    let mut path = [0; MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH];
     for (ordinal, column) in columns.iter().enumerate() {
         let source = resolve(schema.as_ref(), column, creation)?;
         let owned;
@@ -171,9 +168,8 @@ pub(super) fn publish(
             column.nullable(),
         ))?);
         bindings.push(declared.binding);
-        path.clear();
-        path.push(u32::try_from(ordinal).map_err(|_| resource_creation())?);
-        append_facts(source, &mut path, &mut facts, source_bytes, creation)?;
+        path[0] = u32::try_from(ordinal).map_err(|_| resource_creation())?;
+        append_facts(source, &mut path, 1, &mut facts, source_bytes, creation)?;
     }
     let source_fields = creation.arrow_fields(source_fields)?;
     let source_schema = creation.arc(arrow::datatypes::Schema::new(source_fields))?;
@@ -262,7 +258,11 @@ fn count_fields(
 ) -> Result<usize, CreationFailure> {
     creation.work(1)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(resource_creation());
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
+        )
+        .into());
     }
     let mut count = 1usize;
     match ty {
@@ -274,16 +274,22 @@ fn count_fields(
             }
         }
         Some(Type::List(list)) => {
-            count += count_fields(Some(&list.element_field.field_type), depth + 1, creation)?
+            count = count
+                .checked_add(count_fields(
+                    Some(&list.element_field.field_type),
+                    depth + 1,
+                    creation,
+                )?)
+                .ok_or_else(resource_creation)?;
         }
         Some(Type::Map(map)) => {
-            count += count_fields(Some(&map.key_field.field_type), depth + 2, creation)?;
-            count += count_fields(Some(&map.value_field.field_type), depth + 2, creation)?;
+            for field in [&map.key_field, &map.value_field] {
+                count = count
+                    .checked_add(count_fields(Some(&field.field_type), depth + 1, creation)?)
+                    .ok_or_else(resource_creation)?;
+            }
         }
         _ => {}
-    }
-    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(resource_creation());
     }
     Ok(count)
 }
@@ -313,11 +319,7 @@ fn validate_column_declaration(
         let schema = table.mutation_metadata()?.ok_or_else(|| {
             invalid_creation("Iceberg table did not declare mutation file metadata")
         })?;
-        let expected = if source.id == mutation_partition::SPEC_ID {
-            schema.spec_field()
-        } else {
-            schema.partition_field()
-        };
+        let expected = schema.read_field(source.id, !column.nullable());
         if !matches!(relation, IcebergRuntimeRelation::Table(_))
             || !column.is_base_column()
             || source.name != expected.name
@@ -484,16 +486,17 @@ fn validate_identity(
 
 fn append_facts(
     source: &NestedField,
-    path: &mut Vec<u32>,
+    path: &mut [u32; MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH],
+    depth: usize,
     facts: &mut Vec<ConnectorSourceFieldFacts>,
     source_bytes: usize,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<(), CreationFailure> {
     creation.work(1)?;
     let storage = creation.storage();
-    let mut owned_path = creation.reserve::<u32>(path.len())?;
-    creation.work(std::mem::size_of_val(path.as_slice()))?;
-    owned_path.extend_from_slice(path);
+    let mut owned_path = creation.reserve::<u32>(depth)?;
+    creation.work(std::mem::size_of_val(&path[..depth]))?;
+    owned_path.extend_from_slice(&path[..depth]);
     let initial_default = if let Some(default) = &source.initial_default {
         // The SDK literal codec is an original finite source operation. Caller
         // control observes its input bound before entry and its exit afterwards.
@@ -506,9 +509,6 @@ fn append_facts(
             })?;
         let json = value.to_string();
         creation.work(1)?;
-        if json.len() > novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES {
-            return Err(resource_creation());
-        }
         let payload = Layout::array::<u8>(json.len()).map_err(|_| resource_creation())?;
         creation.request(
             novarocks_type_contract::owned_resources::layout::arc_layout(payload)
@@ -536,27 +536,32 @@ fn append_facts(
         |units| work(units).map_err(CreationFailure::Control),
     )?;
     facts.push(fact);
+    // The count pass admits logical D before this author writes any path.
+    // Each Map adds one physical entries ordinal before its two children.
     match source.field_type.as_ref() {
         Type::Struct(fields) => {
             for (ordinal, field) in fields.fields().iter().enumerate() {
-                path.push(u32::try_from(ordinal).map_err(|_| resource_creation())?);
-                append_facts(field, path, facts, source_bytes, creation)?;
-                path.pop();
+                path[depth] = u32::try_from(ordinal).map_err(|_| resource_creation())?;
+                append_facts(field, path, depth + 1, facts, source_bytes, creation)?;
             }
         }
         Type::List(list) => {
-            path.push(0);
-            append_facts(&list.element_field, path, facts, source_bytes, creation)?;
-            path.pop();
+            path[depth] = 0;
+            append_facts(
+                &list.element_field,
+                path,
+                depth + 1,
+                facts,
+                source_bytes,
+                creation,
+            )?;
         }
         Type::Map(map) => {
-            path.push(0);
+            path[depth] = 0;
             for (ordinal, field) in [&map.key_field, &map.value_field].into_iter().enumerate() {
-                path.push(ordinal as u32);
-                append_facts(field, path, facts, source_bytes, creation)?;
-                path.pop();
+                path[depth + 1] = ordinal as u32;
+                append_facts(field, path, depth + 2, facts, source_bytes, creation)?;
             }
-            path.pop();
         }
         _ => {}
     }
@@ -604,9 +609,6 @@ fn source_attributes(
     )?;
     attrs.try_reserve(count).map_err(|_| resource_creation())?;
     for (key, value) in input.into_iter().flatten() {
-        if value.len() > novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES {
-            return Err(resource_creation());
-        }
         retained = retained
             .checked_add(key.len())
             .and_then(|n| n.checked_add(value.len()))

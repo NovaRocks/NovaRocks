@@ -361,13 +361,15 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
             filter_root: None,
             id: p::AggregateCallId::new(id),
             binding: p::AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: AggregateStateArgumentContract::ExactSignature,
                 function: function(FunctionKind::Aggregate, Box::default()),
                 phase: p::AggregatePhase::Single,
                 logical_argument_count: 0,
-                intermediate_type: FunctionValueType::new(DataType::Binary, false),
-                state_format: AggregateStateFormatId::try_new("fixture/state-v1").unwrap(),
+                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract: AggregateStateArgumentContract::ExactSignature,
+                    intermediate_type: FunctionValueType::new(DataType::Binary, false),
+                    state_format: AggregateStateFormatId::try_new("fixture/state-v1").unwrap(),
+                }),
             },
             arguments: Box::default(),
             distinct: false,
@@ -479,6 +481,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(u32::MAX),
             root: table,
             values,
@@ -681,6 +684,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(9),
             root: source,
             values: values
@@ -849,6 +853,7 @@ pub(in crate::physical_package_v2) fn values_package_with_pool(
         p::FragmentStructureInput {
             summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            input_completion: p::FragmentInputCompletion::MayShortCircuit,
             id: p::FragmentId::new(5),
             root: source,
             values: values

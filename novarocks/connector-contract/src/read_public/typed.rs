@@ -145,10 +145,7 @@ impl ConnectorReadPublicFacts {
         let count = schema.fields().len();
         completed_law(
             (|| {
-                if count > MAX_CONNECTOR_RECIPE_COLUMNS
-                    || count != shape.fields().len()
-                    || count != execution.bindings().len()
-                {
+                if count != shape.fields().len() || count != execution.bindings().len() {
                     return Err(invalid(
                         "typed read execution/source occurrence counts differ",
                     ));
@@ -191,17 +188,16 @@ impl ConnectorReadPublicFacts {
             ),
             context,
         )?;
-        // Schema/Field/type allocations are already retained by their explicit
-        // creator objects. Only the existing real scratch walks are admitted.
+        // Schema/Field/type allocations are retained by their explicit creators.
+        // Account retained field/type facts using the bounded borrowed walk.
         for input in [schema, shape] {
             completed_law(
                 budget.add(size_of::<Schema>() + input.fields().len() * size_of::<Arc<Field>>()),
                 context,
             )?;
             for field in input.fields() {
-                let nodes = shape_nodes(field.data_type(), context)?;
                 budget.field_observed(field, context)?;
-                budget.data_type(field.data_type(), nodes, context)?;
+                budget.data_type(field.data_type(), context)?;
             }
         }
         completed_law(
@@ -234,16 +230,6 @@ impl ConnectorReadPublicFacts {
                 context.step()?;
             }
             if let Some(default) = field.initial_default() {
-                completed_law(
-                    if default.as_json().len()
-                        > novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES
-                    {
-                        Err(exhausted())
-                    } else {
-                        Ok(())
-                    },
-                    context,
-                )?;
                 // Provider has already validated/serialized this typed JSON.
                 // Visit the real spelling under the original control meter.
                 for _ in default.as_json().as_bytes().chunks(256) {
@@ -335,42 +321,6 @@ impl ConnectorReadPublicFacts {
         })
     }
 }
-fn shape_nodes<O: OwnedCopy>(root: &DataType, context: &mut O) -> Result<usize, O::Error> {
-    use novarocks_type_contract::{
-        MAX_VALUE_TYPE_NODES, ValueTypeVisit, validate_arrow_layout_structure_with_scratch_observed,
-    };
-    context.work(context.add(
-        novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(),
-        context.add(context.mul(MAX_VALUE_TYPE_NODES, 128)?, 128)?,
-    )?)?;
-    context.flush()?;
-    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
-    context.step()?;
-    context.flush()?;
-    let mut nodes = 0usize;
-    let result = validate_arrow_layout_structure_with_scratch_observed(
-        root,
-        &mut scratch,
-        |event| -> Result<(), LogicalWalkError<O::Error>> {
-            if let ValueTypeVisit::TypeNode(_) = event {
-                nodes += 1;
-            }
-            context.step().map_err(LogicalWalkError::Observer)
-        },
-    );
-    match result {
-        Err(LogicalWalkError::Observer(cause)) => Err(cause),
-        other => completed_law(
-            other.map_err(|cause| match cause {
-                LogicalWalkError::Law(cause) => value_type_error(cause),
-                LogicalWalkError::Observer(_) => unreachable!(),
-            }),
-            context,
-        )
-        .map(|()| nodes),
-    }
-}
-
 #[cfg(test)]
 mod tests;
 

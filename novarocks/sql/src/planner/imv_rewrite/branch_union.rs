@@ -311,11 +311,11 @@ fn branch_union_aggregate_change_stream_output_columns(
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
-    for field in super::target_locator::target_file_metadata_columns(ctx) {
+    for field in super::position_metadata::target_file_metadata_columns(ctx) {
         columns.push(allocate_imv_output_column(
             ctx,
             &field.name,
-            super::target_locator::nullable_file_metadata_value(field)?,
+            super::position_metadata::nullable_file_metadata_value(field)?,
             true,
         )?);
     }

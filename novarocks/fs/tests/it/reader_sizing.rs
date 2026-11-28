@@ -22,9 +22,13 @@ use crate::common::{Fixture, collect};
 #[test]
 fn parquet_decoder_enforces_row_limit() {
     let fixture = Fixture::parquet();
-    let mut reader =
-        open_file_reader(fixture.request(FileFormat::Parquet, FileProjection::All, 3, 1024 * 1024))
-            .expect("open reader");
+    let mut reader = open_file_reader(fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        3,
+        1024 * 1024,
+    ))
+    .expect("open reader");
     assert_eq!(reader.reader_batch_rows(), Some(3));
     let batches = collect(reader.as_mut()).expect("read Parquet");
     assert!(batches.iter().all(|batch| batch.batch.num_rows() <= 3));
@@ -43,7 +47,7 @@ fn parquet_fixed_width_projection_sizes_batches_without_copying_or_rejecting_row
     // The id column is Int32, four bytes per row. Each group has four rows.
     for (bytes, batch_rows) in [(16, 4), (8, 2), (4, 1), (0, 1)] {
         let request = fixture.request(
-            FileFormat::Parquet,
+            FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
             FileProjection::RootIndices(vec![0]),
             4,
             bytes,
@@ -64,7 +68,7 @@ fn parquet_fixed_width_projection_sizes_batches_without_copying_or_rejecting_row
 fn parquet_zero_width_projection_uses_row_limit_even_with_zero_bytes() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::RootIndices(Vec::new()),
         2,
         0,
@@ -83,7 +87,12 @@ fn parquet_zero_width_projection_uses_row_limit_even_with_zero_bytes() {
 #[test]
 fn parquet_no_selected_groups_needs_no_decoder() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 3, 0);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        3,
+        0,
+    );
     request.pruning.row_groups = Some(Vec::new());
     let mut reader = open_file_reader(request).expect("open empty reader");
     assert_eq!(reader.reader_batch_rows(), None);
@@ -95,9 +104,13 @@ fn parquet_no_selected_groups_needs_no_decoder() {
 #[test]
 fn parquet_positions_stay_aligned_across_decoder_batches() {
     let fixture = Fixture::parquet();
-    let mut reader =
-        open_file_reader(fixture.request(FileFormat::Parquet, FileProjection::All, 3, 1024 * 1024))
-            .expect("open reader");
+    let mut reader = open_file_reader(fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        3,
+        1024 * 1024,
+    ))
+    .expect("open reader");
     let batches = collect(reader.as_mut()).expect("read Parquet");
     let positions = batches
         .iter()

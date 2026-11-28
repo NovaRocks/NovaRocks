@@ -1762,9 +1762,6 @@ mod tests {
         fn before_allocation(&mut self, _: std::alloc::Layout) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
-            Ok(())
-        }
         fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
             unreachable!("fixture encoder does not decode")
         }

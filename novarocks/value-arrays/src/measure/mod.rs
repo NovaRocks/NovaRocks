@@ -151,6 +151,11 @@ impl<'a> PrefixPlanner<'a> {
             {
                 return Err(arithmetic().into());
             }
+            for data_type in [source.data_type(), column.target] {
+                crate::carrier::visit_carrier_shape(data_type, |_| {
+                    work(1).map_err(ValueFailure::Caller)
+                })?;
+            }
             let borrow = contiguous && !column.constant && source.data_type() == column.target;
             planned.push(Column::new(
                 source,

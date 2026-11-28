@@ -292,16 +292,19 @@ SELECT CASE WHEN COUNT() = 740
 FROM mvside_${uuid0}.ns_${uuid0}.oversized_mv;
 
 -- query 18
+-- @skip_result_check=true
 -- @retry_count=40
 -- @retry_interval_ms=250
--- @skip_result_check=true
--- @result_contains=AWAITING_EFFECT_SETTLEMENT
+-- @result_rows_where=Property=UnsettledEffects
+-- @result_rows_count=1
+-- @result_rows_expect=Value=0
+-- @result_not_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('mvside_${uuid0}', 'ns_${uuid0}', 'oversized_mv');
 
 -- query 19
 -- @skip_result_check=true
--- @mv_resume_management=oversized_mv,catalog=mvside_${uuid0},database=ns_${uuid0}
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW mvside_${uuid0}.ns_${uuid0}.oversized_mv;
 
 -- query 20
 -- @skip_result_check=true
@@ -331,8 +334,8 @@ FROM mvside_${uuid0}.ns_${uuid0}.oversized_mv;
 
 -- query 22
 -- @skip_result_check=true
--- @mv_resume_management=mv_wide,catalog=mvside_${uuid0},database=ns_${uuid0}
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW mvside_${uuid0}.ns_${uuid0}.mv_wide;
 
 -- query 23
 -- @cleanup=true

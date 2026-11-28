@@ -967,6 +967,7 @@ async fn frozen_requests_match_stable_rest_goldens() {
         let (name, golden) = match shape {
             RequestShape::SnapshotProducing => ("snapshot", include_str!("golden/snapshot.json")),
             RequestShape::MetadataOnly => ("metadata", include_str!("golden/metadata.json")),
+            RequestShape::FencedMarkers => unreachable!("fenced markers have a dedicated test"),
             RequestShape::Create => ("create", include_str!("golden/create.json")),
             RequestShape::DocumentExpiry => unreachable!("expiry has a separate golden"),
             RequestShape::RefRetention => {

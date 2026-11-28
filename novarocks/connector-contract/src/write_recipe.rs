@@ -24,18 +24,12 @@ use crate::validate_write_field_schema_events;
 use crate::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorEncodedPayload, ConnectorError,
     ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputRef, ConnectorWriteInputShape,
-    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, PureProviderCompileError,
-    WRITE_FIELD_ALLOCATION_CHARGE, WriteSchemaVisit, WriterOwnedResourceFacts,
+    PureProviderCompileError, WriteSchemaVisit, WriterOwnedResourceFacts,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 use std::{error::Error, fmt, sync::Arc};
-
-/// Count preflight derived from the existing aggregate schema allocation bound,
-/// not from the read recipe's unrelated column limit.
-pub const MAX_CONNECTOR_WRITE_INPUT_FIELDS: usize =
-    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES / WRITE_FIELD_ALLOCATION_CHARGE;
 
 pub const MAX_CONNECTOR_WRITER_HANDLE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -188,9 +182,6 @@ impl ConnectorWriteRecipeDraft {
         if payload.payload().len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
             return Err(resource("writer recipe handle exceeds the byte limit").into());
         }
-        if input.source_field_count() > MAX_CONNECTOR_WRITE_INPUT_FIELDS {
-            return Err(resource("writer recipe input exceeds the field count limit").into());
-        }
         input.validate_with(observer)?;
         let mut schema_bytes = 0;
         for field in input.field_refs() {
@@ -258,7 +249,6 @@ impl ConnectorWriteRecipeDraft {
         }
         // Preserve the original structural retained charge. Actual cumulative
         // request/work upper bounds are a separate parent contribution.
-        debug_assert!(schema_bytes <= MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
         let charged_bytes = schema_bytes
             .checked_add(payload.payload().len())
             .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
@@ -266,9 +256,10 @@ impl ConnectorWriteRecipeDraft {
                 bytes.checked_add(size_of::<ConnectorWriteInputShape>() + 2 * size_of::<usize>())
             })
             .and_then(|bytes| {
-                bytes.checked_add(
-                    input.source_field_count() * size_of::<crate::ConnectorWriteFieldToken>(),
-                )
+                input
+                    .source_field_count()
+                    .checked_mul(size_of::<crate::ConnectorWriteFieldToken>())
+                    .and_then(|token_bytes| bytes.checked_add(token_bytes))
             })
             .ok_or_else(|| resource("writer recipe retained charge overflowed"))?;
         // Count uses the same physical grammar without constructing fields.
@@ -690,35 +681,31 @@ mod tests {
         }
     }
     #[test]
-    fn writer_recipe_refuses_duplicate_identities_and_unbounded_metadata() {
+    fn writer_recipe_refuses_duplicate_identities_and_accounts_wide_metadata() {
         let valid = draft(ConnectorWriteInputShape::Data {
             fields: vec![field(1)],
         });
-        for input in [
-            ConnectorWriteInputShape::Data {
-                fields: vec![field(1), field(1)],
-            },
-            ConnectorWriteInputShape::Data {
-                fields: vec![ConnectorWriteFieldBinding::new(
-                    field(1).token(),
-                    Field::new("v", DataType::Int64, false).with_metadata(
-                        std::collections::HashMap::<String, String>::from([(
-                            "k".into(),
-                            "x".repeat(crate::MAX_WRITE_RELATION_METADATA_VALUE_BYTES + 1),
-                        )]),
-                    ),
-                )],
-            },
-        ] {
-            assert!(
-                ConnectorWriteRecipeDraft::try_new(
-                    valid.binding.clone(),
-                    valid.payload.clone(),
-                    input
-                )
-                .is_err()
-            );
-        }
+        let create = |fields| {
+            ConnectorWriteRecipeDraft::try_new(
+                valid.binding.clone(),
+                valid.payload.clone(),
+                ConnectorWriteInputShape::Data { fields },
+            )
+        };
+        assert!(create(vec![field(1), field(1)]).is_err());
+        let value_bytes = 16 * 1024 * 1024 + 1;
+        let wide = create(vec![ConnectorWriteFieldBinding::new(
+            field(1).token(),
+            Field::new("v", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "k".into(),
+                "x".repeat(value_bytes),
+            )])),
+        )])
+        .unwrap();
+        assert!(wide.charged_bytes() > value_bytes);
     }
     #[test]
     fn dictionary_field_ids_and_ordering_are_exact_public_facts() {

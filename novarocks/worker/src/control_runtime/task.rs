@@ -478,6 +478,16 @@ struct HostPreparationBinding {
     health: Arc<ExecutionHealth>,
 }
 impl TaskPreparationJob {
+    pub(crate) fn set_memory_observation(
+        &mut self,
+        observation: Option<novarocks_memory::LaneShards>,
+    ) {
+        self.job
+            .as_mut()
+            .expect("one original preparation body")
+            .set_memory_observation(observation);
+    }
+
     /// The actual failed owner took this still-unexposed job from its own
     /// adoption slot. Dispose all original captures inside the same prepaid
     /// preparation body, before that custodian observes capture exit.

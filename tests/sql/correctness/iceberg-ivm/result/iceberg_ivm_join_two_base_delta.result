@@ -1,11 +1,11 @@
 -- query 4
--- legacy
+-- types	bigint	integer	varchar
 id	amount	label
 1	100	old-a
 2	200	old-b
 
 -- query 7
--- legacy
+-- types	bigint	integer	varchar
 id	amount	label
 2	200	new-b
 3	300	new-c

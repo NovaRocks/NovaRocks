@@ -60,7 +60,8 @@ fn render_tree_with_budget_observed(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<String>, SqlCompileError> {
     let mut out = ExplainRenderOutput::new_observed(budget, control)?;
-    let context = TreeContext::new_observed(plan, level, &mut out, Some(control))?;
+    let mut path = Vec::new();
+    let context = TreeContext::new_observed(plan, level, &mut out, Some(control), &mut path)?;
     let result: Result<(), SqlCompileError> = (|| {
         if context.costs() {
             for annotation in plan.annotations() {
@@ -101,7 +102,7 @@ fn render_tree_with_budget_observed(
                 ))?;
                 context.render_sink(fragment, &mut out)?;
             }
-            context.render_node(fragment, fragment.root(), 0, &mut out)?;
+            context.render_fragment(fragment, &mut path, &mut out)?;
         }
         Ok(())
     })();
@@ -294,7 +295,6 @@ impl<D: Display> Display for ProjectExpressionDisplay<'_, D> {
     }
 }
 
-const MAX_TREE_DEPTH: usize = 128;
 const SOURCE_INDEX_BYTES: usize = 4 * 1024 * 1024;
 
 fn source_refusal() -> SqlCompileError {
@@ -341,47 +341,96 @@ fn reserve_exact<T>(count: usize) -> Result<Vec<T>, SqlCompileError> {
     Ok(values)
 }
 
+struct TreeFrame<'a> {
+    node: NodeId,
+    children: std::slice::Iter<'a, NodeId>,
+}
+
+enum TreeVisit {
+    Enter { node: NodeId, depth: usize },
+    Exit(NodeId),
+}
+
+/// Follow one input cursor per ancestor. The caller reserves the fragment's
+/// actual number of nodes once, and the numbering pass checks for back edges.
+fn walk_tree<'a>(
+    root: NodeId,
+    path: &mut Vec<TreeFrame<'a>>,
+    inputs: &impl Fn(NodeId) -> Option<&'a [NodeId]>,
+    mut visit: impl FnMut(TreeVisit) -> Result<bool, SqlCompileError>,
+) -> Result<(), SqlCompileError> {
+    let mut next = Some(root);
+    loop {
+        if let Some(node) = next.take() {
+            if visit(TreeVisit::Enter {
+                node,
+                depth: path.len(),
+            })? {
+                if path.len() == path.capacity() {
+                    return Err(source_refusal());
+                }
+                path.push(TreeFrame {
+                    node,
+                    children: inputs(node).unwrap_or_default().iter(),
+                });
+            }
+        } else if let Some(frame) = path.last_mut() {
+            if let Some(child) = frame.children.next() {
+                next = Some(*child);
+            } else {
+                let finished = frame.node;
+                path.pop();
+                visit(TreeVisit::Exit(finished))?;
+            }
+        } else {
+            return Ok(());
+        }
+    }
+}
+
 fn assign_display_ids<'a>(
     entries: &mut [DisplayNode],
     fragment: FragmentId,
-    node: NodeId,
-    depth: usize,
+    root: NodeId,
     next: &mut usize,
     inputs: &impl Fn(NodeId) -> Option<&'a [NodeId]>,
+    path: &mut Vec<TreeFrame<'a>>,
+    out: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    if depth > MAX_TREE_DEPTH {
-        return Err(source_refusal());
-    }
-    let Ok(index) = entries.binary_search_by_key(&(fragment, node), |entry| entry.key) else {
-        return Ok(());
-    };
-    if entries[index].active {
-        return Err(source_refusal());
-    }
-    if entries[index].display != usize::MAX {
-        // Preserve the original DFS numbering of a shared input: its latest
-        // encounter names it with the current next ID, without expanding it
-        // again. Cycle detection remains independent of this display rule.
-        entries[index].display = *next;
-        return Ok(());
-    }
-    entries[index].display = *next;
-    entries[index].active = true;
-    *next += 1;
-    if let Some(inputs_for_node) = inputs(node) {
-        for input in inputs_for_node {
-            assign_display_ids(entries, fragment, *input, depth + 1, next, inputs)?;
+    walk_tree(root, path, inputs, |visit| {
+        let (node, exiting) = match visit {
+            TreeVisit::Enter { node, .. } => (node, false),
+            TreeVisit::Exit(node) => (node, true),
+        };
+        out.observe()?;
+        let Ok(index) = entries.binary_search_by_key(&(fragment, node), |entry| entry.key) else {
+            return Ok(false);
+        };
+        let entry = &mut entries[index];
+        if exiting {
+            entry.active = false;
+            return Ok(false);
         }
-    }
-    entries[index].active = false;
-    Ok(())
+        if entry.active {
+            return Err(source_refusal());
+        }
+        // Preserve the original DFS numbering of a shared input: its latest
+        // encounter names it with the current next ID without expanding again.
+        let descend = entry.display == usize::MAX;
+        entry.display = *next;
+        if descend {
+            entry.active = true;
+            *next += 1;
+        }
+        Ok(descend)
+    })
 }
 
 impl<'a> TreeContext<'a> {
     #[cfg(test)]
     fn new(plan: &'a PhysicalPlan, level: ExplainLevel) -> Result<Self, SqlCompileError> {
         let mut out = ExplainRenderOutput::new(ExplainRenderBudget::default());
-        Self::new_observed(plan, level, &mut out, None)
+        Self::new_observed(plan, level, &mut out, None, &mut Vec::new())
     }
 
     fn new_observed(
@@ -389,13 +438,15 @@ impl<'a> TreeContext<'a> {
         level: ExplainLevel,
         out: &mut ExplainRenderOutput<'_>,
         diagnostic_control: Option<&'a dyn novarocks_type_contract::PureCompileControl>,
+        path: &mut Vec<TreeFrame<'a>>,
     ) -> Result<Self, SqlCompileError> {
         let mut node_count = 0usize;
+        let mut largest_fragment = 0;
         for fragment in plan.fragments().values() {
             out.observe()?;
-            node_count = node_count
-                .checked_add(fragment.nodes().len())
-                .ok_or_else(source_refusal)?;
+            let nodes = fragment.nodes().len();
+            largest_fragment = largest_fragment.max(nodes);
+            node_count = node_count.checked_add(nodes).ok_or_else(source_refusal)?;
         }
         let mut nodes = 0usize;
         let mut values = 0usize;
@@ -412,8 +463,9 @@ impl<'a> TreeContext<'a> {
         // Two reference capacities include stable-sort scratch. All indexing
         // is admitted before allocating. Together with the output collector's
         // <=16 MiB payload/copy peak, <=3 MiB old/new line headers and <=4 MiB
-        // per-line allocation allowance, this 4 MiB index leaves the 32 MiB
-        // source workspace room for fixed depth stacks and formatter adapters.
+        // per-line allocation allowance, the 4 MiB index and the reusable
+        // path (at most 2 MiB, one frame per node in the largest fragment)
+        // leave space for formatter adapters in the 32 MiB source workspace.
         let bytes = nodes
             .checked_add(values)
             .and_then(|n| n.checked_mul(2 * size_of::<&PlanAnnotation>()))
@@ -426,6 +478,7 @@ impl<'a> TreeContext<'a> {
         if bytes > SOURCE_INDEX_BYTES || node_count > 65_536 {
             return Err(source_refusal());
         }
+        *path = reserve_exact(largest_fragment)?;
         let mut node_annotations = reserve_exact(nodes)?;
         let mut value_names = reserve_exact(values)?;
         for annotation in plan.annotations() {
@@ -471,9 +524,10 @@ impl<'a> TreeContext<'a> {
                     &mut context.display_ids,
                     fragment.id(),
                     fragment.root(),
-                    0,
                     &mut next,
                     &|node| fragment.nodes().get(&node).map(|node| node.inputs.as_ref()),
+                    path,
+                    out,
                 )?;
             }
         }
@@ -678,28 +732,30 @@ impl<'a> TreeContext<'a> {
         Ok(())
     }
 
-    /// Input recursion has a fixed bound, checked before any indentation or
-    /// node output. The ID prepass refuses cycles before publication starts.
-    fn render_node(
+    fn render_fragment(
         &self,
-        fragment: &Fragment,
-        node_id: NodeId,
-        indent: usize,
+        fragment: &'a Fragment,
+        path: &mut Vec<TreeFrame<'a>>,
         out: &mut ExplainRenderOutput,
     ) -> Result<(), SqlCompileError> {
-        if indent > MAX_TREE_DEPTH {
-            return Err(source_refusal());
-        }
-        out.ensure_prefix_fits(indent * 2)?;
-        let pad = Indent(indent);
-        let Some(node) = fragment.nodes().get(&node_id) else {
-            return out.push(format_args!("{pad}{}:UNKNOWN", node_id.get()));
-        };
-        self.render_node_lines(fragment, node, pad, out)?;
-        for input in &node.inputs {
-            self.render_node(fragment, *input, indent + 1, out)?;
-        }
-        Ok(())
+        walk_tree(
+            fragment.root(),
+            path,
+            &|node| fragment.nodes().get(&node).map(|node| node.inputs.as_ref()),
+            |visit| {
+                let TreeVisit::Enter { node, depth } = visit else {
+                    return Ok(false);
+                };
+                out.ensure_prefix_fits(depth * 2)?;
+                let pad = Indent(depth);
+                let Some(definition) = fragment.nodes().get(&node) else {
+                    out.push(format_args!("{pad}{}:UNKNOWN", node.get()))?;
+                    return Ok(false);
+                };
+                self.render_node_lines(fragment, definition, pad, out)?;
+                Ok(true)
+            },
+        )
     }
 
     fn stats_suffix(&self, fragment: FragmentId, node: NodeId) -> impl Display + '_ {
@@ -1615,6 +1671,13 @@ impl TreeContext<'_> {
             }
             NodeKind::WriteLayoutKey { .. } => {
                 out.push(format_args!("{prefix}WRITE_LAYOUT_KEY{stats}"))?;
+            }
+            NodeKind::ContentApply(spec) => {
+                out.push(format_args!(
+                    "{prefix}CONTENT_APPLY(content={}, route-keys={}){stats}",
+                    spec.weighted_content.len(),
+                    spec.route_keys.len(),
+                ))?;
             }
             NodeKind::PositionShard(spec) => {
                 out.push(format_args!(

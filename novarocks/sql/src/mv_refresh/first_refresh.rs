@@ -22,6 +22,7 @@
 //! connector writer at the native distributed root without materializing data
 //! in the frontend.
 
+mod partition_sources;
 mod sql_shape;
 use crate::analyzer::QueryAnalysisPurpose;
 use crate::binding::SqlTableBindingId;
@@ -38,11 +39,10 @@ use crate::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use novarocks_parser::Span;
 use novarocks_parser::{ast, build};
-use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::sync::Arc;
 
+pub use self::partition_sources::{SqlMvPartitionSourceBinding, bind_mv_partition_sources};
 pub use self::sql_shape::{SqlMvSnapshotPin, SqlMvSnapshotPinOccurrence};
 use self::sql_shape::{
     branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
@@ -226,7 +226,11 @@ fn validate_root_distribution(
         );
     }
     match requirement {
-        RootDistributionRequirement::ShuffleOutputName(name) if name == root_hash_column => Ok(()),
+        RootDistributionRequirement::ShuffleOutputName(name)
+            if !name.is_empty() && name == root_hash_column =>
+        {
+            Ok(())
+        }
         RootDistributionRequirement::ShuffleOutputName(_) => Err(
             "MV first-refresh root distribution output name does not match the SQL artifact"
                 .to_string(),
@@ -234,9 +238,18 @@ fn validate_root_distribution(
         RootDistributionRequirement::ShuffleOutputOrdinal(_) => {
             Err("MV first-refresh requires a named root distribution key".to_string())
         }
+        RootDistributionRequirement::Any if root_hash_column.is_empty() => Ok(()),
         RootDistributionRequirement::Any => {
-            Err("MV first-refresh requires an explicit root distribution key".to_string())
+            Err("aggregate MV first-refresh requires its named distribution key".to_string())
         }
+    }
+}
+
+fn first_refresh_distribution(root_hash_column: &str) -> RootDistributionRequirement {
+    if root_hash_column.is_empty() {
+        RootDistributionRequirement::Any
+    } else {
+        RootDistributionRequirement::ShuffleOutputName(root_hash_column.to_string())
     }
 }
 
@@ -257,7 +270,7 @@ pub(crate) struct MvFirstRefreshPhysicalQuery {
 pub struct SqlMvFirstRefreshArtifact {
     physical: MvFirstRefreshPhysicalQuery,
     captured_sources: bool,
-    view_row_lineage: bool,
+    partition_sources: Option<Vec<SqlMvPartitionSourceBinding>>,
 }
 
 impl SqlMvFirstRefreshArtifact {
@@ -265,8 +278,13 @@ impl SqlMvFirstRefreshArtifact {
         Self {
             physical,
             captured_sources: false,
-            view_row_lineage: false,
+            partition_sources: None,
         }
+    }
+
+    pub fn with_partition_sources(mut self, bindings: Vec<SqlMvPartitionSourceBinding>) -> Self {
+        self.partition_sources = Some(bindings);
+        self
     }
 
     pub fn root_hash_column(&self) -> &str {
@@ -348,10 +366,9 @@ pub fn analyze_mv_first_refresh_connector_write(
     artifact: SqlMvFirstRefreshArtifact,
     context: SqlMvFirstRefreshAnalyzeContext<'_>,
 ) -> Result<SqlMvFirstRefreshAnalyzed, crate::compiler::SqlCompileError> {
-    let root_distribution = crate::compiler::RootDistributionRequirement::ShuffleOutputName(
-        artifact.root_hash_column().to_string(),
-    );
+    let root_distribution = first_refresh_distribution(artifact.root_hash_column());
     let settings = context.optimizer_settings.clone();
+    let control = context.control.clone();
     let request = crate::compiler::SqlAnalyzeRequest::new(
         crate::compiler::SqlStatementInput::parsed_query(artifact.physical.query),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
@@ -369,15 +386,11 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.constant_policy,
         context.control,
     )
-    // The physical query is generated from the admitted definition and may
-    // include internal aggregate state calls. Preserve the original view
-    // versions already captured for this artifact when projecting lineage.
-    .with_analysis_purpose(if artifact.view_row_lineage {
-        QueryAnalysisPurpose::FirstRefreshViewRowLineage
-    } else {
-        QueryAnalysisPurpose::Ordinary
-    });
-    let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
+    .with_analysis_purpose(QueryAnalysisPurpose::Ordinary);
+    let mut analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
+    if let Some(sources) = artifact.partition_sources {
+        bind_mv_partition_sources(&mut analyzed, &sources, &control)?;
+    }
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
         sink: context.sink,
@@ -396,7 +409,7 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
-        analyzed.sink,
+        analyzed.sink.require_input_drain(),
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
@@ -421,7 +434,7 @@ pub fn begin_final_mv_first_refresh_connector_write_plan(
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
-        analyzed.sink,
+        analyzed.sink.require_input_drain(),
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
@@ -462,15 +475,9 @@ pub fn analyze_join_first_refresh_connector_write(
     context: SqlMvJoinFirstRefreshAnalyzeContext<'_>,
 ) -> Result<SqlMvJoinFirstRefreshAnalyzed, crate::compiler::SqlCompileError> {
     let snapshot = context.rewrite_snapshot.snapshot();
-    let root_hash_column = snapshot
-        .schema_contract
-        .target
-        .hidden_apply_key
-        .column_name
-        .clone();
-    if !root_hash_column.eq_ignore_ascii_case(&context.expected_root_hash_column) {
+    if !context.expected_root_hash_column.is_empty() {
         return Err(
-            "join first-refresh root hash column does not match the sealed target contract"
+            "non-aggregate join refresh cannot declare a hidden distribution key"
                 .to_string()
                 .into(),
         );
@@ -480,7 +487,6 @@ pub fn analyze_join_first_refresh_connector_write(
     let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
         .map_err(crate::compiler::SqlCompileError::from)?;
-    let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
     // Generated bindings and logical reentry retain the same request scope.
     // The immutable snapshot governs generated calls and logical reentry.
     context.control.check()?;
@@ -505,28 +511,17 @@ pub fn analyze_join_first_refresh_connector_write(
         .map_err(|_| {
             "join first-refresh logical intent did not produce logical SQL facts".to_string()
         })?;
-    let (plan, factory) = build_join_first_refresh_append_logical_plan(
-        crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
-            logical_output.logical_plan,
-        ),
-        logical_output.factory,
-        snapshot,
-        functions,
-        decimal_overflow_policy,
-        context.constant_policy,
-        &context.control,
-    )?;
-    let root_semantics = logical_output
-        .root_semantics
-        .first_refresh_output(&crate::planner::plan_output_columns(&plan)?, snapshot)?;
+    let mut plan = crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
+        logical_output.logical_plan,
+    );
+    crate::planner::imv_rewrite::entrypoint::bind_definition_occurrences(&mut plan, snapshot)?;
+    validate_join_payload(snapshot, &crate::planner::plan_output_columns(&plan)?)?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
-        factory,
-        root_semantics,
+        logical_output.factory,
+        logical_output.root_semantics,
         crate::compiler::SqlCompileIntent::IcebergWrite {
-            root_distribution: crate::compiler::RootDistributionRequirement::ShuffleOutputName(
-                root_hash_column,
-            ),
+            root_distribution: crate::compiler::RootDistributionRequirement::Any,
         },
         crate::compiler::SqlSessionContext {
             sql_semantics,
@@ -559,7 +554,7 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
-        analyzed.sink,
+        analyzed.sink.require_input_drain(),
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
@@ -584,7 +579,7 @@ pub fn begin_final_join_first_refresh_connector_write_plan(
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::begin_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
-        analyzed.sink,
+        analyzed.sink.require_input_drain(),
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
@@ -625,7 +620,17 @@ fn incremental_target_read_requirement(
             ))
         }
         SqlMvIncrementalWriteMode::FastAppend => Ok(TargetReadRequirement::NewOutputRowsOnly),
-        SqlMvIncrementalWriteMode::RowDelta => Ok(TargetReadRequirement::ExistingRows),
+        SqlMvIncrementalWriteMode::RowDelta if snapshot.content_target.is_some() => {
+            Ok(TargetReadRequirement::ContentRows)
+        }
+        SqlMvIncrementalWriteMode::RowDelta if snapshot.schema_contract.aggregate.is_some() => {
+            Ok(TargetReadRequirement::ExistingRows)
+        }
+        SqlMvIncrementalWriteMode::RowDelta => {
+            Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "non-aggregate row delta requires a frozen content target".into(),
+            ))
+        }
     }
 }
 
@@ -651,107 +656,34 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
     pub control: crate::compiler::SqlCompileControl,
 }
 
-pub struct SqlMvJoinIncrementalRefreshAnalyzed {
-    analyzed: crate::compiler::SqlAnalyzedQuery,
-    change_stream_override:
-        Option<crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
-    write_mode: SqlMvIncrementalWriteMode,
-    routes: Vec<crate::planning::dml::DmlChangeStreamRoute>,
-}
+pub type SqlMvJoinIncrementalRefreshAnalyzed = SqlMvIncrementalRefreshAnalyzed;
 
-/// Compile an incremental join refresh all the way to a sealed change-stream
-/// plan.  Canonical compilation deliberately remains plain `LogicalOnly`;
-/// the sealed snapshot is consumed only by the SQL-owned rewrite stage, which
-/// preserves the former Core logical-path semantics.
 pub fn analyze_join_incremental_refresh_change_stream(
     context: SqlMvJoinIncrementalRefreshAnalyzeContext<'_>,
 ) -> Result<SqlMvJoinIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> {
-    validate_join_incremental_routes(&context.routes)?;
     let snapshot = context.rewrite_snapshot.snapshot();
     validate_join_incremental_snapshot(snapshot)?;
-    let target_read = incremental_target_read_requirement(context.write_mode, snapshot)?;
-    if context.write_mode == SqlMvIncrementalWriteMode::FastAppend
-        && context.join_mode != SqlMvJoinIncrementalRefreshMode::AppendOnly
-    {
-        return Err(crate::compiler::SqlCompileError::InvalidRequest(
-            "coalesced join refresh cannot declare insert-only target access".into(),
-        ));
-    }
-    let query = *context.canonical_query;
-    let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
-    let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
-        .map_err(crate::compiler::SqlCompileError::from)?;
-    let decimal_overflow_policy = sql_semantics.sql_mode().decimal_overflow_policy();
-    // Generated bindings and logical reentry retain the same request scope.
-    // The immutable snapshot governs generated calls and logical reentry.
-    context.control.check()?;
-    let scoped_functions = context.functions.snapshot_for_scalar_presence();
-    let functions: &dyn crate::compiler::SqlFunctionCatalog = scoped_functions.as_ref();
-    let request = plain_join_first_refresh_logical_request(
-        query,
-        context.current_catalog,
-        context.current_database,
-        context.optimizer_settings,
-        context.environment,
-        context.catalog,
-        functions,
-        Arc::clone(&context.sealed_functions),
-        sql_semantics.clone(),
-        context.constant_policy,
-        context.control.clone(),
-    );
-    let logical_output = crate::compiler::SqlCompiler::analyze(request)?
-        .into_complete()?
-        .into_logical_output()
-        .map_err(|_| {
-            "join incremental refresh logical intent did not produce logical SQL facts".to_string()
-        })?;
-    let logical = crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
-        logical_output.logical_plan,
-    );
-    let (plan, factory, change_stream_override) = build_join_incremental_refresh_logical_plan(
-        snapshot,
-        context.join_mode,
-        target_read,
-        logical,
-        logical_output.factory,
-        functions,
-        decimal_overflow_policy,
-        context.constant_policy,
-        &context.control,
-    )?;
-    let descriptor = change_stream_override.as_ref().cloned().unwrap_or_else(|| {
-        crate::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&plan)
-    });
-    let root_semantics = logical_output.root_semantics.imv_output(
-        &crate::planner::plan_output_columns(&plan)?,
-        snapshot,
-        &descriptor,
-        matches!(context.join_mode, SqlMvJoinIncrementalRefreshMode::Coalesce),
-    )?;
-    let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
-        plan,
-        factory,
-        root_semantics,
-        crate::compiler::SqlCompileIntent::ChangeStreamWrite,
-        crate::compiler::SqlSessionContext {
-            sql_semantics,
-            current_catalog: None,
-            current_database: String::new(),
-            optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
-        },
-        crate::compiler::SqlPlanningEnvironment::NotApplicable,
-        Arc::clone(&context.sealed_functions),
-        context.constant_policy,
-        context.control,
-    )
-    .with_function_catalog(functions.snapshot());
-    let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
-    Ok(SqlMvJoinIncrementalRefreshAnalyzed {
-        analyzed,
-        change_stream_override,
+    let validation = if snapshot.schema_contract.aggregate.is_some() {
+        crate::compiler::SqlImvRewriteValidation::JoinAggregate
+    } else {
+        crate::compiler::SqlImvRewriteValidation::None
+    };
+    analyze_mv_incremental_refresh_change_stream(SqlMvIncrementalRefreshAnalyzeContext {
+        canonical_query: context.canonical_query,
+        imv_rewrite: crate::compiler::SqlImvPlanningInput::new(
+            context.rewrite_snapshot,
+            validation,
+        ),
         write_mode: context.write_mode,
         routes: context.routes,
+        current_catalog: context.current_catalog,
+        current_database: context.current_database,
+        environment: context.environment,
+        catalog: context.catalog,
+        functions: context.functions,
+        sealed_functions: context.sealed_functions,
+        constant_policy: context.constant_policy,
+        control: context.control,
     })
 }
 
@@ -763,50 +695,13 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
-    let constant_policy = analyzed.analyzed.constant_policy();
-    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
-    let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )?
-    .into_optimized_output()
-    .map_err(|_| {
-        "join incremental logical input did not produce an optimized SQL plan".to_string()
-    })?;
-    let function_catalog = std::sync::Arc::clone(&compiled.function_catalog);
-    let change_stream = analyzed
-        .change_stream_override
-        .unwrap_or(compiled.change_stream);
-    let producer = add_join_incremental_change_stream_effect(
-        compiled.optimized_tree,
-        &change_stream,
-        analyzed.write_mode,
-        decimal_overflow_policy,
-        &control,
-    )?;
-    let effect_output_ordinal = producer
-        .output_columns
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| {
-            "join incremental change-stream producer has no effect output".to_string()
-        })?;
-    crate::planning::dml::seal_final_change_stream_producer_with_effect_ordinal(
-        producer,
-        compiled.statistics.snapshot,
-        analyzed.routes,
+    compile_final_mv_incremental_refresh_change_stream(
+        analyzed,
+        statistics,
+        control,
         statistics_targets,
-        effect_output_ordinal,
-        function_catalog,
-        compiled.sealed_functions,
-        crate::planning::dml::DmlFinalChangeStreamSealContext {
-            pre_expand_keyed_assert: None,
-            shape,
-            final_write,
-        },
-        decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
-        constant_policy,
-        &control,
+        shape,
+        final_write,
     )
 }
 
@@ -823,47 +718,12 @@ pub fn begin_final_join_incremental_refresh_change_stream(
     ),
     crate::compiler::SqlCompileError,
 > {
-    let constant_policy = analyzed.analyzed.constant_policy();
-    let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
-    let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control.clone()),
-    )?
-    .into_optimized_output()
-    .map_err(|_| {
-        "join incremental logical input did not produce an optimized SQL plan".to_string()
-    })?;
-    let change_stream = analyzed
-        .change_stream_override
-        .unwrap_or(compiled.change_stream);
-    let producer = add_join_incremental_change_stream_effect(
-        compiled.optimized_tree,
-        &change_stream,
-        analyzed.write_mode,
-        decimal_overflow_policy,
-        &control,
-    )?;
-    let effect_output_ordinal = producer
-        .output_columns
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| {
-            "join incremental change-stream producer has no effect output".to_string()
-        })?;
-    crate::planning::dml::begin_final_change_stream_producer_with_effect_ordinal(
-        producer,
-        None,
-        compiled.statistics.snapshot,
-        analyzed.routes,
+    begin_final_mv_incremental_refresh_change_stream(
+        analyzed,
+        statistics,
+        control,
         statistics_targets,
-        effect_output_ordinal,
-        compiled.function_catalog,
-        compiled.sealed_functions,
-        None,
         shape,
-        decimal_overflow_policy,
-        compiled.root_allow_throw_exception,
-        constant_policy,
-        &control,
     )
 }
 
@@ -981,6 +841,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         crate::planning::dml::DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: None,
             shape,
+            input_completion: novarocks_physical_plan::FragmentInputCompletion::MustDrain,
             final_write,
         },
         decimal_overflow_policy,
@@ -1035,6 +896,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         compiled.sealed_functions,
         None,
         shape,
+        novarocks_physical_plan::FragmentInputCompletion::MustDrain,
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
         constant_policy,
@@ -1214,213 +1076,6 @@ fn validate_join_incremental_snapshot(
     Ok(())
 }
 
-#[cfg_attr(test, allow(unused_variables))]
-fn build_join_incremental_refresh_logical_plan(
-    snapshot: &Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
-    mode: SqlMvJoinIncrementalRefreshMode,
-    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
-    plan: crate::planner::logical::LogicalPlanNode,
-    factory: crate::column_id::ColumnRefFactory,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantValidation,
-    control: &crate::compiler::SqlCompileControl,
-) -> Result<
-    (
-        crate::planner::logical::LogicalPlanNode,
-        crate::column_id::ColumnRefFactory,
-        Option<crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
-    ),
-    crate::compiler::SqlCompileError,
-> {
-    let is_aggregate_refresh = snapshot.schema_contract.aggregate.is_some();
-    let factory_cell = Rc::new(RefCell::new(factory));
-    let outcome = crate::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-        crate::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-            plan,
-            snapshot: Arc::clone(snapshot),
-            target_read,
-            disabled_rules: join_incremental_disabled_rules(is_aggregate_refresh),
-            decimal_overflow_policy,
-            constant_policy,
-            control,
-            column_ref_factory: Rc::clone(&factory_cell),
-            #[cfg(not(test))]
-            function_catalog: functions.snapshot(),
-        },
-    )
-    .map_err(|error| match error {
-        crate::compiler::SqlCompileError::Compilation(message) => {
-            crate::compiler::SqlCompileError::Compilation(format!(
-                "join refresh logical rewrite: {message}"
-            ))
-        }
-        control => control,
-    })?;
-    let mut factory = Rc::try_unwrap(factory_cell)
-        .map_err(|_| {
-            crate::compiler::SqlCompileError::Compilation(
-                "IMV rewrite leaked ColumnRefFactory references".to_string(),
-            )
-        })?
-        .into_inner();
-    // Keep the actual rewrite annotation for AppendOnly as well as Coalesce.
-    let mut change_stream_override = Some(outcome.annotation.change_stream.clone());
-    let plan = match mode {
-        SqlMvJoinIncrementalRefreshMode::AppendOnly => outcome.plan,
-        SqlMvJoinIncrementalRefreshMode::Coalesce if is_aggregate_refresh => outcome.plan,
-        SqlMvJoinIncrementalRefreshMode::Coalesce => {
-            let descriptor = outcome
-                .annotation
-                .change_stream
-                .join_refresh
-                .clone()
-                .ok_or_else(|| {
-                    crate::compiler::SqlCompileError::Compilation(format!(
-                        "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
-                        snapshot.target.fqn()
-                    ))
-                })?;
-            descriptor.validate().map_err(|error| {
-                crate::compiler::SqlCompileError::Compilation(format!(
-                    "iceberg join MV {} incremental refresh descriptor is invalid: {error}",
-                    snapshot.target.fqn()
-                ))
-            })?;
-            change_stream_override = Some(
-                crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
-                    aggregate: None,
-                    join_refresh: Some(descriptor.clone()),
-                },
-            );
-            let locator_columns =
-                allocate_join_incremental_locator_column_ids(&mut factory, &outcome.plan)
-                    .map_err(crate::compiler::SqlCompileError::Compilation)?;
-            crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                outcome.plan,
-                &descriptor,
-                &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(snapshot),
-                &mut factory,
-                locator_columns.net,
-                locator_columns.file,
-                locator_columns.pos,
-                locator_columns.row_id,
-                locator_columns.last_updated_sequence_number,
-                #[cfg(not(test))]
-                functions,
-                decimal_overflow_policy,
-                constant_policy,
-        control,
-            )
-            .map_err(|error| match error {
-                crate::compiler::SqlCompileError::Compilation(error)=>crate::compiler::SqlCompileError::Compilation(format!("build join refresh coalesce logical plan: {error}")), error=>error,
-            })?
-        }
-    };
-    reserve_factory_for_plan(&mut factory, &plan)
-        .map_err(crate::compiler::SqlCompileError::Compilation)?;
-    Ok((plan, factory, change_stream_override))
-}
-
-fn join_incremental_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
-    let mut disabled_rules =
-        crate::optimizer::options::SessionOptimizerSettings::default().disabled_rules;
-    if !disabled_rules
-        .iter()
-        .any(|rule| rule == "InjectTargetLocatorJoin")
-    {
-        disabled_rules.push("InjectTargetLocatorJoin".to_string());
-    }
-    if is_aggregate_refresh
-        && !disabled_rules
-            .iter()
-            .any(|rule| rule == "RecordJoinRefreshDescriptor")
-    {
-        disabled_rules.push("RecordJoinRefreshDescriptor".to_string());
-    }
-    disabled_rules
-}
-
-struct JoinIncrementalLocatorColumnIds {
-    net: u32,
-    file: u32,
-    pos: u32,
-    row_id: u32,
-    last_updated_sequence_number: u32,
-}
-
-fn allocate_join_incremental_locator_column_ids(
-    factory: &mut crate::column_id::ColumnRefFactory,
-    plan: &crate::planner::logical::LogicalPlanNode,
-) -> Result<JoinIncrementalLocatorColumnIds, String> {
-    reserve_factory_for_plan(factory, plan)?;
-    Ok(JoinIncrementalLocatorColumnIds {
-        net: factory
-            .create(
-                None,
-                "net".to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    false,
-                ),
-            )
-            .0,
-        file: factory
-            .create(
-                None,
-                "_file".to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Utf8,
-                    true,
-                ),
-            )
-            .0,
-        pos: factory
-            .create(
-                None,
-                "_pos".to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                ),
-            )
-            .0,
-        row_id: factory
-            .create(
-                None,
-                "_row_id".to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                ),
-            )
-            .0,
-        last_updated_sequence_number: factory
-            .create(
-                None,
-                "_last_updated_sequence_number".to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                ),
-            )
-            .0,
-    })
-}
-
-/// Turn an optimized incremental producer into the change-event stream the
-/// write contract consumes.
-///
-/// The root has to be the native `ChangeEventExpand`: that node is how a plan
-/// says "each of my rows is a change with this effect", and the writer routes
-/// are bound to its effect column. A projection that merely computes an effect
-/// number looks the same from the side but tells the contract nothing, which
-/// is why sealing one is refused.
-///
-/// Each effect therefore becomes its own event with the predicate that selects
-/// it, and the predicates are made mutually exclusive rather than ordered: the
-/// expand emits one row per *matching* event, so overlapping predicates would
-/// duplicate a row instead of choosing between them.
 fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
@@ -1434,6 +1089,10 @@ fn add_join_incremental_change_stream_effect(
     use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
 
+    let content_apply = matches!(
+        &optimized_tree.op,
+        crate::optimizer::operator::Operator::PhysicalContentApply(_)
+    );
     let output_columns = &optimized_tree.output_columns;
     let has_delete_branch = matches!(write_mode, SqlMvIncrementalWriteMode::RowDelta);
     let mut action_columns = output_columns.iter().filter(|column| {
@@ -1475,7 +1134,8 @@ fn add_join_incremental_change_stream_effect(
                 .map(|column| column.column_id.0)
                 .max()
                 .unwrap_or(0)
-                + 1,
+                .checked_add(1)
+                .ok_or_else(|| "IMV change-stream output column id overflowed".to_owned())?,
         ),
         name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1496,7 +1156,7 @@ fn add_join_incremental_change_stream_effect(
     // The old change-op column selects an event but is not a provider input.
     // Keep the signed input occurrences in their original order so provider
     // route ordinals still name the same fields after expansion.
-    let routed_outputs = output_columns
+    let mut routed_outputs = output_columns
         .iter()
         .filter(|column| {
             action_output
@@ -1520,6 +1180,44 @@ fn add_join_incremental_change_stream_effect(
             })
         })
         .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
+
+    if content_apply {
+        let file = row_lineage_output.as_ref().ok_or_else(|| {
+            "MV content application has no file locator for its delete route".to_owned()
+        })?;
+        let locator_ordinal = routed_outputs
+            .iter()
+            .position(|column| column.column_id == file.column_id)
+            .ok_or_else(|| "MV content application lost its file locator".to_owned())?;
+        let last_lineage_column_id = effect_output
+            .column_id
+            .0
+            .checked_add(2)
+            .ok_or_else(|| "MV content application lineage column id overflowed".to_owned())?;
+        // The signed writer layout places the lineage fields before the file
+        // locator. Leave them unassigned so Iceberg mints fresh lineage for
+        // inserts. The delete route consumes the original locators only.
+        let lineage = [
+            (
+                crate::common::ICEBERG_ROW_ID_COL,
+                last_lineage_column_id - 1,
+            ),
+            (
+                crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+                last_lineage_column_id,
+            ),
+        ]
+        .map(|(name, id)| crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(id),
+            name: name.to_string(),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+            is_internal: true,
+        });
+        routed_outputs.splice(locator_ordinal..locator_ordinal, lineage);
+    }
 
     let not_deleted = action_output
         .as_ref()
@@ -1623,17 +1321,19 @@ fn add_join_incremental_change_stream_effect(
                 effect: ConnectorRowMutationEffect::Insert,
                 assignments: assignments.clone(),
             });
-            events.push(ChangeEventSpec {
-                predicate: Some(conjoin(
-                    &mut arena,
-                    surviving,
-                    is_existing,
-                    decimal_overflow_policy,
-                    control,
-                )?),
-                effect: ConnectorRowMutationEffect::Replace,
-                assignments,
-            });
+            if !content_apply {
+                events.push(ChangeEventSpec {
+                    predicate: Some(conjoin(
+                        &mut arena,
+                        surviving,
+                        is_existing,
+                        decimal_overflow_policy,
+                        control,
+                    )?),
+                    effect: ConnectorRowMutationEffect::Replace,
+                    assignments,
+                });
+            }
         }
     }
 
@@ -1698,14 +1398,6 @@ fn join_incremental_change_op_output(
             output_columns,
             aggregate.action_column_id,
             "aggregate change-stream action column",
-        )
-        .cloned();
-    }
-    if let Some(join) = change_stream.join_refresh.as_ref() {
-        return join_incremental_output_by_column_id(
-            output_columns,
-            join.action_column.column_id,
-            "join change-stream action column",
         )
         .cloned();
     }
@@ -1801,176 +1493,6 @@ fn plain_join_first_refresh_logical_request<'a>(
     .with_analysis_purpose(QueryAnalysisPurpose::MaterializedViewDefinition)
 }
 
-fn build_join_first_refresh_append_logical_plan(
-    mut plan: crate::planner::logical::LogicalPlanNode,
-    mut factory: crate::column_id::ColumnRefFactory,
-    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-    constant_policy: novarocks_functions::ConstantValidation,
-    control: &crate::compiler::SqlCompileControl,
-) -> Result<
-    (
-        crate::planner::logical::LogicalPlanNode,
-        crate::column_id::ColumnRefFactory,
-    ),
-    crate::compiler::SqlCompileError,
-> {
-    crate::planner::imv_rewrite::entrypoint::bind_definition_occurrences(&mut plan, snapshot)?;
-    let (left, right) = join_base_snapshots(snapshot)?;
-    let crate::planner::logical::LogicalPlanNode {
-        kind, mut children, ..
-    } = plan;
-    let crate::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
-        return Err("join first-refresh requires a root Project"
-            .to_string()
-            .into());
-    };
-    if children.len() != 1 {
-        return Err(format!(
-            "join first-refresh root Project expected one input, got {}",
-            children.len()
-        )
-        .into());
-    }
-    let input = children.remove(0);
-    let payload_columns = project
-        .items
-        .iter()
-        .map(|item| crate::analysis::OutputColumn {
-            column_id: item.output_column_id,
-            name: item.output_name.clone(),
-            value_type: item.expr.value_type.clone(),
-
-            is_internal: false,
-        })
-        .collect::<Vec<_>>();
-    validate_join_payload(snapshot, &payload_columns)?;
-    let left_scan = find_unique_base_scan(&input, left, "left")?;
-    let right_scan = find_unique_base_scan(&input, right, "right")?;
-    let left_row_id = find_row_id_column(&left_scan, "left")?;
-    let right_row_id = find_row_id_column(&right_scan, "right")?;
-    let key_pairs = join_key_pairs(
-        snapshot,
-        left.occurrence_id,
-        right.occurrence_id,
-        &left_scan,
-        &right_scan,
-    )?;
-    project.items.push(project_item(&left_row_id));
-    project.items.push(project_item(&right_row_id));
-    let input = crate::planner::logical::LogicalPlanNode::new(
-        crate::planner::logical::LogicalPlanKind::Project(project),
-        vec![input],
-        None,
-    );
-    reserve_factory_for_plan(&mut factory, &input)?;
-    let join_apply_key_type = crate::planner::imv_rewrite::join_refresh_builder::join_row_key_expr(
-        function_catalog,
-        (&left_row_id, &right_row_id),
-        &left.table_object_id,
-        &right.table_object_id,
-        decimal_overflow_policy,
-        constant_policy,
-        control,
-    )?
-    .value_type;
-    let join_apply_key_id = factory.create(
-        None,
-        "__nova_join_row_key".to_string(),
-        join_apply_key_type.clone(),
-    );
-    let action_id = factory.create(
-        None,
-        crate::common::CHANGE_OP_COLUMN.to_string(),
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int8, false),
-    );
-    let join_apply_key = crate::analysis::OutputColumn {
-        column_id: join_apply_key_id,
-        name: "__nova_join_row_key".to_string(),
-        value_type: join_apply_key_type,
-        is_internal: true,
-    };
-    let action = output_column(
-        action_id,
-        crate::common::CHANGE_OP_COLUMN,
-        arrow::datatypes::DataType::Int8,
-        false,
-        true,
-    );
-    let descriptor = build_join_descriptor(
-        snapshot,
-        &left.table,
-        &right.table,
-        payload_columns,
-        left_row_id,
-        right_row_id,
-        action,
-        join_apply_key,
-        key_pairs,
-    )?;
-    descriptor
-        .validate()
-        .map_err(|error| format!("join first-refresh descriptor is invalid: {error}"))?;
-    let plan =
-        crate::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
-            function_catalog,
-            input,
-            &descriptor,
-            &left.table_object_id,
-            &right.table_object_id,
-            join_apply_key_id.0,
-            decimal_overflow_policy,
-            constant_policy,
-            control,
-        )
-        .map_err(|error| match error {
-            crate::compiler::SqlCompileError::Compilation(error) => {
-                crate::compiler::SqlCompileError::Compilation(format!(
-                    "build join first-refresh append projection: {error}"
-                ))
-            }
-            error => error,
-        })?;
-    reserve_factory_for_plan(&mut factory, &plan)?;
-    Ok((plan, factory))
-}
-
-fn join_base_snapshots(
-    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-) -> Result<
-    (
-        &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
-        &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
-    ),
-    String,
-> {
-    let predicate = snapshot
-        .schema_contract
-        .join
-        .as_ref()
-        .and_then(|join| join.predicates.first())
-        .ok_or_else(|| "join first-refresh snapshot has no join predicate facts".to_string())?;
-    let left = snapshot
-        .base_snapshots
-        .iter()
-        .find(|base| base.occurrence_id == predicate.left.occurrence_id)
-        .ok_or_else(|| {
-            "join first-refresh left base is absent from the sealed snapshot".to_string()
-        })?;
-    let right = snapshot
-        .base_snapshots
-        .iter()
-        .find(|base| base.occurrence_id == predicate.right.occurrence_id)
-        .ok_or_else(|| {
-            "join first-refresh right base is absent from the sealed snapshot".to_string()
-        })?;
-    if left.occurrence_id == right.occurrence_id {
-        return Err("join first-refresh requires distinct left and right bases".to_string());
-    }
-    Ok((left, right))
-}
-
 fn validate_join_payload(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     payload_columns: &[crate::analysis::OutputColumn],
@@ -1991,269 +1513,6 @@ fn validate_join_payload(
         }
     }
     Ok(())
-}
-
-#[derive(Clone)]
-struct JoinBaseScan {
-    columns: Vec<crate::analysis::OutputColumn>,
-}
-
-fn find_unique_base_scan(
-    plan: &crate::planner::logical::LogicalPlanNode,
-    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
-    role: &str,
-) -> Result<JoinBaseScan, String> {
-    let mut scans = Vec::new();
-    collect_base_scans(plan, base, &mut scans);
-    match scans.as_slice() {
-        [scan] => Ok(scan.clone()),
-        [] => Err(format!(
-            "join first-refresh cannot find {role} base scan {}",
-            base.table.fqn()
-        )),
-        _ => Err(format!(
-            "join first-refresh found multiple {role} base scans {}",
-            base.table.fqn()
-        )),
-    }
-}
-
-fn collect_base_scans(
-    plan: &crate::planner::logical::LogicalPlanNode,
-    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
-    scans: &mut Vec<JoinBaseScan>,
-) {
-    if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
-        && let crate::planner::table::ScanSource::Sql(source) = &scan.table.source
-        && source.mv_occurrence == Some(base.occurrence_id)
-    {
-        scans.push(JoinBaseScan {
-            columns: scan.columns.clone(),
-        });
-    }
-    for child in &plan.children {
-        collect_base_scans(child, base, scans);
-    }
-}
-
-fn find_row_id_column(
-    scan: &JoinBaseScan,
-    role: &str,
-) -> Result<crate::analysis::OutputColumn, String> {
-    let column = find_unique_column(
-        &scan.columns,
-        crate::common::ICEBERG_ROW_ID_COL,
-        &format!("{role} row-id"),
-    )?;
-    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64 {
-        return Err(format!(
-            "join first-refresh {role} row-id has invalid shape"
-        ));
-    }
-    Ok(crate::analysis::OutputColumn {
-        name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-        is_internal: true,
-        ..column
-    })
-}
-
-fn join_key_pairs(
-    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: crate::compiler::SqlMvRelationOccurrenceId,
-    right: crate::compiler::SqlMvRelationOccurrenceId,
-    left_scan: &JoinBaseScan,
-    right_scan: &JoinBaseScan,
-) -> Result<Vec<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>, String>
-{
-    let join = snapshot
-        .schema_contract
-        .join
-        .as_ref()
-        .ok_or_else(|| "join first-refresh snapshot has no join contract".to_string())?;
-    join.predicates
-        .iter()
-        .map(|predicate| {
-            let (left_lineage, right_lineage) = if predicate.left.occurrence_id == left
-                && predicate.right.occurrence_id == right
-            {
-                (&predicate.left, &predicate.right)
-            } else if predicate.left.occurrence_id == right && predicate.right.occurrence_id == left
-            {
-                (&predicate.right, &predicate.left)
-            } else {
-                return Err(
-                    "join first-refresh predicate does not align with sealed bases".to_string(),
-                );
-            };
-            let left_name = base_field_name(snapshot, left, &left_lineage.field_id)?;
-            let right_name = base_field_name(snapshot, right, &right_lineage.field_id)?;
-            Ok(
-                crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
-                    left_column: find_unique_column(
-                        &left_scan.columns,
-                        &left_name,
-                        "left join key",
-                    )?,
-                    right_column: find_unique_column(
-                        &right_scan.columns,
-                        &right_name,
-                        "right join key",
-                    )?,
-                },
-            )
-        })
-        .collect()
-}
-
-fn base_field_name(
-    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    occurrence: crate::compiler::SqlMvRelationOccurrenceId,
-    field_id: &bytes::Bytes,
-) -> Result<String, String> {
-    snapshot
-        .schema_contract
-        .bases
-        .iter()
-        .find(|base| base.occurrence_id == occurrence)
-        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
-        .map(|field| field.name_at_create.clone())
-        .ok_or_else(|| {
-            format!(
-                "join first-refresh lineage references unknown occurrence {} field {field_id:?}",
-                occurrence.get()
-            )
-        })
-}
-
-fn build_join_descriptor(
-    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: &novarocks_types::naming::TableIdentity,
-    right: &novarocks_types::naming::TableIdentity,
-    payload_columns: Vec<crate::analysis::OutputColumn>,
-    left_row_id_column: crate::analysis::OutputColumn,
-    right_row_id_column: crate::analysis::OutputColumn,
-    action_column: crate::analysis::OutputColumn,
-    join_apply_key_column: crate::analysis::OutputColumn,
-    join_key_pairs: Vec<
-        crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair,
-    >,
-) -> Result<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor, String> {
-    use crate::planner::imv_rewrite::join_refresh_descriptor as descriptor;
-    let mut output_mappings = payload_columns
-        .iter()
-        .map(|column| descriptor::JoinRefreshOutputMapping {
-            mv_output_column: column.clone(),
-            source: descriptor::JoinRefreshOutputSource::Payload(column.column_id),
-        })
-        .collect::<Vec<_>>();
-    output_mappings.push(descriptor::JoinRefreshOutputMapping {
-        mv_output_column: join_apply_key_column.clone(),
-        source: descriptor::JoinRefreshOutputSource::JoinApplyKey(join_apply_key_column.column_id),
-    });
-    output_mappings.push(descriptor::JoinRefreshOutputMapping {
-        mv_output_column: action_column.clone(),
-        source: descriptor::JoinRefreshOutputSource::Action(action_column.column_id),
-    });
-    Ok(descriptor::JoinRefreshDescriptor {
-        left_occurrence_id: join_base_snapshots(snapshot)?.0.occurrence_id,
-        right_occurrence_id: join_base_snapshots(snapshot)?.1.occurrence_id,
-        mode: descriptor::JoinRefreshMode::Full,
-        mv_identity: descriptor::JoinRefreshMvIdentity {
-            catalog: snapshot.target.catalog.clone(),
-            database: snapshot.target.namespace.clone(),
-            name: snapshot.target.table.clone(),
-        },
-        left_base_fqn: left.fqn(),
-        right_base_fqn: right.fqn(),
-        left_row_id_column,
-        right_row_id_column,
-        action_column,
-        join_apply_key_column,
-        payload_columns,
-        join_key_pairs,
-        output_mappings,
-        branches: Vec::new(),
-        needs_target_locator: false,
-    })
-}
-
-fn find_unique_column(
-    columns: &[crate::analysis::OutputColumn],
-    name: &str,
-    role: &str,
-) -> Result<crate::analysis::OutputColumn, String> {
-    let matches = columns
-        .iter()
-        .filter(|column| column.name.eq_ignore_ascii_case(name))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [column] => Ok((*column).clone()),
-        [] => Err(format!(
-            "join first-refresh cannot find {role} column {name}"
-        )),
-        _ => Err(format!(
-            "join first-refresh found multiple {role} columns named {name}"
-        )),
-    }
-}
-
-fn project_item(column: &crate::analysis::OutputColumn) -> crate::analysis::ProjectItem {
-    crate::analysis::ProjectItem {
-        expr: crate::analysis::TypedExpr {
-            kind: crate::analysis::ExprKind::ColumnRef {
-                column_id: column.column_id,
-                qualifier: None,
-                column: column.name.clone(),
-            },
-            value_type: column.value_type.clone(),
-        },
-        output_name: column.name.clone(),
-        output_column_id: column.column_id,
-    }
-}
-
-fn output_column(
-    column_id: crate::column_id::ColumnId,
-    name: &str,
-    data_type: arrow::datatypes::DataType,
-    nullable: bool,
-    is_internal: bool,
-) -> crate::analysis::OutputColumn {
-    crate::analysis::OutputColumn {
-        column_id,
-        name: name.to_string(),
-        value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-
-        is_internal,
-    }
-}
-
-fn reserve_factory_for_plan(
-    factory: &mut crate::column_id::ColumnRefFactory,
-    plan: &crate::planner::logical::LogicalPlanNode,
-) -> Result<(), String> {
-    let mut max_id = crate::planner::plan_output_columns(plan)?
-        .iter()
-        .map(|column| column.column_id.0)
-        .max()
-        .unwrap_or(0);
-    for child in &plan.children {
-        max_id = max_id.max(max_plan_column_id(child)?);
-    }
-    factory.reserve_until(max_id.saturating_add(1));
-    Ok(())
-}
-
-fn max_plan_column_id(plan: &crate::planner::logical::LogicalPlanNode) -> Result<u32, String> {
-    let mut max_id = crate::planner::plan_output_columns(plan)?
-        .iter()
-        .map(|column| column.column_id.0)
-        .max()
-        .unwrap_or(0);
-    for child in &plan.children {
-        max_id = max_id.max(max_plan_column_id(child)?);
-    }
-    Ok(max_id)
 }
 
 impl MvFirstRefreshPhysicalQuery {
@@ -2308,7 +1567,6 @@ impl MvFirstRefreshTargetContract {
             || field_ids.iter().any(|field_id| *field_id <= 0)
             || field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len()
             || partition_spec_id < 0
-            || hidden_hash_key.is_empty()
         {
             return Err("invalid MV first-refresh target physical contract".to_string());
         }
@@ -2353,11 +1611,12 @@ impl MvFirstRefreshTargetContract {
                 "MV first-refresh target physical contract drifted after preparation".to_string(),
             );
         }
-        if !self
-            .schema
-            .fields()
-            .iter()
-            .any(|field| field.name() == &self.hidden_hash_key)
+        if !self.hidden_hash_key.is_empty()
+            && !self
+                .schema
+                .fields()
+                .iter()
+                .any(|field| field.name() == &self.hidden_hash_key)
         {
             return Err(
                 "MV first-refresh target contract has no hidden hash key field".to_string(),
@@ -2513,19 +1772,11 @@ impl SqlMvFirstRefreshArtifactBuilder {
             }
         };
         validate_root_distribution(
-            &RootDistributionRequirement::ShuffleOutputName(
-                physical.root_hash_column().to_string(),
-            ),
+            &first_refresh_distribution(physical.root_hash_column()),
             physical.root_hash_column(),
             self.target_contract.hidden_hash_key(),
         )?;
         physical.captured_sources = self.pin.uses_captured_sources();
-        physical.view_row_lineage = physical.captured_sources
-            && matches!(
-                self.shape,
-                SqlMvFirstRefreshArtifactShape::Projection
-                    | SqlMvFirstRefreshArtifactShape::UnionProjection { .. }
-            );
         Ok(physical)
     }
 }
@@ -2572,7 +1823,7 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),
-            root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            root_hash_column: String::new(),
         },
     ))
 }
@@ -2594,7 +1845,7 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),
-            root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            root_hash_column: String::new(),
         },
     ))
 }
@@ -3136,65 +2387,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn join_first_refresh_row_id_retains_exact_source_nullability() {
-        for nullable in [false, true] {
-            let column = output_column(
-                crate::column_id::ColumnId(7),
-                "_row_id",
-                DataType::Int64,
-                nullable,
-                false,
-            );
-            let scan = JoinBaseScan {
-                columns: vec![column.clone()],
-            };
-            let actual = find_row_id_column(&scan, "left").unwrap();
-            assert_eq!(actual.column_id, column.column_id);
-            assert_eq!(actual.name, column.name);
-            assert_eq!(actual.value_type, column.value_type);
-            assert!(actual.is_internal);
-        }
-    }
-
-    #[test]
-    fn join_first_refresh_row_id_still_requires_unique_int64_source() {
-        let column = output_column(
-            crate::column_id::ColumnId(7),
-            "_row_id",
-            DataType::Utf8,
-            true,
-            false,
-        );
-        assert_eq!(
-            find_row_id_column(
-                &JoinBaseScan {
-                    columns: vec![column]
-                },
-                "left"
-            )
-            .unwrap_err(),
-            "join first-refresh left row-id has invalid shape"
-        );
-        let column = output_column(
-            crate::column_id::ColumnId(7),
-            "_row_id",
-            DataType::Int64,
-            true,
-            false,
-        );
-        assert!(
-            find_row_id_column(
-                &JoinBaseScan {
-                    columns: vec![column.clone(), column]
-                },
-                "left"
-            )
-            .unwrap_err()
-            .contains("multiple left row-id columns")
-        );
-    }
-
     type FinalJoinFirstRefreshCompile =
         fn(
             SqlMvJoinFirstRefreshAnalyzed,
@@ -3553,7 +2745,7 @@ mod tests {
                     let ScanSource::Sql(source) = &scan.table.source;
                     assert!(!matches!(
                         source.kind,
-                        SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+                        SqlScanKind::MvContentTarget { .. } | SqlScanKind::MvTargetState { .. }
                     ));
                     if matches!(source.kind, SqlScanKind::Delta { .. }) {
                         *sources += 1;
@@ -3716,6 +2908,93 @@ mod tests {
     }
 
     #[test]
+    fn content_application_routes_positions_and_leaves_insert_lineage_fresh() {
+        use crate::common::{
+            CHANGE_OP_COLUMN, ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL,
+            ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
+        };
+        use crate::optimizer::operator::{ContentApplyOp, Operator};
+        use arrow::datatypes::{DataType, Fields};
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        use novarocks_type_contract::FunctionValueType;
+
+        let mut file = incremental_column(2, ICEBERG_FILE_PATH_COL);
+        file.value_type = FunctionValueType::new(DataType::Utf8, true);
+        let mut spec = incremental_column(4, "_spec_id");
+        spec.value_type = FunctionValueType::new(DataType::Int32, true);
+        let mut partition = incremental_column(5, "_partition");
+        partition.value_type = FunctionValueType::new(DataType::Struct(Fields::empty()), true);
+        let mut action = incremental_column(6, CHANGE_OP_COLUMN);
+        action.value_type = FunctionValueType::new(DataType::Int8, false);
+        let columns = vec![
+            incremental_column(1, "k"),
+            file,
+            incremental_column(3, ICEBERG_ROW_POS_COL),
+            spec,
+            partition,
+            action,
+        ];
+        let mut content = incremental_producer(columns.clone());
+        content.op = Operator::PhysicalContentApply(ContentApplyOp {
+            route_keys: Box::from([0]),
+            demand_keys: Box::new([]),
+            output_columns: columns,
+        });
+        let producer = add_join_incremental_change_stream_effect(
+            content,
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::RowDelta,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("content application binds the managed writer layout");
+        assert_eq!(
+            producer
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "k",
+                ICEBERG_ROW_ID_COL,
+                ICEBERG_LAST_UPDATED_SEQ_COL,
+                ICEBERG_FILE_PATH_COL,
+                ICEBERG_ROW_POS_COL,
+                "_spec_id",
+                "_partition",
+                crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
+            ],
+        );
+        assert_eq!(
+            incremental_events(&producer),
+            [
+                ConnectorRowMutationEffect::Delete,
+                ConnectorRowMutationEffect::Insert
+            ],
+        );
+        let Operator::PhysicalChangeEventExpand(expand) = &producer.op else {
+            unreachable!("incremental_events verified the expansion");
+        };
+        for column in &producer.output_columns[1..3] {
+            assert_eq!(
+                column.value_type,
+                FunctionValueType::new(DataType::Int64, true)
+            );
+            assert!(expand.events.iter().all(|event| {
+                event
+                    .assignments
+                    .iter()
+                    .all(|assignment| assignment.output_column_id != column.column_id)
+            }));
+        }
+        for locator in &producer.output_columns[3..7] {
+            assert!(expand.events[0].assignments.iter().any(|assignment| {
+                assignment.output_column_id == locator.column_id && assignment.expr.is_some()
+            }));
+        }
+    }
+
+    #[test]
     fn join_incremental_terminal_rejects_incomplete_route_facts() {
         let error = validate_join_incremental_routes(&[])
             .expect_err("no admitted route must fail closed before planning");
@@ -3765,118 +3044,6 @@ mod tests {
                 .unwrap_err()
                 .contains("no join contract")
         );
-    }
-
-    #[test]
-    fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
-        let child_output = crate::analysis::OutputColumn {
-            column_id: crate::column_id::ColumnId(42),
-            name: "child_k".to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-
-            is_internal: false,
-        };
-        let root_output = crate::analysis::OutputColumn {
-            column_id: crate::column_id::ColumnId(6),
-            name: "root_k".to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-
-            is_internal: false,
-        };
-        let child = crate::planner::logical::LogicalPlanNode::new(
-            crate::planner::logical::LogicalPlanKind::Values(
-                crate::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: vec![child_output.clone()],
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        let plan = crate::planner::logical::LogicalPlanNode::new(
-            crate::planner::logical::LogicalPlanKind::Project(
-                crate::planner::payload::PlanProjectNode {
-                    items: vec![crate::analysis::ProjectItem {
-                        expr: crate::analysis::TypedExpr {
-                            kind: crate::analysis::ExprKind::ColumnRef {
-                                column_id: child_output.column_id,
-                                qualifier: None,
-                                column: child_output.name.clone(),
-                            },
-                            value_type: child_output.value_type.clone(),
-                        },
-                        output_name: root_output.name.clone(),
-                        output_column_id: root_output.column_id,
-                    }],
-                    output_qualifier: None,
-                },
-            ),
-            vec![child],
-            None,
-        );
-        let mut factory = crate::column_id::ColumnRefFactory::new();
-        let ids = allocate_join_incremental_locator_column_ids(&mut factory, &plan)
-            .expect("allocate locator column ids");
-        let allocated = [
-            ids.net,
-            ids.file,
-            ids.pos,
-            ids.row_id,
-            ids.last_updated_sequence_number,
-        ];
-        assert!(allocated.iter().all(|id| *id > child_output.column_id.0));
-        assert_eq!(
-            allocated
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            allocated.len()
-        );
-    }
-
-    #[test]
-    fn join_coalesce_locator_factory_metadata_stays_registered() {
-        let plan = crate::planner::logical::LogicalPlanNode::new(
-            crate::planner::logical::LogicalPlanKind::Values(
-                crate::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: vec![crate::analysis::OutputColumn {
-                        column_id: crate::column_id::ColumnId(109),
-                        name: "payload".to_string(),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Int64,
-                            false,
-                        ),
-
-                        is_internal: false,
-                    }],
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        let mut factory = crate::column_id::ColumnRefFactory::new();
-        let ids = allocate_join_incremental_locator_column_ids(&mut factory, &plan)
-            .expect("allocate locator column ids");
-        for (id, name, data_type, nullable) in [
-            (ids.net, "net", DataType::Int64, false),
-            (ids.file, "_file", DataType::Utf8, true),
-            (ids.pos, "_pos", DataType::Int64, true),
-            (ids.row_id, "_row_id", DataType::Int64, true),
-            (
-                ids.last_updated_sequence_number,
-                "_last_updated_sequence_number",
-                DataType::Int64,
-                true,
-            ),
-        ] {
-            let metadata = factory.get(crate::column_id::ColumnId(id));
-            assert!(!metadata.name.starts_with("__reserved_col_"));
-            assert_eq!(metadata.name, name);
-            assert_eq!(metadata.value_type.data_type().clone(), data_type);
-            assert_eq!(metadata.value_type.nullable(), nullable);
-        }
     }
 
     #[test]
@@ -4030,16 +3197,11 @@ mod tests {
     }
 
     fn projection_target_contract() -> MvFirstRefreshTargetContract {
-        let hidden_key = crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
         MvFirstRefreshTargetContract::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                hidden_key,
-                DataType::Utf8,
-                false,
-            )])),
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
             vec![1],
             0,
-            hidden_key.to_string(),
+            String::new(),
         )
         .expect("valid projection target contract")
     }
@@ -4067,10 +3229,7 @@ mod tests {
         .unwrap()
         .build()
         .unwrap();
-        assert_eq!(
-            projection.root_hash_column(),
-            crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
-        );
+        assert!(projection.root_hash_column().is_empty());
 
         let union = SqlMvFirstRefreshArtifactBuilder::try_new(
             parse_query(union_sql),
@@ -4083,10 +3242,7 @@ mod tests {
         .unwrap()
         .build()
         .unwrap();
-        assert_eq!(
-            union.root_hash_column(),
-            crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
-        );
+        assert!(union.root_hash_column().is_empty());
 
         let aggregate = SqlMvFirstRefreshArtifactBuilder::try_new(
             parse_query(aggregate_sql),
@@ -4202,7 +3358,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_keeps_pinned_hidden_apply_key_for_writer_distribution() {
+    fn projection_writes_only_visible_columns_at_the_exact_pin() {
         let prepared = prepare_projection_first_refresh_write_sql(
             &parse_query("SELECT v FROM ice.db.fact"),
             &pin(),
@@ -4210,13 +3366,10 @@ mod tests {
             "db",
         )
         .unwrap();
-        assert_eq!(
-            prepared.root_hash_column(),
-            crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
-        );
+        assert!(prepared.root_hash_column().is_empty());
         use ast::SyntaxEq;
         assert!(prepared.query().syntax_eq(&parse_query(
-            "SELECT v, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 42",
+            "SELECT v FROM ice.db.fact FOR VERSION AS OF 42",
         )));
     }
 

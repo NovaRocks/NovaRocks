@@ -33,6 +33,7 @@ use crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 pub(crate) enum TargetReadRequirement {
     #[default]
     ExistingRows,
+    ContentRows,
     /// Every emitted event is an Insert; old target locators are typed NULL.
     NewOutputRowsOnly,
 }
@@ -41,7 +42,6 @@ pub(crate) enum TargetReadRequirement {
 /// returned to the refresh driver via `ImvRewriteOutcome.annotation`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImvPlanAnnotation {
-    pub target_read: TargetReadRequirement,
     /// Partition derivation outcome. `None` means the derivation stage did
     /// not run or did not match (non-aggregate shapes in P1, or the rule was
     /// disabled via `disable_optimizer_rules`).
@@ -82,7 +82,6 @@ mod tests {
     fn default_annotation_has_no_partition_outcome() {
         let annotation = ImvPlanAnnotation::default();
         assert!(annotation.partition.is_none());
-        assert!(annotation.change_stream.join_refresh.is_none());
     }
 
     #[test]

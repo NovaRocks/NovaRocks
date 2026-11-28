@@ -1188,6 +1188,7 @@ mod tests {
                 operators,
                 &allowed,
                 CompiledProgramFacts {
+                    input_completion: novarocks_local_program::InputCompletion::MayShortCircuit,
                     writes: base.write_recipes().clone(),
                     exchange_inputs: base.exchange_inputs().clone(),
                     scan_inputs: base.scan_inputs().clone(),

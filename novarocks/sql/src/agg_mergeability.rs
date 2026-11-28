@@ -82,7 +82,7 @@ pub(crate) fn scalar_aggregate_mergeability(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<AggMergeability, crate::compiler::SqlCompileError> {
     let binding = call.source.binding();
-    if call.distinct || !call.source.order_by().is_empty() {
+    if call.distinct || !call.source.order_by().is_empty() || binding.selected.aggregate.is_none() {
         return Ok(AggMergeability::SinglePhaseOnly);
     }
     if let Some(eligible) = approx_distinct_split_eligibility(call, arena, control)? {

@@ -107,7 +107,12 @@ fn install_controlled_io(request: &mut novarocks_fs::FileReadRequest) -> Arc<Con
 #[test]
 fn cancelled_before_open_returns_cancelled() {
     let fixture = Fixture::parquet();
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.context.cancellation.cancel();
     assert_eq!(open_error(request).kind(), FileErrorKind::Cancelled);
 }
@@ -115,7 +120,12 @@ fn cancelled_before_open_returns_cancelled() {
 #[test]
 fn cancellation_during_metadata_io_returns_cancelled() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     let io = install_controlled_io(&mut request);
     io.arm_cancel();
     assert_eq!(open_error(request).kind(), FileErrorKind::Cancelled);
@@ -125,7 +135,12 @@ fn cancellation_during_metadata_io_returns_cancelled() {
 #[test]
 fn cancellation_after_open_before_buffered_decode_returns_cancelled() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     let io = install_controlled_io(&mut request);
     let mut reader = open_file_reader(request).expect("open reader");
     // The Parquet session may already hold the next run's input at open.
@@ -143,7 +158,12 @@ fn cancellation_after_open_before_buffered_decode_returns_cancelled() {
 #[test]
 fn deadline_is_checked_after_remote_io() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     request.context.deadline = Some(Instant::now() + Duration::from_millis(5));
     let io = install_controlled_io(&mut request);
     io.set_delay(Duration::from_millis(20));
@@ -154,7 +174,7 @@ fn deadline_is_checked_after_remote_io() {
 fn close_is_idempotent() {
     let fixture = Fixture::parquet();
     let mut reader = open_file_reader(fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::All,
         1024,
         1024 * 1024,
@@ -168,7 +188,12 @@ fn close_is_idempotent() {
 #[test]
 fn terminal_reader_starts_no_new_io() {
     let fixture = Fixture::parquet();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1024,
+        1024 * 1024,
+    );
     let io = install_controlled_io(&mut request);
     let mut reader = open_file_reader(request).expect("open reader");
     reader.close().expect("close");

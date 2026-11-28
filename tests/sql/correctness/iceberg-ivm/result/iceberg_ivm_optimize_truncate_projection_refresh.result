@@ -53,7 +53,7 @@ delete	replace	true	true	true
 
 -- query 28
 -- types	boolean	boolean	boolean
-direct_child	new_publication	changed_files
+exact_publication_chain	new_publication	changed_files
 true	true	true
 
 -- query 29

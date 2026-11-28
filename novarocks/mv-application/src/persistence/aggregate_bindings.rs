@@ -988,13 +988,13 @@ mod tests {
                     },
                 ],
             },
-            apply_key: RuntimeApplyKeyFacts {
+            apply_key: Some(RuntimeApplyKeyFacts {
                 kind: ApplyKeyKind::GroupRowId,
                 ordered_components: vec![RuntimeApplyKeyComponentFacts {
                     logical_id: apply_id,
                     target_field_id: apply_field,
                 }],
-            },
+            }),
             definition_branch_identities: Vec::new(),
             branches: Vec::new(),
             target: RuntimeTargetFacts {

@@ -696,7 +696,7 @@ fn actual_wide_empty_metadata_constructor_fits_original_work_envelope() {
     t.field_facts.reserve_exact(64 * 1024);
     let source = source_bytes(&t);
     assert!(source > 2 * 1024 * 1024);
-    let structural = TypeProjectionLimits::for_validated_source_root_count(401).unwrap();
+    let structural = TypeProjectionLimits::INPUT_DERIVED;
     let mut limit = limits();
     limit.max_definitions = structural.max_definitions;
     limit.max_expanded_nodes = structural.max_expanded_nodes;

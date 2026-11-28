@@ -268,6 +268,7 @@ fn body_slot_reuse_does_not_return_preparation_capacity_before_whole_exit_and_co
 struct ReentrantDrop {
     queue: std::sync::Weak<Queue>,
     drops: Arc<AtomicUsize>,
+    expected_origin: novarocks_memory::lane::RecordRef,
 }
 impl CreationContent for ReentrantDrop {
     fn encoded_len(&self) -> usize {
@@ -287,6 +288,20 @@ impl Drop for ReentrantDrop {
             queue.state.try_lock().is_ok(),
             "opaque input disposal must not hold the queue lock"
         );
+        use novarocks_memory::attribution::AttributingAllocator;
+        use std::alloc::{GlobalAlloc, Layout, System};
+
+        let allocator = AttributingAllocator::new(System);
+        let layout = Layout::from_size_align(600, 8).unwrap();
+        // Observe the exact request's tagged tail before the original free.
+        let origin = unsafe {
+            let block = allocator.alloc(layout);
+            assert!(!block.is_null());
+            let origin = novarocks_memory::lane::RecordRef::read(block.add(layout.size()));
+            allocator.dealloc(block, layout);
+            origin
+        };
+        assert_eq!(origin, self.expected_origin);
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -296,17 +311,31 @@ fn queued_cancel_and_refused_start_dispose_the_original_input_outside_queue_lock
     let scope = fixture.scope();
     let queue = PreparationQueue::new(2, 2, 1);
     let drops = Arc::new(AtomicUsize::new(0));
-    let create_input = || {
+    use novarocks_memory::{
+        AccountKind, AuthorityConfig, ExternalRef, LaneShards, MemoryAuthority,
+    };
+    let authority = MemoryAuthority::new(AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29)).unwrap();
+    let account = || {
+        authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap()
+    };
+    let owner_a = account().create_lane_shards();
+    let owner_b = account().create_lane_shards();
+    let create_input = |owner: &LaneShards| {
         TaskCreationInput::new(
             FrozenBytes::freeze(Bytes::new()),
             Box::new(ReentrantDrop {
                 queue: Arc::downgrade(&queue.0),
                 drops: drops.clone(),
+                expected_origin: owner.explicit_owner().reference().unwrap(),
             }),
         )
     };
-    let (a, job_a) = fixture.admitted(&scope, 1, create_input());
-    let (b, job_b) = fixture.admitted(&scope, 2, create_input());
+    let (a, mut job_a) = fixture.admitted(&scope, 1, create_input(&owner_a));
+    job_a.set_memory_observation(Some(owner_a.clone()));
+    let (b, mut job_b) = fixture.admitted(&scope, 2, create_input(&owner_b));
+    job_b.set_memory_observation(Some(owner_b.clone()));
     let key = job_a.key();
     queue
         .enqueue(job_a)
@@ -317,13 +346,10 @@ fn queued_cancel_and_refused_start_dispose_the_original_input_outside_queue_lock
     let canceled = queue.cancel(key.0, key.1).unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(!a.publish_whole_exit().unwrap());
-    assert!(canceled.dispose());
+    assert!(owner_b.run(|| canceled.dispose()));
     scope.request_stop().unwrap();
-    match queue
-        .pop()
-        .unwrap()
-        .run(|_, _| panic!("stopped queued work cannot start"))
-    {
+    let refused = queue.pop().unwrap();
+    match owner_a.run(|| refused.run(|_, _| panic!("stopped queued work cannot start"))) {
         PreparationOutcome::StartRefused(RuntimeError::Scope(
             novarocks_control_runtime_core::scope::ScopeError::Stopped,
         )) => {}

@@ -239,6 +239,7 @@ impl Fixture {
             function(9, wire::FunctionKind::Aggregate, vec![arg(1)]),
         ];
         let aggregates = vec![wire::AggregateBindingDefinition {
+            state_capability: wire::AggregateStateCapability::Mergeable as i32,
             state_interpretation: None,
             id: u32::MAX,
             function_binding_id: Some(9),
@@ -1107,6 +1108,7 @@ fn owned_expression_unit_enters_actual_sparse_fragment_construction() {
     let input = p::FragmentStructureInput {
         summaries: Box::default(),
         stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
         id: p::FragmentId::new(0),
         root: node,
         values: BTreeMap::from([(

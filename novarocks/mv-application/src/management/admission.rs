@@ -72,15 +72,18 @@ impl MvCurrentManagementAdmission {
     }
 }
 
+use super::name_lifecycle::NameLifecycle;
 use super::observation::{
     FreshCreateIntentObservation, ManagementObservationAuthorization,
     ManagementObservationLiveness, PendingCreateIntentObservation,
 };
 use super::{
     CreateIntent, CreateIntentResponsibility, DeploymentOwner, EffectDisposition, EffectIdentity,
-    EffectResponsibility, EffectScope, ManagedMvTarget, ManagementContinuation,
+    EffectResponsibility, EffectScope, ManagedMvTarget, ManagementClock, ManagementContinuation,
     ManagementObservationError, ManagementObservationPhase, ManagementObservationState,
-    ProcessIncarnation, UnsettledEffect,
+    ManagementTimestamp, NameStartupGrace, NameStartupGraceEnd, NameStartupGraceObservation,
+    ProcessIncarnation, RemoteEffectPolicy, StartupIsolationEvidence, SystemManagementClock,
+    UnsettledEffect,
 };
 
 /// Fresh deletion-only preparation for an already installed exact target.
@@ -347,11 +350,13 @@ struct EntranceInner {
     owner: DeploymentOwner,
     incarnation: ProcessIncarnation,
     activity: MvActivityGate,
+    names: Mutex<NameLifecycle>,
     state: Mutex<HashMap<ConnectorTableIdentity, TargetAdmissionState>>,
     unbound_create: Mutex<HashMap<ConnectorTableIdentity, CreateIntentResponsibility>>,
 }
 
 struct TargetAdmissionState {
+    is_aggregate: bool,
     target: ManagedMvTarget,
     dependencies: ManagementDependencySet,
     unsettled: HashMap<super::EffectIdentity, UnsettledEffect>,
@@ -368,16 +373,148 @@ struct TargetAdmissionState {
     owner_mismatch: bool,
 }
 
+impl TargetAdmissionState {
+    fn can_retire_after_startup_name_absence(&self, catalog: &CatalogHandle) -> bool {
+        self.target.catalog() == catalog
+            && !self.is_aggregate
+            && self.unsettled.is_empty()
+            && self.pending_slot_changes.is_empty()
+            && self.pending_committed_effect.is_none()
+            && matches!(
+                self.pending_continuation.as_ref(),
+                None | Some(ManagementContinuation::SameOwner { .. })
+            )
+            && self.pending_observation.is_none()
+            && self.retired_drop_slots.is_none()
+            && !self.incarnation_mismatch
+            && !self.owner_mismatch
+    }
+}
+
 impl ManagementEntrance {
     pub fn new(owner: DeploymentOwner, incarnation: ProcessIncarnation) -> Self {
+        Self::with_name_lifecycle(
+            owner,
+            incarnation,
+            None,
+            RemoteEffectPolicy::default(),
+            Arc::new(SystemManagementClock),
+        )
+    }
+
+    pub fn new_starting(
+        owner: DeploymentOwner,
+        incarnation: ProcessIncarnation,
+        started_at: ManagementTimestamp,
+        policy: RemoteEffectPolicy,
+        clock: Arc<dyn ManagementClock>,
+    ) -> Self {
+        Self::with_name_lifecycle(owner, incarnation, Some(started_at), policy, clock)
+    }
+
+    fn with_name_lifecycle(
+        owner: DeploymentOwner,
+        incarnation: ProcessIncarnation,
+        started_at: Option<ManagementTimestamp>,
+        policy: RemoteEffectPolicy,
+        clock: Arc<dyn ManagementClock>,
+    ) -> Self {
         Self {
             inner: Arc::new(EntranceInner {
                 owner,
                 incarnation,
                 activity: MvActivityGate::new(),
+                names: Mutex::new(NameLifecycle::new(started_at, policy, clock)),
                 state: Mutex::new(HashMap::new()),
                 unbound_create: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    pub fn note_startup_incarnation(&self, previous: &ProcessIncarnation) {
+        if previous != &self.inner.incarnation {
+            lock(&self.inner.names).note_discovery(Some(previous.clone()));
+        }
+    }
+
+    pub fn note_incomplete_startup_discovery(&self) {
+        lock(&self.inner.names).note_discovery(None);
+    }
+
+    pub fn finish_startup_discovery(&self, catalogs_available: bool) {
+        lock(&self.inner.names).finish_discovery(catalogs_available);
+    }
+
+    pub fn accept_name_startup_declaration(&self, evidence: &StartupIsolationEvidence) {
+        lock(&self.inner.names).accept_declaration(evidence, self.owner(), self.incarnation());
+    }
+
+    pub fn name_startup_observation(&self) -> NameStartupGraceObservation {
+        lock(&self.inner.names).observe(self.incarnation())
+    }
+
+    pub fn take_name_startup_transition(&self) -> Option<NameStartupGraceObservation> {
+        lock(&self.inner.names).take_transition(self.incarnation())
+    }
+
+    /// The DROP owner calls this before capturing even an absent table.
+    pub fn check_name_startup_grace(&self) -> Result<(), ManagementAdmissionError> {
+        check_name_startup_grace(&self.inner)
+    }
+
+    pub fn check_name_isolation(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Result<(), ManagementAdmissionError> {
+        if lock(&self.inner.names).isolated(table) {
+            Err(ManagementAdmissionError::NameIsolated)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Capture the original unresolved DROP identity before observing its exact name.
+    pub fn unresolved_named_drop(
+        &self,
+        catalog: &CatalogHandle,
+        table: &ConnectorTableIdentity,
+    ) -> Option<EffectIdentity> {
+        lock(&self.inner.names)
+            .unresolved_drop(catalog, table)
+            .map(|(effect, _)| effect)
+    }
+
+    /// Exact absence settles the named DROP only. It confers no object cleanup authority.
+    pub fn observe_named_drop_absence(
+        &self,
+        catalog: &CatalogHandle,
+        table: &ConnectorTableIdentity,
+        observed_effect: EffectIdentity,
+    ) {
+        let mut names = lock(&self.inner.names);
+        let Some((effect, object_id)) = names.unresolved_drop(catalog, table) else {
+            return;
+        };
+        if effect != observed_effect {
+            return;
+        }
+        let object_id = object_id.clone();
+        names.settle(
+            catalog,
+            table,
+            observed_effect,
+            EffectDisposition::KnownCommitted,
+        );
+        let mut states = lock(&self.inner.state);
+        if states.get(table).is_some_and(|state| {
+            state.target.catalog() == catalog && state.target.object_id() == &object_id
+        }) {
+            let retired = states
+                .remove(table)
+                .expect("same exact admission under lock");
+            if let Some(observation) = retired.installed_observation {
+                observation.close();
+            }
         }
     }
 
@@ -651,6 +788,8 @@ impl ManagementEntrance {
             keyed_documents::{MV_DOCUMENT_OWNER, decode_keyed_drop_documents},
         };
         let error = |message: &str| MvDocumentError::Contract(message.into());
+        self.check_name_startup_grace()
+            .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
         let view = lease.observe_keyed_documents_async(request.clone()).await?;
         let documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
         if !documents.retired || documents.owner != self.inner.owner {
@@ -685,6 +824,7 @@ impl ManagementEntrance {
         let current = state
             .entry(view.table.clone())
             .or_insert_with(|| TargetAdmissionState {
+                is_aggregate: true,
                 target: documents.target.clone(),
                 dependencies: dependencies.clone(),
                 unsettled: HashMap::new(),
@@ -761,6 +901,8 @@ impl ManagementEntrance {
         request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<(), crate::persistence::documents::MvDocumentError> {
         use crate::persistence::documents::MvDocumentError;
+        self.check_name_startup_grace()
+            .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
         let states = lock(&self.inner.state);
         let current = states.get(&request.target).ok_or_else(|| {
             MvDocumentError::Contract("MV DROP target has not been admitted".into())
@@ -845,7 +987,7 @@ impl ManagementEntrance {
         use crate::persistence::{
             documents::MvDocumentError,
             keyed_documents::{
-                decode_current_keyed_documents, observe_current_keyed_view_with_management,
+                observe_current_keyed_view_with_management, resolve_current_keyed_documents,
             },
         };
         let control = lease.control_runtime_id();
@@ -856,7 +998,7 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog)?;
+        let documents = resolve_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())
@@ -919,10 +1061,50 @@ impl ManagementEntrance {
         ),
         crate::persistence::documents::MvDocumentError,
     > {
+        self.observe_keyed_admission_async_inner(lease, request, None)
+            .await
+    }
+
+    /// Renew an already admitted target only from the expected provider Current
+    /// while the entrance still holds the caller's previously admitted dependencies.
+    pub async fn observe_exact_keyed_admission_async(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        expected: &novarocks_spi::connector::KeyedDocumentView,
+        previous: &ManagementDependencySet,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+            SlotChangeConvergence,
+        ),
+        crate::persistence::documents::MvDocumentError,
+    > {
+        self.observe_keyed_admission_async_inner(lease, request, Some((expected, previous)))
+            .await
+    }
+
+    async fn observe_keyed_admission_async_inner(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        exact: Option<(
+            &novarocks_spi::connector::KeyedDocumentView,
+            &ManagementDependencySet,
+        )>,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+            SlotChangeConvergence,
+        ),
+        crate::persistence::documents::MvDocumentError,
+    > {
         use crate::persistence::{
             documents::MvDocumentError,
             keyed_documents::{
-                decode_current_keyed_documents, observe_current_keyed_view_with_management_async,
+                observe_current_keyed_view_with_management_async, resolve_current_keyed_documents,
             },
         };
         let control = lease.control_runtime_id();
@@ -934,7 +1116,12 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog)?;
+        if exact.is_some_and(|(expected, _)| expected != &view) {
+            return Err(MvDocumentError::Contract(
+                "keyed observation Current differs from the expected view".into(),
+            ));
+        }
+        let documents = resolve_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())
@@ -974,6 +1161,11 @@ impl ManagementEntrance {
             .ok_or_else(|| {
                 MvDocumentError::Contract("keyed observation target admission is closed".into())
             })?;
+        if exact.is_some_and(|(_, previous)| previous != &current.dependencies) {
+            return Err(MvDocumentError::Contract(
+                "keyed observation previously admitted dependencies changed".into(),
+            ));
+        }
         current.dependencies = documents.management_dependencies(control);
         let admission = MvCurrentManagementAdmission {
             target: documents.management_target.clone(),
@@ -993,12 +1185,22 @@ impl ManagementEntrance {
         &self.inner.incarnation
     }
 
-    /// Installs only a state that completed effect closure, exact
-    /// re-observation and owner/incarnation registration.
+    #[cfg(test)]
     pub fn install_observed_target(
         &self,
         observation: &ManagementObservationState,
         dependencies: ManagementDependencySet,
+    ) -> Result<MvCurrentManagementAdmission, ManagementAdmissionError> {
+        self.install_observed_target_with_kind(observation, dependencies, true)
+    }
+
+    /// Installs only a state that completed effect closure, exact
+    /// re-observation and owner/incarnation registration.
+    pub fn install_observed_target_with_kind(
+        &self,
+        observation: &ManagementObservationState,
+        dependencies: ManagementDependencySet,
+        is_aggregate: bool,
     ) -> Result<MvCurrentManagementAdmission, ManagementAdmissionError> {
         if observation.phase() != ManagementObservationPhase::Ready {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
@@ -1057,6 +1259,7 @@ impl ManagementEntrance {
         state.insert(
             observation.target().table().clone(),
             TargetAdmissionState {
+                is_aggregate,
                 target: observation.target().clone(),
                 dependencies,
                 unsettled: HashMap::new(),
@@ -1087,7 +1290,9 @@ impl ManagementEntrance {
         let current = state
             .get_mut(table)
             .ok_or(ManagementObservationError::ObservationNotAllowed)?;
-        if current.unsettled.is_empty() || current.pending_committed_effect.is_some() {
+        if (current.unsettled.is_empty() && (current.is_aggregate || current.ready))
+            || current.pending_committed_effect.is_some()
+        {
             return Err(ManagementObservationError::ObservationNotAllowed);
         }
         if current.pending_continuation.as_ref() != Some(&continuation) {
@@ -1109,6 +1314,51 @@ impl ManagementEntrance {
             None,
             Some(authorization),
         )
+    }
+
+    /// Retain D14 evidence from the exact non-aggregate readmission owner.
+    /// The keyed provider observation, rather than aggregate effect closure,
+    /// decides whether the incarnation slot is registered.
+    pub fn retain_unknown_incarnation_registration(
+        &self,
+        observation: &ManagementObservationState,
+        responsibility: &EffectResponsibility,
+        evidence: novarocks_spi::connector::UnknownCommitEvidence,
+    ) -> Result<(), ManagementAdmissionError> {
+        use crate::persistence::keyed_documents::management_slot_name;
+        use novarocks_spi::connector::UnknownCommitIdentity;
+
+        if !matches!(
+            observation.phase(),
+            ManagementObservationPhase::RegistrationRequired(_)
+        ) || responsibility.target() != observation.target()
+            || responsibility.scope() != EffectScope::CATALOG_COMMIT
+            || responsibility.dispatching_incarnation() != self.incarnation()
+            || evidence.preselected_snapshot <= 0
+            || !matches!(&evidence.identity, UnknownCommitIdentity::SlotWriter { slot }
+                if management_slot_name().is_ok_and(|expected| slot == &expected))
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        let mut states = lock(&self.inner.state);
+        let state = states
+            .get_mut(observation.target().table())
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+        if state.target != *observation.target()
+            || state.is_aggregate
+            || state.ready
+            || state.pending_observation.is_none()
+            || !matching_authorization(
+                state.pending_observation.as_ref(),
+                observation.authorization(),
+            )
+        {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        state
+            .pending_slot_changes
+            .insert(responsibility.identity(), evidence);
+        Ok(())
     }
 
     /// Starts the mandatory exact re-observation after a successful external
@@ -1149,6 +1399,76 @@ impl ManagementEntrance {
         )
     }
 
+    /// Bring a rediscovered non-aggregate target into the original readmission
+    /// path without generating a legacy cross-incarnation effect barrier.
+    pub fn recover_non_aggregate_target(
+        &self,
+        target: ManagedMvTarget,
+        previous_incarnation: ProcessIncarnation,
+    ) -> Result<(), ManagementObservationError> {
+        if previous_incarnation == self.inner.incarnation {
+            return Err(ManagementObservationError::InvalidRecoveryBarrier);
+        }
+        let mut states = lock(&self.inner.state);
+        if states.contains_key(target.table()) {
+            return Err(ManagementObservationError::ObservationAlreadyPending);
+        }
+        let table = target.table().clone();
+        states.insert(
+            table,
+            TargetAdmissionState {
+                is_aggregate: false,
+                target,
+                dependencies: ManagementDependencySet::new(
+                    [0; 32],
+                    [0; 32],
+                    None,
+                    ConnectorControlRuntimeId::from_bytes([0; 16]),
+                ),
+                unsettled: HashMap::new(),
+                pending_slot_changes: HashMap::new(),
+                latest_slot_change_conclusion: None,
+                pending_committed_effect: None,
+                pending_continuation: Some(ManagementContinuation::SameOwner {
+                    previous_incarnation,
+                }),
+                pending_observation: None,
+                installed_observation: None,
+                retired_drop_slots: None,
+                ready: false,
+                incarnation_mismatch: false,
+                owner_mismatch: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// The original continuation may re-observe this non-aggregate target
+    /// with no readmission permits. The authorization remains single-use.
+    pub fn non_aggregate_reobservation(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Option<ProcessIncarnation> {
+        let states = lock(&self.inner.state);
+        let state = states.get(table)?;
+        if state.is_aggregate
+            || state.ready
+            || state.owner_mismatch
+            || state.incarnation_mismatch
+            || !state.unsettled.is_empty()
+            || state.pending_committed_effect.is_some()
+            || state.pending_observation.is_some()
+        {
+            return None;
+        }
+        match state.pending_continuation.as_ref()? {
+            ManagementContinuation::SameOwner {
+                previous_incarnation,
+            } => Some(previous_incarnation.clone()),
+            ManagementContinuation::OwnerHandover { .. } => None,
+        }
+    }
+
     /// Establish the conservative barrier used after process reconstruction.
     /// No durable attempt ledger is loaded: the caller supplies one barrier
     /// covering every operation path that the isolated old incarnation could
@@ -1186,6 +1506,7 @@ impl ManagementEntrance {
         state.insert(
             target.table().clone(),
             TargetAdmissionState {
+                is_aggregate: true,
                 target: target.clone(),
                 dependencies: ManagementDependencySet::new(
                     [0; 32],
@@ -1260,6 +1581,9 @@ impl ManagementEntrance {
         request: ManagementRequest,
         owner: MvActivityOwner,
     ) -> Result<ManagementEntranceTicket, ManagementAdmissionError> {
+        if is_name_operation(request.operation) {
+            check_name_startup_grace(&self.inner)?;
+        }
         let activity_target = CanonicalMvTarget::from_parts(
             Some(request.table.instance_id.as_str()),
             &request.table.namespace,
@@ -1303,6 +1627,57 @@ impl ManagementEntrance {
             .acquire_waiting_async(cancelled)
             .await?
             .ok_or(ManagementAdmissionError::Cancelled)
+    }
+
+    /// A successor CREATE may need to confirm the exact current name after
+    /// startup isolation settles previous process effects.
+    pub async fn acquire_create_async(
+        &self,
+        request: ManagementRequest,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ManagementCreateAdmission, ManagementAdmissionError> {
+        if request.create_intent.is_none() {
+            return Err(ManagementAdmissionError::InvalidRequest);
+        }
+        let mut ticket = self.request(request, MvActivityOwner::Create)?;
+        let activity = ticket
+            .activity
+            .acquire_waiting_async(cancelled)
+            .await?
+            .ok_or(ManagementAdmissionError::Cancelled)?;
+        let request = ticket
+            .request
+            .take()
+            .ok_or(ManagementAdmissionError::InvalidRequest)?;
+        let admission = ManagementEntranceObligation {
+            entrance: Arc::downgrade(&self.inner),
+            request,
+            activity: Some(activity),
+            dispatched: None,
+        };
+        match validate_request_against_state(&self.inner, &admission.request) {
+            Ok(()) => Ok(ManagementCreateAdmission::Ready(admission)),
+            Err(ManagementAdmissionError::TargetAlreadyExists)
+                if matches!(
+                    lock(&self.inner.names).state(),
+                    NameStartupGrace::Ended(
+                        NameStartupGraceEnd::Lifetime | NameStartupGraceEnd::Declaration
+                    )
+                ) =>
+            {
+                let target = lock(&self.inner.state)
+                    .get(&admission.request.table)
+                    .filter(|state| {
+                        state.can_retire_after_startup_name_absence(&admission.request.catalog)
+                    })
+                    .map(|state| state.target.clone())
+                    .ok_or(ManagementAdmissionError::TargetAlreadyExists)?;
+                Ok(ManagementCreateAdmission::ObserveName(
+                    ManagementCreateNameObservationObligation { admission, target },
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Acquire one automatic action through the same FIFO as every other MV
@@ -1389,6 +1764,18 @@ impl ManagementEntrance {
             return MvManagementPhase::Managing;
         }
         MvManagementPhase::Manageable
+    }
+
+    /// Freeze the dependencies of an existing entrance before observing
+    /// provider Current. The later exact renewal still checks liveness and
+    /// compares this value under the management lock.
+    pub fn dependencies_for_current_renewal(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Option<ManagementDependencySet> {
+        lock(&self.inner.state)
+            .get(table)
+            .map(|current| current.dependencies.clone())
     }
 
     /// Close this process's admission when a provider Current observation of
@@ -1544,37 +1931,31 @@ impl ManagementEntrance {
         }
     }
 
-    /// Convert a fresh, matching observation of a previously unbound CREATE
-    /// into the same exact Unknown responsibility used by normal readmission.
-    /// The original operation id, scope, incarnation, and dispatch timestamp
-    /// are retained; this does not invent a new create attempt.
+    /// Narrow a lost stage response to its observed exact object. Object
+    /// presence alone does not attribute the final CREATE publication.
     pub fn resolve_unbound_create_as_unknown(
         &self,
         observation: FreshCreateIntentObservation,
     ) -> Result<ManagedMvTarget, ManagementAdmissionError> {
         let (intent, target) = observation.into_parts();
-        let responsibility = {
-            let unbound = lock(&self.inner.unbound_create);
-            match unbound.get(intent.table()) {
-                Some(responsibility) if responsibility.intent() == &intent => {
-                    responsibility.clone()
-                }
-                _ => return Err(ManagementAdmissionError::ReadmissionIncomplete),
-            }
-        };
+        let mut unbound = lock(&self.inner.unbound_create);
+        let responsibility = unbound
+            .get(intent.table())
+            .filter(|responsibility| responsibility.intent() == &intent)
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
         let exact = responsibility
             .clone()
             .late_bind(target.clone())
             .map_err(|_| ManagementAdmissionError::TargetReplaced)?;
-        let removed = lock(&self.inner.unbound_create).remove(intent.table());
-        if removed.as_ref() != Some(&responsibility) {
+        if !lock(&self.inner.names).bind_create(
+            target.catalog(),
+            target.table(),
+            exact.identity(),
+            target.object_id(),
+        ) {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
         }
-        let weak = Arc::downgrade(&self.inner);
-        if let Err(error) = record_unsettled(&weak, exact) {
-            lock(&self.inner.unbound_create).insert(intent.table().clone(), responsibility);
-            return Err(error);
-        }
+        unbound.remove(intent.table());
         Ok(target)
     }
 }
@@ -1670,6 +2051,58 @@ pub struct ManagementEntranceObligation {
     dispatched: Option<DispatchedEffect>,
 }
 
+pub enum ManagementCreateAdmission {
+    Ready(ManagementEntranceObligation),
+    ObserveName(ManagementCreateNameObservationObligation),
+}
+
+/// Holds the original CREATE's exclusive activity turn through a fresh name
+/// observation. Dropping the obligation releases the turn without dispatch.
+pub struct ManagementCreateNameObservationObligation {
+    admission: ManagementEntranceObligation,
+    target: ManagedMvTarget,
+}
+
+impl ManagementCreateNameObservationObligation {
+    pub fn target(&self) -> &ManagedMvTarget {
+        &self.target
+    }
+
+    /// The original metadata owner observed the exact name absent. Retire
+    /// only the stale local admission. No effect receives a conclusion here.
+    pub fn admit_after_observed_absence(
+        self,
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
+        let entrance = self
+            .admission
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        check_name_startup_grace(&entrance)?;
+        {
+            let names = lock(&entrance.names);
+            if names.isolated(self.target.table()) {
+                return Err(ManagementAdmissionError::NameIsolated);
+            }
+            let mut state = lock(&entrance.state);
+            if let Some(current) = state.get(self.target.table()) {
+                if current.target != self.target {
+                    return Err(ManagementAdmissionError::TargetReplaced);
+                }
+                if !current.can_retire_after_startup_name_absence(self.target.catalog()) {
+                    return Err(ManagementAdmissionError::ReadmissionIncomplete);
+                }
+                if let Some(observation) = &current.installed_observation {
+                    observation.close();
+                }
+                state.remove(self.target.table());
+            }
+        }
+        validate_request_against_state(&entrance, &self.admission.request)?;
+        Ok(self.admission)
+    }
+}
+
 enum DispatchedEffect {
     Exact(EffectResponsibility),
     CreateIntent(CreateIntentResponsibility),
@@ -1758,6 +2191,8 @@ impl ManagementEntranceObligation {
                 }
             }
         }
+        drop(state);
+        register_name_effect(&entrance, &self.request, responsibility.identity())?;
         self.dispatched = Some(DispatchedEffect::Exact(responsibility));
         Ok(())
     }
@@ -1797,6 +2232,7 @@ impl ManagementEntranceObligation {
         {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
         }
+        register_name_effect(&entrance, &self.request, responsibility.identity())?;
         unbound.insert(intent.table().clone(), responsibility.clone());
         self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
         Ok(())
@@ -1812,7 +2248,7 @@ impl ManagementEntranceObligation {
             .entrance
             .upgrade()
             .ok_or(ManagementAdmissionError::EntranceDropped)?;
-        let Some(DispatchedEffect::CreateIntent(intent_responsibility)) = self.dispatched.take()
+        let Some(DispatchedEffect::CreateIntent(intent_responsibility)) = self.dispatched.as_ref()
         else {
             return Err(ManagementAdmissionError::EffectNotDispatched);
         };
@@ -1822,7 +2258,7 @@ impl ManagementEntranceObligation {
             .map_err(|_| ManagementAdmissionError::TargetReplaced)?;
         let mut unbound = lock(&entrance.unbound_create);
         match unbound.get(intent_responsibility.intent().table()) {
-            Some(current) if current == &intent_responsibility => {
+            Some(current) if current == intent_responsibility => {
                 unbound.remove(intent_responsibility.intent().table());
             }
             _ => return Err(ManagementAdmissionError::ReadmissionIncomplete),
@@ -1924,14 +2360,86 @@ impl ManagementEntranceObligation {
         {
             return Err(ManagementAdmissionError::InvalidEffect);
         }
-        record_unsettled_with_evidence(
+        if !self.exact_non_aggregate_target(responsibility)? {
+            record_unknown_effect_with_evidence(
+                &self.entrance,
+                responsibility.clone(),
+                Some(super::PublicationRecoveryEvidence {
+                    original: original.without_process_local_payload(),
+                    observation,
+                }),
+            )?;
+        }
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+
+    /// The durable marker protocol owns late effects for non-aggregate
+    /// refreshes. Release only this exact local update's admission.
+    pub fn defer_content_marker_observation(
+        mut self,
+        original: &novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<(), ManagementAdmissionError> {
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if self.request.operation != ConnectorDocumentManagementOperation::SingleTargetUpdate
+            || responsibility.identity().to_bytes() != original.operation_id().to_bytes()
+            || responsibility.target().table().instance_id != original.descriptor().instance_id
+            || original.operation_kind() != "keyed-documents"
+            || !self.exact_non_aggregate_target(responsibility)?
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+
+    fn exact_non_aggregate_target(
+        &self,
+        original: &EffectResponsibility,
+    ) -> Result<bool, ManagementAdmissionError> {
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let states = lock(&entrance.state);
+        let current = states
+            .get(&self.request.table)
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+        if current.target != *original.target() {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        Ok(!current.is_aggregate)
+    }
+
+    /// An original staged-publication adjudication releases the name
+    /// reservation and requires exact committed Current convergence.
+    pub fn observe_applied_create_name(
+        &mut self,
+        receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
+    ) -> Result<(), ManagementAdmissionError> {
+        use novarocks_spi::connector::{ConnectorStagedCreateReceiptPhase, ExternalMutationEffect};
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if self.request.operation != ConnectorDocumentManagementOperation::Create
+            || receipt.owner().instance_id != self.request.table.instance_id
+            || receipt.phase() != ConnectorStagedCreateReceiptPhase::Published
+            || receipt.effect() != ExternalMutationEffect::Applied
+            || receipt.operation_id().to_bytes() != responsibility.identity().to_bytes()
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        record_committed(&self.entrance, responsibility.clone())?;
+        settle_name_effect(
             &self.entrance,
-            responsibility.clone(),
-            Some(super::PublicationRecoveryEvidence {
-                original: original.without_process_local_payload(),
-                observation,
-            }),
-        )?;
+            &self.request,
+            responsibility.identity(),
+            EffectDisposition::KnownCommitted,
+        );
         self.dispatched.take();
         self.activity.take();
         Ok(())
@@ -1960,35 +2468,48 @@ impl ManagementEntranceObligation {
         let responsibility = match dispatched {
             DispatchedEffect::Exact(responsibility) => responsibility,
             DispatchedEffect::CreateIntent(responsibility) => {
-                if disposition == EffectDisposition::KnownUncommitted {
-                    let entrance = self
-                        .entrance
-                        .upgrade()
-                        .ok_or(ManagementAdmissionError::EntranceDropped)?;
-                    let removed =
-                        lock(&entrance.unbound_create).remove(responsibility.intent().table());
-                    if removed.as_ref() != Some(&responsibility) {
-                        return Err(ManagementAdmissionError::ReadmissionIncomplete);
-                    }
-                    self.activity.take();
-                    return Ok(());
+                let entrance = self
+                    .entrance
+                    .upgrade()
+                    .ok_or(ManagementAdmissionError::EntranceDropped)?;
+                let mut unbound = lock(&entrance.unbound_create);
+                if unbound.get(responsibility.intent().table()) != Some(&responsibility) {
+                    self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
+                    return Err(ManagementAdmissionError::ReadmissionIncomplete);
                 }
-                // The physical target is still unknown. Preserve the
-                // unbound responsibility on Drop and require an exact
-                // provider observation before any terminal other than abort.
-                self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
-                return Err(ManagementAdmissionError::CreateTargetNotBound);
+                match disposition {
+                    EffectDisposition::KnownCommitted => {
+                        self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
+                        return Err(ManagementAdmissionError::CreateTargetNotBound);
+                    }
+                    EffectDisposition::KnownUncommitted => {
+                        unbound.remove(responsibility.intent().table());
+                    }
+                    EffectDisposition::CommitUnknown => {}
+                }
+                settle_name_effect(
+                    &self.entrance,
+                    &self.request,
+                    responsibility.identity(),
+                    disposition,
+                );
+                self.activity.take();
+                return Ok(());
             }
         };
+        let identity = responsibility.identity();
         match disposition {
             EffectDisposition::KnownCommitted => {
                 record_committed(&self.entrance, responsibility)?;
             }
             EffectDisposition::KnownUncommitted => {}
             EffectDisposition::CommitUnknown => {
-                record_unsettled(&self.entrance, responsibility)?;
+                if self.request.operation != ConnectorDocumentManagementOperation::Create {
+                    record_unknown_effect(&self.entrance, responsibility)?;
+                }
             }
         }
+        settle_name_effect(&self.entrance, &self.request, identity, disposition);
         self.activity.take();
         Ok(())
     }
@@ -2020,9 +2541,15 @@ impl ManagementEntranceObligation {
             }
             EffectDisposition::KnownUncommitted => {}
             EffectDisposition::CommitUnknown => {
-                record_unsettled(&self.entrance, responsibility.clone())?;
+                record_unknown_drop(&self.entrance, responsibility.clone())?;
             }
         }
+        settle_name_effect(
+            &self.entrance,
+            &self.request,
+            responsibility.identity(),
+            disposition,
+        );
         self.dispatched.take();
         self.activity.take();
         Ok(())
@@ -2071,6 +2598,7 @@ fn record_committed(
     let table = responsibility.target().table().clone();
     let mut state = lock(&entrance.state);
     let target = state.entry(table).or_insert_with(|| TargetAdmissionState {
+        is_aggregate: true,
         target: responsibility.target().clone(),
         dependencies: ManagementDependencySet::new(
             [0; 32],
@@ -2112,12 +2640,29 @@ impl Drop for ManagementEntranceObligation {
         if let Some(dispatched) = self.dispatched.take() {
             match dispatched {
                 DispatchedEffect::Exact(responsibility) => {
-                    let _ = record_unsettled(&self.entrance, responsibility);
+                    settle_name_effect(
+                        &self.entrance,
+                        &self.request,
+                        responsibility.identity(),
+                        EffectDisposition::CommitUnknown,
+                    );
+                    match self.request.operation {
+                        ConnectorDocumentManagementOperation::Create => {}
+                        ConnectorDocumentManagementOperation::Drop => {
+                            let _ = record_unknown_drop(&self.entrance, responsibility);
+                        }
+                        _ => {
+                            let _ = record_unknown_effect(&self.entrance, responsibility);
+                        }
+                    }
                 }
-                DispatchedEffect::CreateIntent(_) => {
-                    // The unbound intent was registered before the provider
-                    // call. Leaving it in place is the conservative Unknown
-                    // barrier until an exact target can be observed and bound.
+                DispatchedEffect::CreateIntent(responsibility) => {
+                    settle_name_effect(
+                        &self.entrance,
+                        &self.request,
+                        responsibility.identity(),
+                        EffectDisposition::CommitUnknown,
+                    );
                 }
             }
         }
@@ -2133,6 +2678,8 @@ pub enum ManagementAdmissionError {
     TargetReplaced,
     DependencyChanged,
     EffectUnsettled,
+    StartupGrace { state: NameStartupGrace },
+    NameIsolated,
     ReadmissionIncomplete,
     InvalidEffect,
     EffectNotDispatched,
@@ -2150,6 +2697,22 @@ impl fmt::Display for ManagementAdmissionError {
             Self::TargetReplaced => "MV target generation changed",
             Self::DependencyChanged => "MV dependencies changed during preparation",
             Self::EffectUnsettled => "a prior external effect may still change this MV",
+            Self::StartupGrace {
+                state: NameStartupGrace::Discovering,
+            } => "MV name operations are unavailable while startup discovery is in progress",
+            Self::StartupGrace {
+                state: NameStartupGrace::Active { until: Some(until) },
+            } => {
+                return write!(
+                    formatter,
+                    "MV name operations are isolated until {} Unix milliseconds or a deployment settlement declaration",
+                    until.as_unix_millis()
+                );
+            }
+            Self::StartupGrace { .. } => {
+                "MV name operations require a deployment settlement declaration"
+            }
+            Self::NameIsolated => "an unresolved CREATE or DROP still isolates this MV name",
             Self::ReadmissionIncomplete => "MV management readmission is incomplete",
             Self::InvalidEffect => "external effect does not match its management admission",
             Self::EffectNotDispatched => "external effect was not marked dispatched",
@@ -2161,6 +2724,110 @@ impl fmt::Display for ManagementAdmissionError {
 }
 
 impl std::error::Error for ManagementAdmissionError {}
+
+impl novarocks_failure_contract::FailureProjection for ManagementAdmissionError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        use std::num::NonZeroU16;
+
+        let (class, code) = match self {
+            Self::StartupGrace { .. } => (FailureClass::Dependency, 938),
+            Self::NameIsolated => (FailureClass::Dependency, 939),
+            Self::Stopping | Self::Cancelled => {
+                return FailureFact::stop_observation(FailureReason::new(
+                    domain::METADATA,
+                    NonZeroU16::new(940).unwrap(),
+                ));
+            }
+            Self::InvalidRequest => (FailureClass::Data, 941),
+            Self::TargetAlreadyExists
+            | Self::TargetReplaced
+            | Self::DependencyChanged
+            | Self::EffectUnsettled
+            | Self::ReadmissionIncomplete => (FailureClass::Dependency, 942),
+            Self::InvalidEffect
+            | Self::EffectNotDispatched
+            | Self::CreateTargetNotBound
+            | Self::EntranceDropped => (FailureClass::Invariant, 943),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::METADATA, NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
+impl ManagementAdmissionError {
+    pub const fn is_retryable_name_admission(self) -> bool {
+        matches!(self, Self::StartupGrace { .. } | Self::NameIsolated)
+    }
+}
+
+fn is_name_operation(operation: ConnectorDocumentManagementOperation) -> bool {
+    matches!(
+        operation,
+        ConnectorDocumentManagementOperation::Create | ConnectorDocumentManagementOperation::Drop
+    )
+}
+
+fn check_name_startup_grace(entrance: &EntranceInner) -> Result<(), ManagementAdmissionError> {
+    match lock(&entrance.names).state() {
+        NameStartupGrace::Ended(_) => Ok(()),
+        state => Err(ManagementAdmissionError::StartupGrace { state }),
+    }
+}
+
+fn register_name_effect(
+    entrance: &EntranceInner,
+    request: &ManagementRequest,
+    identity: EffectIdentity,
+) -> Result<(), ManagementAdmissionError> {
+    if is_name_operation(request.operation) {
+        check_name_startup_grace(entrance)?;
+        if !lock(&entrance.names).register(
+            &request.catalog,
+            &request.table,
+            request.expected_object_id.as_ref(),
+            identity,
+            request.effect_scope,
+            request.operation,
+        ) {
+            return Err(ManagementAdmissionError::NameIsolated);
+        }
+    }
+    Ok(())
+}
+
+fn settle_name_effect(
+    entrance: &Weak<EntranceInner>,
+    request: &ManagementRequest,
+    identity: EffectIdentity,
+    disposition: EffectDisposition,
+) {
+    if is_name_operation(request.operation)
+        && let Some(entrance) = entrance.upgrade()
+    {
+        lock(&entrance.names).settle(&request.catalog, &request.table, identity, disposition);
+    }
+}
+
+fn record_unknown_drop(
+    entrance: &Weak<EntranceInner>,
+    responsibility: EffectResponsibility,
+) -> Result<(), ManagementAdmissionError> {
+    let original = entrance
+        .upgrade()
+        .ok_or(ManagementAdmissionError::EntranceDropped)?;
+    let non_aggregate = lock(&original.state)
+        .get(responsibility.target().table())
+        .is_some_and(|state| state.target == *responsibility.target() && !state.is_aggregate);
+    if non_aggregate {
+        // The name holds the lost DROP independently of other management.
+        Ok(())
+    } else {
+        record_unknown_effect(entrance, responsibility)
+    }
+}
 
 impl From<MvActivityAdmissionError> for ManagementAdmissionError {
     fn from(value: MvActivityAdmissionError) -> Self {
@@ -2183,8 +2850,16 @@ fn validate_request_against_state(
     entrance: &EntranceInner,
     request: &ManagementRequest,
 ) -> Result<(), ManagementAdmissionError> {
-    if lock(&entrance.unbound_create).contains_key(&request.table) {
-        return Err(ManagementAdmissionError::EffectUnsettled);
+    if is_name_operation(request.operation) {
+        check_name_startup_grace(entrance)?;
+        {
+            let mut names = lock(&entrance.names);
+            if names.isolated(&request.table) {
+                return Err(ManagementAdmissionError::NameIsolated);
+            }
+            names.expire_create(&request.table);
+        }
+        lock(&entrance.unbound_create).remove(&request.table);
     }
     let mut state = lock(&entrance.state);
     match request.operation {
@@ -2248,14 +2923,14 @@ fn activity_owner(operation: ConnectorDocumentManagementOperation) -> MvActivity
     }
 }
 
-fn record_unsettled(
+fn record_unknown_effect(
     entrance: &Weak<EntranceInner>,
     responsibility: EffectResponsibility,
 ) -> Result<(), ManagementAdmissionError> {
-    record_unsettled_with_evidence(entrance, responsibility, None)
+    record_unknown_effect_with_evidence(entrance, responsibility, None)
 }
 
-fn record_unsettled_with_evidence(
+fn record_unknown_effect_with_evidence(
     entrance: &Weak<EntranceInner>,
     responsibility: EffectResponsibility,
     publication_recovery: Option<super::PublicationRecoveryEvidence>,
@@ -2264,16 +2939,9 @@ fn record_unsettled_with_evidence(
         .upgrade()
         .ok_or(ManagementAdmissionError::EntranceDropped)?;
     let table = responsibility.target().table().clone();
-    let mut unknown = match responsibility
-        .clone()
-        .record_terminal(EffectDisposition::CommitUnknown)
-    {
-        super::EffectTerminalFact::CommitUnknown(unknown) => unknown,
-        _ => unreachable!("explicit CommitUnknown always yields an unsettled effect"),
-    };
-    unknown.publication_recovery = publication_recovery;
     let mut state = lock(&entrance.state);
     let target = state.entry(table).or_insert_with(|| TargetAdmissionState {
+        is_aggregate: true,
         target: responsibility.target().clone(),
         dependencies: ManagementDependencySet::new(
             [0; 32],
@@ -2306,10 +2974,19 @@ fn record_unsettled_with_evidence(
     });
     target.pending_observation = None;
     target.installed_observation = None;
-    target
-        .unsettled
-        .entry(responsibility.identity())
-        .or_insert(unknown);
+    if target.is_aggregate {
+        let super::EffectTerminalFact::CommitUnknown(mut unknown) = responsibility
+            .clone()
+            .record_terminal(EffectDisposition::CommitUnknown)
+        else {
+            unreachable!("CommitUnknown yields an unsettled effect");
+        };
+        unknown.publication_recovery = publication_recovery;
+        target
+            .unsettled
+            .entry(responsibility.identity())
+            .or_insert(unknown);
+    }
     Ok(())
 }
 

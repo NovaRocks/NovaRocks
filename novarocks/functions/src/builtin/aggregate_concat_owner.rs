@@ -386,21 +386,15 @@ impl ConcatOwner {
                     "LISTAGG requires its five logical arguments in Single",
                 ));
             }
-            let original_order = contract
-                .state_interpretation()
-                .ok_or_else(|| invalid("LISTAGG requires its original state interpretation"))?;
+            let (ascending, nulls_first): (Vec<_>, Vec<_>) = contract
+                .order_keys()
+                .iter()
+                .map(|key| (key.ascending, key.nulls_first))
+                .unzip();
             work.flush().map_err(compile_failure)?;
             let prepared = Arc::new(ListaggKernel {
-                ascending: original_order
-                    .order_keys
-                    .iter()
-                    .map(|key| key.ascending)
-                    .collect(),
-                nulls_first: original_order
-                    .order_keys
-                    .iter()
-                    .map(|key| key.nulls_first)
-                    .collect(),
+                ascending: ascending.into_boxed_slice(),
+                nulls_first: nulls_first.into_boxed_slice(),
                 contract,
             });
             work.flush().map_err(compile_failure)?;

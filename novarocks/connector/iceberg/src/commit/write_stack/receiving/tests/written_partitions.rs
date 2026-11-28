@@ -36,11 +36,10 @@ use crate::iceberg::spec::{
 };
 use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
 
-fn register(metadata: &TableMetadata) -> IcebergReceiving {
+fn register(metadata: &TableMetadata, original: &RewrittenTargetBinding) -> IcebergReceiving {
     let mut receiving = IcebergReceiving::new(None);
-    let original = binding(metadata);
     receiving
-        .bind_rewritten_target(owner("unit", [1; 16]), original, metadata)
+        .bind_rewritten_target(owner("unit", [1; 16]), original.clone(), metadata)
         .unwrap();
     receiving
 }
@@ -101,8 +100,9 @@ fn receiving_freezes_partition_values_for_every_row_delta_artifact() {
         fragment.try_with_creation(receipt).unwrap()
     };
     let v3_query = write_query_identity();
-    let mut v3 = register(&metadata);
-    let fact = sealed(&metadata, binding(&metadata), owner("unit", [1; 16]));
+    let admitted = binding(&metadata);
+    let mut v3 = register(&metadata, &admitted);
+    let fact = sealed(&metadata, admitted.clone(), owner("unit", [1; 16]));
     v3.begin_query(
         v3_query,
         &v3_handle.expected_targets(),
@@ -217,7 +217,7 @@ fn receiving_freezes_partition_values_for_every_row_delta_artifact() {
     let recipe = fixed_delete_recipe(v2_handle.table());
     let v2_handle = v2_handle.with_mutation_read(recipe);
     let v2_query = write_query_identity();
-    let mut v2 = register(&metadata);
+    let mut v2 = register(&metadata, &admitted);
     let target = v2_handle
         .targets()
         .iter()

@@ -475,6 +475,14 @@ fn to_optimizer_expr_unchecked(
             OptExpr::new(op, vec![outer, inner])
         }
 
+        LogicalPlanKind::ContentApply(node) => {
+            let weighted = to_optimizer_expr_unchecked(plan.left(), scalars, work)?;
+            let target = to_optimizer_expr_unchecked(plan.right(), scalars, work)?;
+            OptExpr::new(
+                Operator::LogicalContentApply(node.clone()),
+                vec![weighted, target],
+            )
+        }
         LogicalPlanKind::ImvDelta(node) => {
             // ImvDelta wraps a child subtree (the base plan being rewritten).
             let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
@@ -665,6 +673,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
                 .collect(),
             columns: op.columns,
         }),
+        Operator::LogicalContentApply(op) => LogicalPlanKind::ContentApply(op),
         Operator::LogicalImvDelta(op) => LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
             is_root: op.is_root,
             action_column: op.action_column,

@@ -1044,7 +1044,7 @@ pub(crate) fn aggregate_node(
                         input_is_intermediate: intermediate,
                         types: None,
                         order,
-                        resolved: resolved_signature(owner),
+                        resolved: Some(resolved_signature(owner)),
                     }],
                     need_finalize: finalize,
                     input_is_intermediate: intermediate,
@@ -1249,7 +1249,9 @@ fn prepared_window_graph(frame: Option<WindowFrame>) -> Result<Fixture, LocalPro
                 functions: vec![StaticWindowFunction {
                     // This fixture declares a window-only prepared call.
                     frozen_aggregate: None,
-                    kind: WindowFunctionKind::Prepared,
+                    kind: WindowFunctionKind::Prepared {
+                        aggregate_order: None,
+                    },
                     args: vec![crate::test_support::root(0, 0)],
                     function_order_by: vec![],
                     state_interpretation: None,
@@ -1914,7 +1916,7 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
                             input_is_intermediate: false,
                             types: None,
                             order: StaticAggregateOrder::default(),
-                            resolved: resolved_signature(&owner),
+                            resolved: Some(resolved_signature(&owner)),
                         })
                         .collect(),
                     need_finalize: false,

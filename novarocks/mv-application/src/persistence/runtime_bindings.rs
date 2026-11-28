@@ -189,8 +189,8 @@ pub fn reconstruct_runtime_bindings(
         .collect::<Result<_, String>>()?;
     let apply_key = interpretation
         .apply_key
-        .components
         .iter()
+        .flat_map(|apply_key| &apply_key.components)
         .map(|component| {
             lookup(PhysicalFieldLogicalIdentity::ApplyKey(
                 component.logical_id.clone(),

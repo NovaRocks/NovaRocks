@@ -639,8 +639,7 @@ fn typed_map64_interning_and_cast_target_collisions_keep_logical_depth() {
         novarocks_type_contract::arrow_data_type_fingerprint_observed::<
             novarocks_type_contract::ValueTypeError,
         >(value.data_type(), &mut || Ok(()))
-        .is_err(),
-        "raw physical policy stays separate"
+        .is_ok(),
     );
     let mut arena = ScalarArena::new();
     let first = arena

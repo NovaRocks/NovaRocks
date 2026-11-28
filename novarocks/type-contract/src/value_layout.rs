@@ -25,8 +25,7 @@ use std::{
 use arrow_schema::{DataType, Field, Fields, UnionFields};
 
 use crate::{
-    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_FIELD_NAME_BYTES,
-    MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_NODES,
+    ArrowTypeDepth, ArrowTypeProfile,
     value_type::{ExecutionValueTypeError, ValueTypeStorageLifetime},
 };
 
@@ -390,19 +389,12 @@ fn preflight(
 fn preflight_field<E: From<ExecutionValueTypeError>>(
     field: &Field,
     role: Option<&str>,
-    named: bool,
     depth: ArrowTypeDepth,
     nodes: &mut usize,
     normalized: bool,
     observe: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<usize, E> {
     observe(1)?;
-    if named && field.name().len() > MAX_ARROW_FIELD_NAME_BYTES {
-        return Err(ExecutionValueTypeError::Invalid(
-            "value layout field name exceeds the byte limit",
-        )
-        .into());
-    }
     if normalized {
         if !field.metadata().is_empty() {
             return Err(ExecutionValueTypeError::Invalid(
@@ -454,15 +446,10 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             ArrowTypeProfile::Value
         })
         .map_err(|_| E::from(ExecutionValueTypeError::Depth))?;
-    // Preserve the existing source/layout occurrence budget. This counts
-    // physical DataTypes, including Map entries, independently of logical
-    // depth; changing that inherited policy belongs to its type owner.
+    // Count physical occurrences with checked arithmetic for source work.
     *nodes = nodes
         .checked_add(1)
         .ok_or_else(|| E::from(ExecutionValueTypeError::Nodes))?;
-    if *nodes > MAX_VALUE_TYPE_NODES {
-        return Err(ExecutionValueTypeError::Nodes.into());
-    }
     crate::validate_arrow_carrier_parameters_observed::<LayoutParameterFailure<E>>(
         data_type,
         || observe(1).map_err(LayoutParameterFailure::Caller),
@@ -476,18 +463,16 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             ExecutionValueTypeError::Invalid("invalid decimal value layout parameters"),
         ),
     })?;
-    let child =
-        |field: &Field, role: Option<&str>, named: bool, nodes: &mut usize, observe: &mut _| {
-            preflight_field(
-                field,
-                role,
-                named,
-                depth.value_child().map_err(ExecutionValueTypeError::from)?,
-                nodes,
-                normalized,
-                observe,
-            )
-        };
+    let child = |field: &Field, role: Option<&str>, nodes: &mut usize, observe: &mut _| {
+        preflight_field(
+            field,
+            role,
+            depth.value_child().map_err(ExecutionValueTypeError::from)?,
+            nodes,
+            normalized,
+            observe,
+        )
+    };
     let mut comparison_work = crate::schema::type_comparison_node_work(data_type)?;
     match data_type {
         DataType::List(item)
@@ -497,14 +482,14 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
         | DataType::FixedSizeList(item, _) => {
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
-                child(item, Some("item"), false, nodes, observe)?,
+                child(item, Some("item"), nodes, observe)?,
             )?
         }
         DataType::Struct(fields) => {
             for field in fields {
                 comparison_work = crate::schema::comparison_work_add(
                     comparison_work,
-                    child(field, None, true, nodes, observe)?,
+                    child(field, None, nodes, observe)?,
                 )?;
             }
         }
@@ -548,9 +533,6 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             *nodes = nodes
                 .checked_add(1)
                 .ok_or_else(|| E::from(ExecutionValueTypeError::Nodes))?;
-            if *nodes > MAX_VALUE_TYPE_NODES {
-                return Err(ExecutionValueTypeError::Nodes.into());
-            }
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
                 crate::schema::comparison_work_add(
@@ -567,7 +549,6 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 preflight_field(
                     &fields[0],
                     Some("key"),
-                    false,
                     entries_depth
                         .value_child()
                         .map_err(ExecutionValueTypeError::from)?,
@@ -581,7 +562,6 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 preflight_field(
                     &fields[1],
                     Some("value"),
-                    false,
                     entries_depth
                         .value_child()
                         .map_err(ExecutionValueTypeError::from)?,
@@ -595,7 +575,7 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             for (_, field) in fields.iter() {
                 comparison_work = crate::schema::comparison_work_add(
                     comparison_work,
-                    child(field, None, true, nodes, observe)?,
+                    child(field, None, nodes, observe)?,
                 )?;
             }
         }
@@ -643,7 +623,6 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 preflight_field(
                     ends,
                     None,
-                    false,
                     depth
                         .encoding_child()
                         .map_err(ExecutionValueTypeError::from)?,
@@ -657,7 +636,6 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 preflight_field(
                     values,
                     None,
-                    false,
                     depth
                         .encoding_child()
                         .map_err(ExecutionValueTypeError::from)?,
@@ -667,15 +645,7 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 )?,
             )?;
         }
-        DataType::Timestamp(_, Some(timezone)) => {
-            observe(1)?;
-            if timezone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
-                return Err(ExecutionValueTypeError::Invalid(
-                    "value layout timezone exceeds the byte limit",
-                )
-                .into());
-            }
-        }
+        DataType::Timestamp(_, Some(_)) => observe(1)?,
         _ => {}
     }
     Ok(comparison_work)
@@ -1156,14 +1126,7 @@ mod tests {
                         "values",
                         DataType::RunEndEncoded(
                             annotated("ends", DataType::Int32, false),
-                            annotated(
-                                "run_values",
-                                DataType::Dictionary(
-                                    Box::new(DataType::Int16),
-                                    Box::new(DataType::LargeUtf8),
-                                ),
-                                true,
-                            ),
+                            annotated("run_values", DataType::LargeUtf8, true),
                         ),
                         true,
                     )),
@@ -1222,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_and_oversized_source_shapes_are_refused_before_normalization() {
+    fn source_shape_checks_reject_invalid_and_overdeep_but_admit_wide() {
         let invalid_map = DataType::Map(
             annotated(
                 "entries",
@@ -1257,13 +1220,11 @@ mod tests {
             Err(ExecutionValueTypeError::Depth)
         ));
         let wide = DataType::Struct(
-            (0..MAX_VALUE_TYPE_NODES)
+            (0..4096)
                 .map(|_| Arc::new(Field::new("v", DataType::Int64, true)))
                 .collect(),
         );
-        assert!(matches!(
-            ValueLayout::try_new(&wide, ValueTypeStorageLifetime::pure()),
-            Err(ExecutionValueTypeError::Nodes)
-        ));
+        let layout = ValueLayout::try_new(&wide, ValueTypeStorageLifetime::pure()).unwrap();
+        assert_eq!(layout.data_type(), &wide);
     }
 }

@@ -959,6 +959,7 @@ impl OrderedOwner {
             )],
         )
         .unwrap();
+        selected.aggregate = None;
         Self {
             inner,
             declaration,
@@ -974,8 +975,7 @@ impl OrderedOwner {
             argument_types: vec![DataType::Int64, DataType::Int32],
             intermediate_type: DataType::Int64,
             output_type: DataType::Int64,
-            state_format: self
-                .selected
+            state_format: self.inner.selections[0]
                 .aggregate
                 .as_ref()
                 .unwrap()
@@ -1202,7 +1202,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         crate::test_support::root(0, 0),
         crate::test_support::root(0, 1),
     ];
-    functions[0].resolved = owner.signature();
+    functions[0].resolved = None;
     // The adapted call has an independently declared order channel. Publish
     // the actual ordered owner's complete selection, replacing the original
     // one-argument fixture owner together with the revised signature.

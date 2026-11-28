@@ -17,11 +17,9 @@
 
 //! Reopening this deployment's own targets after a restart.
 //!
-//! A restarted process closes management on every target its deployment owns
-//! but a previous incarnation wrote. Retiring those barriers one operator
-//! statement at a time does not scale, so the deployment may instead state
-//! once, in a file, that the previous writer is isolated. This pass is what
-//! turns that statement into readmissions.
+//! Non-aggregate targets use an exact SameOwner observation and slot
+//! registration. An accepted deployment isolation file may also enable
+//! aggregate readmission when the effect's guaranteed window has elapsed.
 //!
 //! It is a pass rather than a startup step because neither input is ready at
 //! any single moment. The statement can be written after this process is
@@ -31,18 +29,21 @@
 //! when it arrives. So the pass runs on the maintenance tick, does what it
 //! can, and leaves the rest closed.
 //!
-//! Nothing here decides what the old writer's effects did. A permit only
-//! allows the exact re-observation that finds out.
+//! The declaration can also end startup name grace when it explicitly
+//! states the deployment-wide settlement of all other incarnations.
 
 use std::future::Future;
 
 use novarocks_mv_application::management::{
-    ManagementClock, ManagementContinuationService, ManagementEntrance, StartupContinuation,
-    StartupIsolationEvidence, SystemManagementClock,
+    ManagementClock, ManagementContinuationService, ManagementEntrance, NameStartupGrace,
+    NameStartupGraceEnd, StartupContinuation, StartupIsolationEvidence, SystemManagementClock,
 };
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
 use crate::mv::startup_isolation_file::StartupIsolationSource;
+use crate::task_execution::blocking_io::{
+    ConnectorBlockingIoAdmission, ConnectorBlockingIoResponsibility, ConnectorBlockingIoSupervisor,
+};
 
 /// What one pass did, as an operator needs to see it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -103,8 +104,9 @@ fn accept_declaration(
 /// borrowed wait. No callback owns this receiving or its Root.
 #[derive(Default)]
 pub(crate) struct StartupContinuationReceiving {
+    file_admission: Option<(ConnectorBlockingIoAdmission, ConnectorBlockingIoSupervisor)>,
     input: Option<StartupIsolationSource>,
-    responsibility: Option<crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility>,
+    responsibility: Option<ConnectorBlockingIoResponsibility>,
     job: Option<
         crate::task_execution::blocking_io::ConnectorOperationJob<
             Result<
@@ -129,27 +131,36 @@ impl StartupContinuationReceiving {
     pub(crate) fn prepare_file_in(
         &mut self,
         source: &StartupIsolationSource,
-        blocking: &crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        blocking: &ConnectorBlockingIoSupervisor,
         scope: &novarocks_workload_control::WorkScope,
         window: &novarocks_workload_control::ResultWindowAlias,
     ) -> Result<(), novarocks_workload_control::WorkError> {
-        if self.job.is_some() || self.raw.is_some() {
+        if self.file_admission.is_some() || self.job.is_some() || self.raw.is_some() {
             return Err(novarocks_workload_control::WorkError::Conflict);
         }
-        self.responsibility = Some(
-            crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility::admit(
-                scope, window,
-            )?,
-        );
+        let admission = ConnectorBlockingIoResponsibility::request(scope, window)?;
         self.input = Some(source.clone());
-        blocking.prepare_blocking_owned_in(
-            self.responsibility.as_ref().unwrap(),
-            &mut self.input,
-            |original, _| Some(original.read()),
-            &mut self.job,
-        )
+        self.file_admission = Some((admission, blocking.clone()));
+        Ok(())
     }
     pub(crate) fn poll_progress(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if let Some((admission, _)) = self.file_admission.as_mut() {
+            let admitted = std::task::ready!(admission.poll_ready(cx));
+            let (_, blocking) = self.file_admission.take().unwrap();
+            let prepared = admitted.and_then(|responsibility| {
+                let responsibility = self.responsibility.insert(responsibility);
+                blocking.prepare_blocking_owned_in(
+                    responsibility,
+                    &mut self.input,
+                    |original, _| Some(original.read()),
+                    &mut self.job,
+                )
+            });
+            if let Err(error) = prepared {
+                drop(self.input.take());
+                tracing::warn!(%error, "MV startup continuation could not prepare its original file source");
+            }
+        }
         if self.raw.is_none()
             && let Some(job) = self.job.as_mut()
         {
@@ -195,34 +206,69 @@ fn startup_connector_failure(
     .with_original_failure(cause)
 }
 
+pub(crate) fn log_name_startup_transition(entrance: &ManagementEntrance) {
+    let Some(observation) = entrance.take_name_startup_transition() else {
+        return;
+    };
+    let (state, end_reason) = match observation.state {
+        NameStartupGrace::Discovering => ("discovering", ""),
+        NameStartupGrace::Active { .. } => ("active", ""),
+        NameStartupGrace::Ended(reason) => (
+            "ended",
+            match reason {
+                NameStartupGraceEnd::NoRestartEvidence => "no_restart_evidence",
+                NameStartupGraceEnd::Lifetime => "lifetime",
+                NameStartupGraceEnd::Declaration => "declaration",
+            },
+        ),
+    };
+    let prior_incarnations = observation
+        .prior_incarnations
+        .iter()
+        .map(|incarnation| incarnation.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::info!(
+        state,
+        incarnation = observation.incarnation.as_str(),
+        prior_incarnations,
+        discovery_complete = observation.discovery_complete,
+        end_reason,
+        "{}",
+        novarocks_failpoint::observation_marker::MV_NAME_STARTUP_GRACE
+    );
+}
+
 pub(crate) async fn run_startup_continuation_pass_async_in(
     entrance: &ManagementEntrance,
     continuation: &ManagementContinuationService,
     readiness: &super::readiness::MvReadinessExecution<'_>,
     connector_control: &dyn ConnectorControlResolver,
-    source: &StartupIsolationSource,
+    source: Option<&StartupIsolationSource>,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     factory: &super::staged_create::CurrentProjectionMetadataCpu,
     receiving: &mut StartupContinuationReceiving,
 ) -> StartupContinuationReport {
     std::future::poll_fn(|cx| receiving.poll_progress(cx)).await;
-    let declaration = match receiving.raw.as_ref() {
-        Some(Ok(Ok(Some(declaration)))) => declaration.clone(),
-        Some(Ok(Ok(None))) => return StartupContinuationReport::default(),
-        Some(Ok(Err(error))) => {
-            tracing::warn!(%error, "MV startup isolation evidence could not be read");
-            return StartupContinuationReport::default();
-        }
-        Some(Err(error)) => {
-            tracing::warn!(%error, "MV startup isolation evidence original file job failed");
-            return StartupContinuationReport::default();
-        }
-        None => unreachable!("original file result precedes pass policy"),
-    };
     let clock = SystemManagementClock;
-    let Some(evidence) = accept_declaration(continuation, source, declaration, &clock) else {
-        return StartupContinuationReport::default();
+    let evidence = match (source, receiving.raw.as_ref()) {
+        (Some(source), Some(Ok(Ok(Some(declaration))))) => {
+            accept_declaration(continuation, source, declaration.clone(), &clock)
+        }
+        (_, Some(Ok(Err(error)))) => {
+            tracing::warn!(%error, "MV startup isolation evidence could not be read");
+            None
+        }
+        (_, Some(Err(error))) => {
+            tracing::warn!(%error, "MV startup isolation evidence original file job failed");
+            None
+        }
+        _ => None,
     };
+    if let Some(evidence) = &evidence {
+        entrance.accept_name_startup_declaration(evidence);
+    }
+    log_name_startup_transition(entrance);
     let projections = match readiness
         .candidate_reader()
         .list_candidate_definitions_async()
@@ -237,7 +283,19 @@ pub(crate) async fn run_startup_continuation_pass_async_in(
     let mut report = StartupContinuationReport::default();
     for projection in projections {
         let revision = projection.facts.source_revision();
-        match continuation.resume_target_on_startup_isolation(&revision.target, &evidence, &clock) {
+        let decision = if let Some(previous_incarnation) =
+            entrance.non_aggregate_reobservation(&revision.target)
+        {
+            StartupContinuation::Ready {
+                previous_incarnation,
+                permits: Vec::new(),
+            }
+        } else if let Some(evidence) = &evidence {
+            continuation.resume_target_on_startup_isolation(&revision.target, evidence, &clock)
+        } else {
+            StartupContinuation::Nothing
+        };
+        match decision {
             StartupContinuation::Nothing => {}
             StartupContinuation::NotCovered => report.not_covered += 1,
             StartupContinuation::OperatorOnly => report.operator_only += 1,
