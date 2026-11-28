@@ -2969,6 +2969,7 @@ async fn mv_fixed_main_diagnoses_only_a_definite_same_object_advance() {
     for mode in [
         MvRefreshMode::Incremental,
         MvRefreshMode::MetadataOnly,
+        MvRefreshMode::PartitionReplace,
         MvRefreshMode::Repartition,
     ] {
         for (metadata, dispatch, loads, requests, advanced) in [

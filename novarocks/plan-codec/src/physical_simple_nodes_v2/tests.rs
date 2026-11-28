@@ -1040,3 +1040,41 @@ fn position_shard_node_preserves_route_order_and_required_columns() {
         assert!(decode_simple_node(&incomplete, read, SOURCE, limits()).is_err());
     });
 }
+
+#[test]
+fn content_apply_payload_preserves_roles_and_checks_value_references() {
+    let fixture = Fixture::new();
+    let control = Control::default();
+    let mut physical = source(3);
+    let [a, b, c] = [0, 7, u32::MAX].map(p::ValueId::new);
+    physical.kind = p::NodeKind::ContentApply(p::ContentApplySpec {
+        weighted_content: Box::from([a, b]),
+        target_content: Box::from([c, a]),
+        route_keys: Box::from([1, 0]),
+        weight: a,
+        target: p::ContentApplyTarget {
+            file: c,
+            position: b,
+            spec_id: a,
+            partition: c,
+        },
+    });
+    fixture.with_tokens(&control, |values, expressions, read| {
+        let (encoded, _) =
+            encode_simple_node(&physical, values, expressions, SOURCE, limits()).unwrap();
+        assert_eq!(
+            decode_simple_node(&encoded, read, SOURCE, limits())
+                .unwrap()
+                .0,
+            physical
+        );
+        for required_id in [None, Some(99)] {
+            let mut invalid = encoded.clone();
+            let Some(wire::physical_node::Kind::ContentApply(payload)) = &mut invalid.kind else {
+                panic!("expected content application payload");
+            };
+            payload.weight_value_id = required_id;
+            assert!(decode_simple_node(&invalid, read, SOURCE, limits()).is_err());
+        }
+    });
+}

@@ -19,7 +19,7 @@
 //!
 //! Stages run in order: logical normalize, delta marker, branch union, union
 //! delta, aggregate state, delta pushdown, scan binding, action propagation,
-//! apply key, target locator, change-stream descriptor, partition derivation,
+//! change-stream descriptor, partition derivation,
 //! marker cleanup, validation.
 //! Each stage's name is part of the trace contract and is asserted in pipeline
 //! tests.
@@ -32,26 +32,31 @@ use crate::planner::imv_rewrite::action_propagation::{
     InjectActionColumnRule, PropagateActionColumnRule,
 };
 use crate::planner::imv_rewrite::aggregate_rewrite::RewriteAggregateStateRule;
-use crate::planner::imv_rewrite::apply_key::InjectApplyKeyProjectRule;
 use crate::planner::imv_rewrite::branch_union::RewriteBranchUnionRule;
 use crate::planner::imv_rewrite::change_stream::{
     BuildChangeStreamDescriptorRule, ValidateChangeStreamDescriptorRule,
 };
 use crate::planner::imv_rewrite::delta_pushdown::PushDeltaThroughUnaryRule;
-use crate::planner::imv_rewrite::join_delta::{
-    InjectJoinApplyKeyRule, RecordJoinRefreshDescriptorRule, RewriteJoinDeltaRule,
-    UnsupportedJoinKindCheckRule,
-};
+use crate::planner::imv_rewrite::join_delta::{RewriteJoinDeltaRule, UnsupportedJoinKindCheckRule};
 use crate::planner::imv_rewrite::marker::{UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule};
 use crate::planner::imv_rewrite::partition_derivation::DerivePartitionSpecRule;
 use crate::planner::imv_rewrite::row_id_column::InjectRowIdRule;
 use crate::planner::imv_rewrite::scan_binding::BindIcebergScanRule;
-use crate::planner::imv_rewrite::target_locator::InjectTargetLocatorJoinRule;
 use crate::planner::imv_rewrite::union_delta::{
     RewriteTopLevelUnionDeltaRule, RewriteUnionAggregateDeltaRule,
 };
 
+#[cfg(test)]
 pub(crate) fn build_imv_pipeline() -> RewritePipeline {
+    build_imv_pipeline_for_target(false)
+}
+
+pub(super) fn build_imv_pipeline_for_target(aggregate: bool) -> RewritePipeline {
+    let mut action_rules: Vec<Box<dyn LogicalRewriteRule>> = vec![Box::new(InjectActionColumnRule)];
+    if aggregate {
+        action_rules.push(Box::new(InjectRowIdRule));
+    }
+    action_rules.push(Box::new(PropagateActionColumnRule));
     RewritePipeline::from_stages(vec![
         RewriteStage::new(
             "imv-logical-normalize",
@@ -98,25 +103,7 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
         RewriteStage::new(
             "imv-action-propagation",
             RewritePhase::SemanticRewrite,
-            vec![
-                Box::new(InjectActionColumnRule) as Box<dyn LogicalRewriteRule>,
-                Box::new(InjectRowIdRule),
-                Box::new(PropagateActionColumnRule),
-            ],
-        ),
-        RewriteStage::new(
-            "imv-apply-key",
-            RewritePhase::SemanticRewrite,
-            vec![
-                Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>,
-                Box::new(InjectJoinApplyKeyRule) as Box<dyn LogicalRewriteRule>,
-                Box::new(RecordJoinRefreshDescriptorRule) as Box<dyn LogicalRewriteRule>,
-            ],
-        ),
-        RewriteStage::new(
-            "imv-target-locator",
-            RewritePhase::SemanticRewrite,
-            vec![Box::new(InjectTargetLocatorJoinRule::new()) as Box<dyn LogicalRewriteRule>],
+            action_rules,
         ),
         RewriteStage::new(
             "imv-change-stream-descriptor",
@@ -149,65 +136,6 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pipeline_has_apply_key_stage_after_action_propagation() {
-        let p = build_imv_pipeline();
-        let names = p.stage_names();
-        let ap = names
-            .iter()
-            .position(|n| *n == "imv-action-propagation")
-            .unwrap();
-        let ak = names
-            .iter()
-            .position(|n| *n == "imv-apply-key")
-            .expect("imv-apply-key stage must exist");
-        let val = names.iter().position(|n| *n == "imv-validation").unwrap();
-        assert!(ap < ak && ak < val, "stage order: {names:?}");
-    }
-
-    #[test]
-    fn pipeline_runs_partition_derivation_after_apply_key_before_validation() {
-        let p = build_imv_pipeline();
-        let names = p.stage_names();
-        let ak = names.iter().position(|n| *n == "imv-apply-key").unwrap();
-        let pd = names
-            .iter()
-            .position(|n| *n == "imv-partition-derivation")
-            .expect("imv-partition-derivation stage must exist");
-        let val = names.iter().position(|n| *n == "imv-validation").unwrap();
-        assert!(ak < pd && pd < val, "stage order: {names:?}");
-        assert!(
-            p.rule_names().contains(&"DerivePartitionSpec"),
-            "DerivePartitionSpec must be registered"
-        );
-    }
-
-    #[test]
-    fn pipeline_runs_change_stream_descriptor_after_target_locator_before_partition_derivation() {
-        let p = build_imv_pipeline();
-        let names = p.stage_names();
-        let locator = names
-            .iter()
-            .position(|n| *n == "imv-target-locator")
-            .expect("imv-target-locator stage must exist");
-        let descriptor = names
-            .iter()
-            .position(|n| *n == "imv-change-stream-descriptor")
-            .expect("imv-change-stream-descriptor stage must exist");
-        let partition = names
-            .iter()
-            .position(|n| *n == "imv-partition-derivation")
-            .expect("imv-partition-derivation stage must exist");
-        assert!(
-            locator < descriptor && descriptor < partition,
-            "stage order: {names:?}"
-        );
-        assert!(
-            p.rule_names().contains(&"BuildChangeStreamDescriptor"),
-            "BuildChangeStreamDescriptor must be registered"
-        );
-    }
 
     #[test]
     fn pipeline_validates_change_stream_descriptor_before_action_columns() {

@@ -82,11 +82,9 @@ shell: sleep 2
 SELECT k1, v1 FROM orders_mv ORDER BY k1;
 
 -- query 10
--- Writing to the view is this process's to do only after the restart barrier
--- is retired, which is the same route any restarted target takes.
--- @mv_resume_management=orders_mv,catalog=lnp3a_ice_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
-SELECT 1;
+-- @result_not_contains=ExplicitRebuildRequired
+EXPLAIN REFRESH MATERIALIZED VIEW lnp3a_ice_${uuid0}.ns_${uuid0}.orders_mv;
 
 -- query 11
 -- @skip_result_check=true

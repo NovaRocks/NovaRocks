@@ -291,6 +291,7 @@ fn final_owner_has_one_complete_chain_and_sparse_actual_graph_origins() {
         operators(false, u32::MAX),
         &allowed(),
         CompiledProgramFacts {
+            input_completion: crate::InputCompletion::MayShortCircuit,
             writes: BTreeMap::new(),
             exchange_inputs: BTreeMap::new(),
             scan_inputs: BTreeMap::new(),
@@ -344,6 +345,7 @@ fn final_owner_rejects_foreign_origins_legacy_identity_and_missing_sink() {
                 operators(false, source),
                 &allowed(),
                 CompiledProgramFacts {
+                    input_completion: crate::InputCompletion::MayShortCircuit,
                     writes: BTreeMap::new(),
                     exchange_inputs: BTreeMap::new(),
                     scan_inputs: BTreeMap::new(),
@@ -365,6 +367,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(true, u32::MAX),
             &allowed(),
             CompiledProgramFacts {
+                input_completion: crate::InputCompletion::MayShortCircuit,
                 writes: BTreeMap::new(),
                 exchange_inputs: BTreeMap::new(),
                 scan_inputs: BTreeMap::new(),
@@ -381,6 +384,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
         operators(true, u32::MAX),
         &allowed(),
         CompiledProgramFacts {
+            input_completion: crate::InputCompletion::MayShortCircuit,
             writes: BTreeMap::from([(id, exact.clone())]),
             exchange_inputs: BTreeMap::new(),
             scan_inputs: BTreeMap::new(),
@@ -396,6 +400,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(false, u32::MAX),
             &allowed(),
             CompiledProgramFacts {
+                input_completion: crate::InputCompletion::MayShortCircuit,
                 writes: BTreeMap::from([(ProgramNodeId::new(0), exact)]),
                 exchange_inputs: BTreeMap::new(),
                 scan_inputs: BTreeMap::new(),
@@ -415,6 +420,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(true, u32::MAX),
             &allowed(),
             CompiledProgramFacts {
+                input_completion: crate::InputCompletion::MayShortCircuit,
                 writes: BTreeMap::from([(id, renamed)]),
                 exchange_inputs: BTreeMap::new(),
                 scan_inputs: BTreeMap::new(),
@@ -433,6 +439,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
 fn writer_projection_admits_either_nullability_direction_but_nothing_else() {
     let id = ProgramNodeId::new(1);
     let facts = |field| CompiledProgramFacts {
+        input_completion: crate::InputCompletion::MayShortCircuit,
         writes: BTreeMap::from([(id, recipe(field))]),
         exchange_inputs: BTreeMap::new(),
         scan_inputs: BTreeMap::new(),
@@ -493,6 +500,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
         operators(true, u32::MAX),
         &allowed(),
         CompiledProgramFacts {
+            input_completion: crate::InputCompletion::MayShortCircuit,
             writes: BTreeMap::from([(
                 ProgramNodeId::new(1),
                 recipe(Field::new("v", DataType::Int64, false)),
@@ -521,6 +529,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
                 operators(true, u32::MAX),
                 &allowed(),
                 CompiledProgramFacts {
+                    input_completion: crate::InputCompletion::MayShortCircuit,
                     writes: BTreeMap::from([(
                         ProgramNodeId::new(1),
                         recipe(Field::new("v", DataType::Int64, false)),
@@ -568,6 +577,7 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
                 operators(false, u32::MAX),
                 &allowed(),
                 CompiledProgramFacts {
+                    input_completion: crate::InputCompletion::MayShortCircuit,
                     writes: BTreeMap::new(),
                     exchange_inputs: BTreeMap::from([(node, address.clone())]),
                     scan_inputs: BTreeMap::new(),
@@ -584,6 +594,7 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
         operators(false, u32::MAX),
         &allowed(),
         CompiledProgramFacts {
+            input_completion: crate::InputCompletion::MayShortCircuit,
             writes: BTreeMap::new(),
             exchange_inputs: BTreeMap::new(),
             scan_inputs: BTreeMap::new(),
@@ -603,6 +614,7 @@ fn scan_input_address_on_a_non_scan_node_is_refused() {
             operators(false, u32::MAX),
             &allowed(),
             CompiledProgramFacts {
+                input_completion: crate::InputCompletion::MayShortCircuit,
                 writes: BTreeMap::new(),
                 exchange_inputs: BTreeMap::new(),
                 scan_inputs: BTreeMap::from([(
@@ -628,6 +640,7 @@ fn aggregate_facts_cover_exactly_the_actual_aggregate_nodes() {
                 operators(false, u32::MAX),
                 &allowed(),
                 CompiledProgramFacts {
+                    input_completion: crate::InputCompletion::MayShortCircuit,
                     aggregates: BTreeMap::from([(
                         node,
                         CompiledAggregate {

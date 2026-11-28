@@ -25,14 +25,16 @@ mod admission;
 mod audit;
 mod continuation;
 mod effects;
+mod name_lifecycle;
 mod observation;
 mod ownership;
 mod readmission;
 mod startup_isolation;
 
 pub use admission::{
-    AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
-    ManagementEntrance, ManagementEntranceObligation, ManagementEntranceTicket, ManagementRequest,
+    AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementCreateAdmission,
+    ManagementCreateNameObservationObligation, ManagementDependencySet, ManagementEntrance,
+    ManagementEntranceObligation, ManagementEntranceTicket, ManagementRequest,
     MvCurrentManagementAdmission, MvDropManagementObservation, MvManagementPhase,
     SlotChangeConvergence,
 };
@@ -49,6 +51,7 @@ pub use effects::{
     EffectResponsibility, EffectScope, EffectTerminalFact, PublicationRecoveryEvidence,
     UnsettledEffect,
 };
+pub use name_lifecycle::{NameStartupGrace, NameStartupGraceEnd, NameStartupGraceObservation};
 pub use observation::{
     FreshCreateIntentObservation, FreshManagementObservation, ManagementContinuation,
     ManagementObservationError, ManagementObservationFailure, ManagementObservationPhase,

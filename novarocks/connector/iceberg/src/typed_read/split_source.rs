@@ -51,6 +51,22 @@ use super::split::{
 };
 use super::table_handle::{IcebergTableHandle, identity_partition_source_field_ids};
 
+use novarocks_spi::connector::read_stack::{SplitPruningBasis, SplitPruningLedger};
+
+/// Iceberg addresses a data file by its immutable path inside this pinned
+/// snapshot. The receipt binds the resulting digest to that exact scan.
+pub(crate) fn record_pruned_data_file(
+    pruning: &mut SplitPruningLedger,
+    basis: SplitPruningBasis,
+    file: &IcebergReadFile,
+) -> Result<(), ConnectorError> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"Iceberg split pruning file identity v1");
+    digest.update(file.path.as_bytes());
+    pruning.record_file(basis, digest.finalize().into())
+}
+
 fn data_file_affinity_key(path: &str) -> String {
     format!("{:x}", Sha256::digest(path.as_bytes()))
 }
@@ -129,6 +145,8 @@ pub struct IcebergSplitSource {
     merge_adjacent_split_offsets: bool,
     weight_parameters: IcebergSplitWeightParameters,
     profile: SplitSourceProfile,
+    pruning: SplitPruningLedger,
+    enumeration_coverage: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +161,22 @@ impl IcebergSplitSource {
         table_handle: &IcebergTableHandle,
         files: Vec<IcebergPlannedDataFile>,
         options: IcebergSplitSourceOptions,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_pruning(
+            table_handle,
+            files,
+            options,
+            SplitPruningLedger::default(),
+            false,
+        )
+    }
+
+    pub(crate) fn with_pruning(
+        table_handle: &IcebergTableHandle,
+        files: Vec<IcebergPlannedDataFile>,
+        options: IcebergSplitSourceOptions,
+        mut pruning: SplitPruningLedger,
+        enumeration_coverage: bool,
     ) -> Result<Self, ConnectorError> {
         let mut partition_types = BTreeMap::new();
         let mut identity_partition_ids = BTreeMap::new();
@@ -188,6 +222,15 @@ impl IcebergSplitSource {
             || table_handle.limit() == Some(0)
             || effective_predicate.is_none();
 
+        if effective_predicate.is_none() {
+            for file in &files {
+                record_pruned_data_file(
+                    &mut pruning,
+                    SplitPruningBasis::UnsatisfiablePredicate,
+                    &file.read_file,
+                )?;
+            }
+        }
         if !exhausted {
             let domain = table_handle
                 .read_domain()
@@ -214,6 +257,8 @@ impl IcebergSplitSource {
             merge_adjacent_split_offsets: options.merge_adjacent_split_offsets,
             weight_parameters,
             profile: SplitSourceProfile::default(),
+            pruning,
+            enumeration_coverage,
         })
     }
 
@@ -483,14 +528,31 @@ impl ConnectorSplitSource for IcebergSplitSource {
         if max_size == 0 {
             return Err(invalid("connector split batch size must be positive"));
         }
-        if self.closed || self.exhausted {
-            return Ok(ConnectorSplitBatch::finished());
+        if self.closed {
+            return Ok(ConnectorSplitBatch::closed());
         }
-        // An unsatisfiable snapshot finishes immediately. Otherwise each
-        // unexpanded file observes this batch's immutable snapshot below.
+        if self.exhausted {
+            return Ok(ConnectorSplitBatch::natural_end(
+                Vec::new(),
+                self.pruning.clone(),
+            ));
+        }
         if dynamic_filter.current_predicate().is_none() {
-            self.exhausted = true;
-            return Ok(ConnectorSplitBatch::finished());
+            let basis = if dynamic_filter.is_empty_content_demand() {
+                SplitPruningBasis::EmptyDemand
+            } else {
+                SplitPruningBasis::DynamicFilter
+            };
+            for file in &self.files[self.next_file..] {
+                record_pruned_data_file(&mut self.pruning, basis, &file.read_file)?;
+            }
+            self.next_file = self.files.len();
+            // The strict ledger records complete files only. A file whose
+            // earlier ranges were delivered must send its remaining ranges.
+            if !self.enumeration_coverage && !self.pending.is_empty() {
+                self.pruning.mark_unaccounted_split_remainder();
+                self.pending.clear();
+            }
         }
 
         let max_size = max_size.min(MAX_SPLITS_PER_ASSIGNMENT);
@@ -509,8 +571,20 @@ impl ConnectorSplitSource for IcebergSplitSource {
             let splits = {
                 let file = &self.files[index];
                 match self.file_pruning_decision(file, dynamic_filter)? {
-                    FilePruningDecision::Static => continue,
+                    FilePruningDecision::Static => {
+                        record_pruned_data_file(
+                            &mut self.pruning,
+                            SplitPruningBasis::StaticPredicate,
+                            &file.read_file,
+                        )?;
+                        continue;
+                    }
                     FilePruningDecision::Dynamic => {
+                        record_pruned_data_file(
+                            &mut self.pruning,
+                            SplitPruningBasis::DynamicFilter,
+                            &file.read_file,
+                        )?;
                         self.profile.files_pruned = self.profile.files_pruned.saturating_add(1);
                         continue;
                     }
@@ -527,7 +601,11 @@ impl ConnectorSplitSource for IcebergSplitSource {
             .profile
             .splits_emitted
             .saturating_add(u64::try_from(produced.len()).unwrap_or(u64::MAX));
-        Ok(ConnectorSplitBatch::new(produced, no_more_splits))
+        Ok(if no_more_splits {
+            ConnectorSplitBatch::natural_end(produced, self.pruning.clone())
+        } else {
+            ConnectorSplitBatch::new(produced, false)
+        })
     }
 
     fn is_finished(&self) -> bool {
@@ -924,7 +1002,7 @@ impl ConnectorSplitSource for IcebergChangeWindowSplitSource {
             return Err(invalid("connector split batch size must be positive"));
         }
         if self.closed {
-            return Ok(ConnectorSplitBatch::finished());
+            return Ok(ConnectorSplitBatch::closed());
         }
         // A change window owns every split of the frozen difference. The
         // relationship consuming it may prove a zero contribution separately.
@@ -1453,7 +1531,18 @@ mod tests {
         let overlapping = planned(read_file("b.parquet", 100, 10));
 
         let mut source = split_source_for(&handle, vec![disjoint, overlapping]);
-        let splits = all_splits(&mut source, 8);
+        let batch = source
+            .next_batch(8, &DynamicFilterSnapshot::all_complete())
+            .unwrap();
+        let (splits, enumeration) = batch.into_parts();
+        let novarocks_spi::connector::read_stack::SplitEnumeration::NaturalEnd(pruning) =
+            enumeration
+        else {
+            panic!("expected natural end");
+        };
+        let (basis, files) = pruning.entries().next().unwrap();
+        assert_eq!(basis, SplitPruningBasis::StaticPredicate);
+        assert_eq!(files.file_count, 1);
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].path(), "b.parquet");
         assert_eq!(
@@ -1504,7 +1593,15 @@ mod tests {
 
         let batch = source.next_batch(8, &filter).expect("batch");
         assert!(batch.is_empty());
-        assert!(batch.no_more_splits());
+        let (_, enumeration) = batch.into_parts();
+        let novarocks_spi::connector::read_stack::SplitEnumeration::NaturalEnd(pruning) =
+            enumeration
+        else {
+            panic!("expected natural end");
+        };
+        let (basis, files) = pruning.entries().next().unwrap();
+        assert_eq!(basis, SplitPruningBasis::DynamicFilter);
+        assert_eq!(files.file_count, 1);
         assert_eq!(
             source.profile_snapshot(),
             SplitSourceProfile {
@@ -1514,6 +1611,61 @@ mod tests {
                 splits_emitted: 0,
             }
         );
+    }
+
+    #[test]
+    fn strict_empty_filters_keep_prepared_splits_and_only_attribute_unexpanded_files() {
+        use novarocks_spi::connector::read_stack::SplitEnumeration;
+
+        let handle = handle_with(Some(10), BTreeSet::from([amount_column()]));
+        for (filter, expected_basis) in [
+            (
+                DynamicFilterSnapshot::new(TupleDomain::none(), true),
+                SplitPruningBasis::DynamicFilter,
+            ),
+            (
+                DynamicFilterSnapshot::empty_content_demand(),
+                SplitPruningBasis::EmptyDemand,
+            ),
+        ] {
+            let mut source = IcebergSplitSource::with_pruning(
+                &handle,
+                vec![
+                    planned(read_file("a.parquet", 100, 10)),
+                    planned(read_file("b.parquet", 100, 10)),
+                ],
+                IcebergSplitSourceOptions::default(),
+                SplitPruningLedger::default(),
+                true,
+            )
+            .unwrap();
+            let first = source
+                .next_batch(1, &DynamicFilterSnapshot::all_complete())
+                .unwrap();
+            assert!(!first.no_more_splits());
+            assert_eq!(first.splits()[0].path(), "a.parquet");
+            let (remaining, enumeration) = source.next_batch(32, &filter).unwrap().into_parts();
+            assert_eq!(remaining.len(), 9);
+            assert!(remaining.iter().all(|split| split.path() == "a.parquet"));
+            let SplitEnumeration::NaturalEnd(pruning) = enumeration else {
+                panic!("expected natural end");
+            };
+            assert!(pruning.complete_file_inventory());
+            let facts = pruning.entries().collect::<Vec<_>>();
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].0, expected_basis);
+            assert_eq!(facts[0].1.file_count, 1);
+            assert_ne!(facts[0].1.identity_digest, [0; 32]);
+            source.close().unwrap();
+            assert!(matches!(
+                source
+                    .next_batch(1, &DynamicFilterSnapshot::all_complete())
+                    .unwrap()
+                    .into_parts()
+                    .1,
+                SplitEnumeration::Closed
+            ));
+        }
     }
 
     #[test]
@@ -1536,8 +1688,16 @@ mod tests {
 
     #[test]
     fn an_unsatisfiable_dynamic_filter_finishes_without_fabricating_a_wait() {
+        use novarocks_spi::connector::read_stack::SplitEnumeration;
+
         let handle = handle_with(Some(10), BTreeSet::from([amount_column()]));
-        let mut source = split_source_for(&handle, vec![planned(read_file("a.parquet", 100, 10))]);
+        let mut source = split_source_for(
+            &handle,
+            vec![
+                planned(read_file("a.parquet", 100, 10)),
+                planned(read_file("b.parquet", 100, 10)),
+            ],
+        );
 
         let truthful = DynamicFilterSnapshot::<IcebergColumnHandle>::all_complete();
         assert!(truthful.is_complete());
@@ -1548,6 +1708,14 @@ mod tests {
         let batch = source.next_batch(4, &unsatisfiable).expect("batch");
         assert!(batch.is_empty());
         assert!(batch.no_more_splits());
+        let (_, SplitEnumeration::NaturalEnd(pruning)) = batch.into_parts() else {
+            panic!("expected natural end");
+        };
+        assert!(!pruning.complete_file_inventory());
+        let facts = pruning.entries().collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].0, SplitPruningBasis::DynamicFilter);
+        assert_eq!(facts[0].1.file_count, 1);
     }
 
     #[test]

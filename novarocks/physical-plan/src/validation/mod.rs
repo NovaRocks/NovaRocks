@@ -16,6 +16,7 @@
 // under the License.
 
 mod aggregate;
+mod content_apply;
 mod cuts;
 mod error;
 mod expr;

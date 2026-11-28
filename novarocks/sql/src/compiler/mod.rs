@@ -83,17 +83,16 @@ pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
-    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
-    SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
-    SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
-    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
-    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvPartitionFieldFacts,
-    SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
-    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
-    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
-    SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts,
-    SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
-    SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
+    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvBaseContractFacts,
+    SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts, SqlImvBranchContractFacts, SqlImvContentField,
+    SqlImvExpressionFacts, SqlImvExpressionKindFacts, SqlImvJoinContractFacts, SqlImvJoinKindFacts,
+    SqlImvJoinPredicateFacts, SqlImvOutputColumnFacts, SqlImvPartitionFacts,
+    SqlImvPartitionFieldFacts, SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts,
+    SqlImvRefreshHistoryFacts, SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle,
+    SqlImvSchemaContractFacts, SqlImvTargetColumnsFacts, SqlImvTargetContractFacts,
+    SqlImvTargetVisibleColumnFacts, SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
+    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput,
+    SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
 pub(crate) use statement_system_relation::StatementSystemRelationSource;
 pub(crate) use statement_system_relation::statement_system_relation_site;
@@ -184,9 +183,28 @@ pub(crate) trait SqlStatisticsSnapshot {
         database: &str,
         table: &crate::planner::table::TableDef,
     ) -> Result<(String, crate::optimizer::stats_input::BaseTableStatistics), SqlCompileError>;
+
+    fn scan_volume(
+        &self,
+        _table: &crate::planner::table::TableDef,
+    ) -> Option<crate::planning::mv::SqlMvCostScanVolume> {
+        None
+    }
 }
 
 impl SqlStatisticsSnapshot for crate::planning::dml::DmlStatisticsSnapshot {
+    fn scan_volume(
+        &self,
+        table: &crate::planner::table::TableDef,
+    ) -> Option<crate::planning::mv::SqlMvCostScanVolume> {
+        let crate::planner::table::ScanSource::Sql(source) = &table.source;
+        self.0
+            .mv_scan_volumes
+            .iter()
+            .copied()
+            .find(|volume| volume.matches(source))
+    }
+
     fn collect_table_statistics(
         &self,
         database: &str,
@@ -198,6 +216,52 @@ impl SqlStatisticsSnapshot for crate::planning::dml::DmlStatisticsSnapshot {
             source.table.catalog, source.table.namespace, source.table.table
         );
         let _ = database;
+        if let Some(volume) = self.scan_volume(table) {
+            use crate::optimizer::stats_input::SqlStatisticsFatalError;
+            use crate::optimizer::{
+                statistics::Confidence,
+                stats_input::{BaseTableStatistics, StatValue, StatsSource},
+            };
+            let columns = match self.0.get(source.binding) {
+                // Whole-table column statistics do not describe a signed window.
+                Ok(_)
+                    if matches!(
+                        volume.version,
+                        crate::planning::mv::SqlMvCostScanVersion::Delta { .. }
+                    ) =>
+                {
+                    Default::default()
+                }
+                Ok(entry) => entry.statistics.columns.clone(),
+                Err(SqlStatisticsFatalError::BindingMissing) => Default::default(),
+                Err(error) => {
+                    return Err(SqlCompileError::Compilation(format!(
+                        "frozen SQL statistics binding `{label}` is invalid: {error}"
+                    )));
+                }
+            };
+            return Ok((
+                label,
+                BaseTableStatistics {
+                    row_count: StatValue::known(
+                        volume.rows,
+                        if volume.exact_rows {
+                            Confidence::Exact
+                        } else {
+                            Confidence::Estimated
+                        },
+                        StatsSource::IcebergManifest,
+                    ),
+                    columns,
+                    source: StatsSource::IcebergManifest,
+                },
+            ));
+        }
+        if self.0.require_mv_scan_volumes {
+            return Err(SqlCompileError::InvalidRequest(format!(
+                "MV optimizer cost has no exact scan volume for {label}"
+            )));
+        }
         self.0
             .get(source.binding)
             .map(|entry| (entry.label.clone(), entry.statistics.clone()))
@@ -238,6 +302,18 @@ impl SqlImvPlanningInput {
             target_read:
                 crate::planner::imv_rewrite::annotation::TargetReadRequirement::ExistingRows,
         }
+    }
+
+    pub fn for_append_only(self) -> Self {
+        self.with_target_read_requirement(
+            crate::planner::imv_rewrite::annotation::TargetReadRequirement::NewOutputRowsOnly,
+        )
+    }
+
+    pub fn for_content_location(self) -> Self {
+        self.with_target_read_requirement(
+            crate::planner::imv_rewrite::annotation::TargetReadRequirement::ContentRows,
+        )
     }
 
     pub(crate) fn with_target_read_requirement(
@@ -1308,6 +1384,12 @@ pub struct SqlAnalyzedQuery {
 }
 
 impl SqlAnalyzedQuery {
+    pub(crate) fn logical_plan_mut_for_mv_partition_sources(
+        &mut self,
+    ) -> &mut crate::planner::logical::LogicalPlanNode {
+        &mut self.logical_plan
+    }
+
     pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantValidation {
         self.constant_policy
     }
@@ -2051,8 +2133,6 @@ impl SqlCompiler {
             root_semantics = root_semantics.imv_output(
                 &crate::planner::plan_output_columns(&logical_plan)?,
                 input.snapshot(),
-                &change_stream,
-                true,
             )?;
             factory = std::rc::Rc::try_unwrap(factory_cell)
                 .map_err(|_| {
@@ -2177,6 +2257,16 @@ impl SqlCompiler {
         let root_distribution = match &intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
                 resolve_root_distribution_requirement(&logical_plan, root_distribution)?
+            }
+            SqlCompileIntent::ChangeStreamWrite
+                if matches!(
+                    logical_plan.kind,
+                    crate::planner::logical::LogicalPlanKind::ContentApply(_)
+                ) =>
+            {
+                // The content owner publishes its independent summary through
+                // the same fragment as the change-stream router.
+                Some(crate::optimizer::property::DistributionSpec::Any)
             }
             _ => None,
         };
@@ -2368,6 +2458,9 @@ fn collect_statistics(
             scan.stats_ref = Some(stats_ref);
             let (label, stats) = snapshot.collect_table_statistics(&scan.database, &scan.table)?;
             plan.snapshot.insert(stats_ref, label, stats);
+            if let Some(volume) = snapshot.scan_volume(&scan.table) {
+                plan.snapshot.set_file_bytes(stats_ref, volume.bytes);
+            }
         }
         for child in &mut expr.children {
             walk(snapshot, child, plan)?;
@@ -2746,7 +2839,6 @@ mod tests {
                         },
                     },
                 ),
-                ..Default::default()
             };
         }
         crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {

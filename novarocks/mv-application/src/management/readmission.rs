@@ -39,7 +39,7 @@ impl ManagementTimestamp {
         self.0
     }
 
-    fn checked_add(self, duration: Duration) -> Result<Self, ReadmissionError> {
+    pub(super) fn checked_add(self, duration: Duration) -> Result<Self, ReadmissionError> {
         let millis = duration.as_nanos().div_ceil(1_000_000);
         let millis = u64::try_from(millis).map_err(|_| ReadmissionError::Overflow)?;
         self.0

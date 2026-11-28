@@ -99,6 +99,9 @@ pub(crate) struct RoundSplitSourceRecipe {
         novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
     )>,
     constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint,
+    enumeration_coverage: bool,
+    #[cfg(novarocks_dev_controls)]
+    early_close: Option<crate::query_execution::split_assignment::ContentTargetEarlyClose>,
     access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
 }
 
@@ -118,6 +121,9 @@ impl RoundSplitSourceRecipe {
             constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint::of_summary(
                 novarocks_spi::connector::read_stack::TupleDomain::all(),
             ),
+            enumeration_coverage: false,
+            #[cfg(novarocks_dev_controls)]
+            early_close: None,
         }
     }
 
@@ -146,8 +152,25 @@ impl RoundSplitSourceRecipe {
             assignments: scan.assignments.clone(),
             dynamic_filters: scan.dynamic_filters.clone(),
             constraint: scan.constraint.clone(),
+            enumeration_coverage: false,
+            #[cfg(novarocks_dev_controls)]
+            early_close: None,
             access,
         })
+    }
+
+    pub(crate) fn with_enumeration_coverage(mut self) -> Self {
+        self.enumeration_coverage = true;
+        self
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_content_target_early_close(
+        mut self,
+        early_close: crate::query_execution::split_assignment::ContentTargetEarlyClose,
+    ) -> Self {
+        self.early_close = Some(early_close);
+        self
     }
 
     pub(crate) const fn fragment_id(&self) -> FragmentId {
@@ -254,6 +277,11 @@ impl RoundSplitSourceRecipe {
                 .collect(),
             self.constraint.clone(),
         );
+        let request = if self.enumeration_coverage {
+            request.with_enumeration_coverage()
+        } else {
+            request
+        };
         let request = match preparation {
             Some(preparation) => request.with_source_preparation(preparation),
             None => request,
@@ -267,13 +295,12 @@ impl RoundSplitSourceRecipe {
         responsibility: ConnectorBlockingIoResponsibility,
     ) -> OpenedRoundSplitSource {
         let backing = responsibility.retain_backing();
+        let source = SupervisedSplitSource::new(raw, self.plan_node_id, responsibility);
+        #[cfg(novarocks_dev_controls)]
+        let source = source.with_content_target_early_close(self.early_close);
         OpenedRoundSplitSource {
             scan: ScanNodeKey::new(self.fragment_id, self.plan_node_id),
-            source: Some(SupervisedSplitSource::new(
-                raw,
-                self.plan_node_id,
-                responsibility,
-            )),
+            source: Some(source),
             encoder: Some(capabilities.encoder()),
             feedback_bindings: self.dynamic_filters,
             backing: Some(backing),
@@ -293,6 +320,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
     retry_policy: TaskUpdateRetryPolicy,
     initial_dynamic_filter_wait_cap: std::time::Duration,
     blocking_io: ConnectorBlockingIoSupervisor,
+    receipts: Option<Arc<super::split_assignment::SplitEnumerationReceipts>>,
 }
 
 /// Sources opened while one round is still being assembled.
@@ -403,7 +431,16 @@ impl RoundSplitAssignmentPlan {
             retry_policy,
             initial_dynamic_filter_wait_cap,
             blocking_io,
+            receipts: None,
         }
+    }
+
+    pub(crate) fn with_enumeration_receipts(
+        mut self,
+        receipts: Option<Arc<super::split_assignment::SplitEnumerationReceipts>>,
+    ) -> Self {
+        self.receipts = receipts;
+        self
     }
 
     pub(crate) fn close_in(&mut self, job: &mut Option<ConnectorBlockingIoJob<()>>) {
@@ -1117,6 +1154,7 @@ mod tests {
     #[derive(Default)]
     struct AcknowledgedSplitUpdates {
         requests: Mutex<Vec<CapturedSplitUpdateRequest>>,
+        already_finished_backend: Option<usize>,
     }
     impl TaskUpdateTransport for AcknowledgedSplitUpdates {
         fn begin(
@@ -1142,7 +1180,13 @@ mod tests {
             ticket: TaskUpdateTicket,
             _: &RoundSplitAssignmentStop,
         ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
-            let (_, _, eos, sequence, node) = self.requests.lock().unwrap()[ticket.0 as usize];
+            let (backend, _, eos, sequence, node) =
+                self.requests.lock().unwrap()[ticket.0 as usize];
+            if self.already_finished_backend == Some(backend) {
+                return Some(Ok(TaskUpdateOutcome::DestinationFinished {
+                    detail: "destination closed before accepting EOS".into(),
+                }));
+            }
             Some(Ok(TaskUpdateOutcome::Accepted(vec![AcceptedPlanNode {
                 plan_node_id: node,
                 accepted_through_sequence: sequence,
@@ -1353,6 +1397,57 @@ mod tests {
     }
 
     #[test]
+    fn closed_source_or_destination_does_not_produce_an_enumeration_receipt() {
+        for (batch, already_finished_backend) in [
+            (ConnectorSplitBatch::closed(), None),
+            (ConnectorSplitBatch::finished(), Some(1)),
+        ] {
+            let execution =
+                QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
+            let (closed_tx, _closed_rx) = mpsc::channel();
+            let source = cleanup_test_source(closed_tx);
+            let scan = source.scan;
+            let receipts = Arc::new(
+                crate::query_execution::split_assignment::SplitEnumerationReceipts::new(
+                    execution,
+                    std::iter::once(scan),
+                ),
+            );
+            let targets = (0..2)
+                .map(|backend_idx| AssignmentTarget {
+                    backend_idx,
+                    task_key: novarocks_types::UniqueId::new(17, 20 + backend_idx as i64),
+                })
+                .collect();
+            let transport = Arc::new(AcknowledgedSplitUpdates {
+                already_finished_backend,
+                ..Default::default()
+            });
+            let mut round = RoundSplitAssignment::new(
+                execution,
+                transport.clone(),
+                BTreeMap::from([(scan, targets)]),
+                4,
+                vec![source],
+                TaskUpdateRetryPolicy::default(),
+                Duration::ZERO,
+            )
+            .with_enumeration_receipts(receipts.clone());
+            assert!(round.deliver(scan, batch).unwrap());
+            for _ in 0..8 {
+                if !round.delivery_in_progress() {
+                    break;
+                }
+                round.drive_delivery().unwrap();
+            }
+            assert!(!round.delivery_in_progress());
+            assert_eq!(transport.requests.lock().unwrap().len(), 2);
+            assert!(receipts.complete(execution).is_none());
+            round.close();
+        }
+    }
+
+    #[test]
     fn one_provider_unit_is_delivered_once_and_all_three_tasks_receive_eos() {
         use novarocks_spi::connector as spi;
         use spi::ConnectorReadWireEncoder;
@@ -1488,6 +1583,12 @@ mod tests {
                 task_key: novarocks_types::UniqueId::new(17, 20 + backend_idx as i64),
             })
             .collect();
+        let receipts = Arc::new(
+            crate::query_execution::split_assignment::SplitEnumerationReceipts::new(
+                execution,
+                std::iter::once(scan),
+            ),
+        );
         let mut round = RoundSplitAssignment::new(
             execution,
             transport.clone(),
@@ -1496,7 +1597,8 @@ mod tests {
             vec![source],
             TaskUpdateRetryPolicy::default(),
             Duration::ZERO,
-        );
+        )
+        .with_enumeration_receipts(receipts.clone());
         for _ in 0..4 {
             match round.enumerate_once().unwrap() {
                 RoundSplitEnumeration::Ready(request) => {
@@ -1509,6 +1611,10 @@ mod tests {
                 _ => panic!("fixed single unit must be ready"),
             }
         }
+        assert!(
+            receipts.complete(execution).is_none(),
+            "enumeration before delivery issues no receipt"
+        );
         for _ in 0..32 {
             if !round.delivery_in_progress() {
                 break;
@@ -1516,6 +1622,10 @@ mod tests {
             round.drive_delivery().unwrap();
         }
         assert!(!round.delivery_in_progress());
+        assert_eq!(receipts.complete(execution).unwrap().len(), 1);
+        let newer =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(2).unwrap()).unwrap();
+        assert!(receipts.complete(newer).is_none());
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(

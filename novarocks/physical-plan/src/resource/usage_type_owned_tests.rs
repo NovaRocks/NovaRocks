@@ -554,6 +554,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, ConstantPools, usiz
     let fragment = Fragment::from(crate::plan::FragmentParts {
         summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         id: FragmentId::new(7),
         root: NodeId::new(0),
         values,

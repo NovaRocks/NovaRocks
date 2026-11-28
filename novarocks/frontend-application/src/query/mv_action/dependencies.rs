@@ -102,6 +102,7 @@ impl DependencyPreparation {
                     target: target.clone(),
                     statement: statement.clone(),
                     repartition: Some(fields.clone()),
+                    replay: None,
                 }]);
             }
             MvCommandRequest::Refresh { requested, .. }
@@ -325,15 +326,20 @@ fn refresh_steps(
                 };
             }
             let target = step.into_target();
-            let full = statement.full && &target == requested;
+            let mode = if &target == requested {
+                statement.mode
+            } else {
+                crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed
+            };
             let statement = MvRefreshRequest {
                 name_parts: vec![target.database.clone(), target.name.clone()],
-                full,
+                mode,
             };
             StepRequest::Iceberg {
                 target,
                 statement,
                 repartition: None,
+                replay: None,
             }
         })
         .collect())
@@ -398,7 +404,7 @@ mod tests {
         let requested = original[2].target().clone();
         let statement = MvRefreshRequest {
             name_parts: vec!["requested".into()],
-            full: true,
+            mode: crate::mv::domain::application::MvRefreshRequestMode::Full,
         };
         let actual = refresh_steps(original, &statement, &requested).unwrap();
         assert_eq!(actual.len(), 3);
@@ -406,13 +412,14 @@ mod tests {
             target,
             statement,
             repartition,
+            ..
         } = &actual[0]
         else {
             panic!("first real step")
         };
         assert_eq!(target.name, "upstream");
         assert_eq!(statement.name_parts, ["db", "upstream"]);
-        assert!(!statement.full);
+        assert!(!statement.is_full());
         assert!(repartition.is_none());
         let StepRequest::Unsupported { display_name } = &actual[1] else {
             panic!("original serial refusal")
@@ -422,12 +429,13 @@ mod tests {
             target,
             statement,
             repartition,
+            ..
         } = &actual[2]
         else {
             panic!("requested real step")
         };
         assert_eq!(target, &requested);
-        assert!(statement.full);
+        assert!(statement.is_full());
         assert!(repartition.is_none());
     }
 
@@ -440,7 +448,7 @@ mod tests {
         };
         let statement = MvRefreshRequest {
             name_parts: vec!["requested".into()],
-            full: false,
+            mode: crate::mv::domain::application::MvRefreshRequestMode::IncrementalAllowed,
         };
         assert!(
             matches!(refresh_steps(Vec::new(), &statement, &requested), Err(error)

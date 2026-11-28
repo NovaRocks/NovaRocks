@@ -294,7 +294,8 @@ pub(crate) fn validate_runtime_filter_shape(
         total.saturating_add(match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => 0,
             crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
-            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::ContentDemandScanField { lineage, .. } => {
                 lineage.len()
             }
         })
@@ -384,7 +385,8 @@ pub(crate) fn validate_runtime_filter_shape(
         .iter()
         .filter_map(|producer| match &producer.target {
             crate::RuntimeFilterProducerTarget::JoinBuildKey { equality } => Some(*equality),
-            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => None,
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. }
+            | crate::RuntimeFilterProducerTarget::ContentDemand { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     let consumer_equalities = filter
@@ -393,7 +395,8 @@ pub(crate) fn validate_runtime_filter_shape(
         .filter_map(|consumer| match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { equality }
             | crate::RuntimeFilterConsumerTarget::ScanField { equality, .. } => Some(*equality),
-            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => None,
+            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+            | crate::RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     if !consumer_equalities.is_subset(&producer_equalities) {
@@ -504,6 +507,26 @@ pub(crate) fn validate_runtime_filter_matrix(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    if filter.producers.iter().any(|producer| {
+        matches!(
+            producer.target,
+            crate::RuntimeFilterProducerTarget::ContentDemand { .. }
+        )
+    }) && (filter.producers.len() != 1
+        || filter.consumers.len() != 1
+        || !filter.equality_witnesses.is_empty()
+        || !coverage_is_all_of_only(&filter.availability_coverage)
+        || !matches!(
+            filter.consumers[0].target,
+            crate::RuntimeFilterConsumerTarget::ContentDemandScanField { .. }
+        )
+        || filter.producers[0].completion != crate::RuntimeFilterCompletion::ProducerClosed)
+    {
+        errors.push(ValidationError::new(
+            path,
+            "content demand requires one producer, one target field and complete AllOf coverage",
+        ));
+    }
     if coverage_comparison_safe
         && filter.lifecycle == crate::RuntimeFilterLifecycle::CompleteOnce
         && filter.availability_coverage != filter.terminal_coverage
@@ -871,6 +894,11 @@ pub(crate) fn validate_runtime_filter_producer_progress(
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
             NodeKind::Aggregate { .. },
         ) if node.inputs.len() == 1 && non_build_edges.is_empty() => node.inputs[0],
+        (crate::RuntimeFilterProducerTarget::ContentDemand { .. }, NodeKind::ContentApply(_))
+            if node.inputs.len() == 2 =>
+        {
+            node.inputs[0]
+        }
         _ => {
             errors.push(ValidationError::new(
                 path,
@@ -917,6 +945,9 @@ pub(crate) fn validate_runtime_filter_producer_progress(
             }
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => {
                 "runtime filter Aggregate TopN frontier differs from the exact aggregate input exchange cuts"
+            }
+            crate::RuntimeFilterProducerTarget::ContentDemand { .. } => {
+                "runtime filter content demand frontier differs from the weighted input exchange cut"
             }
         };
         errors.push(ValidationError::new(path, detail));
@@ -1187,6 +1218,25 @@ pub(crate) fn validate_runtime_filter_producer_target(
                         .is_some_and(|value| producer.endpoint.values.as_ref() == [value])
             })
         }
+        crate::RuntimeFilterProducerTarget::ContentDemand { content_ordinal } => {
+            matches!(
+                domain,
+                crate::RuntimeFilterDomain::Membership {
+                    null_semantics: crate::RuntimeFilterNullSemantics::NullSafeEqual,
+                    ..
+                }
+            ) && reduction == crate::RuntimeFilterReduction::SetUnion
+                && producer.apply_point
+                    == (crate::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 })
+                && fragment
+                    .nodes()
+                    .get(&producer.endpoint.node)
+                    .is_some_and(|node| {
+                        matches!(&node.kind, NodeKind::ContentApply(spec)
+                        if spec.weighted_content.get(content_ordinal as usize).is_some_and(|value|
+                            producer.endpoint.values.as_ref() == [*value]))
+                    })
+        }
         crate::RuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal,
             topn,
@@ -1287,6 +1337,9 @@ pub(crate) fn validate_runtime_filter_producer_target(
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => {
                 "runtime filter Aggregate TopN producer target does not match its exact group key"
             }
+            crate::RuntimeFilterProducerTarget::ContentDemand { .. } => {
+                "runtime filter content demand does not name the exact weighted content field"
+            }
         };
         errors.push(ValidationError::new(path, detail));
     }
@@ -1323,7 +1376,8 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
                     crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
                 ),
                 crate::RuntimeFilterConsumerTarget::ScanField { .. }
-                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
+                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                | crate::RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => matches!(
                     late_apply,
                     crate::LateApplyGranularity::Batch
                         | crate::LateApplyGranularity::RowGroup
@@ -1389,11 +1443,40 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
                             )
                     })
         }
+        crate::RuntimeFilterConsumerTarget::ContentDemandScanField { producer, lineage } => {
+            producers.iter().any(|candidate| {
+                candidate.witness == *producer
+                    && matches!(
+                        (candidate.target, lineage.as_ref()),
+                        (
+                            crate::RuntimeFilterProducerTarget::ContentDemand { content_ordinal },
+                            [crate::RuntimeFilterLineageStep::ExchangeMapping {
+                                mapping_ordinal, ..
+                            }],
+                        ) if content_ordinal == *mapping_ordinal
+                    )
+            }) && consumer.apply_point == crate::RuntimeFilterApplyPoint::ScanSource
+                && fragment
+                    .nodes()
+                    .get(&consumer.endpoint.node)
+                    .is_some_and(|node| {
+                        consumer.endpoint.node == fragment.root()
+                            && consumer.endpoint.values.len() == 1
+                            && indexes.scan_provider_contains(
+                                fragment,
+                                node,
+                                consumer.endpoint.values[0],
+                            )
+                    })
+        }
     };
     if !valid {
         let detail = match &consumer.target {
             crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
                 "runtime filter Aggregate TopN consumer has no exact producer witness or scan field"
+            }
+            crate::RuntimeFilterConsumerTarget::ContentDemandScanField { .. } => {
+                "runtime filter content demand consumer must name the corresponding target scan field"
             }
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. }
             | crate::RuntimeFilterConsumerTarget::ScanField { .. } => {
@@ -1420,6 +1503,10 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
         ),
         crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, lineage } => (
             RuntimeFilterLineageOrigin::AggregateTopN(*producer),
+            lineage.as_ref(),
+        ),
+        crate::RuntimeFilterConsumerTarget::ContentDemandScanField { producer, lineage } => (
+            RuntimeFilterLineageOrigin::ContentDemand(*producer),
             lineage.as_ref(),
         ),
         crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => return,
@@ -1475,6 +1562,16 @@ pub(crate) fn validate_local_runtime_filter_consumer_lineage(
             };
             (
                 RuntimeFilterLineageOrigin::AggregateTopN(producer.witness),
+                lineage.as_ref(),
+                producer.endpoint.fragment,
+            )
+        }
+        crate::RuntimeFilterConsumerTarget::ContentDemandScanField { producer, lineage } => {
+            let Some(producer) = producers.iter().find(|item| item.witness == *producer) else {
+                return;
+            };
+            (
+                RuntimeFilterLineageOrigin::ContentDemand(producer.witness),
                 lineage.as_ref(),
                 producer.endpoint.fragment,
             )
@@ -1638,6 +1735,7 @@ fn validate_runtime_filter_local_segments(
 pub(crate) enum RuntimeFilterLineageOrigin {
     Join(crate::RuntimeFilterEqualityWitnessId),
     AggregateTopN(crate::RuntimeFilterWitnessId),
+    ContentDemand(crate::RuntimeFilterWitnessId),
 }
 
 pub(crate) fn runtime_filter_scan_lineage_is_valid<'a>(
@@ -1695,6 +1793,30 @@ fn runtime_filter_lineage_start<'a>(
                 return None;
             }
             (fragment.id(), input, *producer.endpoint.values.first()?)
+        }
+        RuntimeFilterLineageOrigin::ContentDemand(producer_witness) => {
+            let producer = producers
+                .iter()
+                .find(|item| item.witness == producer_witness)?;
+            let crate::RuntimeFilterProducerTarget::ContentDemand { content_ordinal } =
+                producer.target
+            else {
+                return None;
+            };
+            let fragment = get_fragment(producer.endpoint.fragment)?;
+            let application = fragment.nodes().get(&producer.endpoint.node)?;
+            let NodeKind::ContentApply(spec) = &application.kind else {
+                return None;
+            };
+            let input = *application.inputs.get(1)?;
+            if !node_has_exact_parent(&mut indexes.parents, fragment, input, application.id) {
+                return None;
+            }
+            (
+                fragment.id(),
+                input,
+                *spec.target_content.get(content_ordinal as usize)?,
+            )
         }
     };
     Some(position)

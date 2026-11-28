@@ -168,7 +168,7 @@ pub(super) fn validate_node_unit_in(
                     .get(ordinal)
                     .and_then(|id| fragment.nodes().get(id))
                 {
-                    for id in &input.output.columns {
+                    for id in input.data_output_columns() {
                         check(*id)?;
                     }
                 }

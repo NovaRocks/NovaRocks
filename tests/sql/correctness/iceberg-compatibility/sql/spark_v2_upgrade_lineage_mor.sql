@@ -58,11 +58,9 @@ SELECT id, _row_id IS NULL AS missing_row_id,
 FROM ${case_db}.upgrade_lineage_${uuid0} ORDER BY id;
 
 -- query 3
--- @expect_error_tier=target
--- @expect_sql_code=query.execution.invalid_data
--- @expect_sql_phase=Execution
--- @expect_error=has no row lineage (no row range)
-CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0} AS SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
+-- @skip_result_check=true
+CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_early_mv_${uuid0} AS
+SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
 
 -- query 4
 -- @expect_error_tier=drift
@@ -121,4 +119,5 @@ SELECT id,v FROM ${case_db}.upgrade_lineage_mv_${uuid0} ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.upgrade_lineage_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.upgrade_lineage_early_mv_${uuid0};
 DROP TABLE IF EXISTS ${case_db}.upgrade_lineage_${uuid0} ;

@@ -23,11 +23,13 @@ pub(crate) mod binding_model;
 pub mod keyed;
 pub(crate) mod mapping_codec;
 mod markers;
+mod recovery_record;
 mod retirement_record;
 
 pub use binding_model::*;
 pub use mapping_codec::*;
 pub use markers::*;
+pub use recovery_record::*;
 pub use retirement_record::*;
 mod model;
 mod wire;
@@ -365,14 +367,13 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                 }),
             })
             .collect(),
-        apply_key: Some(proto::ApplyKey {
-            kind: Some(match document.apply_key.kind {
+        apply_key: document.apply_key.as_ref().map(|key| proto::ApplyKey {
+            kind: Some(match key.kind {
                 ApplyKeyKind::BaseRowId => 1,
                 ApplyKeyKind::JoinRowKey => 2,
                 ApplyKeyKind::GroupRowId => 3,
             }),
-            components: document
-                .apply_key
+            components: key
                 .components
                 .iter()
                 .map(|component| proto::ApplyKeyComponent {
@@ -479,7 +480,6 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
 fn interpretation_from_proto(
     dto: proto::InterpretationDocument,
 ) -> Result<InterpretationDocument, PersistenceCodecError> {
-    let apply_key = required(dto.apply_key, "interpretation.apply_key")?;
     let target = required(dto.target, "interpretation.target")?;
     Ok(InterpretationDocument {
         definition_revision: DocumentRevision::try_from_bytes(&required(
@@ -542,32 +542,37 @@ fn interpretation_from_proto(
                 })
             })
             .collect::<Result<_, PersistenceCodecError>>()?,
-        apply_key: ApplyKey {
-            kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
-                Some(match value {
-                    1 => ApplyKeyKind::BaseRowId,
-                    2 => ApplyKeyKind::JoinRowKey,
-                    3 => ApplyKeyKind::GroupRowId,
-                    _ => return None,
+        apply_key: dto
+            .apply_key
+            .map(|apply_key| {
+                Ok::<_, PersistenceCodecError>(ApplyKey {
+                    kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
+                        Some(match value {
+                            1 => ApplyKeyKind::BaseRowId,
+                            2 => ApplyKeyKind::JoinRowKey,
+                            3 => ApplyKeyKind::GroupRowId,
+                            _ => return None,
+                        })
+                    })?,
+                    components: apply_key
+                        .components
+                        .into_iter()
+                        .map(|component| {
+                            Ok(ApplyKeyComponent {
+                                logical_id: ApplyKeyIdentity::try_new(required(
+                                    component.logical_id,
+                                    "interpretation.apply_key.component.logical_id",
+                                )?)?,
+                                target_field_id: FieldIdentity::try_new(required(
+                                    component.target_field_id,
+                                    "interpretation.apply_key.component.target_field_id",
+                                )?)?,
+                            })
+                        })
+                        .collect::<Result<_, PersistenceCodecError>>()?,
                 })
-            })?,
-            components: apply_key
-                .components
-                .into_iter()
-                .map(|component| {
-                    Ok(ApplyKeyComponent {
-                        logical_id: ApplyKeyIdentity::try_new(required(
-                            component.logical_id,
-                            "interpretation.apply_key.component.logical_id",
-                        )?)?,
-                        target_field_id: FieldIdentity::try_new(required(
-                            component.target_field_id,
-                            "interpretation.apply_key.component.target_field_id",
-                        )?)?,
-                    })
-                })
-                .collect::<Result<_, PersistenceCodecError>>()?,
-        },
+            })
+            .transpose()?,
         aggregates: dto
             .aggregates
             .into_iter()

@@ -17,7 +17,10 @@
 
 //! Frozen refresh rewrite inputs shared by domain planning and query assembly.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+use bytes::Bytes;
+use novarocks_sql::compiler::SqlImvBaseFieldFacts;
 
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::planning::{RefreshStateBaseline, RefreshStateBaselineSource};
@@ -25,15 +28,15 @@ use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::rewrite::analysis::{MvRewriteAnalysisInput, freeze_rewrite_analysis_facts};
 use crate::mv::domain::rewrite::context::{
     IcebergMvRewriteContext, MvRewriteAnalysisFacts, MvRewriteRebuildLayout,
-    MvRewriteSourceSnapshot,
+    MvRewriteSourceSnapshot, occurrence_table,
 };
 use crate::mv::domain::storage_observation::{
     MvSchemaValidationObservation, MvSourceSchemaObservation,
 };
-use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
-use novarocks_mv_application::persistence::{
-    keyed_documents::StoredKeyedMvProjection, runtime_bindings::MvExactTargetSchemaFacts,
+use novarocks_mv_application::persistence::keyed_documents::{
+    MvStrictRecoveryPublication, StoredKeyedMvProjection,
 };
+use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindowFacts, ConnectorChangeWindowNegativeWeight,
@@ -78,31 +81,27 @@ pub(crate) fn occurrence_window(
 }
 
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
-/// provider facts. Runtime handles and a second Current observation are not
-/// accepted at this boundary.
+/// provider facts. The caller lends its original target and schema observation.
 pub(crate) fn build_neutral_refresh_rewrite_context(
     projection: Arc<StoredKeyedMvProjection>,
     rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
+    recovery_publication: Option<Arc<MvStrictRecoveryPublication>>,
     current: Vec<MvRewriteSourceSnapshot>,
     previous: Vec<MvRewriteSourceSnapshot>,
-    target_table_uuid: String,
-    target_arrow_schema: arrow::datatypes::SchemaRef,
-    target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
-    exact_target: MvExactTargetSchemaFacts,
+    target_binding: &MvTargetBinding,
+    target_observation: &MvSchemaValidationObservation,
     analysis: MvRewriteAnalysisFacts,
-) -> Result<Arc<IcebergMvRewriteContext>, String> {
+) -> Result<IcebergMvRewriteContext, String> {
     IcebergMvRewriteContext::from_parts(
         projection,
         rebuild_layout,
+        recovery_publication,
         current,
         previous,
-        target_table_uuid,
-        target_arrow_schema,
-        target_write_fields,
-        exact_target,
+        target_binding,
+        target_observation,
         analysis,
     )
-    .map(Arc::new)
 }
 
 /// Everything one attempt already froze, assembled into the single rewrite
@@ -110,9 +109,11 @@ pub(crate) fn build_neutral_refresh_rewrite_context(
 /// generation; no second Current observation is taken here.
 pub(crate) struct RefreshRewriteInputs<'a> {
     pub connector_control: &'a dyn ConnectorControlRegistry,
+    pub storage_observation: &'a dyn MvStorageObservationPort,
     pub connector_context: &'a ConnectorRequestContext,
     pub projection: Arc<StoredKeyedMvProjection>,
     pub rebuild_layout: Option<Arc<MvRewriteRebuildLayout>>,
+    pub recovery_publication: Option<Arc<MvStrictRecoveryPublication>>,
     pub pin: &'a RefreshSnapshotPin,
     pub state_baseline: &'a RefreshStateBaseline,
     pub target_binding: &'a MvTargetBinding,
@@ -175,6 +176,7 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
         || (facts.binding(), facts.interpretation()),
         |layout| (&layout.binding, &layout.interpretation),
     );
+    let captured = io.captured_sources();
     let analysis = freeze_rewrite_analysis_facts(MvRewriteAnalysisInput {
         definition_revision: facts.source_revision().definition_revision,
         binding,
@@ -183,20 +185,21 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
         observed_target_partition: inputs.target_binding.partition(),
         join_analysis: inputs.join_analysis.clone(),
         aggregate: inputs.aggregate,
-        source_fields: io
-            .captured_sources()
-            .analyzed_fields()
-            .cloned()
-            .ok_or("MV rewrite lacks the original analyzed source fields")?,
-        direct_output_sources: io
-            .captured_sources()
+        sql_source_fields: freeze_sql_source_fields(
+            &captured,
+            binding,
+            inputs.storage_observation,
+            inputs.connector_context,
+        )?,
+        direct_output_sources: captured
             .direct_output_sources()
             .cloned()
             .ok_or("MV rewrite lacks the original analyzed output lineage")?,
     })?;
-    build_neutral_refresh_rewrite_context(
+    let mut rewrite = build_neutral_refresh_rewrite_context(
         Arc::clone(&inputs.projection),
         inputs.rebuild_layout,
+        inputs.recovery_publication,
         rewrite_current_sources(inputs.pin),
         rewrite_history_sources_original(
             io,
@@ -205,13 +208,91 @@ pub(crate) async fn freeze_refresh_rewrite_context_original(
             inputs.connector_context,
         )
         .await?,
-        inputs.target_binding.table_uuid().to_string(),
-        inputs.target_binding.physical_write_schema()?,
-        inputs.target_binding.write_input_fields()?,
-        inputs.target_observation.exact_schema().clone(),
+        inputs.target_binding,
+        inputs.target_observation,
         analysis,
-    )
-    .map_err(Into::into)
+    )?;
+    rewrite.retain_equivalent_source_contexts(&io.captured_sources())?;
+    Ok(Arc::new(rewrite))
+}
+
+fn freeze_sql_source_fields(
+    sources: &crate::query_execution::mv_assembly::refresh_preparation::captured_sources::CapturedRefreshSources,
+    binding: &novarocks_mv_application::persistence::codec::BindingDocument,
+    storage_observation: &dyn MvStorageObservationPort,
+    context: &ConnectorRequestContext,
+) -> Result<
+    BTreeMap<u32, Vec<SqlImvBaseFieldFacts>>,
+    crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError,
+> {
+    let analyzed = sources
+        .analyzed_fields()
+        .ok_or("MV rewrite lacks the original analyzed source fields")?;
+    binding
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            let projected = sources.require(&occurrence_table(occurrence))?;
+            let metadata = projected.sql_metadata()?;
+            let observed = crate::mv::domain::storage_observation::observe_source_schema(
+                storage_observation,
+                &projected.planning_pin,
+                &metadata,
+                context.clone(),
+            )?;
+            crate::mv::domain::refresh::observation::validate_observed_schema_locator(
+                observed.table(),
+                &metadata.identity,
+            )?;
+            if observed.table_object_id() != &projected.object
+                || observed.selected_snapshot_id() != projected.snapshot
+            {
+                return Err("MV SQL source schema differs from its original pin".into());
+            }
+            super::schema_contract::validate_relation_occurrence_schema(occurrence, &observed)?;
+            let fields = analyzed
+                .get(&occurrence.occurrence_id)
+                .ok_or("MV rewrite lacks an analyzed source occurrence")?;
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let exact = observed
+                        .fields()
+                        .iter()
+                        .find(|value| value.field_id == field.field_id)
+                        .ok_or("MV prepared SQL source lost an admitted field identity")?;
+                    let ordinal = usize::try_from(exact.ordinal)
+                        .map_err(|_| "MV prepared SQL field ordinal is out of range")?;
+                    let arrow = metadata
+                        .schema()
+                        .fields()
+                        .get(ordinal)
+                        .ok_or("MV prepared SQL source has no field at its Provider ordinal")?;
+                    let declaration = metadata
+                        .execution_schema()
+                        .binding(ordinal)
+                        .ok_or("MV prepared SQL source lacks its exact value declaration")?;
+                    if exact.name != field.name
+                        || arrow.name() != &exact.name
+                        || exact.nullable != field.nullable
+                        || declaration.nullable() != exact.nullable
+                    {
+                        return Err(
+                            "MV prepared SQL source changed the admitted field name or nullability"
+                                .to_string(),
+                        );
+                    }
+                    SqlImvBaseFieldFacts::try_new(
+                        Bytes::copy_from_slice(exact.field_id.as_bytes()),
+                        exact.name.clone(),
+                        declaration.data_type().clone(),
+                        declaration.nullable(),
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((occurrence.occurrence_id, fields))
+        })
+        .collect()
 }
 
 pub(crate) async fn rewrite_history_sources_original(

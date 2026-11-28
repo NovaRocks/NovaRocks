@@ -1356,6 +1356,7 @@ impl ContractLoweringVisitor<'_> {
                     NodeKind::GenerateSeries { .. }
                     | NodeKind::SystemRelation { .. }
                     | NodeKind::WriteLayoutKey { .. }
+                    | NodeKind::ContentApply(_)
                     | NodeKind::PositionShard(_) => {}
                     NodeKind::Scan { .. }
                     | NodeKind::Filter { .. }

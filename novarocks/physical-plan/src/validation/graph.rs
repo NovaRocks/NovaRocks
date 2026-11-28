@@ -736,7 +736,7 @@ pub(crate) fn validate_edge(
     } else if let Some(root) = source.nodes().get(&source.root()) {
         let root_values = root_port_indexes
             .entry(source.id())
-            .or_insert_with(|| ValuePortIndex::new(&root.output.columns));
+            .or_insert_with(|| ValuePortIndex::new(root.data_output_columns()));
         if edge
             .source
             .projection

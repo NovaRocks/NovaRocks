@@ -45,6 +45,21 @@ pub struct PreparedMvNativeWriteAssembly {
 }
 
 impl PreparedMvNativeWriteAssembly {
+    pub(crate) fn apply_content_memory_budget(&mut self, budget: u64) -> Result<(), String> {
+        let budget = i64::try_from(budget)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or("MV content verification budget has no Native representation")?;
+        let mut options = self
+            .query_options
+            .take()
+            .map(|options| *options.as_proto())
+            .unwrap_or_default();
+        options.query_mem_limit = budget;
+        self.query_options = Some(QueryOptions::from_proto(options));
+        Ok(())
+    }
+
     /// The commit authority of this write, so a caller that fails between
     /// assembly and dispatch can release it rather than leaving the provider
     /// holding a session for a plan that will never run.

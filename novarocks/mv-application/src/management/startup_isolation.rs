@@ -108,6 +108,8 @@ pub struct StartupIsolationDeclaration {
     /// The incarnations whose dispatches can no longer land.
     pub isolated_incarnations: BTreeSet<ProcessIncarnation>,
     pub scope: StartupIsolationScope,
+    /// The deployment declares every other incarnation's old effects settled.
+    pub all_other_incarnations_settled: bool,
     /// When the isolation was complete. It is the conservative T the remote
     /// effect window is measured from, so a statement that names a later
     /// moment than the truth delays readmission rather than rushing it.
@@ -119,6 +121,9 @@ pub struct StartupIsolationDeclaration {
 /// A declaration this process has accepted for this launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupIsolationEvidence {
+    deployment: DeploymentOwner,
+    incarnation: ProcessIncarnation,
+    all_other_incarnations_settled: bool,
     isolated_incarnations: BTreeSet<ProcessIncarnation>,
     scope: StartupIsolationScope,
     isolated_at: ManagementTimestamp,
@@ -148,7 +153,9 @@ impl StartupIsolationEvidence {
         if declaration.nonce != *launch_nonce {
             return Err(StartupIsolationError::StaleNonce);
         }
-        if declaration.isolated_incarnations.is_empty() {
+        if declaration.isolated_incarnations.is_empty()
+            && !declaration.all_other_incarnations_settled
+        {
             return Err(StartupIsolationError::NoIsolatedIncarnation);
         }
         if declaration
@@ -168,12 +175,34 @@ impl StartupIsolationEvidence {
         if declaration.source.trim().is_empty() {
             return Err(StartupIsolationError::MissingSource);
         }
+        if declaration.all_other_incarnations_settled
+            && declaration.scope != StartupIsolationScope::Deployment
+        {
+            return Err(StartupIsolationError::SettlementRequiresDeploymentScope);
+        }
         Ok(Self {
+            deployment: declaration.deployment,
+            incarnation: declaration.for_incarnation,
+            all_other_incarnations_settled: declaration.all_other_incarnations_settled,
             isolated_incarnations: declaration.isolated_incarnations,
             scope: declaration.scope,
             isolated_at: declaration.isolated_at,
             source: Arc::from(declaration.source.as_str()),
         })
+    }
+
+    pub(super) fn settled_for_launch(
+        &self,
+        owner: &DeploymentOwner,
+        incarnation: &ProcessIncarnation,
+    ) -> bool {
+        self.all_other_incarnations_settled
+            && owner == &self.deployment
+            && incarnation == &self.incarnation
+    }
+
+    pub(super) fn covers_incarnations(&self, prior: &BTreeSet<ProcessIncarnation>) -> bool {
+        prior.is_subset(&self.isolated_incarnations)
     }
 
     /// The isolation this statement establishes for one recovered target, or
@@ -219,6 +248,7 @@ pub enum StartupIsolationError {
     NoIsolatedIncarnation,
     SelfIsolation,
     EmptyScope,
+    SettlementRequiresDeploymentScope,
     IsolationInTheFuture,
     MissingSource,
 }
@@ -243,6 +273,7 @@ impl std::fmt::Display for StartupIsolationError {
                 "startup isolation evidence names no isolated incarnation, so it states nothing"
             }
             Self::SelfIsolation => "startup isolation evidence names this very process as isolated",
+            Self::SettlementRequiresDeploymentScope => "all prior effects require deployment scope",
             Self::EmptyScope => "startup isolation evidence lists no target in its scope",
             Self::IsolationInTheFuture => {
                 "startup isolation evidence is dated after this process read it"
@@ -302,6 +333,7 @@ mod tests {
             nonce: nonce("launch-1"),
             isolated_incarnations: [incarnation("old")].into_iter().collect(),
             scope: StartupIsolationScope::Deployment,
+            all_other_incarnations_settled: false,
             isolated_at: ManagementTimestamp::from_unix_millis(1_000),
             source: "supervisor recorded pid 42 exited".to_string(),
         }

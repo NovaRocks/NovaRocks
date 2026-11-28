@@ -17,3 +17,5 @@
 
 pub(crate) mod build;
 pub(crate) mod write;
+
+pub(crate) const RUNTIME_FILTER_ARTIFACT_BYTES: u64 = 4096;

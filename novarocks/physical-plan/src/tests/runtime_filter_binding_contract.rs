@@ -19,6 +19,26 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+#[test]
+fn content_demand_binding_rejects_any_producer_coverage() {
+    let (_, mut filter) = super::content_apply_contract::runtime_filter_content_apply_fixture();
+    let mut errors = crate::validation::ValidationContext::new();
+    crate::validation::validate_runtime_filter_matrix(&filter, true, "content demand", &mut errors);
+    assert!(errors.into_vec().is_empty());
+    filter.availability_coverage.nodes[1] = RuntimeFilterCoverageNode::AnyOf {
+        children: Box::new([0]),
+    };
+    filter.terminal_coverage = filter.availability_coverage.clone();
+    let mut errors = crate::validation::ValidationContext::new();
+    crate::validation::validate_runtime_filter_matrix(&filter, true, "content demand", &mut errors);
+    assert!(
+        errors
+            .into_vec()
+            .iter()
+            .any(|error| error.message().contains("AllOf coverage"))
+    );
+}
+
 const PARTITIONED_FILTER: u32 = 101;
 const PARTITIONED_PRODUCER_FRAGMENT: u32 = 101;
 const PARTITIONED_CONSUMER_FRAGMENT: u32 = 900;
@@ -257,6 +277,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
         let parts = crate::plan::FragmentParts {
             summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
@@ -322,6 +343,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
         Fragment::from(crate::plan::FragmentParts {
             summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),

@@ -76,6 +76,7 @@ pub enum PreparedMvRefreshWork {
 pub struct PreparedMvRefreshWrite {
     artifact: PreparedMvRefreshWriteArtifact,
     sources: std::sync::Arc<super::refresh_preparation::captured_sources::CapturedRefreshSources>,
+    replace_overlays: Option<super::partition_replace::PreparedPartitionReplacementReads>,
 }
 
 /// The assembly-facing shape remains crate-private so it cannot become part
@@ -95,6 +96,7 @@ impl PreparedMvRefreshWrite {
         Self {
             artifact: PreparedMvRefreshWriteArtifact::FirstRefresh(write),
             sources,
+            replace_overlays: None,
         }
     }
 
@@ -107,7 +109,16 @@ impl PreparedMvRefreshWrite {
         Self {
             artifact: PreparedMvRefreshWriteArtifact::Incremental(write),
             sources,
+            replace_overlays: None,
         }
+    }
+
+    pub(crate) fn with_partition_replacement_overlays(
+        mut self,
+        overlays: super::partition_replace::PreparedPartitionReplacementReads,
+    ) -> Self {
+        self.replace_overlays = Some(overlays);
+        self
     }
 
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -196,8 +207,9 @@ impl PreparedMvRefreshWrite {
     ) -> (
         PreparedMvRefreshWriteArtifact,
         std::sync::Arc<super::refresh_preparation::captured_sources::CapturedRefreshSources>,
+        Option<super::partition_replace::PreparedPartitionReplacementReads>,
     ) {
-        (self.artifact, self.sources)
+        (self.artifact, self.sources, self.replace_overlays)
     }
 }
 

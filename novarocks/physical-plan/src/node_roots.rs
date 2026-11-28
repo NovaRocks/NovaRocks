@@ -295,6 +295,7 @@ pub(crate) fn visit_node_roots(
         | NodeKind::AssertOneRow(_)
         | NodeKind::ExchangeSource { .. }
         | NodeKind::PositionShard(_)
+        | NodeKind::ContentApply(_)
         | NodeKind::WriteLayoutKey { .. }
         | NodeKind::TableWriter { .. } => {}
     }

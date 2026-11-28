@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 /// from its diagnostic text. It owns no tracker or query lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemTrackerLimitExceeded {
+    constraint_scope: Option<novarocks_failure_contract::ResourceScope>,
     detail: String,
     requested: u64,
     limit: u64,
@@ -90,6 +91,7 @@ impl novarocks_failure_contract::FailureProjection for MemTrackerLimitInstallErr
 /// allocating a diagnostic or retaining the tracker that owns the counter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemTrackerLimitFact {
+    pub(crate) constraint_scope: Option<novarocks_failure_contract::ResourceScope>,
     pub(crate) requested: u64,
     pub(crate) limit: u64,
     pub(crate) committed: u64,
@@ -227,6 +229,7 @@ impl novarocks_failure_contract::FailureProjection for MemoryAccountingFailure {
 /// statistics.
 #[derive(Debug)]
 pub struct MemTracker {
+    scope: Option<novarocks_failure_contract::ResourceScope>,
     label: String,
     limit: AtomicI64,
     parent: Option<Arc<MemTracker>>,
@@ -251,7 +254,15 @@ pub(crate) struct TrackerLimitFailureRequestFacts {
 impl MemTracker {
     /// Create a root tracker with no parent.
     pub fn new_root(label: impl Into<String>) -> Arc<Self> {
+        Self::root_with_scope(label, None)
+    }
+
+    fn root_with_scope(
+        label: impl Into<String>,
+        scope: Option<novarocks_failure_contract::ResourceScope>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            scope,
             label: label.into(),
             limit: AtomicI64::new(-1),
             parent: None,
@@ -265,7 +276,25 @@ impl MemTracker {
 
     /// Create a child tracker with the provided parent.
     pub fn new_child(label: impl Into<String>, parent: &Arc<MemTracker>) -> Arc<Self> {
+        Self::child_with_scope(label, parent, None)
+    }
+
+    /// Attach the original query-accounting subtree to its process tracker.
+    pub fn new_query(label: impl Into<String>, parent: &Arc<MemTracker>) -> Arc<Self> {
+        Self::child_with_scope(
+            label,
+            parent,
+            Some(novarocks_failure_contract::ResourceScope::Query),
+        )
+    }
+
+    fn child_with_scope(
+        label: impl Into<String>,
+        parent: &Arc<MemTracker>,
+        scope: Option<novarocks_failure_contract::ResourceScope>,
+    ) -> Arc<Self> {
         let child = Arc::new(Self {
+            scope,
             label: label.into(),
             limit: AtomicI64::new(-1),
             parent: Some(Arc::clone(parent)),
@@ -329,6 +358,7 @@ impl MemTracker {
                 if current > limit {
                     Err(MemTrackerLimitInstallError::Exceeded(
                         MemTrackerLimitExceeded {
+                            constraint_scope: self.scope,
                             detail: self.limit_exceeded_detail(current, limit),
                             requested: 0,
                             limit: limit as u64,
@@ -397,6 +427,7 @@ impl MemTracker {
     pub fn consume_and_check_limit_typed(&self, bytes: i64) -> Result<(), MemTrackerLimitExceeded> {
         self.consume_with_limit_projection(bytes, |tracker, current, limit| {
             MemTrackerLimitExceeded {
+                constraint_scope: tracker.scope,
                 detail: tracker.limit_exceeded_detail(current, limit),
                 requested: bytes as u64,
                 limit: limit as u64,
@@ -410,7 +441,8 @@ impl MemTracker {
         &self,
         bytes: i64,
     ) -> Result<(), MemTrackerLimitFact> {
-        self.consume_with_limit_projection(bytes, |_, committed, limit| MemTrackerLimitFact {
+        self.consume_with_limit_projection(bytes, |tracker, committed, limit| MemTrackerLimitFact {
+            constraint_scope: tracker.scope,
             requested: bytes as u64,
             limit: limit as u64,
             committed: committed as u64,
@@ -524,6 +556,7 @@ impl MemTracker {
             let next = current.saturating_add(bytes);
             if limit > 0 && next > limit {
                 return Err(MemTrackerLimitExceeded {
+                    constraint_scope: self.scope,
                     detail: self.limit_exceeded_detail(next, limit),
                     requested: bytes as u64,
                     limit: limit as u64,
@@ -654,7 +687,12 @@ static PROCESS_TRACKER: OnceLock<Arc<MemTracker>> = OnceLock::new();
 /// owner attaches through `new_child` so one process owns exactly one tracker
 /// hierarchy.
 pub fn process_mem_tracker() -> Arc<MemTracker> {
-    Arc::clone(PROCESS_TRACKER.get_or_init(|| MemTracker::new_root("process")))
+    Arc::clone(PROCESS_TRACKER.get_or_init(|| {
+        MemTracker::root_with_scope(
+            "process",
+            Some(novarocks_failure_contract::ResourceScope::Process),
+        )
+    }))
 }
 
 /// Canonical label for the query-scoped tracker of one query identity.
@@ -950,6 +988,7 @@ mod tests {
 impl novarocks_failure_contract::FailureProjection for MemTrackerLimitExceeded {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureProjection::failure_fact(&MemTrackerLimitFact {
+            constraint_scope: self.constraint_scope,
             requested: self.requested,
             limit: self.limit,
             committed: self.committed,
@@ -968,7 +1007,7 @@ impl novarocks_failure_contract::FailureProjection for MemTrackerLimitFact {
         )
         .with_resource(ResourceFacts {
             request_scope: None,
-            constraint_scope: None,
+            constraint_scope: self.constraint_scope,
             dimension: ResourceDimension::Bytes,
             requested: Some(self.requested),
             required_growth: None,
@@ -983,6 +1022,36 @@ impl novarocks_failure_contract::FailureProjection for MemTrackerLimitFact {
 mod failure_projection_tests {
     use super::*;
     use novarocks_failure_contract::FailureProjection;
+    #[test]
+    fn reports_the_exact_query_or_process_limit_in_a_shared_hierarchy() {
+        use novarocks_failure_contract::ResourceScope;
+        let parent = MemTracker::root_with_scope("process", Some(ResourceScope::Process));
+        let query = MemTracker::new_query("query", &parent);
+        let operator = MemTracker::new_child("content-apply", &query);
+        query.install_limit_once(5).unwrap();
+        parent.install_limit_once(8).unwrap();
+        let query_facts = operator
+            .consume_and_check_limit_nominal(6)
+            .unwrap_err()
+            .failure_fact();
+        assert_eq!(
+            query_facts.resource().unwrap().constraint_scope,
+            Some(ResourceScope::Query)
+        );
+        operator.release(6);
+        parent.consume(7);
+        let process_facts = operator
+            .consume_and_check_limit_typed(2)
+            .unwrap_err()
+            .failure_fact();
+        assert_eq!(
+            process_facts.resource().unwrap().constraint_scope,
+            Some(ResourceScope::Process)
+        );
+        operator.release(2);
+        parent.release(7);
+    }
+
     #[test]
     fn nominal_refusal_keeps_post_charge_facts_without_retaining_its_tracker() {
         let nominal = MemTracker::new_root("nominal capacity source");

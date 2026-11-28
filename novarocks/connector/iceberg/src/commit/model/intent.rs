@@ -18,6 +18,9 @@
 //! A logical operation freezes its source facts once, before any publication attempt.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection;
 
 use super::{
     AddedContent, CommitProtocol, Dependency, FrozenEntry, OperationToken, RequestShape, invalid,
@@ -70,6 +73,7 @@ pub struct OperationIntent {
     parts: OperationIntentParts,
     snapshot_loading: crate::catalog::SnapshotLoading,
     compact_stage: Option<usize>,
+    partition_replace: Option<Arc<ConnectorMvTargetPartitionSelection>>,
 }
 
 impl OperationIntent {
@@ -133,10 +137,22 @@ impl OperationIntent {
                 "Create intent cannot carry an existing start snapshot",
             ));
         }
+        if parts.shape == RequestShape::FencedMarkers
+            && (parts.target_ref != "main"
+                || !matches!(&parts.protocol, CommitProtocol::Legacy)
+                || parts.dependencies != [Dependency::RefUnchanged]
+                || !parts.changes.added.is_empty()
+                || !parts.changes.removed.is_empty())
+        {
+            return Err(invalid(
+                "Fenced marker intent requires a fixed main and no file changes",
+            ));
+        }
         Ok(Self {
             parts,
             snapshot_loading: crate::catalog::SnapshotLoading::All,
             compact_stage: None,
+            partition_replace: None,
         })
     }
     pub(crate) fn with_compact_stage(mut self, stage: usize) -> Result<Self> {
@@ -153,6 +169,23 @@ impl OperationIntent {
 
     pub(crate) fn compact_stage(&self) -> Option<usize> {
         self.compact_stage
+    }
+
+    pub(crate) fn with_partition_replace(
+        mut self,
+        selection: Arc<ConnectorMvTargetPartitionSelection>,
+    ) -> Result<Self> {
+        if !self.protocol().is_partition_replace()
+            || self.start().map(|snapshot| snapshot.snapshot_id) != Some(selection.snapshot_id())
+        {
+            return Err(invalid("Partition replacement has a different fixed base"));
+        }
+        self.partition_replace = Some(selection);
+        Ok(self)
+    }
+
+    pub(crate) fn partition_replace(&self) -> Option<&ConnectorMvTargetPartitionSelection> {
+        self.partition_replace.as_deref()
     }
     pub(crate) fn with_snapshot_loading(mut self, mode: crate::catalog::SnapshotLoading) -> Self {
         self.snapshot_loading = mode;

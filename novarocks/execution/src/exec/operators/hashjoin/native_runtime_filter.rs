@@ -98,16 +98,32 @@ impl NativeMembershipProducerBinding {
                 )));
             }
         };
-        let data_type = key_type()?;
+        Self::checked_membership(
+            contract,
+            join_key_ordinal,
+            expected_null_semantics,
+            key_type()?,
+            session,
+        )
+    }
+
+    fn checked_membership(
+        contract: &execution::RuntimeFilterProducerContract,
+        join_key_ordinal: usize,
+        expected_null_semantics: execution::RuntimeFilterNullSemantics,
+        data_type: arrow::datatypes::DataType,
+        session: execution::RuntimeFilterSessionRef,
+    ) -> ExecutionResult<Self> {
+        let binding_id = contract.binding_id().get();
         if contract.kind() != execution::RuntimeFilterProducerKind::Membership {
             return Err(producer_contract(format!(
-                "native runtime-filter binding_id={binding_id} hash join producer requires a membership producer contract"
+                "native runtime-filter binding_id={binding_id} requires a membership producer contract"
             )));
         }
         let RuntimeFilterExecutionContract::Membership(membership_schema) = contract.contract()
         else {
             return Err(producer_contract(format!(
-                "native runtime-filter binding_id={binding_id} hash join producer requires a membership contract"
+                "native runtime-filter binding_id={binding_id} requires a membership contract"
             )));
         };
         if membership_schema.data_type() != &data_type
@@ -136,6 +152,29 @@ pub(crate) struct NativeRuntimeFilterProducerFactory {
 }
 
 impl NativeRuntimeFilterProducerFactory {
+    pub(crate) fn from_content_demand(
+        producers: &[(usize, execution::RuntimeFilterProducerContract)],
+        mut key_type: impl FnMut(usize) -> ExecutionResult<arrow::datatypes::DataType>,
+        session: execution::RuntimeFilterSessionRef,
+    ) -> ExecutionResult<Self> {
+        let bindings = producers
+            .iter()
+            .map(|(ordinal, contract)| {
+                NativeMembershipProducerBinding::checked_membership(
+                    contract,
+                    *ordinal,
+                    execution::RuntimeFilterNullSemantics::NullSafeEqual,
+                    key_type(*ordinal)?,
+                    Arc::clone(&session),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            bindings,
+            local_partition_count: 1,
+        })
+    }
+
     /// The membership producers of one compiled hash join. Each producer is
     /// the build-key ordinal it observes and its runtime contract;
     /// `build_key_type` gives the static type of the compiled build-key root
@@ -249,6 +288,13 @@ pub(crate) struct NativeRuntimeFilterProducerSet {
 }
 
 impl NativeRuntimeFilterProducerSet {
+    pub(crate) fn accepts_input(&self) -> bool {
+        !self.completed
+            && self.streams.iter().any(|stream| {
+                !stream.terminal && !stream.binding.coordinator.failed.load(Ordering::Acquire)
+            })
+    }
+
     pub(crate) fn bind(&mut self, local_partition_count: u32) -> ExecutionResult<()> {
         for stream in &mut self.streams {
             if let Err(error) = stream.bind(local_partition_count) {

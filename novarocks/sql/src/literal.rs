@@ -581,7 +581,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         SqlType::Map(key, value) => {
             let entries = DataType::Struct(
                 vec![
-                    Arc::new(sql_type_to_arrow_field("key", key, true)?),
+                    Arc::new(sql_type_to_arrow_field("key", key, false)?),
                     Arc::new(sql_type_to_arrow_field("value", value, true)?),
                 ]
                 .into(),
@@ -701,13 +701,10 @@ pub fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
 /// Compare two Arrow [`DataType`]s for structural equality while ignoring
 /// nested [`Field`] metadata and nested-field nullability.
 ///
-/// Motivation: Maps / Structs / Lists scanned from Iceberg parquet carry
-/// `PARQUET:field_id` metadata on every inner Field, and the Iceberg map
-/// convention uses non-null map keys, whereas the layout-derived expected
-/// type produced by [`sql_type_to_arrow_type`] does not carry any metadata
-/// and conservatively marks every nested field nullable. The two are
-/// semantically the same shape; the strict `PartialEq` on `DataType` rejects
-/// them.
+/// Iceberg parquet can carry `PARQUET:field_id` metadata on nested fields and
+/// preserve their storage nullability. SQL declarations mark list elements,
+/// row fields, and map values nullable and require map keys and entries. The
+/// strict `PartialEq` on `DataType` also compares these field properties.
 ///
 /// This helper recurses through the container types (Map, Struct, List,
 /// LargeList, FixedSizeList, Dictionary, Union, RunEndEncoded) and compares
@@ -1061,6 +1058,48 @@ pub fn column_default_to_ast_literal(
 mod tests {
     use super::*;
     use crate::semantic::Literal;
+
+    #[test]
+    fn sql_map_declaration_preserves_required_keys_in_typed_write_fields() {
+        let declaration = SqlType::Map(
+            Box::new(SqlType::String),
+            Box::new(SqlType::Map(
+                Box::new(SqlType::String),
+                Box::new(SqlType::BigInt),
+            )),
+        );
+        let carrier = sql_type_to_arrow_type(&declaration).unwrap();
+
+        let map_value = |carrier: &DataType| {
+            let DataType::Map(entries, false) = carrier else {
+                panic!("expected an unordered MAP");
+            };
+            assert!(!entries.is_nullable());
+            let DataType::Struct(fields) = entries.data_type() else {
+                panic!("expected MAP entries");
+            };
+            let [key, value] = fields.as_ref() else {
+                panic!("expected key and value fields");
+            };
+            assert!(!key.is_nullable());
+            assert!(value.is_nullable());
+            value.clone()
+        };
+        let nested = map_value(&carrier);
+        assert_eq!(map_value(nested.data_type()).data_type(), &DataType::Int64);
+
+        let binding = novarocks_types::execution_value_type_from_declaration(
+            &declaration,
+            &carrier,
+            true,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let value =
+            novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding).unwrap();
+        assert!(value.nullable());
+        assert_eq!(value.data_type(), &carrier);
+    }
 
     #[test]
     fn m07_internal_opaque_facts_do_not_admit_public_casts_or_defaults() {

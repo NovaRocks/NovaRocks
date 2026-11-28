@@ -170,12 +170,6 @@ mod e08s1_owned_lifecycle_tests;
 mod late_call_sql_source_tests;
 
 #[cfg(test)]
-mod mv_catalogue_sql_test_source;
-
-#[cfg(test)]
-mod e08s1_mv_catalogue_retention_tests;
-
-#[cfg(test)]
 mod environment_sql_source_tests;
 
 #[cfg(test)]

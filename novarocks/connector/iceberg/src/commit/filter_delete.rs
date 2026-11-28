@@ -160,6 +160,22 @@ impl Preparer for FilterDeletePreparer {
         let active = || artifacts.check_active();
         active()?;
         let operation = intent.protocol().operation();
+        let partition = if intent.protocol().is_partition_replace() {
+            let admitted = intent
+                .partition_replace()
+                .filter(|_| self.full_refresh)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Partition replacement lost its exact delete selection",
+                    )
+                })?;
+            let checked = crate::typed_boundary::ExactMvTargetPartitions::check(metadata, admitted)
+                .map_err(super::slot_change::document_error)?;
+            Some(checked)
+        } else {
+            None
+        };
         let mut prepared = match &self.selection {
             Selection::Condition(fact) => {
                 Some(ConditionJudge::for_base(fact, metadata, operation)?)
@@ -194,7 +210,19 @@ impl Preparer for FilterDeletePreparer {
                             spec_id: entry.source.descriptor.partition_spec_id,
                             file,
                         };
-                        match self.file_verdict(prepared.as_ref(), &candidate)? {
+                        let verdict = if let Some(exact) = &partition {
+                            match exact.matches(candidate.spec_id, candidate.file.partition()) {
+                                Some(true) => FileVerdict::All,
+                                Some(false) => FileVerdict::None,
+                                None => return Err(super::new_manifests::commit_validation_error_for(
+                                    operation,
+                                    "Partition replacement cannot prove the complete file partition",
+                                )),
+                            }
+                        } else {
+                            self.file_verdict(prepared.as_ref(), &candidate)?
+                        };
+                        match verdict {
                             FileVerdict::All => {
                                 let entry = LocatedEntry::from_bound(index, &entry)?;
                                 let identity = entry.frozen.identity().clone();
@@ -258,7 +286,7 @@ impl Preparer for FilterDeletePreparer {
             snapshot_id,
             manifests,
             &removed,
-            self.full_refresh,
+            self.full_refresh && partition.is_none(),
         )
         .await
     }

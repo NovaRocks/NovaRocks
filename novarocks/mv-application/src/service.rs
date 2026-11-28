@@ -173,6 +173,13 @@ impl MvProductOperations {
         self.scheduler_config.tick_interval_ms()
     }
 
+    /// Use the existing product backoff settings within one strict refresh.
+    pub fn strict_refresh_retry_delay(&self, attempt: u32) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            crate::scheduler_runtime::backoff_ms(&self.scheduler_config, attempt).unsigned_abs(),
+        )
+    }
+
     /// Run one provider-observation adapter transition against the single
     /// product scheduler. The callback receives no clone or handle that could
     /// retain scheduler state outside this process product owner.

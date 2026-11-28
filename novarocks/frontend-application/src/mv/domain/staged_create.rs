@@ -32,8 +32,8 @@ use std::sync::Arc;
 use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
-    ManagementEntrance, ManagementEntranceObligation, ManagementRequest, ManagementTimestamp,
-    ProcessIncarnation,
+    ManagementDependencySet, ManagementEntrance, ManagementEntranceObligation, ManagementRequest,
+    ManagementTimestamp, ProcessIncarnation,
 };
 use novarocks_mv_application::persistence::codec::{DefinitionDocument, InterpretationDocument};
 use novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision;
@@ -46,7 +46,7 @@ use novarocks_spi::connector::document_storage::{
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlPlanningPin, ConnectorExactSemanticRevision,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectId, LakePublicationId,
+    ConnectorTableObjectId, KeyedDocumentView, LakePublicationId,
 };
 
 #[path = "staged_create/create_original.rs"]
@@ -63,7 +63,7 @@ pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> 
     now_unix_millis().map(ManagementTimestamp::from_unix_millis)
 }
 
-fn now_unix_millis() -> Result<u64, String> {
+pub(crate) fn now_unix_millis() -> Result<u64, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system clock is before the Unix epoch".to_string())?;
@@ -376,31 +376,41 @@ pub(crate) async fn install_published_current_projection_async_in(
     .await
 }
 
-pub(crate) async fn install_metadata_only_current_projection_async_in(
-    entrance: &ManagementEntrance,
-    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+pub(crate) enum CurrentRenewal {
+    MetadataOnly(
+        Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
+    ),
+    ExactContent {
+        target: novarocks_mv_application::product::MvTarget,
+        expected: Box<KeyedDocumentView>,
+        previous: ManagementDependencySet,
+    },
+}
+
+pub(crate) async fn renew_admitted_current_projection_async_in(
+    services: CurrentProjectionServices<'_, '_>,
     catalog: CatalogHandle,
-    expected: Arc<
-        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
-    >,
+    renewal: CurrentRenewal,
     context: ConnectorRequestContext,
-    metadata_cpu: &CurrentProjectionMetadataCpu,
-    registration: &CurrentProjectionRegistration,
 ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
+    let (target, convergence) = match renewal {
+        CurrentRenewal::MetadataOnly(expected) => (
+            expected.target(),
+            MvConvergence::MetadataOnlyCurrent { expected },
+        ),
+        CurrentRenewal::ExactContent {
+            target,
+            expected,
+            previous,
+        } => (target, MvConvergence::ExactContent { expected, previous }),
+    };
     install_current_projection_async_in(
-        CurrentProjectionServices {
-            entrance,
-            readiness,
-            connector_control,
-            metadata_cpu,
-            registration,
-        },
+        services,
         catalog,
-        expected.target(),
+        target,
         uuid::Uuid::now_v7(),
         None,
-        MvConvergence::MetadataOnlyCurrent { expected },
+        convergence,
         context,
     )
     .await
@@ -411,6 +421,8 @@ pub(crate) struct CommittedMvMarker {
     pub(crate) operation: uuid::Uuid,
     pub(crate) key: novarocks_spi::connector::ConnectorMarkerKey,
     pub(crate) value: novarocks_spi::connector::ConnectorMarkerValue,
+    pub(crate) original_view: Option<novarocks_spi::connector::KeyedDocumentView>,
+    pub(crate) completion_error: Option<super::application::MvApplicationError>,
 }
 
 pub(crate) async fn install_marked_current_projection_async_in(
@@ -428,7 +440,10 @@ pub(crate) async fn install_marked_current_projection_async_in(
         expected.target(),
         marker.operation,
         None,
-        MvConvergence::CommittedMarker { expected, marker },
+        MvConvergence::CommittedMarker {
+            expected,
+            marker: Box::new(marker),
+        },
         context.after_external_effect(),
     )
     .await
@@ -485,13 +500,18 @@ enum MvConvergence {
             novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
         >,
     },
+    /// Same-owner content Current changed while this entrance stayed open.
+    ExactContent {
+        expected: Box<KeyedDocumentView>,
+        previous: ManagementDependencySet,
+    },
     /// An effect this process committed must be re-observed before management
     /// reopens.
     CommittedEffect,
     CommittedMarker {
         expected:
             Arc<novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection>,
-        marker: CommittedMvMarker,
+        marker: Box<CommittedMvMarker>,
     },
     /// A previous writer's unresolved effects were declared unable to land,
     /// and the target is being readmitted under this process. The permits are
@@ -510,7 +530,15 @@ impl MvConvergence {
     ) -> Result<(), String> {
         if let Self::CommittedMarker { expected, marker } = self
             && (!metadata_only_current_matches(expected, observed)
-                || observed.view.markers.get(&marker.key) != Some(&marker.value))
+                || observed.view.markers.get(&marker.key) != Some(&marker.value)
+                || marker.original_view.as_ref().is_some_and(|original| {
+                    let mut expected = original.clone();
+                    expected
+                        .markers
+                        .insert(marker.key.clone(), marker.value.clone());
+                    expected.metadata_version = observed.view.metadata_version.clone();
+                    expected != observed.view
+                }))
         {
             return Err("MV marker settlement observed a different binding or marker".into());
         }
@@ -643,9 +671,12 @@ fn validate_readmission_capture(
 pub(crate) struct CurrentProjectionRegistration {
     capture: Arc<current_metadata_cpu::CurrentMetadataCapture>,
     receiving: Arc<novarocks_spi::connector::ConnectorCatalogMutationReceiving>,
+    reconciliation: Arc<novarocks_spi::connector::ConnectorCatalogMutationReceiving>,
     preparation: std::sync::OnceLock<CurrentRegistrationPreparation>,
     admission: std::sync::OnceLock<ConnectorDocumentManagementAdmission>,
     call: std::sync::Mutex<CurrentRegistrationCall>,
+    slot_evidence: Arc<std::sync::OnceLock<novarocks_spi::connector::UnknownCommitEvidence>>,
+    non_aggregate_readmission: std::sync::OnceLock<ManagementEntrance>,
     state:
         std::sync::Mutex<Option<novarocks_mv_application::management::ManagementObservationState>>,
     health: novarocks_query_application::api::StatementNativeHealthFailure,
@@ -659,6 +690,28 @@ struct CurrentRegistrationPreparation {
     context: ConnectorRequestContext,
     operation_id: ConnectorMutationOperationId,
     responsibility: EffectResponsibility,
+}
+
+fn incarnation_slot_evidence(
+    documents: &ConnectorDocumentStorage,
+    request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    evidence: novarocks_spi::connector::ExternalMutationEvidence,
+) -> Result<novarocks_spi::connector::UnknownCommitEvidence, novarocks_spi::connector::ConnectorError>
+{
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, UnknownCommitIdentity};
+    let decoded = documents.decode_keyed_slot_change_evidence(request, evidence)?;
+    let expected = novarocks_mv_application::persistence::keyed_documents::management_slot_name()
+        .map_err(|error| {
+        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    })?;
+    if !matches!(&decoded.identity, UnknownCommitIdentity::SlotWriter { slot } if slot == &expected)
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV registration evidence is for another slot",
+        ));
+    }
+    Ok(decoded)
 }
 
 type CurrentRegistrationFuture = std::pin::Pin<
@@ -786,9 +839,14 @@ impl CurrentProjectionRegistration {
         Self {
             capture: current_metadata_cpu::new_current_metadata_capture(),
             receiving: Arc::new(novarocks_spi::connector::ConnectorCatalogMutationReceiving::new()),
+            reconciliation: Arc::new(
+                novarocks_spi::connector::ConnectorCatalogMutationReceiving::new(),
+            ),
             preparation: std::sync::OnceLock::new(),
             admission: std::sync::OnceLock::new(),
             call: std::sync::Mutex::new(CurrentRegistrationCall::default()),
+            slot_evidence: Arc::new(std::sync::OnceLock::new()),
+            non_aggregate_readmission: std::sync::OnceLock::new(),
             state: std::sync::Mutex::new(None),
             health:
                 novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
@@ -813,7 +871,10 @@ impl CurrentProjectionRegistration {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .in_foreign;
-        (unproven || self.receiving.foreign_exit_unproven()).then(|| self.health.clone())
+        (unproven
+            || self.receiving.foreign_exit_unproven()
+            || self.reconciliation.foreign_exit_unproven())
+        .then(|| self.health.clone())
     }
     fn install_state(
         &self,
@@ -905,12 +966,13 @@ impl CurrentProjectionRegistration {
             return Poll::Pending;
         }
         drop(call);
-        let observation = self.receiving.observation();
-        if !observation.dispatched() {
-            return Poll::Ready(());
-        }
-        if !observation.provider_exited() || self.receiving.foreign_exit_unproven() {
-            return Poll::Pending;
+        for receiving in [&self.receiving, &self.reconciliation] {
+            let observation = receiving.observation();
+            if observation.dispatched()
+                && (!observation.provider_exited() || receiving.foreign_exit_unproven())
+            {
+                return Poll::Pending;
+            }
         }
         Poll::Ready(())
     }
@@ -925,11 +987,16 @@ impl CurrentProjectionRegistration {
         };
         use std::task::Poll;
         std::task::ready!(self.poll_registration_physical_closed(cx));
-        let observation = self.receiving.observation();
-        if !observation.dispatched() {
+        let original = self.receiving.observation();
+        if !original.dispatched() {
             return Poll::Ready(());
         }
-        match observation.validated_outcome() {
+        let reconciled = self.reconciliation.observation();
+        let outcome = match original.validated_outcome() {
+            Some(Ok(O::CommitUnknown { .. })) => reconciled.validated_outcome(),
+            original => original,
+        };
+        match outcome {
             Some(Ok(O::KnownCommitted {
                 cleanup: F::Complete,
                 ..
@@ -960,11 +1027,30 @@ impl CurrentProjectionRegistration {
         // No formatting, callback or owner destruction occurs under this lock.
         let (needed, validated, dispatched) = {
             let observation = self.receiving.observation();
+            let reconciled = self.reconciliation.observation();
+            let validated = match (
+                observation.validated_outcome(),
+                reconciled.validated_outcome(),
+            ) {
+                (
+                    Some(Ok(O::CommitUnknown { .. })),
+                    Some(Ok(settled @ (O::KnownCommitted { .. } | O::KnownUncommitted { .. }))),
+                ) => Some(Ok(settled)),
+                (original, _) => original,
+            };
+            let needed = observation.needed_committed().or_else(|| {
+                if matches!(
+                    observation.validated_outcome(),
+                    Some(Ok(O::CommitUnknown { .. }))
+                ) {
+                    reconciled.needed_committed()
+                } else {
+                    None
+                }
+            });
             (
-                observation.needed_committed().cloned(),
-                observation
-                    .validated_outcome()
-                    .map(|outcome| outcome.cloned().map_err(Clone::clone)),
+                needed.cloned(),
+                validated.map(|outcome| outcome.cloned().map_err(Clone::clone)),
                 observation.dispatched(),
             )
         };
@@ -1034,6 +1120,22 @@ impl CurrentProjectionRegistration {
             R::ContractFailure { error, .. } => Err(current_projection_connector(error)),
         };
         Poll::Ready((disposition, result))
+    }
+}
+
+impl Drop for CurrentProjectionRegistration {
+    fn drop(&mut self) {
+        if let Some(entrance) = self.non_aggregate_readmission.get()
+            && let Some(state) = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            // Successful installation already consumed authorization. A refused
+            // observation only releases its own token after original retirement.
+            let _ = entrance.abandon_observation(state);
+        }
     }
 }
 
@@ -1115,21 +1217,67 @@ impl OriginalManagedTargetCurrentSource<'_> {
             .planning
             .derive_mutation_lease()
             .map_err(current_projection_connector)?;
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutationOperation, ConnectorCatalogMutationReconcileRequest,
+            ConnectorCatalogMutationRequest, ExternalMutationOutcome,
+        };
         let receiving = Arc::clone(&self.registration.receiving);
         let context = original.context.clone();
-        // The original future is installed before its first factory/poll. It
-        // owns only exact input/receiving aliases, never its outer Source.
+        let resolve_slot = !observed.interpretation.is_aggregate();
+        let probe = resolve_slot.then(|| {
+            let documents = original.documents.clone();
+            let request = keyed_request(
+                &documents,
+                original.observed.view.table.clone(),
+                original.observed.view.object_id.clone(),
+                context.clone().after_external_effect(),
+            );
+            (
+                documents,
+                request,
+                Arc::clone(&self.registration.slot_evidence),
+                Arc::clone(&self.registration.reconciliation),
+            )
+        });
+        let request = ConnectorCatalogMutationRequest {
+            operation_id,
+            target: original.documents.owner().clone(),
+            operation: ConnectorCatalogMutationOperation::KeyedDocuments { intent },
+            context,
+        };
+        // Both Provider Futures use the exact original request and generation.
+        // The independent receiver reports its actual cleanup and local exit.
         let future: CurrentRegistrationFuture = Box::pin(async move {
-            mutation
-                .execute_operation_async_in(
-                    operation_id,
-                    novarocks_spi::connector::ConnectorCatalogMutationOperation::KeyedDocuments {
-                        intent,
-                    },
-                    context,
-                    receiving.as_ref(),
-                )
-                .await
+            let result = mutation.execute_async_in(request.clone(), &receiving).await;
+            if let Some((documents, observation, slot_evidence, reconciliation)) = probe {
+                let external = match receiving.observation().validated_outcome() {
+                    Some(Ok(ExternalMutationOutcome::CommitUnknown { evidence, .. }))
+                        if evidence.operation_id() == operation_id =>
+                    {
+                        Some(evidence.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(external) = external {
+                    let evidence =
+                        incarnation_slot_evidence(&documents, observation, external.clone())?;
+                    assert!(
+                        slot_evidence.set(evidence).is_ok(),
+                        "one original slot witness"
+                    );
+                    mutation
+                        .reconcile_async_in(
+                            &request,
+                            ConnectorCatalogMutationReconcileRequest {
+                                evidence: external,
+                                context: request.context.clone(),
+                            },
+                            &reconciliation,
+                        )
+                        .await?;
+                }
+            }
+            result
         });
         {
             let mut call = self
@@ -1144,8 +1292,25 @@ impl OriginalManagedTargetCurrentSource<'_> {
             call.future = Some(future);
             call.call_installed = true;
         }
-        let (disposition, result) =
-            std::future::poll_fn(|cx| self.registration.poll_needed(cx)).await;
+        let (disposition, result) = std::future::poll_fn(|cx| {
+            let needed = self.registration.poll_needed(cx);
+            if resolve_slot
+                && matches!(
+                    &needed,
+                    std::task::Poll::Ready((EffectDisposition::CommitUnknown, _))
+                )
+                && !self
+                    .registration
+                    .call
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .actual_exit
+            {
+                return std::task::Poll::Pending;
+            }
+            needed
+        })
+        .await;
         let recorded = self
             .registration
             .call
@@ -1153,13 +1318,29 @@ impl OriginalManagedTargetCurrentSource<'_> {
             .unwrap_or_else(|p| p.into_inner())
             .terminal_recorded;
         if !recorded {
-            state
-                .record_registration_terminal(
-                    original.responsibility.clone().record_terminal(disposition),
-                )
-                .map_err(|error| {
-                    current_projection_conflict(format!("record MV registration: {error:?}"))
-                })?;
+            if resolve_slot && disposition == EffectDisposition::CommitUnknown {
+                if let Some(evidence) = self.registration.slot_evidence.get() {
+                    self.entrance
+                        .retain_unknown_incarnation_registration(
+                            state,
+                            &original.responsibility,
+                            evidence.clone(),
+                        )
+                        .map_err(|error| {
+                            current_projection_conflict(format!(
+                                "retain MV incarnation slot evidence: {error}"
+                            ))
+                        })?;
+                }
+            } else {
+                state
+                    .record_registration_terminal(
+                        original.responsibility.clone().record_terminal(disposition),
+                    )
+                    .map_err(|error| {
+                        current_projection_conflict(format!("record MV registration: {error:?}"))
+                    })?;
+            }
             self.registration
                 .call
                 .lock()
@@ -1184,7 +1365,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         ),
         novarocks_mv_application::readiness::MvProjectionError,
     > {
-        use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+        use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
         use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
         let conflict = |e: String| MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e);
         self.registration.claim_current()?;
@@ -1254,6 +1435,19 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
+            MvConvergence::ExactContent { expected, previous } => {
+                let (observed, admission, _) = self
+                    .entrance
+                    .observe_exact_keyed_admission_async(
+                        &documents,
+                        observation,
+                        expected,
+                        previous,
+                    )
+                    .await
+                    .map_err(MvProjectionError::from)?;
+                return Ok((observed, admission));
+            }
             MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
                 self.entrance.begin_committed_convergence(
                     &table,
@@ -1275,6 +1469,16 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         .map_err(|e| conflict(format!("begin MV Current convergence: {e:?}")))?;
         let mut state = self.registration.install_state(state)?;
         if let MvConvergence::Readmission { permits, .. } = &self.convergence {
+            if permits.is_empty() {
+                self.registration
+                    .non_aggregate_readmission
+                    .set(self.entrance.clone())
+                    .map_err(|_| {
+                        current_projection_conflict(
+                            "MV non-aggregate readmission custody was already installed",
+                        )
+                    })?;
+            }
             for permit in permits {
                 state
                     .accept_readmission_permit(permit.clone())
@@ -1292,7 +1496,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .complete_keyed_current_observation_async(pending, &documents, observation.clone())
             .await
             .map_err(current_projection_observation)?;
-        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+        let mut observed = resolve_current_keyed_documents(view, request.catalog().clone())
             .map_err(MvProjectionError::from)?;
         let convergence = self
             .entrance
@@ -1362,7 +1566,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .resolve_pending_slot_changes_async(&documents, registered_request.clone())
                 .await
                 .map_err(current_projection_connector)?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(MvProjectionError::from)?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
@@ -1370,7 +1574,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .complete_keyed_current_observation_async(pending, &documents, observation)
                 .await
                 .map_err(current_projection_observation)?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(MvProjectionError::from)?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
@@ -1379,9 +1583,10 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .map_err(conflict)?;
         let admission = self
             .entrance
-            .install_observed_target(
+            .install_observed_target_with_kind(
                 &state,
                 observed.management_dependencies(lease.control_runtime_id()),
+                observed.interpretation.is_aggregate(),
             )
             .map_err(|e| conflict(format!("install MV admission: {e:?}")))?;
         Ok((observed, admission))
@@ -1402,7 +1607,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         ),
         novarocks_mv_application::readiness::MvProjectionError,
     > {
-        use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+        use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
         use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
         let conflict = |e: String| MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e);
         let catalog = request
@@ -1467,6 +1672,11 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 }
                 return Ok((observed, admission));
             }
+            MvConvergence::ExactContent { .. } => {
+                return Err(conflict(
+                    "Exact content renewal requires the original async observation".into(),
+                ));
+            }
             MvConvergence::CommittedEffect | MvConvergence::CommittedMarker { .. } => {
                 self.entrance.begin_committed_convergence(
                     &table,
@@ -1503,7 +1713,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         let (phase, view) = state
             .complete_keyed_current_observation(pending, &documents, observation.clone())
             .map_err(|e| conflict(format!("complete MV observation: {e:?}")))?;
-        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+        let mut observed = resolve_current_keyed_documents(view, request.catalog().clone())
             .map_err(|e| conflict(e.to_string()))?;
         let convergence = self
             .entrance
@@ -1563,14 +1773,14 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             self.entrance
                 .resolve_pending_slot_changes(&documents, registered_request.clone())
                 .map_err(|e| conflict(e.to_string()))?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(|e| conflict(e.to_string()))?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
             let (_, view) = state
                 .complete_keyed_current_observation(pending, &documents, observation)
                 .map_err(|e| conflict(format!("complete resolved MV observation: {e:?}")))?;
-            observed = decode_current_keyed_documents(view, request.catalog().clone())
+            observed = resolve_current_keyed_documents(view, request.catalog().clone())
                 .map_err(|e| conflict(e.to_string()))?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
@@ -1579,9 +1789,10 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .map_err(conflict)?;
         let admission = self
             .entrance
-            .install_observed_target(
+            .install_observed_target_with_kind(
                 &state,
                 observed.management_dependencies(lease.control_runtime_id()),
+                observed.interpretation.is_aggregate(),
             )
             .map_err(|e| conflict(format!("install MV admission: {e:?}")))?;
         Ok((observed, admission))
@@ -1615,6 +1826,11 @@ pub(crate) struct AdmittedMvPublication {
     repartitioned: bool,
     replacement: Option<novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions>,
     markers_remove: std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
+    content_pending: Option<Arc<super::refresh::pending_fence::PendingFence>>,
+    full_refresh_markers: Option<novarocks_spi::connector::KeyedFullRefreshMarkers>,
+    partition_replace:
+        Option<novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection>,
+    explicit_recovery: Option<novarocks_mv_application::persistence::codec::RecoveryRecord>,
     released_pending: std::sync::OnceLock<
         std::collections::BTreeSet<novarocks_spi::connector::ConnectorMarkerKey>,
     >,
@@ -1622,6 +1838,22 @@ pub(crate) struct AdmittedMvPublication {
 }
 
 impl AdmittedMvPublication {
+    pub(crate) fn bind_content_pending(
+        &mut self,
+        fence: Arc<super::refresh::pending_fence::PendingFence>,
+    ) -> Result<(), String> {
+        if self.interpretation.is_aggregate()
+            || self.content_pending.is_some()
+            || self.replacement.is_some()
+        {
+            return Err("MV publication cannot bind this Pending fence".into());
+        }
+        self.previous_logical_rows = fence.baseline_rows();
+        self.markers_remove.insert(fence.key().clone());
+        self.content_pending = Some(fence);
+        Ok(())
+    }
+
     pub(crate) const fn admission(&self) -> &ConnectorDocumentManagementAdmission {
         &self.admission
     }
@@ -1747,6 +1979,9 @@ impl AdmittedMvPublication {
                 return Err("MV configuration slot changed after computation".into());
             }
         }
+        if let Some(fence) = &self.content_pending {
+            fence.verify(documents)?;
+        }
         Ok(())
     }
 
@@ -1871,12 +2106,16 @@ impl AdmittedMvPublication {
                 inputs: inputs.inputs().to_vec(),
                 logical_result_rows,
             };
-        let mut documents =
-            novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
-                &versions,
-                &publication,
-            )
-            .map_err(|e| format!("encode MV publication record: {e}"))?;
+        use novarocks_mv_application::persistence::keyed_documents::{
+            keyed_publication_document_set, keyed_recovery_publication_document_set,
+        };
+        let mut documents = match &self.explicit_recovery {
+            Some(record) => {
+                keyed_recovery_publication_document_set(&versions, &publication, record)
+            }
+            None => keyed_publication_document_set(&versions, &publication),
+        }
+        .map_err(|e| format!("encode MV publication record: {e}"))?;
         documents
             .markers_remove
             .extend(self.markers_remove.iter().cloned());
@@ -1920,6 +2159,55 @@ pub(crate) struct AdmittedMvDataPublication {
 }
 
 impl AdmittedMvDataPublication {
+    pub(crate) fn bind_partition_replace(
+        &mut self,
+        selection: novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection,
+    ) -> Result<(), String> {
+        if self.publication.interpretation.is_aggregate()
+            || self.publication.content_pending.is_some()
+            || self.publication.partition_replace.is_some()
+        {
+            return Err("MV publication cannot bind this partition replacement scope".into());
+        }
+        self.publication.partition_replace = Some(selection);
+        Ok(())
+    }
+
+    pub(crate) fn partition_replace(
+        &self,
+    ) -> Option<&novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection> {
+        self.publication.partition_replace.as_ref()
+    }
+
+    pub(crate) fn bind_full_refresh_markers(
+        &mut self,
+        frozen: novarocks_spi::connector::KeyedFullRefreshMarkers,
+        recovery: Option<novarocks_mv_application::persistence::codec::RecoveryRecord>,
+    ) -> Result<(), String> {
+        if self.publication.interpretation.is_aggregate()
+            || self.publication.content_pending.is_some()
+            || self.publication.full_refresh_markers.is_some()
+            || (self.publication.partition_replace.is_some() && recovery.is_some())
+        {
+            return Err("MV full refresh cannot bind those marker requirements".into());
+        }
+        self.publication.full_refresh_markers = Some(frozen);
+        self.publication.explicit_recovery = recovery;
+        Ok(())
+    }
+
+    pub(crate) fn full_refresh_markers(
+        &self,
+    ) -> Option<&novarocks_spi::connector::KeyedFullRefreshMarkers> {
+        self.publication.full_refresh_markers.as_ref()
+    }
+
+    pub(crate) fn content_pending(
+        &self,
+    ) -> Option<&Arc<super::refresh::pending_fence::PendingFence>> {
+        self.publication.content_pending.as_ref()
+    }
+
     pub(crate) const fn previous_logical_rows(&self) -> Option<u64> {
         self.publication.previous_logical_rows
     }
@@ -2009,6 +2297,7 @@ struct MvPublicationAdmissionInput {
     entrance: ManagementEntrance,
     planning: ConnectorControlPlanningPin,
     projection: novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    management_dependencies: ManagementDependencySet,
     publication_id: LakePublicationId,
     configuration: Option<MvRefreshPropertyChanges>,
     context: ConnectorRequestContext,
@@ -2062,6 +2351,10 @@ impl MvPublicationAdmissionParts {
             repartitioned: false,
             replacement: None,
             markers_remove: Default::default(),
+            content_pending: None,
+            full_refresh_markers: None,
+            partition_replace: None,
+            explicit_recovery: None,
             released_pending: std::sync::OnceLock::new(),
             configuration_slot_update: self.configuration_slot_update,
         }
@@ -2204,6 +2497,7 @@ pub(crate) async fn admit_mv_publication_async_in(
     entrance: &ManagementEntrance,
     planning: &ConnectorControlPlanningPin,
     projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    management_dependencies: ManagementDependencySet,
     publication_id: LakePublicationId,
     configuration: Option<&MvRefreshPropertyChanges>,
     context: &ConnectorRequestContext,
@@ -2216,6 +2510,7 @@ pub(crate) async fn admit_mv_publication_async_in(
         entrance: entrance.clone(),
         planning: planning.clone(),
         projection: projection.clone(),
+        management_dependencies,
         publication_id,
         configuration: configuration.cloned(),
         context: context.clone(),
@@ -2239,12 +2534,7 @@ pub(crate) async fn admit_mv_publication_async_in(
             source.target.clone(),
             Some(source.target_object_id.clone()),
             ConnectorDocumentManagementOperation::Publication,
-            Some(
-                input
-                    .projection
-                    .facts
-                    .management_dependencies(input.planning.control_runtime_id()),
-            ),
+            Some(input.management_dependencies.clone()),
             EffectScope::CATALOG_COMMIT,
         )
         .map_err(|error| {
@@ -2449,11 +2739,15 @@ mod tests {
             .unwrap();
         let receiving = MvPublicationAdmissionReceiving::new();
         let publication_id = LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).unwrap();
+        let management_dependencies = projection
+            .facts
+            .management_dependencies(planning.control_runtime_id());
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let mut future = std::pin::pin!(admit_mv_publication_async_in(
             &entrance,
             &planning,
             &projection,
+            management_dependencies.clone(),
             publication_id,
             None,
             &context,
@@ -2475,6 +2769,7 @@ mod tests {
                 &entrance,
                 &planning,
                 &projection,
+                management_dependencies,
                 publication_id,
                 None,
                 &context,

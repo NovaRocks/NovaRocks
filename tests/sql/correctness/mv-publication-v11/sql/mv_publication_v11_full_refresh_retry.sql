@@ -113,7 +113,7 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 -- query 12
 -- @db=mvretry_${uuid0}.ns_${uuid0}
 -- @publication_service_hold=ns_${uuid0}.refusal_mv
--- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.refusal_mv VALUES ('external', -1, CAST(0 AS BIGINT));" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+-- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-occ-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.refusal_mv (k, v) VALUES ('external', -1);" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_trino_error=TRANSACTION_CONFLICT,USER_ERROR
 -- @expect_error=Failed to commit the transaction during refresh materialized view:
 REFRESH MATERIALIZED VIEW refusal_mv;
@@ -138,6 +138,8 @@ added = [snapshot for snapshot_id, snapshot in actual.items() if snapshot_id not
 assert len(added) == 1 and added[0]["snapshot-id"] == after["current-snapshot-id"]
 external = added[0]
 assert external["parent-snapshot-id"] == old
+assert external["summary"]["operation"] == "append"
+assert int(external["summary"]["added-records"]) == 1
 assert "novarocks.doc.v2.record.novarocks.mv~publication" not in external["summary"]
 assert "novarocks.mv.full-refresh-stage.v1" not in external["summary"]
 for key in ("current-schema-id", "default-spec-id", "schemas", "partition-specs"):

@@ -22,6 +22,7 @@
 //! frontend staging lifecycle; none of those authorities can cross back into
 //! `sql/**`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
@@ -29,7 +30,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::mv::domain::rewrite::context::{MvRewriteAnalysisFacts, MvRewriteSourceSnapshot};
-use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifact;
 
 use novarocks_mv_application::product::{
@@ -52,9 +53,14 @@ pub(crate) struct MvFirstRefreshLogicalContext {
         novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     pub(crate) rebuild_layout:
         Option<Arc<crate::mv::domain::rewrite::context::MvRewriteRebuildLayout>>,
+    pub(crate) recovery_publication: Option<
+        Arc<novarocks_mv_application::persistence::keyed_documents::MvStrictRecoveryPublication>,
+    >,
     pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub(crate) pin: Vec<MvRewriteSourceSnapshot>,
     pub(crate) previous: Vec<MvRewriteSourceSnapshot>,
+    /// Exact NetZero predecessors whose context scans can use their retained To.
+    pub(crate) equivalent_context_from: BTreeMap<SqlMvRelationOccurrenceId, i64>,
     pub(crate) analysis: MvRewriteAnalysisFacts,
     pub(crate) target_table_uuid: String,
     #[allow(
@@ -92,7 +98,7 @@ impl MvFirstRefreshLogicalArtifact {
     }
 
     pub(crate) const fn root_hash_column(&self) -> &str {
-        MV_JOIN_APPLY_KEY_COLUMN_NAME
+        ""
     }
 }
 

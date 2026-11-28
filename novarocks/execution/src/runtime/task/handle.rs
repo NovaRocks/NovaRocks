@@ -52,6 +52,9 @@ pub struct LocalTaskPrepareContext {
     join_build_control:
         Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
     #[cfg(novarocks_dev_controls)]
+    pub(super) content_apply_insert_control:
+        Option<crate::runtime::runtime_state::ContentApplyInsertControl>,
+    #[cfg(novarocks_dev_controls)]
     query_tracker_witness: std::sync::Weak<MemTracker>,
     result_writer: Arc<dyn TaskResultWriter>,
     root_result_session: Option<Arc<dyn crate::runtime::task::io::RootResultSession>>,
@@ -2456,6 +2459,8 @@ impl Default for LocalTaskPrepareContext {
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
             #[cfg(novarocks_dev_controls)]
+            content_apply_insert_control: None,
+            #[cfg(novarocks_dev_controls)]
             query_tracker_witness: std::sync::Weak::new(),
             edge_gates: None,
             result_writer: crate::runtime::task::io::result::discard_result_writer(),
@@ -2509,6 +2514,8 @@ impl LocalTaskPrepareContext {
             task_protocol_test_observer: None,
             #[cfg(novarocks_dev_controls)]
             join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            content_apply_insert_control: None,
             #[cfg(novarocks_dev_controls)]
             query_tracker_witness: std::sync::Weak::new(),
             result_writer,
@@ -2583,6 +2590,15 @@ impl LocalTaskPrepareContext {
         control: Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
     ) -> Self {
         self.join_build_control = control;
+        self
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn with_content_apply_insert_control(
+        mut self,
+        control: crate::runtime::runtime_state::ContentApplyInsertControl,
+    ) -> Self {
+        self.content_apply_insert_control = Some(control);
         self
     }
 

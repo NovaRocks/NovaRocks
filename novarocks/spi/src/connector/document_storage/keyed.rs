@@ -282,6 +282,8 @@ pub struct KeyedSlotChange {
 pub struct KeyedRetirement {
     pub operation_id: crate::connector::ConnectorMutationOperationId,
     pub retired_publication: crate::connector::LakePublicationId,
+    /// The snapshot known to carry the exact retired publication.
+    pub baseline_snapshot_id: i64,
     pub expected_root: DocumentIdentity,
     pub retired_record: ConnectorSnapshotRecord,
     pub record: ConnectorSnapshotRecord,
@@ -294,7 +296,8 @@ impl KeyedRetirement {
         self.record.validate()?;
         self.invalid_marker.0.validate()?;
         self.invalid_marker.1.validate()?;
-        if self.retired_record.owner != self.record.owner
+        if self.baseline_snapshot_id < 0
+            || self.retired_record.owner != self.record.owner
             || self.retired_record.owner != self.invalid_marker.0.owner
             || self.retired_record.name == self.record.name
             || self.retired_record.binding != Some(self.expected_root)
@@ -597,6 +600,8 @@ pub struct KeyedWriteObservation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeyedMutation {
     Markers(KeyedMarkerWrite),
+    /// Update markers on the exact observed metadata base and main.
+    FencedMarkers(KeyedMarkerWrite),
     SlotChange(KeyedSlotChange),
     /// A single admitted slot change and evaluated user property update.
     SlotChangeWithTableProperties {
@@ -640,6 +645,15 @@ impl KeyedMutationIntent {
         }
         match &self.mutation {
             KeyedMutation::Markers(write) => write.validate(),
+            KeyedMutation::FencedMarkers(write) => {
+                write.validate()?;
+                if self.expected_snapshot != self.expected_metadata.snapshot_id() {
+                    return Err(invalid(
+                        "fenced markers require their exact metadata base and main",
+                    ));
+                }
+                Ok(())
+            }
             KeyedMutation::SlotChange(change) => change.validate(),
             KeyedMutation::SlotChangeWithTableProperties { change, properties } => {
                 change.validate()?;
@@ -710,10 +724,27 @@ impl KeyedCreateIntent {
         Ok(())
     }
 }
+/// Owner-scoped marker behavior evaluated on the metadata of each full-write
+/// attempt. Marker keys and names belong to the document owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyedFullRefreshMarkers {
+    Fenced {
+        owner: String,
+        keys: BTreeSet<ConnectorMarkerKey>,
+    },
+    ClearObserved {
+        owner: String,
+        names: BTreeSet<String>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyedPublicationIntent {
     pub declaration: super::ConnectorDocumentPublicationDeclaration,
     pub documents: KeyedPublication,
+    pub full_refresh_markers: Option<KeyedFullRefreshMarkers>,
+    pub partition_replace:
+        Option<crate::connector::read_stack::ConnectorMvTargetPartitionSelection>,
 }
 impl KeyedPublicationIntent {
     pub fn validate_for(
@@ -725,6 +756,52 @@ impl KeyedPublicationIntent {
             return Err(invalid(
                 "keyed publication does not match its write declaration",
             ));
+        }
+        if let Some(selection) = &self.partition_replace
+            && (declaration.technique()
+                != crate::connector::ConnectorManagedPublicationTechnique::Full
+                || declaration.empty_input()
+                    != crate::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+                || selection.object_id() != declaration.target_object_id()
+                || declaration.partition_spec_replacement().is_some()
+                || matches!(self.full_refresh_markers, Some(KeyedFullRefreshMarkers::ClearObserved { .. })))
+        {
+            return Err(invalid("invalid partition replacement on a keyed publication"));
+        }
+        if let Some(policy) = &self.full_refresh_markers {
+            if declaration.technique()
+                != crate::connector::ConnectorManagedPublicationTechnique::Full
+            {
+                return Err(invalid("marker policy requires a full keyed publication"));
+            }
+            match policy {
+                KeyedFullRefreshMarkers::Fenced { owner, keys } => {
+                    validate_document_token(owner)?;
+                    for key in keys {
+                        key.validate()?;
+                        if &key.owner != owner {
+                            return Err(invalid(
+                                "marker fence contains a different document owner",
+                            ));
+                        }
+                    }
+                }
+                KeyedFullRefreshMarkers::ClearObserved { owner, names } => {
+                    validate_document_token(owner)?;
+                    for name in names {
+                        validate_document_token(name)?;
+                    }
+                    if names.is_empty()
+                        || self
+                            .documents
+                            .markers_set
+                            .keys()
+                            .any(|key| &key.owner == owner && names.contains(&key.name))
+                    {
+                        return Err(invalid("invalid observed marker removal policy"));
+                    }
+                }
+            }
         }
         Ok(())
     }

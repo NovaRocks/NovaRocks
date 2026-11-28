@@ -494,8 +494,26 @@ pub(crate) async fn extract_data_files_with_stats_at_with_control(
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<Vec<DataFileWithStats>, novarocks_spi::connector::ConnectorError> {
-    extract_data_files_with_stats_at_projected(table, snapshot_id, control, |stats, _, _| stats)
-        .await
+    extract_data_files_with_stats_at_projected(table, snapshot_id, control, &[], |stats, _, _| {
+        stats
+    })
+    .await
+}
+
+pub(crate) async fn extract_data_files_with_requested_average_sizes_at(
+    table: &Table,
+    snapshot_id: i64,
+    control: &dyn novarocks_spi::connector::ConnectorOperationControl,
+    average_size_columns: &[&str],
+) -> Result<Vec<DataFileWithStats>, novarocks_spi::connector::ConnectorError> {
+    extract_data_files_with_stats_at_projected(
+        table,
+        snapshot_id,
+        Some(control),
+        average_size_columns,
+        |stats, _, _| stats,
+    )
+    .await
 }
 
 /// Run the original statistics author once. The legacy projection returns
@@ -505,15 +523,25 @@ pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    average_size_columns: &[&str],
     project: impl FnMut(
         DataFileWithStats,
         std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
         crate::delete_semantics::LoadView,
     ) -> O,
 ) -> Result<Vec<O>, novarocks_spi::connector::ConnectorError> {
-    let read_snapshot =
+    let read_snapshot = if average_size_columns.is_empty() {
         crate::read_snapshot::build_read_snapshot_at_with_control(table, snapshot_id, control)
-            .await?;
+            .await?
+    } else {
+        crate::read_snapshot::build_statistics_read_snapshot_at(
+            table,
+            snapshot_id,
+            control,
+            average_size_columns,
+        )
+        .await?
+    };
     finish_data_files_with_stats_from_original_files(
         table.metadata(),
         snapshot_id,

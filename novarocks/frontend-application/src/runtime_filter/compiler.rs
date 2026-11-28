@@ -127,6 +127,7 @@ struct BindingSpec {
     witness: Option<u32>,
     role: BindingRole,
     feedback_wait: Option<FrontendRuntimeFilterFeedbackWaitEligibility>,
+    content_demand: bool,
 }
 
 #[derive(Clone)]
@@ -510,6 +511,7 @@ fn materialize_bindings(
             witness: fact.coverage_witness_id(),
             role,
             feedback_wait: fact.feedback_wait(),
+            content_demand: fact.content_demand(),
         };
         if bindings.insert(binding_id, spec).is_some() {
             return Err(compilation_error(format!(
@@ -750,7 +752,11 @@ fn compile_feedback_declaration(
         if channel.lifecycle != filter::RuntimeFilterLifecycle::CompleteOnce as i32 {
             continue;
         }
-        let Some((owner, participants)) = feedback_publishers(channel, roles.get(&channel_id))?
+        let content_demand = bindings
+            .values()
+            .any(|binding| binding.channel_id == channel_id && binding.content_demand);
+        let Some((owner, participants)) =
+            feedback_publishers(channel, roles.get(&channel_id), content_demand)?
         else {
             continue;
         };
@@ -819,6 +825,7 @@ fn compile_feedback_declaration(
                         publisher_owner,
                         contract_digest: contract_digest.to_vec(),
                         max_encoded_domain_bytes,
+                        publish_empty_content_demand: content_demand,
                     },
                 )
                 .is_some()
@@ -854,6 +861,7 @@ fn compile_feedback_declaration(
             publishers: publisher_slots,
             scan_bindings,
             wait_eligibility,
+            content_demand,
         });
     }
     Ok(FeedbackCompilation {
@@ -885,6 +893,7 @@ fn membership_feedback_contract_digest(
 fn feedback_publishers(
     channel: &ChannelSpec,
     role: Option<&RoleChannel>,
+    content_demand: bool,
 ) -> Result<Option<(FrontendRuntimeFilterFeedbackPublisherOwner, Vec<u32>)>, DistributedQueryError>
 {
     let Some(role) = role else {
@@ -892,6 +901,21 @@ fn feedback_publishers(
     };
     match channel.terminal_coverage.kind.as_ref() {
         Some(filter::runtime_filter_coverage::Kind::AllOf(_)) => {
+            if content_demand && role.aggregator.is_none() {
+                let mut producers = role.producers.keys().copied();
+                if let (Some(source), None) = (producers.next(), producers.next())
+                    && role.routes.iter().any(|route| {
+                        matches!(route.kind, RouteKind::Direct)
+                            && route.from_participant == source
+                            && route.to_participant == source
+                    })
+                {
+                    return Ok(Some((
+                        FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource,
+                        vec![source],
+                    )));
+                }
+            }
             let Some(aggregator) = role.aggregator else {
                 return Ok(None);
             };
@@ -1695,6 +1719,50 @@ mod tests {
             required_capabilities: BTreeSet::new(),
             policy: filter::RuntimeFilterPolicyRequirement::default(),
         }
+    }
+
+    #[test]
+    fn content_demand_authorizes_direct_feedback_only_for_its_full_local_coverage() {
+        use filter::{
+            RuntimeFilterCoverage, RuntimeFilterCoverageAllOf, runtime_filter_coverage::Kind,
+        };
+
+        let mut channel = membership_channel(Some([9; 32]));
+        channel.terminal_coverage = RuntimeFilterCoverage {
+            kind: Some(Kind::AllOf(RuntimeFilterCoverageAllOf {
+                children: vec![RuntimeFilterCoverage {
+                    kind: Some(Kind::LeafWitnessId(7)),
+                }],
+            })),
+        };
+        let mut role = RoleChannel::default();
+        role.producers.insert(1, BTreeSet::from([7]));
+        role.routes.push(Route {
+            edge_id: 1,
+            kind: RouteKind::Direct,
+            from_participant: 1,
+            from_binding: 7,
+            to_participant: 1,
+            to_binding: 8,
+        });
+        assert!(
+            feedback_publishers(&channel, Some(&role), false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            feedback_publishers(&channel, Some(&role), true).unwrap(),
+            Some((
+                FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource,
+                vec![1]
+            ))
+        );
+        role.producers.insert(2, BTreeSet::from([7]));
+        assert!(
+            feedback_publishers(&channel, Some(&role), true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

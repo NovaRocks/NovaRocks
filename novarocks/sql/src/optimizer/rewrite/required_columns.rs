@@ -37,7 +37,7 @@ use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
 use crate::common::CteId;
-use crate::optimizer::operator::{Operator, UnionOp};
+use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
@@ -85,6 +85,17 @@ pub(crate) fn tag_required_columns(
         Operator::LogicalCTEProduce(_) => tag_cte_produce(expr, arena, parent_needed),
         Operator::LogicalWindow(_) => tag_window(expr, arena, parent_needed),
         Operator::LogicalRepeat(_) => tag_repeat(expr, arena, parent_needed),
+        // Counts and routes use the complete content identity regardless of
+        // the downstream writer projection.
+        Operator::LogicalContentApply(_) => OptExpr {
+            op: expr.op,
+            children: expr
+                .children
+                .into_iter()
+                .map(|child| tag_required_columns(child, arena, None))
+                .collect(),
+            required_output_columns: parent_needed,
+        },
         Operator::LogicalChangeEventExpand(_) => {
             tag_change_event_expand(expr, arena, parent_needed)
         }
@@ -653,10 +664,6 @@ fn tag_union(
         };
     }
 
-    let join_refresh_protocol_ids = join_refresh_union_protocol_ids(&node);
-    let parent_needed =
-        require_join_refresh_union_protocol_columns(join_refresh_protocol_ids, parent_needed);
-
     // Resolve which positions in the output schema are needed.
     let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
     let mut needed_positions: Vec<usize> = match &parent_needed {
@@ -692,109 +699,15 @@ fn tag_union(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_else(|| collect_output_ids_ordered_opt(&child));
-                let mut child_needed: HashSet<ColumnId> = needed_positions
+                let child_needed: HashSet<ColumnId> = needed_positions
                     .iter()
                     .filter_map(|&i| child_outputs.get(i).copied())
                     .collect();
-                require_join_refresh_branch_protocol_columns(&node, child_idx, &mut child_needed);
                 tag_required_columns(child, arena, Some(child_needed))
             })
             .collect(),
         required_output_columns: parent_needed,
     }
-}
-
-fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<Vec<ColumnId>> {
-    let has_action = node
-        .output_columns
-        .iter()
-        .any(is_join_refresh_action_column);
-    let has_join_apply_key = node
-        .output_columns
-        .iter()
-        .any(is_join_refresh_apply_key_column);
-    if !has_action || !has_join_apply_key {
-        return None;
-    }
-
-    Some(
-        node.output_columns
-            .iter()
-            .filter(|column| is_join_refresh_protocol_column(column))
-            .map(|column| column.column_id)
-            .collect(),
-    )
-}
-
-fn require_join_refresh_union_protocol_columns(
-    protocol_ids: Option<Vec<ColumnId>>,
-    parent_needed: Option<HashSet<ColumnId>>,
-) -> Option<HashSet<ColumnId>> {
-    let Some(protocol_ids) = protocol_ids else {
-        return parent_needed;
-    };
-
-    match parent_needed {
-        None => None,
-        Some(mut needed) => {
-            for protocol_id in protocol_ids {
-                needed.insert(protocol_id);
-            }
-            Some(needed)
-        }
-    }
-}
-
-fn require_join_refresh_branch_protocol_columns(
-    node: &UnionOp,
-    child_idx: usize,
-    child_needed: &mut HashSet<ColumnId>,
-) {
-    let Some(child_outputs) = node.child_output_columns.get(child_idx) else {
-        return;
-    };
-    let has_join_refresh_protocol = node
-        .output_columns
-        .iter()
-        .any(is_join_refresh_action_column)
-        && node
-            .output_columns
-            .iter()
-            .any(is_join_refresh_apply_key_column);
-    if !has_join_refresh_protocol {
-        return;
-    }
-
-    for column in child_outputs {
-        if is_join_refresh_protocol_column(column) {
-            child_needed.insert(column.column_id);
-        }
-    }
-}
-
-fn is_join_refresh_protocol_column(column: &crate::analysis::OutputColumn) -> bool {
-    is_join_refresh_action_column(column)
-        || is_join_refresh_apply_key_column(column)
-        || is_join_refresh_row_id_column(column)
-}
-
-fn is_join_refresh_action_column(column: &crate::analysis::OutputColumn) -> bool {
-    column.is_internal
-        && column
-            .name
-            .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
-}
-
-fn is_join_refresh_apply_key_column(column: &crate::analysis::OutputColumn) -> bool {
-    column
-        .name
-        .eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
-}
-
-fn is_join_refresh_row_id_column(column: &crate::analysis::OutputColumn) -> bool {
-    column
-        .name
-        .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
 }
 
 fn tag_intersect(
@@ -1706,192 +1619,6 @@ mod tests {
     }
 
     #[test]
-    fn tag_union_preserves_join_refresh_protocol_columns() {
-        let arena_rc = make_arena();
-        let mut action =
-            make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Int8,
-            action.value_type.nullable(),
-            action.value_type.logical_type(),
-        )
-        .unwrap();
-        action.is_internal = true;
-        let mut join_apply_key = make_output_column(
-            ColumnId::new_for_test(15),
-            crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
-        );
-        join_apply_key.value_type =
-            novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
-                join_apply_key.value_type.nullable(),
-                join_apply_key.value_type.logical_type(),
-            )
-            .unwrap();
-        join_apply_key.is_internal = true;
-        let mut row_id = make_output_column(
-            ColumnId::new_for_test(19),
-            crate::common::ICEBERG_ROW_ID_COL,
-        );
-        row_id.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Int64,
-            row_id.value_type.nullable(),
-            row_id.value_type.logical_type(),
-        )
-        .unwrap();
-        row_id.is_internal = true;
-        let output_columns = vec![
-            make_output_column(ColumnId::new_for_test(1), "id"),
-            make_output_column(ColumnId::new_for_test(2), "region"),
-            make_output_column(ColumnId::new_for_test(3), "amount"),
-            make_output_column(ColumnId::new_for_test(9), "category"),
-            action,
-            row_id,
-            join_apply_key,
-        ];
-        let left_columns = output_columns.clone();
-        let right_columns = output_columns.clone();
-        let union = OptExpr::new(
-            Operator::LogicalUnion(UnionOp {
-                all: true,
-                output_columns,
-                child_output_columns: vec![],
-            }),
-            vec![
-                make_values_with_columns(left_columns),
-                make_values_with_columns(right_columns),
-            ],
-        );
-
-        let arena = arena_rc.borrow();
-        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
-
-        assert_eq!(
-            required_columns(&tagged),
-            &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
-            "join refresh UNION must keep internal protocol and row-lineage columns in its own required set"
-        );
-        for child in &tagged.children {
-            assert_eq!(
-                required_columns(child),
-                &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
-                "join refresh UNION must pass protocol and row-lineage columns to each branch by position"
-            );
-        }
-    }
-
-    #[test]
-    fn tag_union_maps_join_refresh_protocol_columns_through_child_output_metadata() {
-        let arena_rc = make_arena();
-        let mut action =
-            make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Int8,
-            action.value_type.nullable(),
-            action.value_type.logical_type(),
-        )
-        .unwrap();
-        action.is_internal = true;
-        let mut join_apply_key = make_output_column(
-            ColumnId::new_for_test(20),
-            crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
-        );
-        join_apply_key.value_type =
-            novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                DataType::Utf8,
-                join_apply_key.value_type.nullable(),
-                join_apply_key.value_type.logical_type(),
-            )
-            .unwrap();
-        join_apply_key.is_internal = false;
-        let mut row_id = make_output_column(
-            ColumnId::new_for_test(19),
-            crate::common::ICEBERG_ROW_ID_COL,
-        );
-        row_id.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
-            DataType::Int64,
-            row_id.value_type.nullable(),
-            row_id.value_type.logical_type(),
-        )
-        .unwrap();
-        row_id.is_internal = true;
-        let mut branch_row_id = make_output_column(
-            ColumnId::new_for_test(91),
-            crate::common::ICEBERG_ROW_ID_COL,
-        );
-        branch_row_id.value_type =
-            novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                DataType::Int64,
-                branch_row_id.value_type.nullable(),
-                branch_row_id.value_type.logical_type(),
-            )
-            .unwrap();
-        branch_row_id.is_internal = true;
-        let output_columns = vec![
-            make_output_column(ColumnId::new_for_test(1), "id"),
-            make_output_column(ColumnId::new_for_test(2), "region"),
-            make_output_column(ColumnId::new_for_test(3), "amount"),
-            make_output_column(ColumnId::new_for_test(9), "category"),
-            action.clone(),
-            row_id,
-            join_apply_key.clone(),
-        ];
-        let branch_columns = vec![
-            make_output_column(ColumnId::new_for_test(1), "id"),
-            make_output_column(ColumnId::new_for_test(2), "region"),
-            make_output_column(ColumnId::new_for_test(3), "amount"),
-            make_output_column(ColumnId::new_for_test(90), "_file"),
-            make_output_column(ColumnId::new_for_test(9), "category"),
-            action.clone(),
-            branch_row_id,
-            join_apply_key.clone(),
-        ];
-        let branch_union_columns = vec![
-            branch_columns[0].clone(),
-            branch_columns[1].clone(),
-            branch_columns[2].clone(),
-            branch_columns[4].clone(),
-            branch_columns[5].clone(),
-            branch_columns[6].clone(),
-            branch_columns[7].clone(),
-        ];
-        let union = OptExpr::new(
-            Operator::LogicalUnion(UnionOp {
-                all: true,
-                output_columns,
-                child_output_columns: vec![branch_union_columns.clone(), branch_union_columns],
-            }),
-            vec![
-                make_project_with_columns(&arena_rc, branch_columns.clone()),
-                make_project_with_columns(&arena_rc, branch_columns),
-            ],
-        );
-
-        let arena = arena_rc.borrow();
-        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
-
-        assert_eq!(
-            required_columns(&tagged),
-            &needed_set(&[1, 2, 3, 9, 14, 19, 20]),
-            "join refresh UNION must keep action, row lineage, and join row key"
-        );
-        for child in &tagged.children {
-            assert!(
-                required_columns(child).contains(&ColumnId::new_for_test(20)),
-                "branch project must keep join row key even when its wide output position differs from the UNION output"
-            );
-            assert!(
-                required_columns(child).contains(&ColumnId::new_for_test(91)),
-                "branch project must keep row-lineage even when its wide output position differs from the UNION output"
-            );
-            assert!(
-                !required_columns(child).contains(&ColumnId::new_for_test(90)),
-                "branch project should use child_output_columns mapping instead of wide child positions"
-            );
-        }
-    }
-
-    #[test]
     fn tag_union_distinct_preserves_all_child_columns() {
         let arena_rc = make_arena();
         let union = OptExpr::new(
@@ -1933,6 +1660,38 @@ mod tests {
         for id in [4, 5, 6] {
             assert!(b_req.contains(&ColumnId::new_for_test(id)));
         }
+    }
+
+    #[test]
+    fn content_apply_keeps_complete_input_columns_when_output_is_projected() {
+        use crate::optimizer::operator::ContentApplyOp;
+
+        let arena = make_arena();
+        let projects = [[1, 2, 3], [4, 5, 6]].map(|ids| {
+            make_project_with_columns(
+                &arena,
+                ids.into_iter()
+                    .map(|id| make_output_column(ColumnId::new_for_test(id), "value"))
+                    .collect(),
+            )
+        });
+        let expr = OptExpr::new(
+            Operator::LogicalContentApply(ContentApplyOp {
+                route_keys: Box::new([0]),
+                demand_keys: Box::default(),
+                output_columns: vec![make_output_column(ColumnId::new_for_test(7), "value")],
+            }),
+            Vec::from(projects),
+        );
+        let tagged = tag_required_columns(expr, &arena.borrow(), Some(needed_set(&[7])));
+        assert_eq!(
+            required_columns(tagged.child(0).child(0)),
+            &needed_set(&[1, 2, 3])
+        );
+        assert_eq!(
+            required_columns(tagged.child(1).child(0)),
+            &needed_set(&[4, 5, 6])
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl NativeQueryContextRuntime {
         ) -> Result<QueryMemoryBinding, novarocks_memory::CapacityError>,
     ) -> Result<Arc<QueryContext>, NativeTaskAdmissionError> {
         let query = execution.query_id();
-        let tracker = MemTracker::new_child(
+        let tracker = MemTracker::new_query(
             mem_tracker::query_tracker_label(query.high(), query.low()),
             &mem_tracker::process_mem_tracker(),
         );

@@ -1,22 +1,63 @@
 # 物化视图管理接续
 
-FE 重启后，本部署自己写过的 MV 不会自动恢复可管理。本文说明为什么，以及两种把它恢复回来的方式。
+| 重启后的操作 | 接续依据 |
+| --- | --- |
+| 非聚合 MV 的刷新与管理 | FE 重读湖上文档。首次写入前，以带 main 条件的槽变更登记本次 FE incarnation。 |
+| MV 的 CREATE 与 DROP | 启动发现和部署级名字宽限。运行期间按 catalog、namespace、name 隔离结果未知的建删。 |
+| 聚合 MV 的旧写者接续 | 逐目标屏障、现有运维声明与准确重新观察。 |
 
-## 为什么重启后管理是关着的
+## 非聚合 MV
 
-一个 MV 目标上的受管标记记录了是哪个部署、哪个进程实例（incarnation）在写它。新起的 FE
-读到自己部署名下、但不是自己 incarnation 写的目标时，无法知道上一个写者停下来的那一刻有没有
-一次已经发出、还没收到答复的效果（catalog commit 或对象删除）。假定没有，是唯一一种会损坏目标
-的假定。
+直接读取沿现有规则读取当前快照。查询改写与刷新按湖上的发布资格判断，适用的 Invalid 或未解除 Pending
+会限制相应操作。零文件退役继续引用原数据文件。
+重启后的首次写入先登记本进程。已确认的发布、退役或槽登记由原操作记收据。
+未知结果保留在原进程能证明的范围内。跨进程恢复以当前发布、持久标记和 main 条件为准。
 
-所以进程给每个这样的目标挂一道屏障，管理关闭，直到有证据说明旧写者已经不可能再动作。
-**读不受影响**：已发布的物化结果就是湖里的事实，查询与改写照常。
+适用 Pending 记录了核验义务、源窗口、基准快照、目标映射修订、估计和内存预算。下一次刷新先比较基准到当前
+main 的可见内容。Provider 证明两端净零后，FE 从基准 P 取得旧绑定，用原窗口、解释与预算重放并重新核验。
+基准失去等价、历史不可读或确定性资源不足时，Pending 保持。`EXPLAIN REFRESH` 可查看资格与恢复原因。
+Invalid 以及无法重放的 Pending 需要明确重建。当前 SQL 运维路径是等名字约束解除后 DROP 并重新 CREATE，
+显式重建的扩展过程由后续入口交付。
 
-`CALL novarocks_mv_management_status('<catalog>', '<database>', '<name>')` 会报告目标当前处于
-哪个阶段、有几个未收束效果、本进程的 owner 与 incarnation，以及做声明时要引用的 challenge。
+## 名字隔离与启动宽限
 
-## 方式一：逐目标的运维声明
+FE 在派发 MV CREATE 或 DROP 前登记准确名字和效果。效果结果未知时，同名建删等待观察确认或声明的
+效果寿命过去。无寿命保证时，隔离持续至本进程退出。DROP 确认原目标已不存在时可以释放名字。
+刷新和读取仍按自身资格运行。
 
+FE 启动后进入 `discovering`，MV CREATE 与 DROP 返回可重试的 `SERVER_STARTING_UP`。发现过程结束后：
+
+- 发现完整并且找不到本部署的其他 incarnation 写过的目标，结束宽限，原因是 `no_restart_evidence`。
+- 找到本部署旧写者，或者 catalog 不可达、目标无法解码使发现不完整，进入 `active`。
+- `active` 在两个条件中先成立者处结束。catalog 提交和对象删除都有实际远端效果寿命保证，且自本次
+  FE 启动起已等满相应寿命与安全余量，结束原因是 `lifetime`。接受本次启动的部署级全覆盖声明，
+  结束原因是 `declaration`，结束状态在本次进程内锁存。
+
+观察日志 `NOVAROCKS_MV_NAME_STARTUP_GRACE` 带 `state`、`incarnation`、`prior_incarnations`、
+`discovery_complete` 与 `end_reason`。以 `ended` 判断部署级名字宽限结束。其它准入仍按各自合同运行。
+
+### 声明的授权范围
+
+结束名字宽限的声明必须绑定当前部署、进程 incarnation 与本次 launch nonce。它覆盖本部署除当前进程
+之外的全部 incarnation，包含发现日志列出的写者，也覆盖因发现不完整而未被列出的写者。
+写入方断言这些旧写者的 catalog 提交和对象删除已经收束。单凭旧 FE 退出只能说明它停止发起新操作。
+声明的 `source` 应指出实际远端效果已收束的证据。
+
+按以下顺序操作：
+
+1. 确认旧 FE 和远端效果已经收束，记录来源与确认时刻。
+2. 用新的 launch nonce 启动 FE。观察这次进程的 `incarnation`、已发现的旧写者和发现完整性。
+3. 以同配置的权限保护写入下文声明文件。部署级声明省略 `[[target]]`，设
+   `all_other_incarnations_settled = true` 并列出全部已知旧写者。
+4. FE 每个维护周期读取声明。等待日志报告 `state=ended`、`end_reason=declaration` 后继续建删。
+
+若外部引擎先删除了旧目标，重启发现可能缺少对应的旧写者证据，迟到的按名 DROP 仍可能删除新同名对象。
+其他引擎或普通表的同名建表由各自的入口控制。存储表唯一命名是进一步收紧这一风险的边界。
+
+## 聚合 MV 的逐目标接续
+
+新 FE 看到本部署旧 incarnation 拥有的聚合目标时，按原策略保留接续屏障。
+`CALL novarocks_mv_management_status` 报告当前阶段、未收束效果、本进程身份以及声明所需的 challenge。
 适合少量目标或一次性处理：
 
 ```sql
@@ -28,24 +69,21 @@ CALL novarocks_mv_resume_management(
 );
 ```
 
-声明先写审计再生效；`[mv_management].audit_log` 没有配置时命令直接拒绝——写不下来的声明不能生效。
+声明先写入 `[mv_management].audit_log` 再生效。缺少审计日志配置时命令拒绝。
+`novarocks_mv_set_owner` 继续按现有授权与精确目标协议运行。
 
-## 方式二：部署级的启动隔离声明
+部署也可以用启动隔离文件证明旧写者从时刻 T 起停止发起操作。对于聚合目标，这份证据仍需和配置的
+各相关远端效果寿命结合。等满自 T 起的窗口后进行准确重新观察，由该次观察决定旧效果的实际结论。
+缺少所需远端保证、目标未被声明覆盖或窗口尚未到期时，聚合目标的屏障继续生效。
 
-持有几十个 MV 的部署逐个声明不现实。这时由**停掉上一个进程的那一方**写一份声明：它对**写者**
-说话，而不是对每个目标说话。
+## 配置与文件
 
-声明本身不能让管理立刻打开。它确定的是"旧写者从哪一刻起不可能再动作"这个保守时刻 T；从 T 起还要
-等满配置的远端效果寿命窗口，屏障才会退休。**没有配置远端保证时没有窗口可等，部署保持只读**——
-这是默认，不是故障。
-
-### 配置
+下例的寿命和余量用于展示配置字段，部署值来自实际服务合同和部署约束。
 
 ```toml
 [mv_management]
 audit_log = "mv-management-audit.log"
 
-# 两条路径都要有界，跨路径的重启屏障才可能自动退休。
 [mv_management.catalog_commit_guarantee]
 lifetime_ms = 60000
 safety_margin_ms = 5000
@@ -56,92 +94,32 @@ source = "Iceberg REST 服务合同 §4.2"
 lifetime_ms = 120000
 safety_margin_ms = 5000
 basis = "deployment-enforced-bound"
-source = "对象存储删除请求由入口网关在 120s 后拒绝"
+source = "对象存储删除请求由入口网关约束"
 
 [mv_management.startup_isolation]
-# 绝对路径。它承载运维授权，按与本配置文件同等的权限保护。
 evidence_file = "/var/lib/novarocks/mv-startup-isolation.toml"
-# 每次启动一个新值，由编排同时写进环境与声明文件。
 launch_nonce = "${ENV:NOVAROCKS_MV_LAUNCH_NONCE}"
 ```
 
-### 声明文件
+结束名字宽限的部署级声明示例：
 
 ```toml
 deployment = "prod-a"
-# 本次启动的 FE incarnation，见下面的取法。
 for_incarnation = "0199a1c2-3d4e-7f01-8a2b-3c4d5e6f7a8b"
-# 与 NOVAROCKS_MV_LAUNCH_NONCE 相同。
 nonce = "launch-7f3c9a"
-# 已隔离的旧 incarnation，可以多个。
 isolated_incarnations = ["0198f0e1-2c3d-7e90-8b1a-2d3c4e5f6a7b"]
-# 隔离完成的时刻。宁可写晚，写晚只会推迟接续，写早会提前打开。
+all_other_incarnations_settled = true
 isolated_at_unix_ms = 1726650000000
-# 后来的人据此判断这份声明可不可信。
-source = "systemd: novarocks-fe.service MainPID 1234 exited 2026-09-18T07:00:00Z"
-
-# 省略 [[target]] 表示本部署的全部目标。
-# 列出则只覆盖列出的这些，其余保持只读。
-# [[target]]
-# catalog = "ice_rest"
-# database = "analytics"
-# name = "orders_mv"
+source = "Deployment audit: catalog and object deletion work for every prior FE incarnation settled"
 ```
 
-未被读取的键会被拒绝：作者以为写下了、而进程根本没看的字段，比没写更糟。
-
-### 编排流程
-
-新 FE 的 incarnation 是进程自己在启动时铸的，编排事先不知道。所以声明**在进程起来之后写**，
-进程每个维护周期重读一次，不是只在启动时读一次。
-
-```bash
-#!/bin/sh
-# 1. 停掉上一个进程，并确认它真的退出了。这一步产生 isolated_at 与 source。
-systemctl stop novarocks-fe
-OLD_PID_EXIT_MS=$(date +%s000)
-
-# 2. 本次启动的 nonce，写进环境；配置里的 ${ENV:...} 会解析它。
-NONCE="launch-$(openssl rand -hex 4)"
-systemctl set-environment NOVAROCKS_MV_LAUNCH_NONCE="$NONCE"
-systemctl start novarocks-fe
-
-# 3. 等 FE 可服务，然后问它自己的 incarnation 与上一个写者是谁。
-trino --server http://127.0.0.1:8080 --user root --execute \
-  "CALL novarocks_mv_management_status('ice_rest', 'analytics', 'orders_mv')"
-
-# 4. 写声明。文件权限按配置文件同级保护。
-umask 077
-cat > /var/lib/novarocks/mv-startup-isolation.toml <<EOF
-deployment = "prod-a"
-for_incarnation = "$NEW_INCARNATION"
-nonce = "$NONCE"
-isolated_incarnations = ["$OLD_INCARNATION"]
-isolated_at_unix_ms = $OLD_PID_EXIT_MS
-source = "systemd: novarocks-fe.service MainPID $OLD_PID exited"
-EOF
-```
-
-`NEW_INCARNATION` 取自第 3 步的 `LocalIncarnation` 行，`OLD_INCARNATION` 取自
-`UnsettledEffect1Incarnation` 行。
-
-### 什么情况下仍然保持只读
-
-下列每一种都不会打开管理，而且都会在日志里说明原因：
-
-- 没有声明文件——这是默认；
-- 声明里的 `deployment` 不是本部署；
-- `for_incarnation` 不是本进程（上一次启动留下的文件属于这一类）；
-- `nonce` 不是本次启动的；
-- `isolated_incarnations` 为空，或包含本进程自己；
-- `[[target]]` 列表没有覆盖到某个目标——该目标保持只读，其余不受影响；
-- `isolated_at_unix_ms` 晚于进程读到它的时刻；
-- 该效果的路径没有配置远端保证（跨路径的重启屏障需要**两条**路径都有）；
-- 从 T 起的窗口还没走完——这一种会在窗口到期后的某个维护周期自动接续。
-
-声明只允许一次精确的重新观察发生。**那次观察看到什么，仍然决定旧写者的效果究竟做了什么。**
+只为聚合目标提供原隔离时刻的声明可省略 `all_other_incarnations_settled`，也可通过 `[[target]]`
+限定 catalog、database 与 name。FE 拒绝未知字段、不匹配的部署或 launch、把自身列为旧写者、未来时刻、
+缺失来源，以及用逐目标声明断言全部旧效果已收束。当发现日志列出旧写者时，全覆盖声明需要把它们列入
+`isolated_incarnations`。
 
 ## 相关
 
-- `docs/guides/deployment/distributed.md`：正常的 FE/BE 部署形态。
-- `docs/guides/deployment/disposable-frontend.md`：蓝绿 drain 与 probes。
+- [可见元组维护与严格恢复](../../adr/ADR-0278-mv-maintains-visible-tuples-and-replays-verification.md)
+- [FE/BE 分布式部署](distributed.md)
+- [可替换 FE 与 drain](disposable-frontend.md)

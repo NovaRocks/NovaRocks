@@ -29,7 +29,10 @@ USE mvclean_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW cleanup_mv WITH (partitioning = ARRAY['bucket(k, 4)'], refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
 REFRESH MATERIALIZED VIEW cleanup_mv;
 INSERT INTO fact VALUES ROW('west', 20);
+-- Populate a fixed three-publication FULL history for the expiry exercise.
+SET SESSION mvclean_${uuid0}.incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW cleanup_mv;
+RESET SESSION mvclean_${uuid0}.incremental_refresh_enabled;
 ALTER MATERIALIZED VIEW cleanup_mv SET PROPERTIES partitioning = ARRAY['truncate(k, 2)'];
 
 -- query 6
@@ -49,7 +52,10 @@ import scala.collection.JavaConverters._
 import spark.implicits._
 val table = Spark3Util.loadIcebergTable(spark, "ice_rest.ns_${uuid0}.cleanup_mv")
 spark.sparkContext.hadoopConfiguration.set("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-require(table.snapshots().asScala.size == 5, "fixture did not create three publications with two FULL pairs")
+val snapshots = table.snapshots().asScala.toVector
+val publicationKey = "novarocks.doc.v2.record.novarocks.mv~publication"
+require(snapshots.size == 6 && snapshots.count(_.summary().containsKey(publicationKey)) == 3,
+  "Expected three FULL pairs, got %d snapshots and %d publications".format(snapshots.size, snapshots.count(_.summary().containsKey(publicationKey))))
 for (fileList <- Seq(false, true)) {
   val path = table.location() + "/data/t09-orphan-${uuid0}-" + fileList + ".bin"
   val output = table.io().newOutputFile(path).create()
@@ -70,8 +76,10 @@ require(table.snapshots().asScala.size == 1, "external expiration did not retain
 println("MV_EXTERNAL_CLEANUP_OK")
 } catch { case t: Throwable => t.printStackTrace(); System.exit(1) }
 SPARK_SCALA
-spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)"
+spark_status=0
+spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || spark_status=$?
 printf '%s\n' "$spark_out"
+test "$spark_status" -eq 0
 printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_CLEANUP_OK
 
 -- query 7
@@ -93,13 +101,15 @@ REFRESH MATERIALIZED VIEW cleanup_mv;
 SELECT k, v FROM cleanup_mv ORDER BY k;
 
 -- query 10
--- This second MV is disposable after an external data rewrite. Separate
--- publications guarantee two candidate files; rewrite-all must really commit.
+-- The second MV will have no current P after an external data rewrite. The action
+-- must replace at least one file and advance main.
 -- @skip_result_check=true
 CREATE MATERIALIZED VIEW rewrite_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
 REFRESH MATERIALIZED VIEW rewrite_mv;
 INSERT INTO fact VALUES ROW('north', 30);
+SET SESSION "mvclean_${uuid0}".incremental_refresh_enabled = false;
 REFRESH MATERIALIZED VIEW rewrite_mv;
+RESET SESSION "mvclean_${uuid0}".incremental_refresh_enabled;
 
 -- query 11
 -- @result_contains=MV_EXTERNAL_REWRITE_NO_RECORD
@@ -119,15 +129,25 @@ require(!table.currentSnapshot().summary().containsKey("novarocks.doc.v2.record.
 println("MV_EXTERNAL_REWRITE_NO_RECORD")
 } catch { case t: Throwable => t.printStackTrace(); System.exit(1) }
 SPARK_SCALA
-spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)"
+spark_status=0
+spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || spark_status=$?
 printf '%s\n' "$spark_out"
+test "$spark_status" -eq 0
 printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_REWRITE_NO_RECORD
 
 -- query 12
--- @expect_error=external
-REFRESH MATERIALIZED VIEW rewrite_mv;
+-- @result_contains=MV refresh: FullReplace
+EXPLAIN REFRESH MATERIALIZED VIEW rewrite_mv;
 
 -- query 13
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.rewrite_mv,publications=3,slot-changes=0,external-replaces=1,full-refreshes=3,full-refresh-last=true,logical-rows=3,total-records=3,source=fact
+REFRESH MATERIALIZED VIEW rewrite_mv;
+
+-- query 14
+SELECT k, v FROM rewrite_mv ORDER BY k, v;
+
+-- query 15
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvclean_${uuid0}.ns_${uuid0};

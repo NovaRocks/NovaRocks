@@ -270,6 +270,12 @@ range/planning输入准备与校验见保留的 [range fixture](../benchmarks/ue
 
 MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。
 
+`mv/content-strict-recovery-restart` 使用原来的私有 Iceberg REST 夹具和原生 1FE+3BE。场景通过单次 FE 授权关闭准确的目标扫描，核对失败前后的可见行袋，再换 FE 执行同一 Pending 窗口的严格恢复。严格重放核对同一 Root 的两种 summary、Worker 收束、外部效果和原 Action 实际退出。两个后续 ContentLocate 窗口分别在 write-committed 和 publication-committed 替换 FE，按 REST 快照与写入计数核对原发布及重启后仅提交一次无行变更的 MetadataOnly。普通重启由测试集群在原 FE 退出后发布与新进程绑定的隔离声明，并等待 FE 自己报告结束宽限。跨重启保留外部请求的场景可延后声明，由该场景在确认旧效果收束后发布。
+
+`mv/content-pending-slot-change` 在 Pending 窗口变更调度槽，核对严格恢复后的行袋和已持久化的暂停状态。`mv/content-deployment-budget` 用低部署预算验证事前拒绝、EXPLAIN 零提交以及 FullReplace 的一次原子提交。`mv/content-late-landing`、`mv/content-late-retirement`、`mv/content-late-pending-marker` 分别保留旧发布、退役和 Pending 写入的原始 REST 请求，等新 FE 提交后再核对旧请求的实际目录冲突。`mv/name-grace-restart` 则保留旧 DROP，核对宽限期间的拒绝、DROP 实际生效和随后创建的新表身份。
+
+`mv/content-unknown-*` 分别丢失发布、退役、Pending、Pending 解除和 incarnation 槽登记的真实成功响应，核对原目录文档、零 UnsettledEffects 及下一次刷新。
+
 ### MV documents (explicit)
 
 The explicit MV document stages are `mv/document-expiry-channel`,

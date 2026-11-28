@@ -23,7 +23,7 @@ use crate::mv::domain::refresh::contract::{
     JoinRefreshContract,
 };
 pub(crate) use novarocks_sql::planning::mv::{RefreshFragmentProperty, TargetIdentity};
-use novarocks_sql::planning::mv::{SqlImvApplyKeyFacts, SqlImvRefreshContractFacts};
+use novarocks_sql::planning::mv::{SqlImvRefreshContractFacts, SqlImvRefreshShape};
 
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::mv::domain::analysis::MvAnalysis,
@@ -44,13 +44,13 @@ pub fn derive_fragment_property(
 pub(crate) fn map_sql_imv_refresh_contract(
     value: SqlImvRefreshContractFacts,
 ) -> ImvRefreshContract {
-    let apply_key = match value.apply_key {
-        SqlImvApplyKeyFacts::ProjectionFilter => ApplyKeyContract::projection_filter(),
-        SqlImvApplyKeyFacts::UnionProjectionFilter => ApplyKeyContract::union_projection_filter(),
-        SqlImvApplyKeyFacts::JoinProjectionFilter => ApplyKeyContract::join_projection_filter(),
-        SqlImvApplyKeyFacts::AggregateGroupRow => ApplyKeyContract::aggregate_group_row(),
-        SqlImvApplyKeyFacts::JoinAggregateGroupRow => ApplyKeyContract::join_aggregate_group_row(),
-        SqlImvApplyKeyFacts::BranchUnionAggregateGroupRow => {
+    let apply_key = match value.shape {
+        SqlImvRefreshShape::ProjectionFilter => ApplyKeyContract::projection_filter(),
+        SqlImvRefreshShape::UnionProjectionFilter => ApplyKeyContract::union_projection_filter(),
+        SqlImvRefreshShape::JoinProjectionFilter => ApplyKeyContract::join_projection_filter(),
+        SqlImvRefreshShape::Aggregate => ApplyKeyContract::aggregate_group_row(),
+        SqlImvRefreshShape::JoinAggregate => ApplyKeyContract::join_aggregate_group_row(),
+        SqlImvRefreshShape::BranchUnionAggregate => {
             ApplyKeyContract::branch_union_aggregate_group_row()
         }
     };
@@ -85,7 +85,7 @@ mod tests {
     fn maps_sql_refresh_contract_to_execution_contract() {
         let mapped = map_sql_imv_refresh_contract(SqlImvRefreshContractFacts {
             base_refs: Vec::new(),
-            apply_key: SqlImvApplyKeyFacts::BranchUnionAggregateGroupRow,
+            shape: SqlImvRefreshShape::BranchUnionAggregate,
             aggregate: Some(SqlImvAggregateFacts {
                 group_key_count: 2,
                 aggregate_count: 3,

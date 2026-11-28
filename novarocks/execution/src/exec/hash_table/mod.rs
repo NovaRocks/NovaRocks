@@ -20,6 +20,7 @@
 pub mod hash;
 pub mod key_builder;
 pub(crate) mod key_index;
+pub use key_index::{ContentKeyIndexSizing, estimate_content_key_index};
 
 pub(crate) mod allocation;
 

@@ -1,0 +1,11 @@
+-- query 5
+-- types	integer	bigint	bigint
+p	rows_visible	total
+1	1	9
+2	2048	2098176
+
+-- query 9
+-- types	integer	bigint	bigint
+p	rows_visible	total
+1	1	9
+2	2047	2098175

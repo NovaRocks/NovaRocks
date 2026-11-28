@@ -23,8 +23,10 @@
 
 use super::{ConnectorReadBinding, ConnectorReadChangeWindow, OpaquePayload, SchemaTableName};
 use crate::connector::{
-    ConnectorChangeWindowFacts, ConnectorExactSemanticRevision, ConnectorProcessLocalPayload,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableObjectId,
+    ConnectorChangePartitionTransform, ConnectorChangePartitionValue, ConnectorChangeWindowFacts,
+    ConnectorError, ConnectorErrorKind, ConnectorExactSemanticRevision,
+    ConnectorProcessLocalPayload, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableObjectId,
 };
 use std::sync::Arc;
 
@@ -46,6 +48,66 @@ impl ConnectorReadSourceSelection {
     }
 }
 
+/// An ordered source coordinate for a target partition field proved by MV mapping.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorExactSourcePartitionField {
+    pub source_field_id: bytes::Bytes,
+    pub transform: ConnectorChangePartitionTransform,
+}
+
+/// Physical data-file metrics over all files included by the exact source
+/// predicate. Delete applicability can decrease the logical result row count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorExactPartitionSliceVolume {
+    pub record_count: u128,
+    pub file_size_in_bytes: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorExactPartitionSliceOutcome {
+    Proven(ConnectorExactPartitionSliceVolume),
+    NotAligned,
+}
+
+/// The complete inverse image of affected target keys at the enclosing To pin.
+/// The provider must prove it can evaluate this predicate exactly before
+/// admitting the read. It may not turn it into an unrestricted snapshot read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorExactSourcePartitionSlice {
+    fields: Arc<[ConnectorExactSourcePartitionField]>,
+    keys: Arc<[Vec<ConnectorChangePartitionValue>]>,
+}
+
+impl ConnectorExactSourcePartitionSlice {
+    pub fn try_new(
+        fields: Vec<ConnectorExactSourcePartitionField>,
+        keys: Arc<[Vec<ConnectorChangePartitionValue>]>,
+    ) -> Result<Self, ConnectorError> {
+        if fields.is_empty()
+            || fields.iter().any(|field| field.source_field_id.is_empty())
+            || keys.iter().any(|key| key.len() != fields.len())
+            || keys.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "exact source partition slice requires fields and ordered distinct complete keys",
+            ));
+        }
+        Ok(Self {
+            fields: fields.into(),
+            keys,
+        })
+    }
+
+    pub fn fields(&self) -> &[ConnectorExactSourcePartitionField] {
+        &self.fields
+    }
+
+    pub fn keys(&self) -> &[Vec<ConnectorChangePartitionValue>] {
+        &self.keys
+    }
+}
+
 /// The original object's pin and exact revisions. A snapshot selection has no
 /// From revision; an empty source retains its original SkipEmpty disposition
 /// instead of manufacturing snapshot zero or a change window.
@@ -58,6 +120,7 @@ pub struct ConnectorReadSourcePreparationRequest {
     selection: ConnectorReadSourceSelection,
     from_revision: Option<ConnectorExactSemanticRevision>,
     to_revision: ConnectorExactSemanticRevision,
+    exact_partition_slice: Option<ConnectorExactSourcePartitionSlice>,
 }
 
 impl ConnectorReadSourcePreparationRequest {
@@ -77,6 +140,7 @@ impl ConnectorReadSourcePreparationRequest {
             selection: ConnectorReadSourceSelection::Snapshot(snapshot_id),
             from_revision: None,
             to_revision: revision,
+            exact_partition_slice: None,
         }
     }
 
@@ -97,6 +161,7 @@ impl ConnectorReadSourcePreparationRequest {
             selection: ConnectorReadSourceSelection::ChangeWindow(window),
             from_revision: Some(from_revision),
             to_revision,
+            exact_partition_slice: None,
         }
     }
 
@@ -119,6 +184,30 @@ impl ConnectorReadSourcePreparationRequest {
                 revision,
             )
         }
+    }
+
+    /// Freeze a restricted To read under the original snapshot and observation.
+    pub fn with_exact_partition_slice(
+        mut self,
+        slice: ConnectorExactSourcePartitionSlice,
+    ) -> Result<Self, ConnectorError> {
+        if !matches!(
+            self.selection,
+            ConnectorReadSourceSelection::Snapshot(_)
+                | ConnectorReadSourceSelection::CurrentAtSnapshot(_)
+        ) || self.exact_partition_slice.is_some()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "exact source partition slice requires an original unsliced snapshot request",
+            ));
+        }
+        self.exact_partition_slice = Some(slice);
+        Ok(self)
+    }
+
+    pub const fn exact_partition_slice(&self) -> Option<&ConnectorExactSourcePartitionSlice> {
+        self.exact_partition_slice.as_ref()
     }
 
     pub const fn name(&self) -> &SchemaTableName {
@@ -172,6 +261,7 @@ pub struct ConnectorPreparedSourceRead {
     window_facts: Option<ConnectorChangeWindowFacts>,
     payload: OpaquePayload,
     to_metadata: Arc<ConnectorTableMetadata>,
+    exact_partition_slice: Option<ConnectorExactPartitionSliceOutcome>,
 }
 
 impl ConnectorPreparedSourceRead {
@@ -195,11 +285,19 @@ impl ConnectorPreparedSourceRead {
         &self.to_metadata
     }
 
+    pub const fn exact_partition_slice_volume(&self) -> Option<ConnectorExactPartitionSliceVolume> {
+        match self.exact_partition_slice {
+            Some(ConnectorExactPartitionSliceOutcome::Proven(volume)) => Some(volume),
+            _ => None,
+        }
+    }
+
     pub(crate) fn new<T: Send + Sync + 'static>(
         binding: ConnectorReadBinding,
         request: ConnectorReadSourcePreparationRequest,
         window_facts: Option<ConnectorChangeWindowFacts>,
         to_metadata: Arc<ConnectorTableMetadata>,
+        exact_partition_slice: Option<ConnectorExactPartitionSliceOutcome>,
         facts: T,
     ) -> Self {
         Self {
@@ -208,6 +306,7 @@ impl ConnectorPreparedSourceRead {
             window_facts,
             payload: OpaquePayload::new(facts),
             to_metadata,
+            exact_partition_slice,
         }
     }
 
@@ -216,6 +315,9 @@ impl ConnectorPreparedSourceRead {
     }
 
     pub(crate) fn permits(&self, projection: ConnectorReadSourceProjection) -> bool {
+        if self.exact_partition_slice == Some(ConnectorExactPartitionSliceOutcome::NotAligned) {
+            return false;
+        }
         self.window_facts
             .as_ref()
             .map_or(projection == ConnectorReadSourceProjection::To, |facts| {

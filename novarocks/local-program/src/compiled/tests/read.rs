@@ -341,6 +341,7 @@ fn finish_with(
             .collect(),
         &(0..count).map(source_id).collect(),
         CompiledProgramFacts {
+            input_completion: crate::InputCompletion::MayShortCircuit,
             writes: BTreeMap::new(),
             exchange_inputs: BTreeMap::new(),
             scan_inputs,

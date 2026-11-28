@@ -110,6 +110,8 @@ const READ_VARIABLE_PREFIX: &str = "r";
 /// ends. The encoding is read once, when the plan is put on the wire, and dies
 /// with the plan version.
 pub(crate) struct FrozenProviderRead {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) content_target: bool,
     pub(crate) access: ConnectorReadAttemptAccess,
     /// The generation this read was frozen against, held open for as long as
     /// the plan may run. Releasing it earlier would let the provider retire a
@@ -666,12 +668,26 @@ fn prepare_read_opening(
     let mut original_table = None;
     let mut original_name = None;
     let mut original_reference = None;
-    let admitted = if let ProviderReadRelationNeed::MvTarget {
-        target_table_uuid,
-        target_snapshot_id,
-        use_affected_partitions,
-        ..
-    } = relation
+    let target = match relation {
+        ProviderReadRelationNeed::MvTarget {
+            target_table_uuid,
+            target_snapshot_id,
+            use_affected_partitions,
+            ..
+        } => Some((
+            target_table_uuid,
+            *target_snapshot_id,
+            *use_affected_partitions,
+        )),
+        ProviderReadRelationNeed::MvContentTarget {
+            target_table_uuid,
+            target_snapshot_id,
+            ..
+        } => Some((target_table_uuid, Some(*target_snapshot_id), false)),
+        _ => None,
+    };
+    let admitted = if let Some((target_table_uuid, target_snapshot_id, use_affected_partitions)) =
+        target
     {
         let binding = bindings.binding(need.binding())?;
         let target = binding.mv_target_read.as_ref().ok_or_else(|| {
@@ -680,14 +696,14 @@ fn prepare_read_opening(
             })
         })?;
         if target.target_table_uuid != *target_table_uuid
-            || target.frozen_snapshot_id != *target_snapshot_id
+            || target.frozen_snapshot_id != target_snapshot_id
         {
             return Err(format!(
                 "provider read of {name} names a different MV target UUID or snapshot than its frozen binding"
             ).into());
         }
         AdmittedRead::MvTarget {
-            materialization: if *use_affected_partitions {
+            materialization: if use_affected_partitions {
                 target.affected_partitions.clone()
             } else {
                 target.full.clone()
@@ -973,6 +989,28 @@ async fn prepare_observation(
                     *to_snapshot_id,
                 ),
             },
+            ProviderReadRelationNeed::MvContentTarget {
+                target_snapshot_id, ..
+            } => {
+                let AdmittedRead::MvTarget {
+                    materialization,
+                    object_id,
+                    original_source: Some(original_source),
+                } = &opening.admitted
+                else {
+                    return Err(format!(
+                        "provider read of {} lacks its original MV content target observation",
+                        opening.name
+                    )
+                    .into());
+                };
+                K::FrozenMvContentTarget {
+                    table: materialization.table.clone(),
+                    original_source: original_source.clone(),
+                    object_id: object_id.clone(),
+                    snapshot_id: *target_snapshot_id,
+                }
+            }
             ProviderReadRelationNeed::MvTarget {
                 target_snapshot_id, ..
             } => {
@@ -1165,7 +1203,8 @@ fn relation_open_error(
         ProviderReadRelationNeed::Delta { .. } => {
             format!("provider read of {name} cannot open change window")
         }
-        ProviderReadRelationNeed::MvTarget { .. } => {
+        ProviderReadRelationNeed::MvTarget { .. }
+        | ProviderReadRelationNeed::MvContentTarget { .. } => {
             format!("provider read of {name} cannot open frozen MV target")
         }
         ProviderReadRelationNeed::PinnedFileSet { .. } => {
@@ -1202,7 +1241,8 @@ fn relation_open_missing(
         ProviderReadRelationNeed::Delta { .. } => {
             format!("provider read of {name} exposes no change window")
         }
-        ProviderReadRelationNeed::MvTarget { .. } => {
+        ProviderReadRelationNeed::MvTarget { .. }
+        | ProviderReadRelationNeed::MvContentTarget { .. } => {
             format!("provider read of {name} exposes no frozen MV target")
         }
         ProviderReadRelationNeed::PinnedFileSet { .. } => {
@@ -1485,6 +1525,11 @@ fn finish_read_from_opened(
             FrozenReadAccess {
                 binding: need.binding(),
                 access: FrozenProviderRead {
+                    #[cfg(novarocks_dev_controls)]
+                    content_target: matches!(
+                        need.relation(),
+                        ProviderReadRelationNeed::MvContentTarget { .. }
+                    ),
                     access,
                     generation: planning_pin.clone(),
                     catalog: catalog_properties,
@@ -1568,7 +1613,8 @@ fn frozen_input(
         // The binding retains the exact admitted generation. The endpoints
         // are stated by the Delta need and select the window at open time.
         ProviderReadRelationNeed::Delta { .. } => return Ok(QueryFrozenReadInput::Current),
-        ProviderReadRelationNeed::MvTarget { .. } => {
+        ProviderReadRelationNeed::MvTarget { .. }
+        | ProviderReadRelationNeed::MvContentTarget { .. } => {
             return Err("MV target reads require their target admission"
                 .to_string()
                 .into());
@@ -1593,7 +1639,10 @@ fn frozen_input(
 fn unsupported_family(relation: &ProviderReadRelationNeed) -> String {
     let (family, owner) = match relation {
         ProviderReadRelationNeed::Delta { .. } => ("change window", "incremental view maintenance"),
-        ProviderReadRelationNeed::MvTarget { .. } => ("MV target", "incremental view maintenance"),
+        ProviderReadRelationNeed::MvTarget { .. }
+        | ProviderReadRelationNeed::MvContentTarget { .. } => {
+            ("MV target", "incremental view maintenance")
+        }
         ProviderReadRelationNeed::PinnedFileSet { .. } => ("pinned file set", "row mutation"),
         ProviderReadRelationNeed::Data { .. }
         | ProviderReadRelationNeed::FrozenInputSet { .. }
@@ -1612,6 +1661,7 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
         | ProviderReadRelationNeed::Metadata { relation, .. }
         | ProviderReadRelationNeed::Delta { relation, .. }
         | ProviderReadRelationNeed::MvTarget { relation, .. }
+        | ProviderReadRelationNeed::MvContentTarget { relation, .. }
         | ProviderReadRelationNeed::PinnedFileSet { relation } => relation,
     }
 }

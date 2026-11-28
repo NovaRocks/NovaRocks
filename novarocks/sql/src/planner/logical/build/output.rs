@@ -93,6 +93,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             Ok(columns)
         }
         LogicalPlanKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanKind::ContentApply(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }

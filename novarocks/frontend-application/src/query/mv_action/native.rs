@@ -53,6 +53,8 @@ pub(super) struct MvNativePhase {
     assembly_installed: bool,
     ready_received: bool,
     ready_local_exit: bool,
+    coverage: Arc<crate::query_execution::logical_execution::SplitCoverageReceiving>,
+    delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
 }
 impl MvNativePhase {
     pub(super) fn poll_supervision_failure(
@@ -74,6 +76,7 @@ impl MvNativePhase {
         >,
     ) -> Self {
         let session = assembly.write_session().clone();
+        let coverage = initial.credentials().require_split_coverage();
         Self {
             computation: StatementComputation::new(
                 root,
@@ -90,7 +93,22 @@ impl MvNativePhase {
             assembly_installed: false,
             ready_received: false,
             ready_local_exit: false,
+            coverage,
+            delete_verification: None,
         }
+    }
+    pub(super) fn verified_coverage(&self) -> bool {
+        self.coverage.complete()
+    }
+
+    pub(super) fn delete_verification(
+        &self,
+    ) -> Option<novarocks_result_contract::DeleteVerificationCounts> {
+        self.delete_verification
+    }
+
+    pub(super) const fn assembly_installed(&self) -> bool {
+        self.assembly_installed
     }
     pub(super) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.health
@@ -171,6 +189,7 @@ impl MvNativePhase {
             // The exact accepted payload and terminal credential resolver are
             // already held by the original session. No Ready result window
             // may leak into the subsequent publication/Current phase.
+            self.delete_verification = ready.accepted.delete_verification();
             drop(ready);
             self.ready_received = true;
         }
@@ -195,6 +214,26 @@ impl MvNativePhase {
                 }
             }
             self.ready_local_exit = true;
+        }
+        if !self.coverage.complete() {
+            if let Some(error) = self.poll_supervision_failure(cx) {
+                self.fail(
+                    novarocks_query_application::session_outcome::governed_query_execution_error(
+                        error,
+                    ),
+                );
+                return Poll::Ready(self.selected.as_ref().unwrap().clone());
+            }
+            if let Some(tail) = self.tail.as_mut() {
+                match tail.poll_exit(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(health)) => {
+                        self.health = Some(health);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
         }
         self.selected = Some(Ok(()));
         Poll::Ready(Ok(()))

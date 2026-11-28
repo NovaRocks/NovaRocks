@@ -411,6 +411,10 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
         self.binding.feedback_wait.clone()
     }
 
+    pub(crate) fn content_demand(self) -> bool {
+        self.binding.content_demand
+    }
+
     pub fn role(self) -> RuntimeFilterDeploymentBindingRoleFacts {
         match &self.binding.role {
             attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Producer {

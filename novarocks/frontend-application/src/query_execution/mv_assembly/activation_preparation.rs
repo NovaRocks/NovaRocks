@@ -80,7 +80,7 @@ pub(crate) async fn prepare_analysis(
     let control =
         crate::query_execution::planning::sql_compile_control_from_execution(&input.execution);
     let settings = input.execution.optimizer_settings().clone();
-    let (artifact, sources) = input.prepared.into_assembly_artifact();
+    let (artifact, sources, replacement_reads) = input.prepared.into_assembly_artifact();
     if let Some(views) = sources.views() {
         bindings.retain_statement_views(views).await;
     }
@@ -124,9 +124,20 @@ pub(crate) async fn prepare_analysis(
                 .to_vec();
             let (capture, rewrite) = match prepared.into_execution_artifact() {
                 MvFirstRefreshExecutionArtifact::Sql(source) => {
+                    let source = match replacement_reads {
+                        Some(reads) => source.with_partition_sources(
+                            reads.register(&bindings).map_err(|error| error.0)?,
+                        ),
+                        None => source,
+                    };
                     (MvCatalogCaptureQuery::FirstSql(source), None)
                 }
                 MvFirstRefreshExecutionArtifact::Logical(logical) => {
+                    if replacement_reads.is_some() {
+                        return Err(contract_error(
+                            "MV partition replacement requires its original projection or UNION query",
+                        ));
+                    }
                     let facts = logical.into_context();
                     let identity = validate_frozen_mv_rewrite_identity(
                         &target_catalog,
@@ -278,7 +289,10 @@ pub(crate) async fn prepare_analysis(
                     &bindings,
                     input.planning.clone(),
                     input.target.metadata().clone(),
-                    Some(&facts.affected_partitions),
+                    rewrite
+                        .interpretation()
+                        .is_aggregate()
+                        .then_some(&facts.affected_partitions),
                     mode == novarocks_mv_application::product::MvIncrementalWriteMode::RowDelta,
                 )
                 .map_err(contract_error)?;
@@ -342,8 +356,11 @@ pub(crate) async fn prepare_analysis(
             let rewrite_snapshot = match mode {
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend =>
                     rewrite.to_sql_rewrite_snapshot(target_binding),
-                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta =>
+                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
+                    if rewrite.interpretation().is_aggregate() =>
                     rewrite.to_sql_rewrite_snapshot_with_target_file_metadata(target_binding, input.target.metadata()),
+                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta =>
+                    rewrite.to_sql_content_rewrite_snapshot(target_binding, input.target.metadata()),
             }.map_err(contract_error)?;
             let analysis = match artifact {
                 MvIncrementalExecutionArtifact::CanonicalQuery => {

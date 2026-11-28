@@ -60,6 +60,7 @@ fn with_nodes(fragment: &Fragment, nodes: BTreeMap<NodeId, PhysicalNode>) -> Fra
     FragmentParts {
         summaries: Box::default(),
         stage_placement: fragment.stage_placement().clone(),
+        input_completion: crate::FragmentInputCompletion::MayShortCircuit,
         id: fragment.id(),
         root: fragment.root(),
         values: fragment.values().clone(),

@@ -177,7 +177,7 @@ impl FragmentValidationIndexes {
             owner.gate()?;
             let mut ports = BTreeMap::new();
             for node in fragment.nodes().values() {
-                let port = ValuePortIndex::new_core(&node.output.columns, Some(owner))?;
+                let port = ValuePortIndex::new_core(node.data_output_columns(), Some(owner))?;
                 owner.work.flush()?;
                 let port = Arc::new(port);
                 owner.work.step()?;
@@ -194,7 +194,12 @@ impl FragmentValidationIndexes {
             fragment
                 .nodes()
                 .values()
-                .map(|node| (node.id, Arc::new(ValuePortIndex::new(&node.output.columns))))
+                .map(|node| {
+                    (
+                        node.id,
+                        Arc::new(ValuePortIndex::new(node.data_output_columns())),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>()
         };
         let mut visible_inputs = BTreeMap::new();

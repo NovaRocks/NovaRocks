@@ -250,6 +250,14 @@ impl MvObservedSourceField {
     }
 }
 
+/// Exact table format observed by the source provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvSourceFormatVersion {
+    V1,
+    V2,
+    V3,
+}
+
 /// A provider projection from the same exact planning pin and metadata
 /// generation and its selected source schema. Target partition layout and OCC
 /// are separate observations. Frontend stamps SQL relation occurrences onto
@@ -259,7 +267,7 @@ pub struct MvSourceSchemaObservation {
     table: ConnectorTableIdentity,
     object_id: ConnectorTableObjectId,
     schema_version: Bytes,
-    format_v3: bool,
+    format_version: MvSourceFormatVersion,
     selected_snapshot_id: Option<i64>,
     selected_snapshot_has_row_range: bool,
     fields: Vec<MvObservedSourceField>,
@@ -270,7 +278,7 @@ impl MvSourceSchemaObservation {
         table: ConnectorTableIdentity,
         object_id: ConnectorTableObjectId,
         schema_version: Bytes,
-        format_v3: bool,
+        format_version: MvSourceFormatVersion,
         selected_snapshot_id: Option<i64>,
         selected_snapshot_has_row_range: bool,
         fields: Vec<MvObservedSourceField>,
@@ -278,7 +286,7 @@ impl MvSourceSchemaObservation {
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
         validate_table(&table, "MV source schema")?;
-        if selected_snapshot_has_row_range && !format_v3 {
+        if selected_snapshot_has_row_range && format_version != MvSourceFormatVersion::V3 {
             return corrupt("MV source snapshot row range requires its observed v3 format");
         }
         if selected_snapshot_id.is_some_and(|id| id < 0)
@@ -322,7 +330,7 @@ impl MvSourceSchemaObservation {
             table,
             object_id,
             schema_version,
-            format_v3,
+            format_version,
             selected_snapshot_id,
             selected_snapshot_has_row_range,
             fields,
@@ -341,8 +349,8 @@ impl MvSourceSchemaObservation {
         &self.schema_version
     }
 
-    pub const fn is_format_v3(&self) -> bool {
-        self.format_v3
+    pub const fn format_version(&self) -> MvSourceFormatVersion {
+        self.format_version
     }
 
     /// The exact selected source snapshot; `None` means no snapshot exists.
@@ -1336,7 +1344,7 @@ mod tests {
             table(),
             target_object_id(),
             Bytes::from_static(b"schema-1"),
-            true,
+            MvSourceFormatVersion::V3,
             Some(11),
             true,
             vec![field.clone(), field],
@@ -1359,7 +1367,7 @@ mod tests {
             table(),
             target_object_id(),
             Bytes::from_static(b"schema-1"),
-            false,
+            MvSourceFormatVersion::V2,
             Some(11),
             true,
             vec![field],

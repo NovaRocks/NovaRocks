@@ -37,7 +37,7 @@ pub fn statistics_data_version(
 
 pub fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
     match metric {
-        StatisticsMetric::RowCount => None,
+        StatisticsMetric::RowCount | StatisticsMetric::DataFileBytes => None,
         StatisticsMetric::NullCount { column }
         | StatisticsMetric::Minimum { column }
         | StatisticsMetric::Maximum { column }

@@ -31,6 +31,7 @@ const FINISH: FragmentId = FragmentId::new(34);
 const ROUTES: [EdgeId; 2] = [EdgeId::new(41), EdgeId::new(42)];
 const RESULTS: [EdgeId; 2] = [EdgeId::new(43), EdgeId::new(44)];
 const SUMMARY: EdgeId = EdgeId::new(45);
+const VERIFICATION: EdgeId = EdgeId::new(46);
 
 #[derive(Clone, Copy)]
 enum Colocation {
@@ -169,44 +170,251 @@ fn edge(
     }
 }
 
-fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, FragmentPackage> {
-    let mut constants = novarocks_physical_plan::ConstantPools::empty();
-    let mut builder = FragmentBuilder::new(ROUTER);
-    let source = builder.reserve_node_id().unwrap();
-    let source_type = ty(DataType::Int64, false);
-    let source_value = builder
-        .add_value(
-            source_type.clone(),
-            ValueOrigin::NodeOutput {
-                node: source,
-                output_ordinal: 0,
+fn content_distribution(key: ValueId) -> Distribution {
+    Distribution::Hash {
+        keys: Box::from([key]),
+        scheme: HashPartitionScheme {
+            space: PartitionSpaceId::try_new([51; 32]).unwrap(),
+            count: PartitionCountParameter {
+                id: PartitionCountParameterId::try_new([52; 32]).unwrap(),
+                admissible: PartitionCountDomain {
+                    min: 1,
+                    max: 4,
+                    requires_power_of_two: false,
+                },
             },
-        )
-        .unwrap();
-    let source_expression = builder
-        .add_root(
-            source,
-            source_type.clone(),
-            crate::test_constants::i64(
-                &mut constants,
-                &source_type,
-                17,
-                options(1, None).constants,
-            ),
-            RootScope::AllPorts,
-        )
-        .unwrap();
+            definition: HashDefinition::native_exchange(),
+        },
+    }
+}
+
+fn content_input(
+    receiver: &mut FragmentBuilder,
+    source_fragments: &mut Vec<novarocks_physical_plan::Fragment>,
+    edges: &mut Vec<Edge>,
+    source: FragmentId,
+    edge_id: EdgeId,
+    types: &[ValueType],
+) -> (NodeId, Vec<ValueId>) {
+    let mut sender = FragmentBuilder::new(source);
+    let root = sender.reserve_node_id().unwrap();
+    let output = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            sender
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::NodeOutput {
+                        node: root,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     insert(
-        &mut builder,
-        source,
+        &mut sender,
+        root,
         vec![],
-        vec![source_value],
+        output.clone(),
         NodeKind::Values {
-            rows: Box::from([Box::from([source_expression])]),
+            rows: Box::default(),
         },
         Distribution::Singleton,
         vec![],
     );
+    source_fragments.push(
+        sender
+            .finish_fixture_definition(
+                root,
+                FragmentSink::Stream { edge: edge_id },
+                dop_domain(),
+                StagePlacementPolicy::Singleton,
+            )
+            .unwrap(),
+    );
+    let sources = output
+        .iter()
+        .copied()
+        .zip(types.iter().cloned())
+        .collect::<Vec<_>>();
+    let (input, values) = receive(receiver, edge_id, &sources, |values| {
+        content_distribution(values[0])
+    });
+    edges.push(edge(
+        edge_id,
+        OutputRole::Relational,
+        source,
+        FragmentOutputPort::Root,
+        &output,
+        ROUTER,
+        input,
+        &values,
+        content_distribution(output[0]),
+        content_distribution(values[0]),
+    ));
+    (input, values)
+}
+
+fn summary_carrier(field: SummaryField) -> DataType {
+    match field.wire_type() {
+        novarocks_physical_plan::SummaryWireType::Int64 => DataType::Int64,
+        novarocks_physical_plan::SummaryWireType::FixedSizeBinary(width) => {
+            DataType::FixedSizeBinary(i32::from(width))
+        }
+    }
+}
+
+fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, FragmentPackage> {
+    packages_with_content(mode, summary_first, false)
+}
+
+fn packages_with_content(
+    mode: Colocation,
+    summary_first: bool,
+    with_content_apply: bool,
+) -> BTreeMap<FragmentId, FragmentPackage> {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    let mut builder = FragmentBuilder::new(ROUTER);
+    let source_type = ty(DataType::Int64, false);
+    let mut edges = Vec::new();
+    let mut source_fragments = Vec::new();
+    let (source, source_value, verification) = if with_content_apply {
+        let (weighted, weighted_values) = content_input(
+            &mut builder,
+            &mut source_fragments,
+            &mut edges,
+            FragmentId::new(35),
+            EdgeId::new(47),
+            &[source_type.clone(), ty(DataType::Int8, false)],
+        );
+        let metadata = [
+            DataType::Utf8,
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Struct(Default::default()),
+        ];
+        let target_types = std::iter::once(source_type.clone())
+            .chain(metadata.iter().cloned().map(|carrier| ty(carrier, false)))
+            .collect::<Vec<_>>();
+        let (target, target_values) = content_input(
+            &mut builder,
+            &mut source_fragments,
+            &mut edges,
+            FragmentId::new(36),
+            EdgeId::new(48),
+            &target_types,
+        );
+        let apply = builder.reserve_node_id().unwrap();
+        let mut data_columns = Vec::new();
+        for (ordinal, ty) in std::iter::once(source_type.clone())
+            .chain(metadata.into_iter().map(|carrier| ty(carrier, true)))
+            .chain(std::iter::once(ty(DataType::Int8, false)))
+            .enumerate()
+        {
+            data_columns.push(
+                builder
+                    .add_value(
+                        ty,
+                        ValueOrigin::NodeOutput {
+                            node: apply,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        let mut verification_values = Vec::new();
+        for &field in novarocks_physical_plan::SummaryKind::DeleteVerification.fields() {
+            verification_values.push(
+                builder
+                    .add_value(
+                        ty(summary_carrier(field), false),
+                        ValueOrigin::Summary { field },
+                    )
+                    .unwrap(),
+            );
+        }
+        let [requested, matched, insufficient, fingerprint] = verification_values[..] else {
+            unreachable!("DeleteVerification declares four fields");
+        };
+        let verification = SummaryOutput {
+            edge: VERIFICATION,
+            columns: SummaryColumns::delete_verification(
+                requested,
+                matched,
+                insufficient,
+                fingerprint,
+            ),
+            author: SummaryAuthor::Node(apply),
+        };
+        let [target_value, file, position, spec_id, partition] = target_values[..] else {
+            unreachable!("target fixture has one content and four identity fields");
+        };
+        let data = data_columns[0];
+        data_columns.extend(verification_values);
+        insert(
+            &mut builder,
+            apply,
+            vec![weighted, target],
+            data_columns,
+            NodeKind::ContentApply(novarocks_physical_plan::ContentApplySpec {
+                weighted_content: Box::from([weighted_values[0]]),
+                target_content: Box::from([target_value]),
+                route_keys: Box::from([0]),
+                weight: weighted_values[1],
+                target: novarocks_physical_plan::ContentApplyTarget {
+                    file,
+                    position,
+                    spec_id,
+                    partition,
+                },
+            }),
+            Distribution::Unconstrained,
+            vec![
+                content_distribution(weighted_values[0]),
+                content_distribution(target_value),
+            ],
+        );
+        (apply, data, Some(verification))
+    } else {
+        let source = builder.reserve_node_id().unwrap();
+        let source_value = builder
+            .add_value(
+                source_type.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let source_expression = builder
+            .add_root(
+                source,
+                source_type.clone(),
+                crate::test_constants::i64(
+                    &mut constants,
+                    &source_type,
+                    17,
+                    options(1, None).constants,
+                ),
+                RootScope::AllPorts,
+            )
+            .unwrap();
+        insert(
+            &mut builder,
+            source,
+            vec![],
+            vec![source_value],
+            NodeKind::Values {
+                rows: Box::from([Box::from([source_expression])]),
+            },
+            Distribution::Singleton,
+            vec![],
+        );
+        (source, source_value, None)
+    };
     let root = builder.reserve_node_id().unwrap();
     let effect = builder
         .add_value(
@@ -328,13 +536,19 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             edge: ROUTES[index],
         })
         .collect();
-    builder.set_summaries(Box::new([summary]));
+    builder.set_summaries(std::iter::once(summary).chain(verification).collect());
     let router = builder
         .finish_fixture_definition(
             root,
             FragmentSink::Router { effect, routes },
             dop_domain(),
-            StagePlacementPolicy::Singleton,
+            if with_content_apply {
+                StagePlacementPolicy::Spread {
+                    max_instances: None,
+                }
+            } else {
+                StagePlacementPolicy::Singleton
+            },
         )
         .unwrap();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap());
@@ -342,8 +556,10 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         plan.insert_constant_pool(id, pool.clone()).unwrap();
     }
     plan.add_fragment(router).unwrap();
+    for source in source_fragments {
+        plan.add_fragment(source).unwrap();
+    }
     let mut writer_fields = Vec::new();
-    let mut edges = Vec::new();
     for index in 0..2 {
         let mut builder = FragmentBuilder::new(WRITERS[index]);
         // Equal source values still mint independent destination occurrences.
@@ -528,7 +744,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
     ));
     let finish = builder.reserve_node_id().unwrap();
     let output = relation_fields(&mut builder, finish, true);
-    let (inputs, roles) = if summary_first {
+    let (mut inputs, mut roles) = if summary_first {
         (
             vec![summary_receiver, union],
             FinishInputs {
@@ -551,6 +767,33 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             },
         )
     };
+    let delete_verification = verification.map(|verification| {
+        let kind = verification.kind();
+        let sources = verification
+            .columns
+            .fields()
+            .map(|(field, value)| (value, ty(summary_carrier(field), false)))
+            .collect::<Vec<_>>();
+        let (receiver, values) = receive(&mut builder, VERIFICATION, &sources, |_| {
+            Distribution::Singleton
+        });
+        edges.push(edge(
+            VERIFICATION,
+            OutputRole::Summary(kind),
+            ROUTER,
+            FragmentOutputPort::Summary(kind),
+            verification.columns.values(),
+            FINISH,
+            receiver,
+            &values,
+            Distribution::Singleton,
+            Distribution::Singleton,
+        ));
+        roles.summaries.delete_verification = Some(inputs.len() as u32);
+        inputs.push(receiver);
+        SummaryColumns::delete_verification(values[0], values[1], values[2], values[3])
+    });
+    let required = vec![Distribution::Singleton; inputs.len()];
     insert(
         &mut builder,
         finish,
@@ -565,7 +808,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
                     summary_values[1],
                     summary_values[2],
                 )),
-                delete_verification: None,
+                delete_verification,
             },
             expected_target_ordinals: Box::from(ordinals),
             input_schema: WriterRelationSchema {
@@ -580,7 +823,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             grouped_unpivot: None,
         }),
         Distribution::Singleton,
-        vec![Distribution::Singleton, Distribution::Singleton],
+        required,
     );
     plan.add_fragment(
         builder
@@ -864,6 +1107,69 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
                 .filter(|fact| fact.role == ProgramOutputRole::WriterResults)
                 .count(),
             2
+        );
+    }
+}
+
+#[test]
+fn content_apply_lowers_independent_data_and_both_summary_ports() {
+    use novarocks_local_program::{StaticSummaryAuthor, SummaryKind};
+
+    let mut packages = packages_with_content(Colocation::None, true, true);
+    let router = compile(&Arc::new(packages.remove(&ROUTER).unwrap()), 4, None).unwrap();
+    let graph = router.graph();
+    let (apply, spec) = graph
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind() {
+            ProgramNodeKind::ContentApply(spec) => Some((node, spec)),
+            _ => None,
+        })
+        .expect("content application was lowered");
+    assert_eq!(apply.output_layout().slots().len(), 6);
+    assert_eq!(graph.summaries().len(), 2);
+    assert!(
+        graph
+            .summaries()
+            .iter()
+            .any(|summary| summary.kind() == SummaryKind::WriteCounts
+                && summary.author() == StaticSummaryAuthor::RouterSink)
+    );
+    let verification = graph
+        .summaries()
+        .iter()
+        .find(|summary| summary.kind() == SummaryKind::DeleteVerification)
+        .unwrap();
+    assert_eq!(
+        verification.author(),
+        StaticSummaryAuthor::Node(apply.local_id().unwrap())
+    );
+    assert_eq!(verification.layout().slots(), &spec.summary_slots);
+    assert!(
+        spec.summary_slots
+            .iter()
+            .all(|slot| !apply.output_layout().slots().contains(slot))
+    );
+
+    let finish = compile(&Arc::new(packages.remove(&FINISH).unwrap()), 1, Some(1)).unwrap();
+    let graph = finish.graph();
+    let ProgramNodeKind::TableFinish {
+        inputs,
+        input_roles,
+        summary_layouts,
+        ..
+    } = graph.nodes()[graph.root().index()].kind()
+    else {
+        panic!("logical finish was not lowered");
+    };
+    assert_eq!(inputs.len(), 3);
+    for kind in SummaryKind::ALL {
+        let input = inputs[*input_roles.summaries.get(kind).unwrap() as usize];
+        let role = finish.exchange_inputs()[&input].role;
+        assert_eq!(role, ProgramOutputRole::Summary(kind));
+        assert_eq!(
+            summary_layouts.get(kind).unwrap().slots(),
+            graph.nodes()[input.index()].output_layout().slots()
         );
     }
 }

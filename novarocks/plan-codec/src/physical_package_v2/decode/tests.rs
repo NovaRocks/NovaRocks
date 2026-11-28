@@ -518,7 +518,7 @@ fn change_stream_package_refuses_role_and_cut_downgrades() {
         .find(|package| package.fragment().id().get() == 3)
         .unwrap();
     type PackageMutation = fn(&mut wire::FragmentPackage);
-    let cases: [(&str, PackageMutation); 11] = [
+    let cases: [(&str, PackageMutation); 13] = [
         ("summary uses relational root", |dto| {
             dto.cuts
                 .as_mut()
@@ -602,6 +602,12 @@ fn change_stream_package_refuses_role_and_cut_downgrades() {
         }),
         ("missing mandatory stage policy", |dto| {
             dto.fragment.as_mut().unwrap().stage_placement = None;
+        }),
+        ("missing mandatory input completion policy", |dto| {
+            dto.fragment.as_mut().unwrap().input_completion = 0;
+        }),
+        ("unknown input completion policy", |dto| {
+            dto.fragment.as_mut().unwrap().input_completion = i32::MAX;
         }),
         ("zero explicit stage cap", |dto| {
             dto.fragment

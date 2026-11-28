@@ -91,12 +91,13 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 GROUP BY region;
 
 -- query 6
--- @expect_error=reserved for internal branch id
+-- @skip_result_check=true
 CREATE MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0} AS SELECT id AS __branch_id__, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 UNION ALL
 SELECT id AS __branch_id__, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2;
+REFRESH MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0};
 
 -- query 7
 -- @expect_error=a composed UNION ALL of aggregates is only supported when every branch shares the same base tables and structure
@@ -122,8 +123,21 @@ JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 AS d ON g.id = d.id
 GROUP BY d.region;
 
 -- query 9
+SELECT __branch_id__, region FROM union_reserved_branch_id_mv_${uuid0}
+ORDER BY __branch_id__, region;
+
+-- query 10
+-- @expect_error=reserved for internal branch id
+CREATE MATERIALIZED VIEW union_aggregate_reserved_branch_id_mv_${uuid0} AS
+SELECT region, COUNT(*) AS __branch_id__ FROM t1 GROUP BY region
+UNION ALL
+SELECT region, COUNT(*) AS __branch_id__ FROM t1 GROUP BY region;
+
+-- query 11
 -- @cleanup=true
 -- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS union_aggregate_reserved_branch_id_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS union_reserved_branch_id_mv_${uuid0};
 DROP MATERIALIZED VIEW union_duplicate_base_mv_${uuid0};
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 ;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 ;

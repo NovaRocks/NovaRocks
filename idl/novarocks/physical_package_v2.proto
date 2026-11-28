@@ -86,6 +86,13 @@ message Fragment {
   novarocks.call_request.FragmentCallRequests call_requests = 9;
   StagePlacementPolicy stage_placement = 10;
   repeated SummaryOutput summaries = 11;
+  FragmentInputCompletion input_completion = 12;
+}
+
+enum FragmentInputCompletion {
+  FRAGMENT_INPUT_COMPLETION_UNSPECIFIED = 0;
+  FRAGMENT_INPUT_COMPLETION_MAY_SHORT_CIRCUIT = 1;
+  FRAGMENT_INPUT_COMPLETION_MUST_DRAIN = 2;
 }
 
 // Exact placement policy; edge distribution never supplies an implicit width.
@@ -686,7 +693,18 @@ message PhysicalNode {
     SystemRelationNode system_relation = 27;
     PositionShardNode position_shard = 28;
     WriteLayoutKeyNode write_layout_key = 29;
+    ContentApplyNode content_apply = 31;
   }
+}
+message ContentApplyNode {
+  repeated uint32 weighted_content_value_ids = 1;
+  repeated uint32 target_content_value_ids = 2;
+  repeated uint32 route_key_ordinals = 3;
+  optional uint32 weight_value_id = 4;
+  optional uint32 file_value_id = 5;
+  optional uint32 position_value_id = 6;
+  optional uint32 spec_id_value_id = 7;
+  optional uint32 partition_value_id = 8;
 }
 message OutputPort {
   optional uint32 node_id = 1;
@@ -1424,6 +1442,7 @@ message RuntimeFilterProducerTarget {
   oneof kind {
     uint32 join_build_equality_id = 1;
     RuntimeFilterAggregateTopNKey aggregate_topn_key = 2;
+    uint32 content_demand_ordinal = 3;
   }
 }
 message RuntimeFilterAggregateTopNKey {
@@ -1462,6 +1481,7 @@ message RuntimeFilterConsumerTarget {
     uint32 join_probe_equality_id = 1;
     RuntimeFilterScanField scan_field = 2;
     RuntimeFilterAggregateTopNScanField aggregate_topn_scan_field = 3;
+    RuntimeFilterContentDemandScanField content_demand_scan_field = 4;
   }
 }
 message RuntimeFilterScanField {
@@ -1469,6 +1489,10 @@ message RuntimeFilterScanField {
   repeated RuntimeFilterLineageStep lineage = 2;
 }
 message RuntimeFilterAggregateTopNScanField {
+  optional uint32 producer_witness_id = 1;
+  repeated RuntimeFilterLineageStep lineage = 2;
+}
+message RuntimeFilterContentDemandScanField {
   optional uint32 producer_witness_id = 1;
   repeated RuntimeFilterLineageStep lineage = 2;
 }

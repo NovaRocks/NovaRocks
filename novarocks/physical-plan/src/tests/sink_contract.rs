@@ -2137,6 +2137,7 @@ fn writer_projected_values_have_one_exact_private_owner_and_type() {
             summaries: original.summaries().into(),
             dop_domain: original.dop_domain(),
             stage_placement: original.stage_placement().clone(),
+            input_completion: crate::FragmentInputCompletion::MayShortCircuit,
             runtime_filters: original.runtime_filters().into(),
             call_requests: original.call_requests().clone(),
             calls: original.calls().clone(),

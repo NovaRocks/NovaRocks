@@ -207,7 +207,7 @@ impl MvWritePreparationCustody {
                 .take()
                 .expect("same original analysis receiver")
             {
-                Ok(MvWriteActivationOutput::Analyzed(analyzed)) => analyzed,
+                Ok(MvWriteActivationOutput::Analyzed(analyzed)) => *analyzed,
                 Err(error) => return Err(F::Domain(error)),
                 _ => {
                     return Err(F::Domain(contract_error(
@@ -230,10 +230,21 @@ impl MvWritePreparationCustody {
             .await
             .map_err(F::Statistics)?,
         );
+        let delta_volumes =
+            super::refresh_cost::prepared_delta_volumes(self.bindings.as_ref().unwrap())
+                .map_err(|error| F::Domain(contract_error(error)))?;
+        let statistics = self
+            .statistics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .clone()
+            .with_mv_scan_volumes(delta_volumes)
+            .map_err(|error| F::Domain(contract_error(error)))?;
         let analysis = self.analyzed.take();
         self.install_phase(MvWriteActivationRequest::Optimize {
             analysis,
-            statistics: self.statistics.as_ref().unwrap().snapshot().clone(),
+            statistics,
             control: control.clone(),
         });
         self.receive_phase().await?;
@@ -243,7 +254,7 @@ impl MvWritePreparationCustody {
                 .take()
                 .expect("same original optimizer receiver")
             {
-                Ok(MvWriteActivationOutput::ProviderNeeds(needs)) => needs,
+                Ok(MvWriteActivationOutput::ProviderNeeds(needs)) => *needs,
                 Err(error) => return Err(F::Domain(error)),
                 _ => {
                     return Err(F::Domain(contract_error(

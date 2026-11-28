@@ -353,6 +353,14 @@ impl MvReadinessExecution<'_> {
             .load_ready_settled(&canonical_mv_target(target))
             .await
     }
+    pub(crate) async fn load_renewal_base(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<(LoadedKeyedMvProjection, bool)>, MvRepositoryError> {
+        self.service
+            .load_renewal_base(&canonical_mv_target(target))
+            .await
+    }
     /// The returned inventory already retains this same weak request selection;
     /// its next_ready/next_listable methods are async product methods.
     pub(crate) async fn local_projection_inventory(

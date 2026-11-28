@@ -54,10 +54,6 @@ pub(crate) enum NullPolicy {
 pub(crate) enum KeyEquality {
     SqlGrouping(NullPolicy),
     IeeeFloat,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RWM-10 first constructs result-content indexes.")
-    )]
     ResultContent,
 }
 impl KeyEquality {

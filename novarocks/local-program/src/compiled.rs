@@ -104,11 +104,20 @@ pub struct CompiledAggregate {
     pub grouping: CompiledAggregateGrouping,
 }
 
+/// Whether a local operator may complete before it receives input EOS.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InputCompletion {
+    #[default]
+    MayShortCircuit,
+    MustDrain,
+}
+
 /// Every compiled-only fact the program carries beside its checked graph.
 /// Each map addresses exactly the graph nodes of its family; the final owner
 /// validates all of them against that one graph.
 #[derive(Clone, Debug, Default)]
 pub struct CompiledProgramFacts {
+    pub input_completion: InputCompletion,
     pub writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     pub exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
     pub scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
@@ -117,6 +126,7 @@ pub struct CompiledProgramFacts {
 
 #[derive(Debug)]
 pub struct LocalProgram {
+    input_completion: InputCompletion,
     graph: LocalProgramGraph,
     units: Box<[std::sync::Arc<novarocks_expression::CompiledExprSet>]>,
     calls: ProgramResolvedCalls,
@@ -359,6 +369,7 @@ impl LocalProgram {
         control: &dyn PureCompileControl,
     ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
         let CompiledProgramFacts {
+            input_completion,
             writes,
             exchange_inputs,
             scan_inputs,
@@ -464,6 +475,7 @@ impl LocalProgram {
         validate_scan_inputs(&graph, &scan_inputs, control)?;
         validate_aggregates(&graph, &aggregates, control)?;
         Ok(Self {
+            input_completion,
             graph,
             units,
             _unit_storage: unit_storage,
@@ -476,6 +488,10 @@ impl LocalProgram {
             aggregates,
         })
     }
+    pub const fn input_completion(&self) -> InputCompletion {
+        self.input_completion
+    }
+
     pub fn graph(&self) -> &LocalProgramGraph {
         &self.graph
     }

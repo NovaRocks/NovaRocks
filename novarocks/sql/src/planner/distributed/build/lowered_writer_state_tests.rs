@@ -230,6 +230,7 @@ pub(crate) fn authored_with_catalog(
             version(),
             dop(),
             FinalChangeStreamWriteLowering {
+                input_completion: novarocks_physical_plan::FragmentInputCompletion::MayShortCircuit,
                 reads: None,
                 dag: ChangeStreamWriteDagSpec::for_test(1, routes),
                 auxiliary: &auxiliary,

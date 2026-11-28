@@ -246,6 +246,26 @@ impl MutationMetadataSchema {
         &self.partition
     }
 
+    /// An exact read can require the partition Struct root: even an
+    /// unpartitioned file materializes a valid empty Struct. Child nullability
+    /// continues to describe the historical union of all partition specs.
+    pub(crate) fn read_field(
+        &self,
+        field_id: i32,
+        required_partition: bool,
+    ) -> std::borrow::Cow<'_, NestedField> {
+        use std::borrow::Cow;
+        if field_id == SPEC_ID {
+            Cow::Borrowed(self.spec_field())
+        } else if required_partition {
+            let mut partition = self.partition.as_ref().clone();
+            partition.required = true;
+            Cow::Owned(partition)
+        } else {
+            Cow::Borrowed(self.partition_field())
+        }
+    }
+
     pub(crate) fn partition_type(&self) -> &StructType {
         let Type::Struct(partition) = self.partition.field_type.as_ref() else {
             unreachable!("the mutation partition field is authored as a Struct")
@@ -423,7 +443,7 @@ pub(super) fn bind(
             DataType::Int32,
             IcebergColumnSource::MutationSpecId(spec.spec_id()),
         ),
-        (PARTITION_ID, PARTITION_NAME, true, Type::Struct(partition)) => {
+        (PARTITION_ID, PARTITION_NAME, _, Type::Struct(partition)) => {
             if spec.fields().len() != values.fields().len() {
                 return Err(super::corrupt("Iceberg mutation partition arity differs"));
             }
@@ -780,6 +800,16 @@ mod tests {
                 .unwrap(),
             Struct::empty()
         );
+        let required =
+            super::super::IcebergColumnHandle::base_column(&schema.read_field(PARTITION_ID, true))
+                .unwrap();
+        let (field, source) = bind(&required, &spec, &Struct::empty()).unwrap();
+        assert!(!field.is_nullable());
+        assert_eq!(field.data_type(), array.data_type());
+        assert!(
+            matches!(source, super::super::IcebergColumnSource::MutationPartition(values) if values.is_empty())
+        );
+        assert!(!schema.partition_field().required);
         let null = StructArray::new_empty_fields(3, Some(arrow::buffer::NullBuffer::new_null(3)));
         assert!(
             schema

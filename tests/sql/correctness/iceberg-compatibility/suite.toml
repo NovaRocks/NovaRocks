@@ -53,6 +53,7 @@ paths = [
     "novarocks/execution/src/exec/operators/position_shard.rs",
     "tests/sql/fixtures/iceberg-delete-applicability/run.sh",
     "tests/sql/fixtures/iceberg-delete-applicability/validate_receipts.py",
+    "tests/sql/fixtures/mv-visible-content-encodings/**",
     "docker/iceberg-rest/spark-shell.sh",
     "tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala",
     "novarocks/functions/src/array_projection.rs",

@@ -176,19 +176,15 @@ pub(crate) fn admit_writer_family(
                 .ok_or(FragmentCompileError::Invalid(
                     "missing table finish writer input",
                 ))?;
-            let logical =
-                spec.count_mode == novarocks_physical_plan::FinishCountMode::LogicalChanges;
-            if node.inputs.len() != if logical { 2 } else { 1 } {
+            if node.inputs.len() != 1 + spec.inputs.summaries.iter().count() {
                 return Err(FragmentCompileError::Invalid(
                     "table finish input roles differ",
                 ));
             }
-            if logical {
-                let summary = spec
+            for (kind, port) in spec.inputs.summaries.iter() {
+                let summary = node
                     .inputs
-                    .summaries
-                    .write_counts
-                    .and_then(|port| node.inputs.get(port as usize))
+                    .get(*port as usize)
                     .and_then(|id| fragment.nodes().get(id))
                     .ok_or(FragmentCompileError::Invalid(
                         "missing logical finish summary input",
@@ -198,8 +194,8 @@ pub(crate) fn admit_writer_family(
                     carried |= cut.destination_node == summary.id
                         && cut.delivery == novarocks_physical_plan::DeliveryRequirement::MustDrain
                         && matches!(
-                            cut.payload,
-                            novarocks_physical_plan::ExchangePayloadContract::Summary(_)
+                                &cut.payload,
+                                novarocks_physical_plan::ExchangePayloadContract::Summary(proof) if proof.kind() == kind
                         );
                     work.step()?;
                 }

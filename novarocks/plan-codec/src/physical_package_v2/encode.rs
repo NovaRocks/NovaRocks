@@ -810,6 +810,7 @@ fn encode_fragment_package_structural_in<'s>(
             summaries: envelope.summaries,
             dop_domain: Some(envelope.dop_domain),
             stage_placement: Some(envelope.stage_placement),
+            input_completion: envelope.input_completion,
             runtime_filter_ids: envelope.runtime_filter_ids,
             call_requests: Some(call_requests),
         }),

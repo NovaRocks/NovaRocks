@@ -83,18 +83,21 @@ pub use projection::{
 pub use public_schema::{ConnectorReadPublicSchema, ConnectorReadSchemaCreation};
 pub use runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorDeleteConditionOutcome,
-    ConnectorDeleteTargetFacts, ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture,
-    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
-    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
-    ConnectorReadAttemptRuntime, ConnectorReadBinding, ConnectorReadChangeWindow,
-    ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
-    ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
-    ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadOpenedRelation,
-    ConnectorReadOriginalTableObservation, ConnectorReadPageSourceProvider,
-    ConnectorReadRegistrationPin, ConnectorReadRelation, ConnectorReadRelationKind,
-    ConnectorReadRelationPreparation, ConnectorReadRelationPreparationFuture,
-    ConnectorReadRelationPreparationKind, ConnectorReadRelationPreparationRequest,
-    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
+    ConnectorDeleteTargetFacts, ConnectorExactPartitionSliceOutcome,
+    ConnectorExactPartitionSliceVolume, ConnectorExactSourcePartitionField,
+    ConnectorExactSourcePartitionSlice, ConnectorPreparedSourceRead,
+    ConnectorPreparedSourceReadFuture, ConnectorReadAttemptAccessMint,
+    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,
+    ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
+    ConnectorReadConstraint, ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot,
+    ConnectorReadFilterApplication, ConnectorReadLimitApplication, ConnectorReadMetadata,
+    ConnectorReadOpenedRelation, ConnectorReadOriginalTableObservation,
+    ConnectorReadPageSourceProvider, ConnectorReadRegistrationPin, ConnectorReadRelation,
+    ConnectorReadRelationKind, ConnectorReadRelationPreparation,
+    ConnectorReadRelationPreparationFuture, ConnectorReadRelationPreparationKind,
+    ConnectorReadRelationPreparationRequest, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
     ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
     ConnectorReadSourceSelection, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadSplitManager, ConnectorReadSplitOpenFuture, ConnectorReadSplitOpenRequest,
@@ -106,7 +109,10 @@ pub use session::{
     ConnectorCatalogSession, ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue,
 };
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
-pub use split_source::{ConnectorSplitBatch, ConnectorSplitSource, SplitSourceProfile};
+pub use split_source::{
+    ConnectorSplitBatch, ConnectorSplitSource, PrunedSplitFiles, SplitEnumeration,
+    SplitPruningBasis, SplitPruningLedger, SplitSourceProfile,
+};
 pub use static_facts::{
     ConnectorReadArtifactCoverage, ConnectorReadBucketLayout, ConnectorReadDistribution,
     ConnectorReadInputVersion, ConnectorReadMetadataKind, ConnectorReadMetadataRequest,

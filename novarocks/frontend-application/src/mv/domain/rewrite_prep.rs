@@ -30,7 +30,7 @@ use novarocks_mv_application::persistence::{
     codec::BindingDependency,
     exact_revision::{persist_exact_connector_revision, restore_exact_query_revision},
     keyed_documents::StoredKeyedMvProjection,
-    keyed_documents::{MvKeyedObservedCurrentDocuments, decode_current_keyed_documents},
+    keyed_documents::{MvKeyedObservedCurrentDocuments, resolve_current_keyed_documents},
 };
 use novarocks_query_application::preparation::CatalogFactPort;
 use novarocks_sql::compiler::{
@@ -445,24 +445,10 @@ fn freeze_base_table_state(
             .map_err(|error| error.to_string())?
             .clone();
         let observed =
-            decode_current_keyed_documents(view, catalog).map_err(|error| error.to_string())?;
-        let publication = observed
-            .publication
-            .as_ref()
-            .ok_or("MV rewrite upstream has no current publication")?;
-        let markers = observed
-            .decoded_markers()
-            .map_err(|error| error.to_string())?;
-        if novarocks_mv_application::persistence::codec::marker_eligibility(
-            novarocks_mv_application::persistence::codec::PublicationEvidence::Current(
-                &publication.publication_id,
-            ),
-            &markers,
-        )
-        .automatic_reuse_blocked
-        {
-            return Err("MV rewrite upstream publication is blocked".into());
-        }
+            resolve_current_keyed_documents(view, catalog).map_err(|error| error.to_string())?;
+        observed
+            .servable_publication()
+            .ok_or("MV rewrite upstream has no eligible publication")?;
         let (object, _) =
             persist_exact_connector_revision(&revision).map_err(|error| error.to_string())?;
         nested.push((object, observed.versions.definition_revision()));
@@ -478,28 +464,14 @@ fn verify_rewrite_publication(
         novarocks_mv_application::persistence::identity::DocumentRevision,
     )],
 ) -> Result<(), String> {
-    use novarocks_mv_application::persistence::codec::{PublicationEvidence, marker_eligibility};
-
     verify_rewrite_dependencies(
         &frozen.versions.binding_document.dependencies,
         views,
         nested,
     )?;
-    let publication = frozen
-        .publication
-        .as_ref()
-        .ok_or("MV rewrite target has no current publication")?;
-    let markers = frozen
-        .decoded_markers()
-        .map_err(|error| error.to_string())?;
-    if marker_eligibility(
-        PublicationEvidence::Current(&publication.publication_id),
-        &markers,
-    )
-    .automatic_reuse_blocked
-    {
-        return Err("The current materialized-view publication has an active blocker".into());
-    }
+    frozen
+        .servable_publication()
+        .ok_or("The current materialized-view publication is ineligible for rewrite")?;
     Ok(())
 }
 
@@ -558,7 +530,10 @@ mod tests {
 
     #[test]
     fn rewrite_requires_the_exact_original_view_declaration() {
-        use super::{freeze_mv_rewrite_selection, verify_rewrite_publication};
+        use super::{
+            freeze_mv_rewrite_selection, resolve_current_keyed_documents,
+            verify_rewrite_publication,
+        };
         use crate::mv::domain::persistence::source_bindings::view_binding_dependency;
         use novarocks_mv_application::{
             persistence::{
@@ -603,7 +578,7 @@ mod tests {
             ConnectorInstanceId::parse("ice").unwrap(),
             CatalogVersion::from_bytes([1; 32]),
         );
-        let mut frozen = observed_current_keyed(&projection, catalog);
+        let frozen = observed_current_keyed(&projection, catalog.clone());
         assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored.clone())], &[]).is_ok());
         let output = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
             ConnectorProviderId::parse("iceberg").unwrap(),
@@ -638,8 +613,10 @@ mod tests {
         }
         .encode()
         .unwrap();
-        frozen.view.markers.insert(key, marker);
-        assert!(verify_rewrite_publication(&frozen, &[Arc::new(stored)], &[]).is_err());
+        let mut marked_view = frozen.view;
+        marked_view.markers.insert(key, marker);
+        let marked = resolve_current_keyed_documents(marked_view, catalog).unwrap();
+        assert!(verify_rewrite_publication(&marked, &[Arc::new(stored)], &[]).is_err());
     }
 
     struct CapturedEvent {

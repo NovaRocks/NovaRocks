@@ -12,7 +12,7 @@ use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagementRequest,
     ManagementTimestamp,
 };
-use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
+use novarocks_mv_application::persistence::keyed_documents::resolve_current_keyed_documents;
 use novarocks_parser::ast::LiteralKind;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_query_application::sql::PreparedMaintenanceCall;
@@ -305,7 +305,7 @@ pub(crate) fn try_execute_document_expiry(
             admitted_context.clone().after_external_effect(),
         )?;
     }
-    let observed = decode_current_keyed_documents(full.current.clone(), catalog.clone())
+    let observed = resolve_current_keyed_documents(full.current.clone(), catalog.clone())
         .map_err(|e| format!("decode MV document expiry Current: {e}"))?;
     if observed.management_target != initial.management_target
         || observed.deployment_owner != *entrance.owner()

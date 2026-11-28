@@ -20,8 +20,9 @@
 -- @tags=mv,iceberg,ivm,delete_applicability,equality_delete,deletion_vector,endpoint_bag
 -- Official Iceberg 1.11 writers construct immutable endpoint fixtures. Independent
 -- integer/string row bags below are fixed before the NovaRocks verification run.
--- Each mutation is followed by an explicit incremental-plan assertion and compares
--- the incremental MV, a separately rebuilt MV, and a direct base read (rewrite off).
+-- Each mutation is followed by a comparison of eligible refresh costs. The
+-- regular refresh, a forced full refresh, and a direct base read must agree.
+-- MV rewrite is off for the result checks.
 -- Stages: same-commit data+DV+equality; cumulative DV in the same immutable Puffin
 -- plus equality replacement; equivalent artifact replacement; whole-file removal.
 -- The expected signed bags preserve duplicate old and new row values.
@@ -129,7 +130,11 @@ printf 'UEA4G_IVM_STAGE_1_OK\n'
 
 -- query 6
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable
+-- @result_contains=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
@@ -190,7 +195,12 @@ printf 'UEA4G_IVM_STAGE_2_OK\n'
 
 -- query 10
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
@@ -246,7 +256,13 @@ printf 'UEA4G_IVM_STAGE_3_OK\n'
 
 -- query 14
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
+-- The artifact addresses change even though the independent visible bag stays equal.
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
@@ -302,7 +318,12 @@ printf 'UEA4G_IVM_STAGE_4_OK\n'
 
 -- query 18
 -- @skip_result_check=true
--- @result_contains=source: IcebergDeltaTable
+-- @result_contains_any=MV refresh: ContentLocate
+-- @result_contains_any=MV refresh: FullReplace
+-- @result_contains=MV optimizer cost ContentLocate:
+-- @result_contains=exact change-window volume, source and target manifests
+-- @result_contains=MV optimizer cost FullReplace:
+-- @result_contains=complete source manifests
 SET SESSION explain_detail = 'VERBOSE'
 ;
 EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}

@@ -20,6 +20,27 @@ use arrow::datatypes::{DataType, Field};
 use novarocks_type_contract::{CompilePhase, OrderedComparisonAlgorithm, PureCompileControl};
 use std::{alloc::Layout, sync::Mutex};
 const B: usize = 1 << 20;
+
+#[test]
+fn content_demand_keeps_its_zero_ordinal_and_exact_scan_lineage() {
+    let producer = p::RuntimeFilterProducerTarget::ContentDemand { content_ordinal: 0 };
+    assert_eq!(
+        read_producer_target(&encode_producer_target(&producer)).unwrap(),
+        producer
+    );
+    let consumer = p::RuntimeFilterConsumerTarget::ContentDemandScanField {
+        producer: p::RuntimeFilterWitnessId::new(31),
+        lineage: Box::new([p::RuntimeFilterLineageStep::ExchangeMapping {
+            edge: p::EdgeId::new(17),
+            mapping_ordinal: 0,
+        }]),
+    };
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let wire = encode_consumer_target(&consumer, &mut work).unwrap();
+    assert_eq!(decode_consumer_target(&wire, &mut work).unwrap(), consumer);
+    work.flush().unwrap();
+}
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,
