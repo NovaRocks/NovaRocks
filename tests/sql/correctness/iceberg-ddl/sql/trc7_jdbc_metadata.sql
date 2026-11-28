@@ -109,6 +109,15 @@ SELECT count(*) AS super_types_rows FROM system.jdbc.super_types;
 SELECT count(*) AS udts_rows FROM system.jdbc.udts;
 
 -- query 18
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT count(*) AS retained_types FROM system.jdbc.table_types
+WHERE CAST(table_type AS BIGINT) > 0 AND table_type = '__missing__';
+
+-- query 19
+SELECT count(*) AS retained_types FROM system.jdbc.table_types
+WHERE table_type = '__missing__' AND CAST(table_type AS BIGINT) > 0;
+
+-- query 20
 -- @cleanup=true
 -- @skip_result_check=true
 DROP VIEW IF EXISTS trc_jdbc_${uuid0}.metadata_${uuid0}.metadata_view;

@@ -92,13 +92,13 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         let mut remaining = Vec::new();
         {
             let arena = arena_rc.borrow();
-            // A connector may execute a pushed atom before every scan residual.
-            // If it leaves the atom to SQL, residual evaluation preserves the
-            // supplied order. Both placements must be allowed to remove rows.
-            if scan.predicates.iter().any(|&predicate| {
-                !arena.effects(predicate).permits_filter_row_elimination
-                    || scalar_expr::is_internal_assertion(&arena, predicate)
-            }) {
+            // A connector may evaluate an offered atom before any existing
+            // Scan residual. The original residuals precede this Filter.
+            if scan
+                .predicates
+                .iter()
+                .any(|&predicate| !arena.effects(predicate).can_skip_for_earlier_filter())
+            {
                 return Ok(RewriteResult::Unchanged);
             }
             let columns: HashMap<_, _> = scan
@@ -114,12 +114,9 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             let mut seen = HashSet::new();
             let mut can_move = true;
             for conjunct in conjuncts {
-                let effects = arena.effects(conjunct);
-                let may_eliminate_rows = effects.permits_filter_row_elimination
-                    && !scalar_expr::is_internal_assertion(&arena, conjunct);
+                let can_skip = arena.effects(conjunct).can_skip_for_earlier_filter();
                 if can_move
-                    && may_eliminate_rows
-                    && effects.expression.permits_earlier_evaluation()
+                    && can_skip
                     && scalar_expr::all_column_refs_match(&arena, conjunct, |id, ty| {
                         columns
                             .get(&id)
@@ -133,34 +130,18 @@ impl LogicalRewriteRule for PushDownPredicateScan {
                     }
                 } else {
                     remaining.push(conjunct);
-                    can_move &= may_eliminate_rows;
+                    can_move &= can_skip;
                 }
             }
             if pushed.is_empty() {
                 return Ok(RewriteResult::Unchanged);
             }
-            // Preserve the existing total prefix. A pushed term only needs
-            // to precede residuals whose row errors or effects its filtering
-            // may suppress, even when the connector leaves that term to SQL.
-            let boundary = scan
-                .predicates
-                .iter()
-                .position(|&predicate| {
-                    !arena
-                        .effects(predicate)
-                        .expression
-                        .permits_earlier_evaluation()
-                })
-                .unwrap_or(scan.predicates.len());
-            let mut suffix = scan.predicates.split_off(boundary);
-            suffix.retain(|predicate| !seen.contains(predicate));
-            let prefix: HashSet<_> = scan.predicates.iter().copied().collect();
+            let existing: HashSet<_> = scan.predicates.iter().copied().collect();
             scan.predicates.extend(
                 pushed
                     .into_iter()
-                    .filter(|predicate| !prefix.contains(predicate)),
+                    .filter(|predicate| !existing.contains(predicate)),
             );
-            scan.predicates.append(&mut suffix);
         }
 
         let new_scan = OptExpr {
@@ -591,9 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn moves_only_the_total_necessary_term_across_selected_wait() {
-        let mut arena = ScalarArena::new();
-        let scan = scan_opt(&mut arena, &["a", "b"]);
+    fn scan_moves_a_guard_only_before_the_selected_wait_and_division() {
         let checked = eq(
             TypedExpr {
                 value_type: col("a").value_type,
@@ -608,34 +587,47 @@ mod tests {
             int_lit(4),
         );
         let wait = bound_call("sleep", col("b"));
-        let filter = filter_opt(
-            &mut arena,
-            and(wait, and(checked, eq(col("a"), int_lit(3)))),
-            scan,
-        );
-        let parts = ordered_parts(&arena, &filter);
-        assert!(arena.effects(parts[0]).permits_filter_row_elimination);
-        assert!(arena.effects(parts[1]).expression.may_raise_row_error);
-        let mut ctx = make_ctx(arena);
-        let RewriteResult::Changed(out) = PushDownPredicateScan.apply(filter, &mut ctx).unwrap()
-        else {
-            panic!("total term moves across the original wait and checked division");
-        };
-        assert_eq!(
-            ordered_parts(&ctx.scalar_arena().borrow(), &out),
-            parts[..2]
-        );
-        let Operator::LogicalScan(scan) = &out.unary_input().op else {
-            panic!("residual Filter input is the original Scan");
-        };
-        assert_eq!(scan.predicates, parts[2..]);
+        let guard = eq(col("a"), int_lit(3));
+        for (guard_first, predicate) in [
+            (true, and(guard.clone(), and(checked.clone(), wait.clone()))),
+            (
+                false,
+                and(checked.clone(), and(guard.clone(), wait.clone())),
+            ),
+            (false, and(wait, and(guard, checked))),
+        ] {
+            let mut arena = ScalarArena::new();
+            let scan = scan_opt(&mut arena, &["a", "b"]);
+            let filter = filter_opt(&mut arena, predicate, scan);
+            let parts = ordered_parts(&arena, &filter);
+            assert_eq!(
+                arena.effects(parts[0]).can_skip_for_earlier_filter(),
+                guard_first
+            );
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    assert_eq!(
+                        ordered_parts(&ctx.scalar_arena().borrow(), &out),
+                        parts[1..]
+                    );
+                    let Operator::LogicalScan(scan) = &out.unary_input().op else {
+                        panic!("residual Filter input is the original Scan");
+                    };
+                    assert_eq!(scan.predicates, parts[..1]);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
+        }
     }
 
     #[test]
-    fn unconsumed_scan_necessary_term_precedes_existing_ordered_residuals() {
+    fn new_scan_predicate_cannot_cross_an_existing_wait_residual() {
         let mut arena = ScalarArena::new();
         let mut scan = scan_opt(&mut arena, &["a", "b"]);
-        let [total, wait, necessary] = [
+        let [total, wait, guard] = [
             is_not_null(col("b")),
             bound_call("sleep", col("b")),
             eq(col("a"), int_lit(3)),
@@ -651,24 +643,18 @@ mod tests {
         let Operator::LogicalScan(scan_op) = &mut scan.op else {
             unreachable!()
         };
-        // The id already occurs below the wait. The necessary term still needs
-        // its earlier slot when the provider retains it as a SQL residual.
-        scan_op.predicates = vec![total, wait, necessary];
+        // An existing occurrence behind the wait gives no permission to offer
+        // the same predicate ahead of that wait.
+        scan_op.predicates = vec![total, wait, guard];
         let filter = OptExpr::new(
-            Operator::LogicalFilter(FilterOp {
-                predicate: necessary,
-            }),
+            Operator::LogicalFilter(FilterOp { predicate: guard }),
             vec![scan],
         );
         let mut ctx = make_ctx(arena);
-        let RewriteResult::Changed(out) = PushDownPredicateScan.apply(filter, &mut ctx).unwrap()
-        else {
-            panic!("the already present necessary term can move");
-        };
-        let Operator::LogicalScan(scan) = &out.op else {
-            panic!("no residual Filter");
-        };
-        assert_eq!(scan.predicates, [total, necessary, wait]);
+        assert!(matches!(
+            PushDownPredicateScan.apply(filter, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     #[test]

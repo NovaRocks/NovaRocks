@@ -19,7 +19,7 @@
 //! interval containment, and compensation computation.
 //! StarRocks counterpart: PredicateSplit / RangePredicate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
@@ -322,8 +322,47 @@ fn high_contained(query: &Option<Bound>, mv: &Option<Bound>) -> Option<bool> {
     }
 }
 
-/// Core check: MV data ⊇ query data. Returns None when not contained (or
-/// not provably contained). On success returns the compensation conjuncts.
+/// Authorize the MV to remove rows only when the original query already
+/// excludes those rows in its initial effect-free prefix. The MV's contents
+/// cannot recover an earlier invocation on a row the MV omits.
+pub(crate) fn check_ordered_containment(
+    query_conjuncts: &[ScalarId],
+    query_arena: &ScalarArena,
+    mv_conjuncts: &[ScalarId],
+    mv_arena: &ScalarArena,
+    query_base_names: &HashMap<ColumnId, String>,
+    mv_base_names: &HashMap<ColumnId, String>,
+    control: &dyn PureCompileControl,
+) -> Result<Option<ContainmentResult>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut prefix_len = 0;
+    for &conjunct in query_conjuncts {
+        work.step()?;
+        if !query_arena.effects(conjunct).can_skip_for_earlier_filter() {
+            break;
+        }
+        prefix_len += 1;
+    }
+    work.finish()?;
+    let (prefix, required) = query_conjuncts.split_at(prefix_len);
+    let Some(mut result) = check_containment(
+        prefix,
+        query_arena,
+        mv_conjuncts,
+        mv_arena,
+        query_base_names,
+        mv_base_names,
+        control,
+    )?
+    else {
+        return Ok(None);
+    };
+    result.compensation.extend_from_slice(required);
+    Ok(Some(result))
+}
+
+/// Value-domain check: MV data ⊇ the supplied conjuncts. The caller must
+/// establish which original query uses are eligible to justify earlier pruning.
 pub(crate) fn check_containment(
     query_conjuncts: &[ScalarId],
     query_arena: &ScalarArena,
@@ -341,7 +380,7 @@ pub(crate) fn check_containment(
         let Some(m) = classify(mv_arena, mv_conjuncts, mv_base_names, &mut work)? else {
             return Ok(None);
         };
-        let mut compensation = Vec::new();
+        let mut owed = HashSet::new();
         for (col, (mv_range, _)) in &m.ranges {
             work.flush()?;
             let contained = q.ranges.get(col).and_then(|(q_range, _)| {
@@ -366,7 +405,7 @@ pub(crate) fn check_containment(
             work.flush()?;
             if !equal {
                 for original in originals {
-                    compensation.push(*original);
+                    owed.insert(*original);
                     work.step()?;
                 }
             }
@@ -383,9 +422,16 @@ pub(crate) fn check_containment(
         for (qn, original) in q.residuals.iter().zip(&q.residual_ids) {
             work.flush()?;
             if !norm_contains(&m.residuals, qn, control)? {
-                compensation.push(*original);
+                owed.insert(*original);
             }
             work.step()?;
+        }
+        let mut compensation = Vec::new();
+        for &original in query_conjuncts {
+            work.step()?;
+            if owed.contains(&original) {
+                compensation.push(original);
+            }
         }
         Ok(Some(ContainmentResult { compensation }))
     })();
@@ -558,6 +604,47 @@ mod tests {
             crate::optimizer::test_optimizer_control(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn view_rows_can_be_removed_only_by_the_initial_pure_query_prefix() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, TrinoCastMode};
+
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let names = HashMap::from([(ColumnId(1), "a".into()), (ColumnId(2), "s".into())]);
+        let text = OutputColumn {
+            value_type: FunctionValueType::new(DataType::Utf8, true),
+            ..col(2, "s")
+        };
+        let conversion = TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: Some(TrinoCastMode::Explicit),
+                expr: novarocks_parser::ast::AstBox::new(col_ref(&text)),
+                target: DataType::Int64,
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: FunctionValueType::new(DataType::Int64, true),
+        };
+        let guard = intern_typed(&mut arena, &gt_a(0), control).unwrap();
+        let tighter = intern_typed(&mut arena, &gt_a(4), control).unwrap();
+        let residual = intern_typed(&mut arena, &ne_a(8), control).unwrap();
+        let failing =
+            intern_typed(&mut arena, &bin(conversion, BinOp::Gt, int_lit(0)), control).unwrap();
+        assert!(!arena.effects(failing).can_skip_for_earlier_filter());
+
+        let check = |query: &[ScalarId]| {
+            check_ordered_containment(query, &arena, &[guard], &arena, &names, &names, control)
+                .unwrap()
+        };
+        assert!(check(&[failing, guard]).is_none());
+        assert_eq!(check(&[guard, failing]).unwrap().compensation, [failing]);
+        assert_eq!(
+            check(&[residual, guard, tighter, failing, guard, failing])
+                .unwrap()
+                .compensation,
+            [residual, guard, tighter, failing, guard, failing],
+        );
     }
 
     #[test]

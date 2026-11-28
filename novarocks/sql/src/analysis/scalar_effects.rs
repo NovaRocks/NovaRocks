@@ -83,6 +83,14 @@ impl ScalarEffects {
         self.expression.may_raise_row_error || self.expression.may_raise_invocation_data
     }
 
+    /// A later filter can omit this occurrence only if the omission cannot
+    /// hide a required error, effect, or internal check on a rejected row.
+    pub(crate) const fn can_skip_for_earlier_filter(self) -> bool {
+        !self.has_internal_assertion
+            && self.permits_filter_row_elimination
+            && self.expression.permits_earlier_evaluation()
+    }
+
     pub(crate) const fn can_share(self) -> bool {
         !self.has_internal_assertion
             && self.expression.permits_earlier_evaluation()

@@ -119,16 +119,11 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
-        if !arena.effects(filter_op.predicate).can_share()
-            || !arena
-                .effects(filter_op.predicate)
-                .permits_filter_row_elimination
-            || agg.group_by.iter().any(|&key| {
-                let effects = arena.effects(key);
-                !effects.expression.permits_boolean_reordering()
-                    || !effects.permits_filter_row_elimination
-            })
-        {
+        if agg.group_by.iter().any(|&key| {
+            let effects = arena.effects(key);
+            !effects.expression.permits_boolean_reordering()
+                || !effects.permits_filter_row_elimination
+        }) {
             return Ok(RewriteResult::Unchanged);
         }
         for call in &agg.aggregates {
@@ -179,17 +174,21 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         scalar_expr::split_conjuncts(&arena, filter_op.predicate, &mut conjuncts);
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
+        let mut can_move = true;
         for conjunct in conjuncts {
+            let effects = arena.effects(conjunct);
+            let can_skip = effects.can_skip_for_earlier_filter();
             let mut uses_group_key = false;
             let matches_input = scalar_expr::all_column_refs_match(&arena, conjunct, |id, ty| {
                 uses_group_key = true;
                 group_keys.get(&id).is_some_and(|&key_type| key_type == ty)
             });
             // A constant term does not prove which original groups survive.
-            if matches_input && uses_group_key {
+            if can_move && can_skip && effects.can_share() && matches_input && uses_group_key {
                 pushable.push(conjunct);
             } else {
                 remaining.push(conjunct);
+                can_move &= can_skip;
             }
         }
 
@@ -464,6 +463,67 @@ mod tests {
                 other => panic!("expected Filter under Aggregate, got {:?}", other),
             },
             other => panic!("expected Aggregate at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn aggregate_moves_a_key_guard_only_before_the_original_having_error() {
+        for guard_first in [true, false] {
+            let mut arena = ScalarArena::new();
+            let scan = make_scan(&mut arena);
+            let aggregate = make_agg(&mut arena, scan);
+            let total = col_typed_expr("sum_b");
+            let checked = eq_expr(
+                TypedExpr {
+                    value_type: total.value_type.clone(),
+                    kind: ExprKind::BinaryOp {
+                        left: novarocks_parser::ast::AstBox::new(int_lit_expr(12)),
+                        op: BinOp::Div,
+                        right: novarocks_parser::ast::AstBox::new(total),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                },
+                int_lit_expr(4),
+            );
+            let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+            let checked = intern_typed(&mut arena, &checked, control).unwrap();
+            let guard = intern_typed(
+                &mut arena,
+                &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+                control,
+            )
+            .unwrap();
+            let conjuncts = if guard_first {
+                vec![guard, checked]
+            } else {
+                vec![checked, guard]
+            };
+            let predicate = scalar_expr::combine_conjuncts(&mut arena, conjuncts, control)
+                .unwrap()
+                .unwrap();
+            let filter = OptExpr::new(
+                Operator::LogicalFilter(FilterOp { predicate }),
+                vec![aggregate],
+            );
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateAggregate.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    let Operator::LogicalFilter(residual) = &out.op else {
+                        panic!("checked predicate remains above the Aggregate");
+                    };
+                    assert_eq!(residual.predicate, checked);
+                    let aggregate = out.unary_input();
+                    assert!(matches!(aggregate.op, Operator::LogicalAggregate(_)));
+                    let Operator::LogicalFilter(pushed) = &aggregate.unary_input().op else {
+                        panic!("guard moves below the Aggregate");
+                    };
+                    assert_eq!(pushed.predicate, guard);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
         }
     }
 

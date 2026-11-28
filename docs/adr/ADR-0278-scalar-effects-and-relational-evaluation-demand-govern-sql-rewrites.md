@@ -8,6 +8,7 @@ superseded-by: null
 date: 2026-11-27
 provenance:
   - "2026-11-27 design discussion on optimizer use-site effects and relational demand"
+  - "2026-11-28 approved I1 source-order amendment"
 code-anchors:
   - "novarocks/functions/src/pure_catalogue.rs (PureOverloadDeclaration::static_scalar_effects_observed)"
   - "novarocks/sql/src/analysis/scalar_effects.rs (ScalarEffectQuery)"
@@ -41,9 +42,9 @@ SQL 规则如何判断表达式可以提前求值、共享或省略，并在逻�
 ## 裁决
 
 1. **按原作者查询。** 静态查询复用实际原语配方和安装重载。维持行错误、整次调用 Data、值稳定性、实例状态和可观察动作的独立含义。证据不足时保守保留候选的位置和求值。取消、期限、资源和已知无效绑定沿原编译控制报告。
-2. **按规则证明使用点。** 提前求值、纯布尔重排、重放和副本求值各有准入条件。CSE 逐个核对拟替换的实际位置，验证目标可见的完整类型、NULL 扩展、守卫与共同物化位置。静态只读类型的实参保留其类型定义。
-3. **按关系证明可淘汰的行。** 普通筛选的纯、总定义必要项可以提前移除非 TRUE 行。行级调用 owner 可以准许在仍需其结果的行上执行。存活行保留原独立调用、相对顺序和错误作用域。整次调用 Data、内部校验、合成分组、聚合原实参和排序需求继续沿原域履行。
-4. **按匹配域选择 Join key。** 普通筛选允许提取可提前求值的必要等值项。剩余条件沿原顺序保留在匹配配对上。NAA 与 LeftMark 使用自己的值需求、安全前缀和 UNKNOWN 契约。
+2. **按规则证明使用点。** 提前求值、移动布尔项、重放和副本求值各有准入条件。CSE 逐个核对拟替换的实际位置，验证目标可见的完整类型、NULL 扩展、守卫与共同物化位置。静态只读类型的实参保留其类型定义。
+3. **按原需求证明可淘汰的行。** 同一筛选条件按源序求值。TruthOnly 的 AND 只把 TRUE 行交给后项，已需求的第一处行错立即结算。必要项须证明被跳过的前项无行错、无可观察动作且没有原作用域义务。Provider offer、系统表快照键和 MV 代换同样按提前移除输入行核对。跨关系的独立投影和组生命周期按各自规则核对，整次调用 Data、内部校验、合成分组、聚合原实参和排序需求继续沿原域履行。
+4. **按匹配域选择 Join key。** 普通筛选允许从原可跳过的安全前缀中提取可提前求值的必要等值项。剩余条件沿原顺序保留在匹配配对上。NAA 与 LeftMark 使用自己的值需求、安全前缀和 UNKNOWN 契约。
 5. **按真实生效点放置 runtime filter。** 所有 Hash key 来源复用共同放置作者。Join 能排除一个键时，仍须核对消费者所在关系及生效点。取前 N 行及 LIMIT 保有原输入选择，合法的 Join 探测输入可以执行过滤。
 
 ## 接受的妥协（诚实记录）

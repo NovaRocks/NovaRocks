@@ -18,8 +18,8 @@
 
 -- @tags=optimizer,predicate_pushdown,relation_demand
 -- @order_sensitive=true
--- A TruthOnly filter can eliminate rows before a selected wait. A Value
--- projection and surviving rows still observe the original row-error scope.
+-- TruthOnly evaluates each term over the rows admitted by its source prefix.
+-- A Value projection and surviving rows retain their original row-error scope.
 
 -- query 1
 -- @skip_result_check=true
@@ -51,7 +51,7 @@ INSERT INTO ${case_db}.predicate_demand_groups VALUES
 -- @explain_contains=predicates: enabled
 -- @explain_contains=sleep(delay)
 SELECT id FROM ${case_db}.predicate_demand_rows
-WHERE 12 / d > 3 AND sleep(delay) AND enabled AND dt = 10 ORDER BY id;
+WHERE enabled AND dt = 10 AND 12 / d > 3 AND sleep(delay) ORDER BY id;
 
 -- query 6
 -- The original wait must not run for FALSE or NULL rows. Passing the Scan
@@ -61,7 +61,7 @@ SET SESSION enable_connector_static_predicate_pushdown = false;
 
 -- query 7
 SELECT id FROM ${case_db}.predicate_demand_rows
-WHERE 12 / d > 3 AND sleep(delay) AND enabled AND dt = 10 ORDER BY id;
+WHERE enabled AND dt = 10 AND 12 / d > 3 AND sleep(delay) ORDER BY id;
 
 -- query 8
 -- @skip_result_check=true
@@ -70,7 +70,7 @@ SET SESSION enable_connector_static_predicate_pushdown = true;
 -- query 9
 -- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
 SELECT id FROM ${case_db}.predicate_demand_rows
-WHERE 12 / d > 3 AND sleep(delay) AND enabled AND dt = 20;
+WHERE enabled AND dt = 20 AND 12 / d > 3 AND sleep(delay);
 
 -- query 10
 -- @skip_result_check=true
@@ -79,7 +79,7 @@ SET SESSION disable_optimizer_rules = 'PushDownPredicateScan';
 -- query 11
 -- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
 SELECT id FROM ${case_db}.predicate_demand_rows
-WHERE 12 / d > 3 AND sleep(delay) AND enabled AND dt = 10;
+WHERE id = 1 AND 12 / d > 3 AND enabled;
 
 -- query 12
 -- @skip_result_check=true
@@ -90,11 +90,11 @@ SET SESSION disable_optimizer_rules = '';
 -- @result_contains=provider-guarantee root=
 -- @result_contains=builtin.scalar/rand/v1
 EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
-SELECT id FROM ${case_db}.predicate_demand_rows WHERE rand() < 0.1 AND dt = 10;
+SELECT id FROM ${case_db}.predicate_demand_rows WHERE dt = 10 AND rand() < 0.1;
 
 -- query 14
 SELECT id FROM ${case_db}.predicate_demand_rows
-WHERE 12 / d > 3 AND enabled AND id IN (2, 5) ORDER BY id;
+WHERE id IN (2, 5) AND enabled AND 12 / d > 3 ORDER BY id;
 
 -- query 15
 -- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
@@ -147,3 +147,56 @@ FROM ${case_db}.predicate_demand_rows WHERE id = 1;
 -- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
 SELECT TRY_CAST(CAST(txt AS BIGINT) AS DOUBLE)
 FROM ${case_db}.predicate_demand_rows WHERE id = 1;
+
+-- query 27
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id = 1 AND 12 / d > 3 AND enabled;
+
+-- query 28
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id = 2 AND 12 / d > 3 AND enabled;
+
+-- query 29
+-- @skip_result_check=true
+SET SESSION disable_optimizer_rules = 'PushDownPredicateScan';
+
+-- query 30
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id IN (1, 2, 3) AND enabled AND 12 / d > 3 ORDER BY id;
+
+-- query 31
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id = 2 AND 12 / d > 3 AND enabled;
+
+-- query 32
+-- @skip_result_check=true
+SET SESSION disable_optimizer_rules = '';
+
+-- query 33
+-- @skip_result_check=true
+-- @result_not_contains=provider-guarantee root=
+-- @result_contains=builtin.scalar/rand/v1
+EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
+SELECT id FROM ${case_db}.predicate_demand_rows WHERE rand() < 0.1 AND dt = 10;
+
+-- query 34
+SELECT k, SUM(safe_v) AS total FROM ${case_db}.predicate_demand_groups
+GROUP BY k HAVING k = 1 AND 10 / (25 - SUM(safe_v)) = 0;
+
+-- query 35
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT k, SUM(safe_v) AS total FROM ${case_db}.predicate_demand_groups
+GROUP BY k HAVING 10 / (25 - SUM(safe_v)) = 0 AND k = 1;
+
+-- query 36
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id = 1 AND 12 / d > 3 AND CAST(txt AS BIGINT) > 0 AND enabled;
+
+-- query 37
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT id FROM ${case_db}.predicate_demand_rows
+WHERE id = 1 AND CAST(txt AS BIGINT) > 0 AND 12 / d > 3 AND enabled;

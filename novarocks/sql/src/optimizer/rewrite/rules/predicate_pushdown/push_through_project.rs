@@ -118,23 +118,17 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         let mut remaining = Vec::new();
         let mut can_move = true;
         for conjunct in conjuncts {
-            let effects = arena.effects(conjunct);
-            let may_eliminate_rows = effects.permits_filter_row_elimination
-                && !scalar_expr::is_internal_assertion(&arena, conjunct);
+            let can_skip = arena.effects(conjunct).can_skip_for_earlier_filter();
             if can_move
-                && may_eliminate_rows
-                && effects.expression.permits_earlier_evaluation()
+                && can_skip
                 && let Some(rewritten) =
                     remap_scalar(&mut arena, conjunct, &bindings, &ctx.control_view())?
-                && arena
-                    .effects(rewritten)
-                    .expression
-                    .permits_earlier_evaluation()
+                && arena.effects(rewritten).can_skip_for_earlier_filter()
             {
                 pushable.push(rewritten);
             } else {
                 remaining.push(conjunct);
-                can_move &= may_eliminate_rows;
+                can_move &= can_skip;
             }
         }
 
@@ -978,6 +972,59 @@ mod tests {
             other => panic!("expected Changed, got {:?}", other),
         }
     }
+    #[test]
+    fn project_moves_a_guard_only_before_the_original_filter_error() {
+        let a = col_ref("a", col_id(1));
+        let b = col_ref("b", col_id(2));
+        let guard = eq(a, int_lit(3));
+        let checked = eq(
+            TypedExpr {
+                value_type: b.value_type.clone(),
+                kind: ExprKind::BinaryOp {
+                    left: novarocks_parser::ast::AstBox::new(int_lit(12)),
+                    op: BinOp::Div,
+                    right: novarocks_parser::ast::AstBox::new(b),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            },
+            int_lit(4),
+        );
+        for (guard_first, predicate) in [
+            (true, and(guard.clone(), checked.clone())),
+            (false, and(checked, guard)),
+        ] {
+            let mut arena = ScalarArena::new();
+            let columns = [("a", col_id(1)), ("b", col_id(2))];
+            let scan = scan_opt(&mut arena, &columns);
+            let project = passthrough_project_opt(&mut arena, &columns, None, scan);
+            let filter = filter_opt(&mut arena, predicate, project);
+            let Operator::LogicalFilter(original) = &filter.op else {
+                unreachable!()
+            };
+            let mut conjuncts = Vec::new();
+            scalar_expr::split_conjuncts(&arena, original.predicate, &mut conjuncts);
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateProject.apply(filter, &mut ctx).unwrap();
+            match (guard_first, result) {
+                (true, RewriteResult::Changed(out)) => {
+                    let Operator::LogicalFilter(residual) = &out.op else {
+                        panic!("checked predicate remains above the Project");
+                    };
+                    assert_eq!(residual.predicate, conjuncts[1]);
+                    let project = out.unary_input();
+                    assert!(matches!(project.op, Operator::LogicalProject(_)));
+                    let Operator::LogicalFilter(pushed) = &project.unary_input().op else {
+                        panic!("guard moves below the Project");
+                    };
+                    assert_eq!(pushed.predicate, conjuncts[0]);
+                }
+                (false, RewriteResult::Unchanged) => {}
+                (_, other) => panic!("unexpected rewrite: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn filter_eliminates_unused_rows_of_pure_projection_but_retains_internal_assertions() {
         use novarocks_functions::{

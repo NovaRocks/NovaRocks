@@ -48,7 +48,7 @@ use crate::planner::payload::MvRewriteSelection;
 use super::aggregate_rollup::{RollupKind, plan_rollup};
 use super::column_mapping::{MvColumnMap, NormExpr, normalize};
 use super::descriptor::{MatchedShape, SpjgDescriptor, SpjgOutputExpr};
-use super::predicate_split::check_containment;
+use super::predicate_split::check_ordered_containment;
 use super::{MvRewriteCandidate, RULE_NAME};
 
 pub(crate) struct MvRewriteRule {
@@ -226,7 +226,7 @@ fn try_rewrite_candidate(
     let m_names = cand.mv.base_name_of();
 
     // 2. Predicate containment + compensation (still over base columns).
-    let containment = candidate!(check_containment(
+    let containment = candidate!(check_ordered_containment(
         &query.predicates,
         &memo.scalars,
         &cand.mv.predicates,
@@ -235,6 +235,16 @@ fn try_rewrite_candidate(
         &m_names,
         control,
     )?);
+    // The materialized scan has its own invocation domains. Aggregate MV
+    // rows are groups and cannot host work required on each surviving row.
+    for &predicate in &containment.compensation {
+        let effects = memo.scalars.effects(predicate);
+        if !effects.permits_filter_row_elimination
+            || cand.mv.aggregate.is_some() && !effects.can_skip_for_earlier_filter()
+        {
+            return Ok(None);
+        }
+    }
 
     // 3. Consume the candidate's frozen output-to-target binding.
     if cand.output_targets.len() != cand.mv.outputs.len() {
@@ -299,7 +309,7 @@ fn try_rewrite_candidate(
         containment
             .compensation
             .iter()
-            .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names, control))
+            .map(|p| col_map.rewrite_compensation(&mut memo.scalars, *p, &q_names, control))
             .map(Result::transpose)
             .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
             .transpose()?
@@ -1628,6 +1638,88 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_mv_cannot_move_required_compensation_from_rows_to_groups() {
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let narrowed = TypedExpr {
+            kind: ExprKind::Cast {
+                cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
+                expr: novarocks_parser::ast::AstBox::new(col_ref(&a)),
+                target: DataType::Int8,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, true),
+        };
+        let effectful = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: novarocks_parser::ast::AstBox::new(narrowed),
+                negated: true,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        };
+        let predicate = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                op: BinOp::And,
+                left: novarocks_parser::ast::AstBox::new(ge(col_ref(&a), 10)),
+                right: novarocks_parser::ast::AstBox::new(effectful),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+        };
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode { predicate }),
+                vec![base_scan(&[a, v])],
+                None,
+            )],
+            None,
+        );
+
+        let mut memo = test_memo();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+        let control = crate::optimizer::test_optimizer_control();
+        let candidate = agg_candidate(0);
+        let (query, _) = SpjgDescriptor::from_memo(&root_expr, &mut memo, control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(query.predicates.len(), 2);
+        assert!(
+            !memo
+                .scalars
+                .effects(query.predicates[1])
+                .can_skip_for_earlier_filter()
+        );
+        assert!(
+            check_ordered_containment(
+                &query.predicates,
+                &memo.scalars,
+                &candidate.mv.predicates,
+                &candidate.mv_scalars,
+                &query.base_name_of(),
+                &candidate.mv.base_name_of(),
+                control,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            MvRewriteRule::new(vec![candidate])
+                .apply(&root_expr, &mut memo, control)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn candidate_without_publication_proof_never_reaches_the_rewrite_rule() {
         let a = col(1, "a");
         let v = col(2, "v");
@@ -1963,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn spj_query_on_spj_mv_injects_project() {
+    fn spj_query_on_spj_mv_injects_project_only_if_compensation_preserves_obligations() {
         // SPJ MV: SELECT a, b, v FROM t WHERE a >= 0  (no aggregate).
         let mv_a = col(100, "a");
         let mv_b = col(101, "b");
@@ -2009,9 +2101,9 @@ mod tests {
         let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
-        let root_expr = memo.groups[root].logical_exprs[0].clone();
+        let mut root_expr = memo.groups[root].logical_exprs[0].clone();
 
-        let rule = MvRewriteRule::new(vec![candidate]);
+        let rule = MvRewriteRule::new(vec![candidate.clone()]);
         let alts = rule
             .apply(
                 &root_expr,
@@ -2045,6 +2137,44 @@ mod tests {
                 .definition_occurrence_id()
                 .get(),
             0
+        );
+
+        let Operator::LogicalFilter(filter) = &mut root_expr.op else {
+            panic!("expected the query's original Filter");
+        };
+        let control = crate::optimizer::test_optimizer_control();
+        let guard = filter.predicate;
+        let argument =
+            crate::optimizer::scalar::function_argument(&memo.scalars, guard, control).unwrap();
+        let selected = crate::functions::bind_assert_true(
+            crate::functions::builtin_engine_function_catalog(),
+            &[argument],
+            control,
+        )
+        .unwrap();
+        let assertion = memo.scalars.intern(
+            ScalarNode::FunctionCall {
+                name: "assert_true".into(),
+                args: vec![guard],
+                distinct: false,
+                binding: crate::binding::SqlFunctionBinding::from_test(
+                    selected,
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                ),
+                volatility: crate::functions::FunctionVolatility::Immutable,
+            },
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        );
+        assert!(memo.scalars.effects(assertion).has_internal_assertion);
+        filter.predicate =
+            scalar_expr::combine_conjuncts(&mut memo.scalars, vec![guard, assertion], control)
+                .unwrap()
+                .unwrap();
+        assert!(
+            MvRewriteRule::new(vec![candidate])
+                .apply(&root_expr, &mut memo, control)
+                .unwrap()
+                .is_empty()
         );
     }
 

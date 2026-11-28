@@ -178,6 +178,20 @@ fn nonnullable_safe_scope_prefix_can_exclude_without_skipping_required_error() {
 }
 
 #[test]
+fn a_later_nonnullable_scope_key_cannot_prune_before_required_value_work() {
+    let mut arena = ScalarArena::new();
+    let c = comparison(&mut arena);
+    let s = scope(&mut arena, false, false);
+    let r = throwing(&mut arena);
+    assert!(arena.effects(r).may_raise_data());
+    let e = binary(&mut arena, r, BinOp::And, s, DataType::Boolean, false);
+    let op = authored(&mut arena, c, Some(e));
+    let condition = admit(&mut arena, &op).unwrap();
+    assert!(condition.scope_keys().unwrap().is_empty());
+    assert_eq!(*condition.residual(), Some(e));
+}
+
+#[test]
 fn comparison_must_remain_the_original_guard_prefix() {
     let mut arena = ScalarArena::new();
     let c = comparison(&mut arena);

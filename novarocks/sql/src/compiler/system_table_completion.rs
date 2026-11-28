@@ -21,6 +21,7 @@ use super::completion::{CompileNeedId, SystemTableSnapshotFact, SystemTableSnaps
 use super::completion_predicate::{
     ProviderPredicateColumn, lower_atom_with_literal, lower_literal,
 };
+use crate::analysis::scalar_effects::ScalarEffectQuery;
 use crate::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::common::binary_operator::typed_comparison;
@@ -145,23 +146,56 @@ fn exact_like_key(
         },
         None => None,
     };
-    let literal =
-        native_like::exact_literal_observed(
-            &pattern,
-            escape.as_deref(),
-            &mut |event| match event {
-                LikeObservation::Step => work.step(),
-                LikeObservation::OpaqueBoundary => work.flush(),
-            },
-        );
-    match literal {
-        Ok(literal) => Ok(literal.map(|literal| (column.ordinal as usize, literal.into_owned()))),
+    Ok(exact_like_literal(&pattern, escape.as_deref(), work)?
+        .map(|literal| (column.ordinal as usize, literal)))
+}
+
+fn exact_like_literal(
+    pattern: &str,
+    escape: Option<&str>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<String>, SqlCompileError> {
+    match native_like::exact_literal_observed(pattern, escape, &mut |event| match event {
+        LikeObservation::Step => work.step(),
+        LikeObservation::OpaqueBoundary => work.flush(),
+    }) {
+        Ok(literal) => Ok(literal.map(|literal| literal.into_owned())),
         Err(LikeError::Host(error)) => Err(error.into()),
         Err(LikeError::Pattern(_) | LikeError::Operation(_)) => Ok(None),
     }
 }
 
-fn add_conjuncts(expression: &TypedExpr, predicates: &mut Vec<Predicate>) {
+fn total_literal_like(
+    expression: &TypedExpr,
+    effects: &ScalarEffectQuery<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    let Some((input, pattern, escape)) = like_operands(expression) else {
+        return Ok(false);
+    };
+    let Some(ConnectorValue::Varchar(pattern)) = lower_varchar_literal(pattern) else {
+        return Ok(false);
+    };
+    let escape = match escape.map(lower_varchar_literal) {
+        Some(Some(ConnectorValue::Varchar(value))) => Some(value),
+        Some(_) => return Ok(false),
+        None => None,
+    };
+    // The pattern owner discharges the call's possible row error for this
+    // exact literal. Its input still has its own original demand.
+    Ok(effects.typed(input)?.can_skip_for_earlier_filter()
+        && exact_like_literal(&pattern, escape.as_deref(), work)?.is_some())
+}
+
+/// Retain only terms that may reject snapshot rows before the original Filter.
+#[recursive::recursive]
+fn collect_filter_prefix(
+    expression: &TypedExpr,
+    predicates: &mut Vec<Predicate>,
+    effects: &ScalarEffectQuery<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    work.step()?;
     let expression = unnest(expression);
     if let ExprKind::BinaryOp {
         left,
@@ -170,34 +204,49 @@ fn add_conjuncts(expression: &TypedExpr, predicates: &mut Vec<Predicate>) {
         ..
     } = &expression.kind
     {
-        add_conjuncts(left, predicates);
-        add_conjuncts(right, predicates);
-    } else {
-        predicates.push(Predicate {
-            expression: expression.clone(),
-            mapping: None,
-        });
+        return Ok(collect_filter_prefix(left, predicates, effects, work)?
+            && collect_filter_prefix(right, predicates, effects, work)?);
     }
+    let fact = effects.typed(expression)?;
+    if !(fact.can_skip_for_earlier_filter()
+        || fact.permits_filter_row_elimination
+            && fact.expression.permits_boolean_reordering()
+            && total_literal_like(expression, effects, work)?)
+    {
+        return Ok(false);
+    }
+    predicates.push(Predicate {
+        expression: expression.clone(),
+        mapping: None,
+    });
+    Ok(true)
 }
 
 pub(super) fn collect(
     mut plan: PhysicalPlanNode,
     next_need: &mut u32,
     materialize: bool,
-    control: &dyn PureCompileControl,
+    effects: &ScalarEffectQuery<'_>,
 ) -> Result<(PhysicalPlanNode, Box<[SystemTableSnapshotNeed]>), SqlCompileError> {
     fn walk(
         plan: &mut PhysicalPlanNode,
         mut predicates: Vec<Predicate>,
         next_need: &mut u32,
-        next_occurrence: &mut u32,
         materialize: bool,
         needs: &mut Vec<SystemTableSnapshotNeed>,
+        effects: &ScalarEffectQuery<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), SqlCompileError> {
         work.step()?;
         match &mut plan.kind {
-            PhysicalPlanKind::Filter(filter) => add_conjuncts(&filter.predicate, &mut predicates),
+            PhysicalPlanKind::Filter(filter) => {
+                let mut local = Vec::new();
+                if !collect_filter_prefix(&filter.predicate, &mut local, effects, work)? {
+                    // This child filter executes before every inherited condition.
+                    predicates.clear();
+                }
+                predicates.extend(local);
+            }
             PhysicalPlanKind::Project(project) => {
                 let mapping = project
                     .items
@@ -346,12 +395,15 @@ pub(super) fn collect(
                     *next_need = next_need.checked_add(1).ok_or_else(|| {
                         SqlCompileError::Compilation("system table need identity overflow".into())
                     })?;
-                    let occurrence = SystemTableOccurrenceId::new(*next_occurrence);
-                    *next_occurrence = next_occurrence.checked_add(1).ok_or_else(|| {
-                        SqlCompileError::Compilation(
-                            "system table occurrence identity overflow".into(),
-                        )
-                    })?;
+                    let ordinal = u32::try_from(needs.len())
+                        .ok()
+                        .filter(|&ordinal| ordinal < u32::MAX)
+                        .ok_or_else(|| {
+                            SqlCompileError::Compilation(
+                                "system table occurrence identity overflow".into(),
+                            )
+                        })?;
+                    let occurrence = SystemTableOccurrenceId::new(ordinal);
                     table.occurrence = Some(occurrence);
                     needs.push(SystemTableSnapshotNeed::new(
                         id,
@@ -371,23 +423,36 @@ pub(super) fn collect(
                 child,
                 predicates.clone(),
                 next_need,
-                next_occurrence,
                 materialize,
                 needs,
+                effects,
                 work,
             )?;
         }
         Ok(())
     }
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
+    let mut work = CompileCheckpoints::try_new(effects.control, CompilePhase::ProviderValidation)?;
+    // Ordinary queries should not analyze Filter effects for snapshot offers.
+    let mut pending = vec![&plan];
+    loop {
+        let Some(node) = pending.pop() else {
+            work.finish()?;
+            return Ok((plan, Box::default()));
+        };
+        work.step()?;
+        if matches!(node.kind, PhysicalPlanKind::SystemTable(_)) {
+            break;
+        }
+        pending.extend(node.children.iter());
+    }
     let mut needs = Vec::new();
     walk(
         &mut plan,
         Vec::new(),
         next_need,
-        &mut 0,
         materialize,
         &mut needs,
+        effects,
         &mut work,
     )?;
     work.finish()?;

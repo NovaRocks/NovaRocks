@@ -33,6 +33,7 @@ use super::{
     SqlAnalyzedQuery, SqlCompileControl, SqlCompileError,
 };
 use crate::analysis::LiteralValue;
+use crate::analysis::scalar_effects::ScalarEffectQuery;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -137,6 +138,11 @@ impl SqlAnalyzedQuery {
         }
 
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
+        let effects = ScalarEffectQuery {
+            functions: Some(self.function_catalog.as_ref()),
+            allow_throw_exception: self.root_allow_throw_exception,
+            control,
+        };
         let mut conjuncts = Vec::new();
         split_conjuncts(&arena, predicate, &mut conjuncts);
         for conjunct in conjuncts {
@@ -144,8 +150,14 @@ impl SqlAnalyzedQuery {
             if literal_cannot_match(&arena, conjunct, control)? {
                 return work.finish_result(Ok(DeleteAbsorption::Empty), SqlCompileError::from);
             }
+            let expression = scalar::materialize(&arena, conjunct);
+            if !effects.typed(&expression)?.can_skip_for_earlier_filter() {
+                // Metadata absorption cannot evaluate the original required
+                // prefix, even when a later predicate proves no match.
+                return work.finish_result(Ok(DeleteAbsorption::RowLevel), SqlCompileError::from);
+            }
             if !is_true_literal(&arena, conjunct, control)? {
-                scan.predicates.push(scalar::materialize(&arena, conjunct));
+                scan.predicates.push(expression);
             }
         }
         let Some(original_columns) = original_columns else {
@@ -158,7 +170,8 @@ impl SqlAnalyzedQuery {
             .cloned()
             .collect::<Vec<_>>();
         let (columns, predicate_columns) = provider_columns(&outputs, &scan, &mut work)?;
-        let predicates = lower_delete_provider_predicates(&scan, &predicate_columns, &mut work)?;
+        let predicates =
+            lower_delete_provider_predicates(&scan, &predicate_columns, &effects, &mut work)?;
         if predicates.is_empty() || predicates.len() != scan.predicates.len() {
             return work.finish_result(Ok(DeleteAbsorption::RowLevel), SqlCompileError::from);
         }
@@ -314,6 +327,18 @@ mod tests {
         assert!(!matches!(
             probe("id IS NOT NULL"),
             DeleteAbsorption::AllRows
+        ));
+    }
+
+    #[test]
+    fn metadata_delete_eliminates_rows_only_at_the_original_guard() {
+        assert!(matches!(
+            probe("12 / id > 3 AND FALSE"),
+            DeleteAbsorption::RowLevel
+        ));
+        assert!(matches!(
+            probe("FALSE AND 12 / id > 3"),
+            DeleteAbsorption::Empty
         ));
     }
 

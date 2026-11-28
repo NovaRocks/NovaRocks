@@ -124,20 +124,33 @@ fn nullable(values: &SelectedValues<'_>) -> Vec<Option<bool>> {
         .collect()
 }
 
-// Independent SQL truth table: errors are suppressible only within this pure
-// ordered region, and successful NULL differs from an errored NULL placeholder.
+// Independent oracle. TruthOnly settles each demanded row in source order.
+// A pure Value region can still suppress errors with its Boolean decider.
 fn expected(
     shape: ControlShape,
     demand: EvaluationDemand,
     pair: [Cell; 2],
 ) -> (Option<bool>, bool) {
+    if demand == EvaluationDemand::TruthOnly {
+        for cell in pair {
+            match (shape, cell) {
+                (_, Cell::Error) => return (None, true),
+                (ControlShape::Conjunction, Cell::False | Cell::Null) => {
+                    return (Some(false), false);
+                }
+                (ControlShape::Disjunction, Cell::True) => return (Some(true), false),
+                _ => {}
+            }
+        }
+        return (Some(shape == ControlShape::Conjunction), false);
+    }
     let has = |test: fn(Cell) -> bool| pair.iter().copied().any(test);
     let t = has(|c| matches!(c, Cell::True));
     let f = has(|c| matches!(c, Cell::False));
     let n = has(|c| matches!(c, Cell::Null));
     let e = has(|c| matches!(c, Cell::Error));
     if shape == ControlShape::Conjunction {
-        if f || (n && demand == EvaluationDemand::TruthOnly) {
+        if f {
             (Some(false), false)
         } else if e {
             (None, true)
@@ -151,10 +164,7 @@ fn expected(
     } else if e {
         (None, true)
     } else if n {
-        (
-            (demand == EvaluationDemand::TruthOnly).then_some(false),
-            false,
-        )
+        (None, false)
     } else {
         (Some(false), false)
     }
@@ -330,9 +340,9 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
             .unwrap();
             let result = finish_values(Selection::all(1), result);
             if demand == EvaluationDemand::TruthOnly {
-                assert_eq!(nullable(&result), vec![Some(false)]);
-                assert!(result.errors().is_empty());
-                assert_eq!(consumed, if first_error { 2 } else { 1 });
+                assert_eq!(nullable(&result), vec![(!first_error).then_some(false)]);
+                assert_eq!(result.errors().len(), usize::from(first_error));
+                assert_eq!(consumed, 1);
             } else {
                 assert_eq!(nullable(&result), vec![None]);
                 assert_eq!(result.errors().len(), 1);
@@ -369,7 +379,7 @@ fn successful_null_and_error_distinguish_truth_demand_and_error_placeholder() {
                 &mut terminal,
                 work
             )?,
-            vec![0]
+            Vec::<usize>::new()
         );
         state.finish(
             ControlShape::Conjunction,

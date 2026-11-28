@@ -93,3 +93,8 @@ super_types_rows
 -- types	bigint
 udts_rows
 0
+
+-- query 19
+-- types	bigint
+retained_types
+0

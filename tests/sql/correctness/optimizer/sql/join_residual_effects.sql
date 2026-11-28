@@ -17,9 +17,10 @@
 
 -- @order_sensitive=true
 -- @tags=optimizer,join,residual,runtime_filter
--- Only candidate pairs with matching non-NULL k can need the checked CAST.
+-- With equality first, only matching non-NULL pairs need the checked CAST.
 -- The independent oracles are k=2 when the bad source row cannot match,
 -- a typed error when it matches k=1, and an empty result with an empty side.
+-- With CAST first, even pairs that fail the later equality need the CAST.
 -- The probe's TopN first picks k=1. Moving the runtime filter before TopN
 -- would promote k=2 into its result and incorrectly produce a match.
 
@@ -169,3 +170,41 @@ ORDER BY l.k;
 SET SESSION enable_global_runtime_filter = true;
 
 SET SESSION disable_optimizer_rules = '';
+
+-- @result_contains=NEST LOOP JOIN
+-- @result_not_contains=HASH JOIN
+-- @result_not_contains=RUNTIME FILTER GRAPH
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT l.k
+FROM ${case_db}.i1_join_left l
+JOIN ${case_db}.i1_join_right r
+  ON CAST(l.s AS BIGINT) = r.v AND l.k = r.k
+ORDER BY l.k;
+
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT l.k
+FROM ${case_db}.i1_join_left l
+JOIN ${case_db}.i1_join_right r
+  ON CAST(l.s AS BIGINT) = r.v AND l.k = r.k
+ORDER BY l.k;
+
+-- The only candidate has a NULL key comparison after the checked CAST.
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT l.k
+FROM (SELECT k, s FROM ${case_db}.i1_join_left WHERE k IS NULL) l
+JOIN (SELECT k, v FROM ${case_db}.i1_join_right WHERE k = 2) r
+  ON CAST(l.s AS BIGINT) = r.v AND l.k = r.k;
+
+-- The producer can still use the equality. Its RF must not discard the
+-- unmatched probe row before the input relation's own checked filter.
+-- @result_contains=HASH JOIN
+-- @result_contains=consumer binding
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE', disable_optimizer_rules = 'JoinCommutativity'
+SELECT l.k
+FROM (SELECT k FROM ${case_db}.i1_join_left WHERE CAST(s AS BIGINT) > 0) l
+JOIN ${case_db}.i1_join_right r ON l.k = r.k;
+
+-- @expect_trino_error=INVALID_CAST_ARGUMENT,USER_ERROR
+SELECT l.k
+FROM (SELECT k FROM ${case_db}.i1_join_left WHERE CAST(s AS BIGINT) > 0) l
+JOIN ${case_db}.i1_join_right r ON l.k = r.k;

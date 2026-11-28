@@ -612,10 +612,8 @@ fn ordinary_hash_condition(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarJoinCondition>, crate::compiler::SqlCompileError> {
     let effects = arena.effects(condition);
-    // Hash changes the evaluated pair domain and physical traversal order.
-    // A pair-local error can be skipped on an excluded pair in this pure
-    // TruthOnly region. Stateful work or invocation Data needs a different
-    // pair-domain proof, even when the individual equality is total.
+    // Hash changes physical pair traversal. Stateful work or invocation Data
+    // needs a separate pair-domain proof, even if the equality is total.
     if !effects.expression.permits_boolean_reordering() || !effects.permits_filter_row_elimination {
         return Ok(None);
     }
@@ -624,15 +622,23 @@ fn ordinary_hash_condition(
     scalar_expr::split_conjuncts(arena, condition, &mut conjuncts);
     let mut keys = Vec::new();
     let mut residual = Vec::new();
+    let mut can_prune_pairs = true;
     for conjunct in conjuncts {
         control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-        let pair = match comparison_key(arena, conjunct) {
-            Some(pair) => place_hash_join_key(arena, pair, left_ids, right_ids, control)?,
-            None => None,
+        let pair = if can_prune_pairs {
+            match comparison_key(arena, conjunct) {
+                Some(pair) => place_hash_join_key(arena, pair, left_ids, right_ids, control)?,
+                None => None,
+            }
+        } else {
+            None
         };
         if let Some(pair) = pair {
             keys.push(pair);
         } else {
+            // Hash rejects pairs before evaluating the residual. A later key
+            // cannot hide a required error or effect of an earlier conjunct.
+            can_prune_pairs &= arena.effects(conjunct).can_skip_for_earlier_filter();
             residual.push(conjunct);
         }
     }

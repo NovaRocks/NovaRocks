@@ -287,7 +287,11 @@ struct ScanAndFilter {
     ),
 }
 
-fn scan_and_filter(sql: &str, with_second_wait: bool) -> ScanAndFilter {
+fn scan_and_filter(
+    sql: &str,
+    with_second_wait: bool,
+    expected_scan_residuals: usize,
+) -> ScanAndFilter {
     use arrow::datatypes::{DataType, Field};
     use novarocks_sql_testkit::sql_source_with_declared_fields;
     use novarocks_test_compile_to_execute::compiler_results::compiler_results_with_declared_read_fields;
@@ -311,9 +315,7 @@ fn scan_and_filter(sql: &str, with_second_wait: bool) -> ScanAndFilter {
         for node in program.graph().nodes() {
             match node.kind() {
                 ProgramNodeKind::Scan { residuals, .. } => {
-                    // Bare BOOLEAN is kept as an executable Scan residual by
-                    // the SQL/provider contract, including NULL as non-TRUE.
-                    assert_eq!(residuals.len(), 1);
+                    assert_eq!(residuals.len(), expected_scan_residuals);
                     assert!(
                         scan.replace((program.clone(), node.local_id().unwrap()))
                             .is_none()
@@ -367,6 +369,7 @@ impl ScanAndFilter {
         &self,
         original_rows: &[usize],
         control: &RecordedWaits,
+        host: &mut dyn novarocks_expression::ScalarCallHost<Refusal = std::convert::Infallible>,
     ) -> Result<ArrayRef, novarocks_expression::ExprEvaluationFailure<std::convert::Infallible>>
     {
         let (scan, scan_node) = &self.scan;
@@ -375,30 +378,34 @@ impl ScanAndFilter {
                 .output_layout()
                 .schema(),
         );
-        let selection = Selection::try_sparse(scan_batch.num_rows(), original_rows).unwrap();
-        let scan_result = CompiledFilterConjunctionInstance::try_new_with_allocator(
-            &predicate_units(scan, *scan_node),
-            control,
-            None,
-        )
-        .unwrap()
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &scan_batch,
-                source: None,
-            },
-            selection,
-            control,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-        let kept = scan_result.as_any().downcast_ref::<BooleanArray>().unwrap();
-        let rows = original_rows
-            .iter()
-            .copied()
-            .zip(kept.iter())
-            .filter_map(|(row, truth)| (truth == Some(true)).then_some(row))
-            .collect::<Vec<_>>();
+        let scan_units = predicate_units(scan, *scan_node);
+        let rows = if scan_units.is_empty() {
+            original_rows.to_vec()
+        } else {
+            let selection = Selection::try_sparse(scan_batch.num_rows(), original_rows).unwrap();
+            let scan_result = CompiledFilterConjunctionInstance::try_new_with_allocator(
+                &scan_units,
+                control,
+                None,
+            )
+            .unwrap()
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &scan_batch,
+                    source: None,
+                },
+                selection,
+                control,
+                host,
+            )?;
+            let kept = scan_result.as_any().downcast_ref::<BooleanArray>().unwrap();
+            original_rows
+                .iter()
+                .copied()
+                .zip(kept.iter())
+                .filter_map(|(row, truth)| (truth == Some(true)).then_some(row))
+                .collect()
+        };
 
         let (filter, filter_node) = &self.filter;
         let ProgramNodeKind::Filter {
@@ -425,28 +432,33 @@ impl ScanAndFilter {
                 },
                 Selection::try_sparse(filter_batch.num_rows(), &rows).unwrap(),
                 control,
-                &mut PassThroughCallHost,
+                host,
             )
     }
 }
 
 #[test]
-fn scan_necessary_term_cuts_wait_and_row_error_domain_with_original_wait_order() {
+fn scan_leading_guard_limits_division_and_waits_to_original_true_rows() {
     use novarocks_expression::ExprEvaluationFailure;
 
     let source = scan_and_filter(
         concat!(
-            "SELECT id FROM fixture WHERE 12 / d > 3 AND sleep(CAST(first_delay AS BIGINT)) ",
-            "AND sleep(CAST(second_delay AS BIGINT)) AND enabled",
+            "SELECT id FROM fixture WHERE enabled AND 12 / d > 3 ",
+            "AND sleep(CAST(first_delay AS BIGINT)) AND sleep(CAST(second_delay AS BIGINT))",
         ),
         true,
+        1,
     );
     let control = RecordedWaits::default();
-    let output = source.apply(&[0, 1], &control).unwrap();
+    let output = source
+        .apply(&[0, 1], &control, &mut PassThroughCallHost)
+        .unwrap();
     assert!(output.is_empty());
     assert!(control.0.lock().unwrap().is_empty());
 
-    let output = source.apply(&[0, 1, 2], &control).unwrap();
+    let output = source
+        .apply(&[0, 1, 2], &control, &mut PassThroughCallHost)
+        .unwrap();
     assert_eq!(
         output
             .as_any()
@@ -462,7 +474,9 @@ fn scan_necessary_term_cuts_wait_and_row_error_domain_with_original_wait_order()
     );
 
     let control = RecordedWaits::default();
-    let Err(ExprEvaluationFailure::RequiredRow(error)) = source.apply(&[3], &control) else {
+    let Err(ExprEvaluationFailure::RequiredRow(error)) =
+        source.apply(&[3], &control, &mut PassThroughCallHost)
+    else {
         panic!("the surviving bad divisor still reports a row error");
     };
     assert_eq!(error.batch_row(), 3);
@@ -470,17 +484,103 @@ fn scan_necessary_term_cuts_wait_and_row_error_domain_with_original_wait_order()
 }
 
 #[test]
-fn scan_does_not_advance_a_fallible_term_before_the_original_wait() {
+fn same_expression_late_guard_preserves_the_first_required_division_error() {
+    use novarocks_expression::ExprEvaluationFailure;
+
+    let source = scan_and_filter(
+        "SELECT id FROM fixture WHERE 12 / d > 3 AND enabled AND sleep(CAST(first_delay AS BIGINT))",
+        false,
+        0,
+    );
+    for (rows, expected_row) in [(&[0, 1][..], 0), (&[1][..], 1), (&[3][..], 3)] {
+        let control = RecordedWaits::default();
+        let Err(ExprEvaluationFailure::RequiredRow(error)) =
+            source.apply(rows, &control, &mut PassThroughCallHost)
+        else {
+            panic!("the division precedes the guard for each selected row");
+        };
+        assert_eq!(error.batch_row(), expected_row);
+        assert!(control.0.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn same_expression_late_guard_preserves_wait_then_division_on_rejected_rows() {
     use novarocks_expression::ExprEvaluationFailure;
 
     let source = scan_and_filter(
         "SELECT id FROM fixture WHERE sleep(CAST(first_delay AS BIGINT)) AND 12 / d > 3 AND enabled",
         false,
+        0,
     );
-    let control = RecordedWaits::default();
-    let Err(ExprEvaluationFailure::RequiredRow(error)) = source.apply(&[3], &control) else {
-        panic!("the original division still fails after the selected wait");
+    for (row, delay) in [(0, 10), (1, 11), (3, 13)] {
+        let control = RecordedWaits::default();
+        let Err(ExprEvaluationFailure::RequiredRow(error)) =
+            source.apply(&[row], &control, &mut PassThroughCallHost)
+        else {
+            panic!("the original division still fails after the selected wait");
+        };
+        assert_eq!(error.batch_row(), row);
+        assert_eq!(*control.0.lock().unwrap(), vec![Duration::from_secs(delay)]);
+    }
+}
+
+#[test]
+fn same_expression_observes_rand_only_when_the_source_guard_demands_it() {
+    use novarocks_expression::{
+        ScalarCallFailure, ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts,
     };
-    assert_eq!(error.batch_row(), 3);
-    assert_eq!(*control.0.lock().unwrap(), vec![Duration::from_secs(13)]);
+    use novarocks_functions::AggregateStateAllocator;
+    use std::convert::Infallible;
+
+    #[derive(Default)]
+    struct CallBodies(usize);
+
+    impl ScalarCallHost for CallBodies {
+        type Refusal = Infallible;
+
+        fn begin_call(&mut self) {}
+
+        fn run_admitted(
+            &mut self,
+            phase: ScalarCallPhase,
+            facts: ScalarCallRequestFacts,
+            body: &mut dyn FnMut() -> Result<(), ScalarCallFailure<Infallible>>,
+        ) -> Result<(), ScalarCallFailure<Infallible>> {
+            if phase == ScalarCallPhase::Body {
+                self.0 += 1;
+            }
+            PassThroughCallHost.run_admitted(phase, facts, body)
+        }
+
+        fn callback_request_facts(
+            &mut self,
+            allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        ) -> Result<ScalarCallRequestFacts, ScalarCallFailure<Infallible>> {
+            PassThroughCallHost.callback_request_facts(allocator)
+        }
+    }
+
+    for (predicate, expected_scan_residuals, executes_rand) in [
+        ("enabled AND rand() < 0.5", 1, false),
+        ("rand() < 0.5 AND enabled", 0, true),
+    ] {
+        let sql = format!("SELECT id, d, first_delay FROM fixture WHERE {predicate}");
+        let source = scan_and_filter(&sql, false, expected_scan_residuals);
+        let mut host = CallBodies::default();
+        let output = source
+            .apply(&[0, 1], &RecordedWaits::default(), &mut host)
+            .unwrap();
+        assert!(
+            output
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .all(|value| value == Some(false))
+        );
+        // The comparison needs the value of the original admitted RAND call
+        // when it precedes the guard. Its sampled value cannot keep these rows.
+        assert_eq!(host.0 > 0, executes_rand, "{predicate}");
+    }
 }

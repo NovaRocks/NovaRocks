@@ -842,6 +842,45 @@ mod tests {
     }
 
     #[test]
+    fn a_later_equality_does_not_derive_not_null_before_a_checked_on_term() {
+        let mut arena = ScalarArena::new();
+        let left = col_typed("l", "a", 1, true);
+        let right = col_typed("r", "b", 2, true);
+        let checked = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(right.clone()),
+                op: BinOp::Div,
+                right: novarocks_parser::ast::AstBox::new(right.clone()),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: right.value_type.clone(),
+        };
+        let on = and_expr(eq_expr(checked, right.clone()), eq_expr(left, right));
+        let plan = join_opt(
+            &mut arena,
+            JoinKind::Inner,
+            scan_opt("l", "tl", &[("a", 1, true)]),
+            scan_opt("r", "tr", &[("b", 2, true)]),
+            Some(on),
+        );
+        let Operator::LogicalJoin(join) = &plan.op else {
+            unreachable!()
+        };
+        assert!(
+            arena
+                .effects(join.condition.unwrap())
+                .expression
+                .may_raise_row_error
+        );
+        assert!(matches!(
+            DeriveJoinNotNullPredicate
+                .apply(plan, &mut make_ctx(arena))
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
     fn non_equi_and_missing_condition_skipped() {
         {
             let mut arena = ScalarArena::new();

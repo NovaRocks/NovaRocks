@@ -112,7 +112,8 @@ pub(crate) struct SpjgDescriptor {
     pub table: TableDef,
     /// Scan output columns: ColumnId -> base column binding.
     pub scan_columns: Vec<OutputColumn>,
-    /// All conjuncts below the aggregate (scan predicates + filter, CNF-split).
+    /// Predicates below the aggregate. A single-table shape retains scan
+    /// predicates first, then each Filter's conjuncts in execution order.
     pub predicates: Vec<ScalarId>,
     pub aggregate: Option<SpjgAggregate>,
     /// Visible outputs in order (the subtree's output schema).
@@ -205,16 +206,7 @@ impl SpjgDescriptor {
         };
 
         let mut predicates: Vec<ScalarId> = Vec::new();
-        while let Operator::LogicalFilter(f) = &node.op {
-            scalar_expr::split_conjuncts(arena, f.predicate, &mut predicates);
-            node = node
-                .children
-                .first()
-                .ok_or_else(|| "filter without child in MV rewrite shape".to_string())?;
-        }
-
         let (scan, joins) = peel_join_spine_opt(node, arena, &mut predicates)?;
-        predicates.extend(scan.predicates.iter().copied());
 
         // Composition map: ColumnId -> defining expr over scan columns
         // (from the mid project). Identity for scan columns themselves.
@@ -367,8 +359,6 @@ impl SpjgDescriptor {
         if scan.mv_rewritten_from.is_some() {
             return Ok(None);
         }
-        predicates.extend(scan.predicates.iter().copied());
-
         // Composition map from the mid project (ColumnId -> expr over scan cols).
         let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
         if let Some(p) = &mid_project {
@@ -618,12 +608,16 @@ fn peel_join_spine_memo(
     predicates: &mut Vec<ScalarId>,
 ) -> Option<(ScanOp, Option<JoinShape>)> {
     let mut n = node.clone();
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        filters.push(f.predicate);
         n = first_logical_expr(memo, *n.children.first()?)?;
     }
-    match &n.op {
-        Operator::LogicalScan(scan) => Some((scan.clone(), None)),
+    let shape = match &n.op {
+        Operator::LogicalScan(scan) => {
+            predicates.extend(scan.predicates.iter().copied());
+            Some((scan.clone(), None))
+        }
         Operator::LogicalJoin(join) => {
             if join.join_type != JoinKind::Inner {
                 return None;
@@ -652,7 +646,9 @@ fn peel_join_spine_memo(
             Some((driving, Some(shape)))
         }
         _ => None,
-    }
+    }?;
+    append_filter_conjuncts(&memo.scalars, filters, predicates);
+    Some(shape)
 }
 
 fn peel_filter_scan_memo(
@@ -661,8 +657,9 @@ fn peel_filter_scan_memo(
     predicates: &mut Vec<ScalarId>,
 ) -> Option<JoinInput> {
     let mut n = node.clone();
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(&memo.scalars, f.predicate, predicates);
+        filters.push(f.predicate);
         n = first_logical_expr(memo, *n.children.first()?)?;
     }
     let Operator::LogicalScan(scan) = &n.op else {
@@ -672,6 +669,7 @@ fn peel_filter_scan_memo(
         return None;
     }
     predicates.extend(scan.predicates.iter().copied());
+    append_filter_conjuncts(&memo.scalars, filters, predicates);
     Some(JoinInput {
         table: scan.table.clone(),
         scan_columns: scan.columns.clone(),
@@ -679,9 +677,8 @@ fn peel_filter_scan_memo(
 }
 
 /// Peel a left-deep inner-join spine (or a bare scan) at the bottom of the
-/// SPJG shape. On entry `node` is the operator directly below the filter
-/// chain. Returns the driving (left-deep first) scan and an optional
-/// `JoinShape` describing every additional inner-join input. Predicates pushed
+/// SPJG shape, including its enclosing filter chain. Returns the driving scan
+/// and the optional join shape. Predicates pushed
 /// onto join inputs and residual (non-equi) join conjuncts are appended to
 /// `predicates` (the descriptor keeps a single flat predicate list). Rejects
 /// any non-`Inner` join kind, a right child that is not `Filter*->Scan`, and
@@ -692,15 +689,20 @@ fn peel_join_spine_opt<'a>(
     predicates: &mut Vec<ScalarId>,
 ) -> Result<(&'a ScanOp, Option<JoinShape>), String> {
     let mut n = node;
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        filters.push(f.predicate);
         n = n
             .children
             .first()
             .ok_or_else(|| "filter without child in MV rewrite join spine".to_string())?;
     }
     match &n.op {
-        Operator::LogicalScan(scan) => Ok((scan, None)),
+        Operator::LogicalScan(scan) => {
+            predicates.extend(scan.predicates.iter().copied());
+            append_filter_conjuncts(arena, filters, predicates);
+            Ok((scan, None))
+        }
         Operator::LogicalJoin(join) => {
             if join.join_type != JoinKind::Inner {
                 return Err(format!(
@@ -737,6 +739,7 @@ fn peel_join_spine_opt<'a>(
             });
             shape.inputs.push(right_input);
             shape.equi_edges.extend(edges);
+            append_filter_conjuncts(arena, filters, predicates);
             Ok((driving, Some(shape)))
         }
         _ => Err(format!(
@@ -754,8 +757,9 @@ fn peel_filter_scan_opt(
     predicates: &mut Vec<ScalarId>,
 ) -> Result<JoinInput, String> {
     let mut n = node;
+    let mut filters = Vec::new();
     while let Operator::LogicalFilter(f) = &n.op {
-        scalar_expr::split_conjuncts(arena, f.predicate, predicates);
+        filters.push(f.predicate);
         n = n
             .children
             .first()
@@ -768,10 +772,21 @@ fn peel_filter_scan_opt(
         ));
     };
     predicates.extend(scan.predicates.iter().copied());
+    append_filter_conjuncts(arena, filters, predicates);
     Ok(JoinInput {
         table: scan.table.clone(),
         scan_columns: scan.columns.clone(),
     })
+}
+
+fn append_filter_conjuncts(
+    arena: &ScalarArena,
+    filters: Vec<ScalarId>,
+    predicates: &mut Vec<ScalarId>,
+) {
+    for root in filters.into_iter().rev() {
+        scalar_expr::split_conjuncts(arena, root, predicates);
+    }
 }
 
 /// Split a join `ON` condition into equi-join edges (`col = col`) and residual
@@ -1751,6 +1766,40 @@ mod tests {
         assert_eq!(mem.predicates.len(), logical.predicates.len());
         assert!(mem.aggregate.is_none());
         assert_eq!(mem.outputs.len(), logical.outputs.len());
+    }
+
+    #[test]
+    fn single_table_predicates_follow_scan_and_filter_execution_order() {
+        use crate::analysis::BinOp;
+        use crate::planner::optimizer_bridge::scalar::intern_typed;
+
+        let a = col(1, "a");
+        let guard = |v| cmp(col_ref(&a), BinOp::Gt, int_lit(v));
+        let mut scan = scan(std::slice::from_ref(&a));
+        scan.predicates.push(guard(0));
+        let scan = LogicalPlanNode::new(LogicalPlanKind::scan(scan), vec![], None);
+        let filter = |predicate, input| {
+            LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode { predicate }),
+                vec![input],
+                None,
+            )
+        };
+        let plan = filter(guard(3), filter(cmp(guard(1), BinOp::And, guard(2)), scan));
+        let control = crate::optimizer::test_optimizer_control();
+        let expected = |arena: &mut ScalarArena| {
+            (0..=3)
+                .map(|v| intern_typed(arena, &guard(v), control).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let (descriptor, mut arena) = descriptor_from_plan(&plan).unwrap();
+        assert_eq!(descriptor.predicates, expected(&mut arena));
+        let (mut memo, root) = memo_root(&plan);
+        let (descriptor, _) = SpjgDescriptor::from_memo(&root, &mut memo, control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(descriptor.predicates, expected(&mut memo.scalars));
     }
 
     #[test]

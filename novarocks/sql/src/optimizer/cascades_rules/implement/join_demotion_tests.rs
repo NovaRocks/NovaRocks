@@ -18,6 +18,7 @@
 use super::*;
 use crate::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::column_id::ColumnId;
+use crate::optimizer::cascades_rules::join_commutativity::JoinCommutativity;
 use crate::optimizer::memo::{LogicalProperties, MExpr, Memo};
 use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
 use crate::optimizer::scalar::ScalarId;
@@ -540,44 +541,55 @@ fn int(value: i64) -> TypedExpr {
     }
 }
 
+fn checked_divide(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+    use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
+    let value_type = arithmetic_result_value_type_with_op(
+        &left.value_type,
+        &right.value_type,
+        ArithmeticOperator::Divide,
+    )
+    .unwrap()
+    .with_nullable(true)
+    .unwrap();
+    let mut division = bin(left, BinOp::Div, right);
+    division.value_type = value_type;
+    division
+}
+
 #[test]
-fn safe_ordinary_equality_preserves_checked_residual_order() {
+fn only_source_order_safe_equalities_become_hash_keys() {
     let mut memo = Memo::new();
     let left_group = mk_scan_group(&mut memo, &["a_id", "a_name"]);
     let right_group = mk_scan_group(&mut memo, &["b_id"]);
-    let cast = TypedExpr {
-        kind: ExprKind::Cast {
-            expr: novarocks_parser::ast::AstBox::new(col_typed("a_name", DataType::Utf8)),
-            target: DataType::Int32,
-            cast_mode: Some(novarocks_type_contract::TrinoCastMode::Explicit),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-    };
-    let prefix = bin(cast, BinOp::Eq, col("b_id"));
-    let key = bin(col("a_id"), BinOp::Eq, col("b_id"));
-    let demoted = bin(col("a_id"), BinOp::Eq, col("a_name"));
-    let suffix = bin(col("b_id"), BinOp::Gt, int(0));
-    let expr = logical_join_expr(
+    let divide = checked_divide(int(12), col("a_name"));
+    let mut checked = bin(divide, BinOp::Eq, col("b_id"));
+    checked.value_type = checked.value_type.with_nullable(true).unwrap();
+    let first_key = bin(col("a_id"), BinOp::Eq, col("b_id"));
+    let later_key = bin(col("a_name"), BinOp::Eq, col("b_id"));
+    let total_residual = bin(col("a_id"), BinOp::Gt, int(0));
+    let join = logical_join_expr(
         &mut memo,
         JoinKind::Inner,
         bin(
-            bin(prefix.clone(), BinOp::And, key),
+            bin(total_residual.clone(), BinOp::And, first_key.clone()),
             BinOp::And,
-            bin(demoted.clone(), BinOp::And, suffix.clone()),
+            bin(checked.clone(), BinOp::And, later_key.clone()),
         ),
         vec![left_group, right_group],
     );
     let control = crate::optimizer::test_optimizer_control();
-    let expected = [prefix, demoted, suffix]
+    let expected = [total_residual, checked.clone(), later_key]
         .map(|part| intern_typed(&mut memo.scalars, &part, control).unwrap());
     assert!(
         memo.scalars
             .effects(expected[0])
-            .expression
-            .may_raise_row_error
+            .can_skip_for_earlier_filter()
     );
-    let alt = JoinToHashJoin.apply(&expr, &mut memo, control).unwrap();
+    let checked_effects = memo.scalars.effects(expected[1]);
+    assert!(checked_effects.permits_filter_row_elimination);
+    assert!(checked_effects.expression.may_raise_row_error);
+    assert!(!checked_effects.expression.may_raise_invocation_data);
+    let alt = JoinToHashJoin.apply(&join, &mut memo, control).unwrap();
     let [
         NewExpr {
             op: Operator::PhysicalHashJoin(hash),
@@ -585,7 +597,7 @@ fn safe_ordinary_equality_preserves_checked_residual_order() {
         },
     ] = alt.as_slice()
     else {
-        panic!("expected one hash join");
+        panic!("expected the source-order-safe hash key");
     };
     assert_eq!(hash.condition.keys().len(), 1);
     let mut actual = Vec::new();
@@ -595,19 +607,39 @@ fn safe_ordinary_equality_preserves_checked_residual_order() {
             .condition
             .residual()
             .as_ref()
-            .expect("checked residual"),
+            .expect("ordered residual"),
         &mut actual,
     );
     assert_eq!(actual, expected);
     assert!(
         JoinToNestLoop
-            .apply(&expr, &mut memo, control)
+            .apply(&join, &mut memo, control)
             .unwrap()
             .is_empty()
     );
 
+    let bad_first = logical_join_expr(
+        &mut memo,
+        JoinKind::Inner,
+        bin(checked, BinOp::And, first_key),
+        vec![left_group, right_group],
+    );
+    assert!(
+        JoinToHashJoin
+            .apply(&bad_first, &mut memo, control)
+            .unwrap()
+            .is_empty()
+    );
+    assert_original_nested_loop_condition(&bad_first, &mut memo);
+
     memo.hash_join_enabled = false;
-    let alt = JoinToNestLoop.apply(&expr, &mut memo, control).unwrap();
+    assert_original_nested_loop_condition(&join, &mut memo);
+}
+
+fn assert_original_nested_loop_condition(join: &MExpr, memo: &mut Memo) {
+    let alt = JoinToNestLoop
+        .apply(join, memo, crate::optimizer::test_optimizer_control())
+        .unwrap();
     let [
         NewExpr {
             op: Operator::PhysicalNestLoopJoin(nlj),
@@ -615,12 +647,52 @@ fn safe_ordinary_equality_preserves_checked_residual_order() {
         },
     ] = alt.as_slice()
     else {
-        panic!("a disabled Hash implementation must leave the ordinary Join plannable");
+        panic!("expected the original nested loop condition");
     };
-    let Operator::LogicalJoin(original) = &expr.op else {
+    let Operator::LogicalJoin(original) = &join.op else {
         unreachable!()
     };
     assert_eq!(nlj.condition, original.condition);
+}
+
+#[test]
+fn join_commutativity_preserves_required_pair_evaluation_order() {
+    let mut memo = Memo::new();
+    let left = mk_scan_group(&mut memo, &["a_id"]);
+    let right = mk_scan_group(&mut memo, &["b_id"]);
+    let control = crate::optimizer::test_optimizer_control();
+    let equality = bin(col("a_id"), BinOp::Eq, col("b_id"));
+    let safe = logical_join_expr(
+        &mut memo,
+        JoinKind::Inner,
+        equality.clone(),
+        vec![left, right],
+    );
+    let alternatives = JoinCommutativity.apply(&safe, &mut memo, control).unwrap();
+    let [commuted] = alternatives.as_slice() else {
+        panic!("a total equality can commute");
+    };
+    assert_eq!(commuted.children, [right, left]);
+
+    let divide = checked_divide(int(12), col("a_id"));
+    let mut checked = bin(divide, BinOp::Gt, int(3));
+    checked.value_type = checked.value_type.with_nullable(true).unwrap();
+    let checked_id = intern_typed(&mut memo.scalars, &checked, control).unwrap();
+    let checked_effects = memo.scalars.effects(checked_id);
+    assert!(checked_effects.permits_filter_row_elimination);
+    assert!(checked_effects.expression.may_raise_row_error);
+    let join = logical_join_expr(
+        &mut memo,
+        JoinKind::Inner,
+        bin(checked, BinOp::And, equality),
+        vec![left, right],
+    );
+    assert!(
+        JoinCommutativity
+            .apply(&join, &mut memo, control)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -660,17 +732,13 @@ fn independently_evaluated_rand_terms_keep_the_original_join_condition() {
             .unwrap()
             .is_empty()
     );
-    let alt = JoinToNestLoop.apply(&expr, &mut memo, control).unwrap();
-    let [
-        NewExpr {
-            op: Operator::PhysicalNestLoopJoin(nlj),
-            ..
-        },
-    ] = alt.as_slice()
-    else {
-        panic!("expected the original nested loop condition");
-    };
-    assert_eq!(nlj.condition, Some(original_condition));
+    assert!(
+        JoinCommutativity
+            .apply(&expr, &mut memo, control)
+            .unwrap()
+            .is_empty()
+    );
+    assert_original_nested_loop_condition(&expr, &mut memo);
     let mut parts = Vec::new();
     scalar_expr::split_conjuncts(&memo.scalars, original_condition, &mut parts);
     assert_eq!(parts.len(), 3);

@@ -292,6 +292,36 @@ fn conjunctive_key_constraint_is_exact_and_engine_filter_remains() {
 }
 
 #[test]
+fn snapshot_key_offer_preserves_an_earlier_required_cast() {
+    for (predicate, key_offered) in [
+        (
+            "CAST(payload AS BIGINT) > 0 AND schema_name = 'none'",
+            false,
+        ),
+        ("schema_name = 'none' AND CAST(payload AS BIGINT) > 0", true),
+    ] {
+        let provider = snapshot_need(&format!(
+            "SELECT payload FROM system.metadata.fixture WHERE {predicate}"
+        ));
+        let SqlNeedBatch::ProviderInputs { system_tables, .. } = provider.needs() else {
+            panic!("expected a System snapshot need");
+        };
+        let constraint = system_tables[0].key_constraint();
+        assert_eq!(constraint.columns().len(), usize::from(key_offered));
+        assert_eq!(constraint.allows(0, "Db"), !key_offered);
+        let completed = finish(provider);
+        assert!(
+            completed
+                .plan()
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .any(|node| matches!(node.kind, NodeKind::Filter { .. }))
+        );
+    }
+}
+
+#[test]
 fn disjunction_and_nonkey_filters_do_not_prune_provider_rows() {
     for predicate in [
         "schema_name = 'a' OR schema_name = 'b'",

@@ -685,27 +685,12 @@ struct ProbePushPolicy<'a> {
     effects: &'a ScalarEffectQuery<'a>,
 }
 
-fn pure_prunable_expressions<'a>(
+fn skippable_before_probe_filter<'a>(
     expressions: impl IntoIterator<Item = &'a TypedExpr>,
     query: &ScalarEffectQuery<'_>,
 ) -> Result<bool, SqlCompileError> {
     for expr in expressions {
-        let effects = query.typed(expr)?;
-        if !effects.permits_filter_row_elimination
-            || !effects.expression.permits_boolean_reordering()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn truth_only_prunable_predicates<'a>(
-    predicates: impl IntoIterator<Item = &'a TypedExpr>,
-    query: &ScalarEffectQuery<'_>,
-) -> Result<bool, SqlCompileError> {
-    for predicate in predicates {
-        if !query.typed(predicate)?.permits_filter_row_elimination {
+        if !query.typed(expr)?.can_skip_for_earlier_filter() {
             return Ok(false);
         }
     }
@@ -713,22 +698,22 @@ fn truth_only_prunable_predicates<'a>(
 }
 
 /// A filter on a join probe can reach an earlier input only if that input
-/// still denotes the same value and eliminating its rows preserves the
-/// intervening operator's demand. Otherwise place it at the producing join.
+/// still denotes the same value and pruning cannot skip earlier required
+/// work. Otherwise place the filter at the producing join.
 fn can_prune_before(
     node: &PhysicalPlanNode,
     effects: &ScalarEffectQuery<'_>,
 ) -> Result<bool, SqlCompileError> {
     match &node.kind {
         PhysicalPlanKind::Filter(filter) => {
-            truth_only_prunable_predicates([&filter.predicate], effects)
+            skippable_before_probe_filter([&filter.predicate], effects)
         }
-        PhysicalPlanKind::Scan(scan) => truth_only_prunable_predicates(&scan.predicates, effects),
+        PhysicalPlanKind::Scan(scan) => skippable_before_probe_filter(&scan.predicates, effects),
         PhysicalPlanKind::Project(project) => {
-            pure_prunable_expressions(project.items.iter().map(|item| &item.expr), effects)
+            skippable_before_probe_filter(project.items.iter().map(|item| &item.expr), effects)
         }
         PhysicalPlanKind::Sort(sort) if sort.partition_limit.is_none() && sort.offset.is_none() => {
-            pure_prunable_expressions(
+            skippable_before_probe_filter(
                 sort.items
                     .iter()
                     .map(|item| &item.expr)
@@ -744,10 +729,10 @@ fn can_prune_before(
                     }
                 }
             }
-            pure_prunable_expressions(join.condition.residual().iter(), effects)
+            skippable_before_probe_filter(join.condition.residual().iter(), effects)
         }
         PhysicalPlanKind::Redistribute(exchange) => {
-            pure_prunable_expressions(&exchange.partition_exprs, effects)
+            skippable_before_probe_filter(&exchange.partition_exprs, effects)
         }
         // These leaves have no earlier child on which the pass could change
         // the value domain. The package uses them as join-probe witnesses.
@@ -1762,7 +1747,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let predicate = TypedExpr {
+        let assertion = TypedExpr {
             value_type: result.clone(),
             kind: ExprKind::FunctionCall {
                 name: "assert_true".into(),
@@ -1775,15 +1760,56 @@ mod tests {
                 distinct: false,
             },
         };
-        // The original filter fails on probe row 1 even though it cannot
-        // match build row 2. Pre-filtering the leaf would lose that check.
+        let int = |value| typed_expr(ExprKind::Literal(crate::analysis::LiteralValue::Int(value)));
+        use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_value_type_with_op};
+        let numerator = int(12);
+        let divisor = col_ref(1, "probe_key");
+        let result = arithmetic_result_value_type_with_op(
+            &numerator.value_type,
+            &divisor.value_type,
+            ArithmeticOperator::Divide,
+        )
+        .unwrap()
+        .with_nullable(true)
+        .unwrap();
+        let div = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(numerator),
+                op: BinOp::Div,
+                right: novarocks_parser::ast::AstBox::new(divisor),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: result,
+        };
+        let bool_type = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false);
+        let division = TypedExpr {
+            value_type: bool_type.with_nullable(true).unwrap(),
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(div),
+                op: BinOp::Gt,
+                right: novarocks_parser::ast::AstBox::new(int(3)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+        };
+        let total = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: novarocks_parser::ast::AstBox::new(col_ref(1, "probe_key")),
+                negated: true,
+            },
+            value_type: bool_type,
+        };
+        let division_effects = test_effect_query().typed(&division).unwrap();
+        assert!(division_effects.permits_filter_row_elimination);
+        assert!(division_effects.expression.may_raise_row_error);
+        // The upstream filter fails on probe row 0, which cannot match build
+        // row 2. Earlier RF placement would hide that failure.
         let probe_column = out_col(1, "probe_key");
         let mut probe_leaf = leaf(vec![probe_column.clone()]);
         let PhysicalPlanKind::Values(input) = &mut probe_leaf.kind else {
             unreachable!()
         };
         input.rows.push(vec![TypedExpr {
-            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(1)),
+            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(0)),
             value_type: probe_column.value_type.clone(),
         }]);
         let build_column = out_col(2, "build_key");
@@ -1795,24 +1821,10 @@ mod tests {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(2)),
             value_type: build_column.value_type.clone(),
         }]);
-        for safe in [false, true] {
-            let predicate = if safe {
-                TypedExpr {
-                    kind: ExprKind::IsNull {
-                        expr: novarocks_parser::ast::AstBox::new(col_ref(1, "probe_key")),
-                        negated: true,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                }
-            } else {
-                predicate.clone()
-            };
-            let truth_only_effects = test_effect_query().typed(&predicate).unwrap();
-            assert_eq!(truth_only_effects.permits_filter_row_elimination, safe);
-            assert_eq!(truth_only_effects.expression.may_raise_row_error, !safe);
+        for (predicate, safe) in [(assertion, false), (division, false), (total, true)] {
+            let effects = test_effect_query().typed(&predicate).unwrap();
+            assert_eq!(effects.can_skip_for_earlier_filter(), safe);
+            assert_eq!(effects.expression.may_raise_row_error, !safe);
             let probe = PhysicalPlanNode {
                 kind: PhysicalPlanKind::Filter(crate::planner::payload::PlanFilterNode {
                     predicate,
