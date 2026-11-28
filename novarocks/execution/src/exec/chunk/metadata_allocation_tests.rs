@@ -29,8 +29,8 @@ fn by_schema_allocation_stream_equals_original_request_contribution() {
     let mut original_steps = 0;
     let old = contract
         .original_reconcile_metadata_request_observed::<KernelCloneProbeError>(
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
             &mut || {
                 original_steps += 1;
                 Ok(())
@@ -49,8 +49,8 @@ fn by_schema_allocation_stream_equals_original_request_contribution() {
         };
     let actual = contract
         .original_reconcile_metadata_allocation_requests_observed::<KernelCloneProbeError>(
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
             &mut || {
                 new_steps += 1;
                 Ok(())
@@ -86,7 +86,7 @@ fn by_schema_allocation_shared_metadata_requests_only_the_original_field_name() 
         };
     let facts = field
         .original_field_clone_allocation_requests_observed(
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
             &mut || Ok(()),
             &mut Some(&mut allocations as MetadataAllocationLoan<'_, KernelCloneProbeError>),
         )
@@ -116,8 +116,8 @@ fn by_schema_allocation_every_callback_retains_seven_first_causes_and_no_footer(
     };
     contract
         .original_reconcile_metadata_allocation_requests_observed(
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
             &mut || {
                 count.set(count.get() + 1);
                 Ok(())
@@ -147,8 +147,8 @@ fn by_schema_allocation_every_callback_retains_seven_first_causes_and_no_footer(
             };
             let mut allocations = |_: Layout, _: usize| check();
             let result = contract.original_reconcile_metadata_allocation_requests_observed(
-                &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-                &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+                &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+                &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
                 &mut || check(),
                 &mut Some(&mut allocations as MetadataAllocationLoan<'_, KernelCloneProbeError>),
             );

@@ -409,6 +409,47 @@ pub(super) fn project_aggregate_inputs(
     ))
 }
 
+/// Route complete groups by their original computed keys. A separate input
+/// column leaves the post-aggregate output identity and call inputs intact.
+pub(super) fn project_raw_aggregate_group_keys(
+    current: LogicalPlanNode,
+    group_by: &mut [TypedExpr],
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    if group_by
+        .iter()
+        .all(|expr| direct_column_ref_id(expr).is_some())
+    {
+        return Ok(current);
+    }
+    let mut items = pass_through_input(&current)?;
+    for (ordinal, expr) in group_by.iter_mut().enumerate() {
+        if direct_column_ref_id(expr).is_some() {
+            continue;
+        }
+        let name = format!("__aggregate_group_key_{ordinal}");
+        let output_column_id = factory.create(None, name.clone(), expr.value_type.clone());
+        items.push(ProjectItem {
+            expr: expr.clone(),
+            output_name: name.clone(),
+            output_column_id,
+        });
+        expr.kind = ExprKind::ColumnRef {
+            column_id: output_column_id,
+            qualifier: None,
+            column: name,
+        };
+    }
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![current],
+        None,
+    ))
+}
+
 type AggregateProjectionSplit = (
     Vec<ProjectItem>,
     Vec<AggregateCall>,

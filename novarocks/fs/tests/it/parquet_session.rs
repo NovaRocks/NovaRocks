@@ -51,7 +51,12 @@ fn prepared_footer_stages_exact_suffix_and_parses_without_second_get() {
         BytesMut::from(&bytes[offset as usize..]),
     )
     .expect("complete footer");
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let before = fixture.io.block_on_bytes_calls();
     std::fs::remove_file(fixture.file.location().path()).expect("remove source");
     let inspection = inspect_parquet_metadata_from_prepared(
@@ -76,7 +81,12 @@ fn prepared_footer_rejects_incomplete_or_wrong_identity() {
         BytesMut::from(&bytes[size - 8..]),
     )
     .expect("prepared tail");
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     assert_eq!(
         inspect_parquet_metadata_from_prepared(
             fixture.file.clone(),
@@ -107,7 +117,12 @@ fn prepared_footer_rejects_incomplete_or_wrong_identity() {
 #[test]
 fn inspection_reuses_footer_across_row_group_runs_and_preserves_positions() {
     let fixture = Fixture::parquet();
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 2, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        2,
+        1024 * 1024,
+    );
     let inspection = inspect_parquet_metadata(
         fixture.file.clone(),
         None,
@@ -117,7 +132,12 @@ fn inspection_reuses_footer_across_row_group_runs_and_preserves_positions() {
     .expect("inspect file once");
 
     for (group, expected) in [(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])] {
-        let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 2, 1024 * 1024);
+        let mut request = fixture.request(
+            FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+            FileProjection::All,
+            2,
+            1024 * 1024,
+        );
         request.pruning.row_groups = Some(vec![group]);
         let mut reader = open_file_reader_with_parquet_inspection(request, Some(&inspection))
             .expect("open run with inspected footer");
@@ -146,7 +166,12 @@ fn inspection_reuses_footer_across_row_group_runs_and_preserves_positions() {
 fn small_file_probe_serves_footer_and_later_runs_from_one_file_read() {
     let fixture = Fixture::parquet();
     assert!(fixture.file.identity().file_size() <= 64 * 1024);
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let before = fixture.io.block_on_bytes_calls();
     let inspection = inspect_parquet_metadata(
         fixture.file.clone(),
@@ -158,7 +183,12 @@ fn small_file_probe_serves_footer_and_later_runs_from_one_file_read() {
     assert_eq!(fixture.io.block_on_bytes_calls() - before, 1);
 
     for group in [0, 1] {
-        let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+        let mut request = fixture.request(
+            FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+            FileProjection::All,
+            4,
+            1024 * 1024,
+        );
         request.pruning.row_groups = Some(vec![group]);
         let mut reader = open_file_reader_with_parquet_inspection(request, Some(&inspection))
             .expect("open run from one small-file probe");
@@ -174,7 +204,12 @@ fn small_file_probe_serves_footer_and_later_runs_from_one_file_read() {
 #[test]
 fn inspection_rejects_different_file_identity() {
     let fixture = Fixture::parquet();
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let inspection = inspect_parquet_metadata(
         fixture.file.clone(),
         None,
@@ -182,7 +217,12 @@ fn inspection_rejects_different_file_identity() {
         novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
     )
     .expect("inspect file");
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let identity = fixture.file.identity();
     request.file = fixture
         .file
@@ -207,7 +247,12 @@ fn inspection_rejects_different_file_identity() {
 #[test]
 fn inspection_upgrades_page_index_once_for_later_runs() {
     let fixture = Fixture::parquet();
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let cache = DataCachePolicy::external(CacheOptions {
         enable_scan_datacache: true,
         enable_populate_datacache: false,
@@ -228,7 +273,12 @@ fn inspection_upgrades_page_index_once_for_later_runs() {
     .expect("inspect footer without page indexes");
 
     for (run, expected_index_requests) in [(0, true), (1, false)] {
-        let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+        let mut request = fixture.request(
+            FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+            FileProjection::All,
+            4,
+            1024 * 1024,
+        );
         request.cache = Some(cache.clone());
         request.pruning.row_groups = Some(vec![run]);
         request.options.enable_parquet_reader_page_index = true;
@@ -255,7 +305,7 @@ fn inspection_upgrades_page_index_once_for_later_runs() {
 fn metadata_only_plan_uses_projected_column_range_without_decoder() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::RootIndices(vec![0]),
         4,
         1024 * 1024,
@@ -286,7 +336,7 @@ fn metadata_only_plan_uses_projected_column_range_without_decoder() {
 fn metadata_only_plan_uses_page_index_for_selected_pages() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(
-        FileFormat::Parquet,
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
         FileProjection::RootIndices(vec![0]),
         4,
         1024 * 1024,
@@ -325,7 +375,12 @@ fn metadata_only_plan_uses_page_index_for_selected_pages() {
 #[test]
 fn push_decoder_preserves_values_and_absolute_positions_across_disjoint_groups() {
     let fixture = Fixture::parquet_three_groups();
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1, 1024 * 1024);
+    let mut request = fixture.request(
+        FileFormat::Parquet(novarocks_fs::ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        1,
+        1024 * 1024,
+    );
     request.pruning.row_groups = Some(vec![0, 2]);
     for row_group in [0, 2] {
         request

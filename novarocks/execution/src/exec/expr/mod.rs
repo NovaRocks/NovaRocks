@@ -77,7 +77,7 @@ mod numeric_unary_state_compile_control_tests;
 mod numeric_unary_ordered_sql_source_tests;
 
 #[cfg(test)]
-mod numeric_unary_typed_ordered_merge_tests;
+mod numeric_unary_typed_ordered_tests;
 
 #[cfg(test)]
 mod sql_published_source_observation_tests;

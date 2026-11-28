@@ -58,7 +58,10 @@ pub use call_context::*;
 mod function;
 mod largeint;
 mod logical;
-pub use depth_profile::{ArrowTypeDepth, ArrowTypeProfile, TypeTraversalFrame};
+pub use depth_profile::{
+    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_TYPE_PATH_DEPTH,
+    MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH, TypeTraversalFrame,
+};
 mod canonical_fact;
 pub mod owned_resources;
 mod partition;
@@ -146,8 +149,8 @@ pub use function::{
 };
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use logical::{
-    MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
-    ValueTypeError, ValueTypeVisit, field_logical_type, preserves_nested_logical_identity,
+    MAX_VALUE_TYPE_DEPTH, NR_LOGICAL_TYPE_KEY, ValueLogicalType, ValueTypeError, ValueTypeVisit,
+    field_logical_type, preserves_nested_logical_identity,
     preserves_nested_logical_identity_observed, validate_arrow_layout_structure_observed,
     validate_arrow_layout_structure_with_profile_and_scratch_observed,
     validate_arrow_layout_structure_with_profile_observed,
@@ -155,8 +158,8 @@ pub use logical::{
     validate_nested_logical_types_observed, validate_value_type_structure_observed,
     validate_value_type_structure_with_profile_and_scratch_observed,
     validate_value_type_structure_with_profile_observed,
-    validate_value_type_structure_with_scratch_observed,
-    visit_original_data_type_clone_with_scratch_observed,
+    validate_value_type_structure_with_scratch_observed, visit_arrow_layout_events_observed,
+    visit_arrow_layout_nodes_observed, visit_original_data_type_clone_with_scratch_observed,
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
@@ -164,10 +167,7 @@ pub use partition::{
     avalanche_hash_u64,
 };
 pub use schema::{
-    MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-    MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, TypeComparisonStep,
-    arrow_data_types_equal_borrowed_observed,
+    TypeComparisonStep, arrow_data_types_equal_borrowed_observed,
     arrow_data_types_equal_borrowed_with_profile_observed, arrow_data_types_equal_observed,
     arrow_data_types_equal_with_profile_observed, arrow_data_types_exact,
     arrow_data_types_exact_borrowed_observed,

@@ -44,11 +44,6 @@ where
             novarocks_type_contract::ValueTypeError::TooManyNodes,
         ))
     })?;
-    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        )));
-    }
     let mut child = |array: &ArrayRef| {
         validate_encoded_keys_and_root_nulls_observed(array, observe, depth + 1, nodes).map(|_| ())
     };

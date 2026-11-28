@@ -876,13 +876,7 @@ fn containing_node_updates_keep_original_envelope_and_monotone_base() {
 #[test]
 fn admitted_clone_uses_original_requests_and_callbacks_without_double_charge() {
     let source = FunctionValueType::new(
-        DataType::Dictionary(
-            Box::new(DataType::Int8),
-            Box::new(DataType::Dictionary(
-                Box::new(DataType::Int16),
-                Box::new(DataType::Utf8),
-            )),
-        ),
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
         true,
     );
     let control = Control::default();

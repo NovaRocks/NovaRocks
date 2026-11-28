@@ -77,10 +77,12 @@ fn visit(
 ) -> Result<(), Failure> {
     creation.work(1)?;
     *nodes = nodes.checked_add(1).ok_or_else(resource)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        || *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-    {
-        return Err(resource());
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
+        )
+        .into());
     }
     Ok(())
 }

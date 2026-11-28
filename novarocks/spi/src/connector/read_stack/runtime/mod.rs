@@ -497,7 +497,8 @@ pub enum ConnectorReadRelationPreparationKind {
         table: crate::connector::ConnectorTableHandle,
         original_source: crate::connector::ConnectorProcessLocalPayload,
         snapshot_id: Option<i64>,
-        preparation_digest: [u8; 32],
+        preparation_identity: crate::connector::ConnectorRowMutationPreparationIdentity,
+        source_schema_digest: [u8; 32],
     },
     FrozenMvTarget {
         table: crate::connector::ConnectorTableHandle,

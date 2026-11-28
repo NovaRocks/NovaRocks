@@ -381,7 +381,7 @@ impl FailureProjection for LocalProgramError {
             Self::TooDeep => limit(
                 ProgramReason::LocalProgramTooDeep as u16,
                 ResourceDimension::Items,
-                crate::MAX_PROGRAM_NODE_DEPTH,
+                crate::MAX_RECURSIVE_PIPELINE_BUILD_DEPTH,
             ),
             Self::ExpandedLimit => limit(
                 ProgramReason::LocalProgramExpandedLimit as u16,

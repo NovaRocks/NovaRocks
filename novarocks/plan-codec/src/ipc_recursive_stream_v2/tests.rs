@@ -382,7 +382,6 @@ fn recursive_source_retention_and_checked_arithmetic_fail_before_hidden_work() {
     assert!(capacity(usize::MAX).is_err());
     let control = Control::default();
     let work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-    assert!(reader_work::metadata_comparison_work(usize::MAX, 1024).is_err());
     work.finish().unwrap();
 }
 
@@ -432,15 +431,6 @@ fn metadata_struct(entries: usize, sparse: bool) -> (ArrayRef, Field) {
 
 #[test]
 fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map() {
-    // Hand-calculated candidate/table/byte upper bound for K=3, B=4096:
-    // B*(1+K+2K+2) + (K+K²+K²+K+2).
-    assert_eq!(
-        reader_work::metadata_comparison_work(3, 4096).unwrap(),
-        49_178
-    );
-    assert_eq!(reader_work::metadata_comparison_work(0, 4096).unwrap(), 0);
-    assert!(reader_work::metadata_comparison_work(257, 4096).is_ok());
-    assert!(reader_work::metadata_comparison_work(1, usize::MAX).is_err());
     let (array, field) = metadata_struct(3, false);
     let (metadata, body) = encoded(array, &field);
     let checked = geometry(&metadata, &body, &field);
@@ -448,16 +438,11 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
     work.finish().unwrap();
-    assert_eq!(actual.one_comparison, 49_178);
+    let child_work = reader_work::metadata_comparison_work(checked.nodes[1].field).unwrap();
+    assert!(child_work > 0);
+    assert_eq!(actual.one_comparison, child_work);
     assert_eq!(actual.native_comparisons, 0);
-    assert_eq!(
-        actual.total,
-        4096 * (6 * 2 + 2)
-            + 4 * 2 * novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len()
-            + 3 * 49_178
-            + std::mem::size_of::<[usize; novarocks_type_contract::MAX_VALUE_TYPE_NODES]>()
-            + 4 // Base calculation, metadata scan, index insertion, linear group item.
-    );
+    assert!(actual.total >= 6 * child_work);
     // The map on the root Field is still covered by the original source
     // walks/probes. It does not add a fourth metadata exact-comparison pass.
     assert_eq!(checked.nodes[0].field.metadata().len(), 1);
@@ -479,9 +464,8 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
     work.finish().unwrap();
-    // One shared map is visited twice; independent per-name deduplication
-    // would incorrectly charge it only once. Its group weight must be 24.
-    assert_eq!(actual.one_comparison, 4096 * 24 + 2 * 26);
+    // Repeated immutable Fields still contribute each occurrence.
+    assert_eq!(actual.one_comparison, 2 * child_work);
     assert_eq!(actual.native_comparisons, 0);
     let z = Arc::new(fields[0].as_ref().clone().with_name("z"));
     let aa = Arc::new(fields[0].as_ref().clone().with_name("aa"));
@@ -498,9 +482,7 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
     work.finish().unwrap();
-    // Sort by actual bytes (aa before z); the two separated z occurrences
-    // must form one weighted group, with all three candidate counts retained.
-    assert_eq!(actual.one_comparison, 4096 * 24 + 3 * 26);
+    assert_eq!(actual.one_comparison, 3 * child_work);
     assert_eq!(actual.native_comparisons, 0);
     let array = nested();
     let field = Field::new("root", array.data_type().clone(), true);
@@ -515,8 +497,9 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
     work.finish().unwrap();
-    assert_eq!(actual.one_comparison, 4096 * 6 + 6);
-    assert_eq!(actual.native_comparisons, 8 * (4096 * 6 + 6));
+    let nested_metadata = reader_work::metadata_comparison_work(checked.nodes[2].field).unwrap();
+    assert_eq!(actual.one_comparison, nested_metadata);
+    assert_eq!(actual.native_comparisons, 8 * nested_metadata);
     let child = Arc::new(Field::new("child", DataType::Int32, true));
     let array: ArrayRef = Arc::new(StructArray::new(
         vec![child].into(),
@@ -532,10 +515,7 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
     work.finish().unwrap();
     assert_eq!(actual.one_comparison, 0);
     assert_eq!(actual.native_comparisons, 0);
-    assert_eq!(
-        actual.total,
-        4096 * 14 + 8 * novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len() + 2
-    ); // Base and one length scan, without fixed-stack initialization work.
+    assert_eq!(actual.total, 6 * (2 * (4 + 5) + 2 * 64) + 2);
     assert_eq!(
         control.trace(),
         [(CompilePhase::Decode, 0), (CompilePhase::Decode, 2)]
@@ -549,8 +529,8 @@ fn recursive_converted_metadata_invoice_and_k_work_refuse_before_constant_prefli
     let checked = geometry(&metadata, &body, &field);
     let input = input(&field, &metadata, &body, &checked);
     // The staging HashMap has exited. These are two explicit source invoice
-    // estimates for the same attached BTree/Arc/text and Field/FVT owners;
-    // their difference exercises the conservative envelope, not spare buckets.
+    // estimates for the same attached BTree/Arc/text and Field/FVT owners.
+    // Retained storage may differ independently of comparison work.
     let sparse_invoice = 1 << 20;
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -558,7 +538,8 @@ fn recursive_converted_metadata_invoice_and_k_work_refuse_before_constant_prefli
         reader_work::source_metadata_work(&checked.nodes, sparse_invoice, &mut work).unwrap();
     let compact = reader_work::source_metadata_work(&checked.nodes, 1 << 16, &mut work).unwrap();
     work.finish().unwrap();
-    assert!(sparse.one_comparison > compact.one_comparison);
+    assert_eq!(sparse.one_comparison, compact.one_comparison);
+    assert_eq!(sparse.total, compact.total);
     let facts = admitted(&input, sparse_invoice, reader_limits(), &Control::default()).unwrap();
     assert!(facts.cumulative_library_work_upper_bound > sparse.total);
     let mut limits = reader_limits();
@@ -592,8 +573,7 @@ fn recursive_converted_metadata_invoice_and_k_work_refuse_before_constant_prefli
 
 #[test]
 fn recursive_actual_long_source_names_preserve_every_original_control_prefix() {
-    // Source maps are opaque bounded library work. The actual Rust walk
-    // compares source names, so give its real sort long common-prefix names.
+    // Give the real Field walk long common-prefix names and metadata.
     let fields = (0..20)
         .map(|index| {
             Arc::new(

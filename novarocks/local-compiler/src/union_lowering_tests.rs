@@ -1089,7 +1089,7 @@ fn nested_union_package(layers: usize) -> (Arc<FragmentPackage>, Vec<NodeId>) {
 }
 
 #[test]
-fn union_all_nested_actual_tree_accepts_depth_sixty_three_and_refuses_sixty_five() {
+fn nested_union_all_preserves_normalization_projects_across_the_old_expanded_depth_limit() {
     let functions = functions();
     let (source, original_unions) = nested_union_package(31);
     assert_eq!(source.fragment().nodes().len(), 63);
@@ -1215,17 +1215,22 @@ fn union_all_nested_actual_tree_accepts_depth_sixty_three_and_refuses_sixty_five
     // owner despite the three local pieces per union.
     assert_eq!(program.provenance().cost_owners().count(), 63);
 
-    let (over_source, over_unions) = nested_union_package(32);
-    assert_eq!(over_source.fragment().nodes().len(), 65);
-    assert_eq!(over_unions.len(), 32);
-    // The original full Package admits physical depth 33. Only the compiler's
-    // actual 65-layer expanded local tree exceeds its existing depth-64 gate.
-    assert!(matches!(
-        compile_package(&over_source, &functions, &Control),
-        Err(FragmentCompileError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
+    let (deeper_source, deeper_unions) = nested_union_package(32);
+    assert_eq!(deeper_source.fragment().nodes().len(), 65);
+    assert_eq!(deeper_unions.len(), 32);
+    // The 65-node path has 32 normalization Projects, which the pipeline
+    // builder visits on its worklist. Only the Union and Values frames nest.
+    let deeper_program = compile_package(&deeper_source, &functions, &Control).unwrap();
+    assert_eq!(deeper_program.graph().nodes().len(), 129);
+    assert_eq!(
+        deeper_program
+            .graph()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), ProgramNodeKind::Project { .. }))
+            .count(),
+        64
+    );
 }
 
 pub(super) fn fixture_width(width: usize) -> Fixture {

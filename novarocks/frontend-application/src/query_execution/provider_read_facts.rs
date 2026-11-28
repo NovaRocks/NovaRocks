@@ -568,7 +568,8 @@ enum AdmittedRead {
         original_identity: novarocks_spi::connector::ConnectorTableIdentity,
         original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
         snapshot_id: Option<i64>,
-        preparation_digest: [u8; 32],
+        preparation_identity: novarocks_spi::connector::ConnectorRowMutationPreparationIdentity,
+        source_schema_digest: [u8; 32],
     },
     PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
     MvTarget {
@@ -762,7 +763,12 @@ fn prepare_read_opening(
                     source: source.clone(),
                 }
             }
-            QueryTableBindingAdmission::RowMutationMatch(_, snapshot_id, preparation_digest) => {
+            QueryTableBindingAdmission::RowMutationMatch(
+                _,
+                snapshot_id,
+                preparation_identity,
+                source_schema_digest,
+            ) => {
                 if !matches!(relation, ProviderReadRelationNeed::Data { .. })
                     || input != QueryFrozenReadInput::Current
                 {
@@ -778,7 +784,8 @@ fn prepare_read_opening(
                     original_identity: original.identity.clone(),
                     original_source: original.source_read_facts().cloned(),
                     snapshot_id: *snapshot_id,
-                    preparation_digest: *preparation_digest,
+                    preparation_identity: preparation_identity.clone(),
+                    source_schema_digest: *source_schema_digest,
                 }
             }
             _ => {
@@ -938,7 +945,8 @@ async fn prepare_observation(
         materialization,
         original_source,
         snapshot_id,
-        preparation_digest,
+        preparation_identity,
+        source_schema_digest,
         ..
     } = &opening.admitted
     {
@@ -948,7 +956,8 @@ async fn prepare_observation(
                 "mutation target scan has no original provider access provenance".to_string()
             })?,
             snapshot_id: *snapshot_id,
-            preparation_digest: *preparation_digest,
+            preparation_identity: preparation_identity.clone(),
+            source_schema_digest: *source_schema_digest,
         }
     } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(), cohort) {

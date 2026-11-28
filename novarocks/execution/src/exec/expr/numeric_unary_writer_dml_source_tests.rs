@@ -290,9 +290,18 @@ fn assert_writer_selections(
                     argument_types: binding.function.argument_types.clone(),
                     result_type: FunctionResultType::Scalar(binding.function.result_type.clone()),
                     aggregate: Some(AggregateBindingSelection {
-                        state_argument_contract: binding.state_argument_contract,
-                        intermediate_type: binding.intermediate_type.clone(),
-                        state_format: binding.state_format.clone(),
+                        state_argument_contract: binding
+                            .merge_state
+                            .as_ref()
+                            .unwrap()
+                            .state_argument_contract,
+                        intermediate_type: binding
+                            .merge_state
+                            .as_ref()
+                            .unwrap()
+                            .intermediate_type
+                            .clone(),
+                        state_format: binding.merge_state.as_ref().unwrap().state_format.clone(),
                     }),
                 };
                 let expected = functions

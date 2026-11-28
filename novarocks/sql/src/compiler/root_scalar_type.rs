@@ -551,13 +551,7 @@ mod tests {
             physical(
                 D::Struct(
                     (0..count)
-                        .map(|_| {
-                            Arc::new(Field::new(
-                                "n".repeat(novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES),
-                                D::Int32,
-                                true,
-                            ))
-                        })
+                        .map(|_| Arc::new(Field::new("n".repeat(1024), D::Int32, true)))
                         .collect::<Vec<_>>()
                         .into(),
                 ),
@@ -567,13 +561,7 @@ mod tests {
         assert!(scalar_field(&make_names(100)).is_ok());
         assert!(scalar_field(&make_names(300)).is_err());
         let zone = physical(
-            D::Timestamp(
-                TimeUnit::Nanosecond,
-                Some(
-                    "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
-                        .into(),
-                ),
-            ),
+            D::Timestamp(TimeUnit::Nanosecond, Some("z".repeat(1024).into())),
             true,
         );
         assert!(scalar_field(&zone).is_ok());

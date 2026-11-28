@@ -162,6 +162,7 @@ fn raw_function(wide: bool) -> wire::FunctionBindingDefinition {
 }
 fn raw_aggregate(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBindingDefinition {
     wire::AggregateBindingDefinition {
+        state_capability: wire::AggregateStateCapability::Mergeable as i32,
         state_interpretation: None,
         id,
         function_binding_id: Some(u32::MAX),
@@ -177,7 +178,6 @@ fn four_phases() -> Vec<wire::AggregateBindingDefinition> {
     let mut independent = raw_aggregate(0, wire::aggregate_phase::Kind::PartialSequenceId(0));
     independent.state_argument_contract =
         novarocks_proto_models::common::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32;
-    independent.logical_argument_count = 0;
     vec![
         raw_aggregate(
             u32::MAX,
@@ -293,18 +293,40 @@ fn aggregate_materialization_all_four_phases_preserve_sparse_order_and_seven_fie
         ];
         for (at, (_, binding)) in output.definitions().iter().enumerate() {
             assert_eq!(binding.phase, expected[at]);
-            assert_eq!(binding.logical_argument_count, if at == 1 { 0 } else { 2 });
-            assert_eq!(binding.state_format.as_str(), "test/aggregate/state-v1");
+            assert_eq!(binding.logical_argument_count, 2);
             assert_eq!(
-                binding.state_argument_contract,
+                binding.merge_state.as_ref().unwrap().state_format.as_str(),
+                "test/aggregate/state-v1"
+            );
+            assert_eq!(
+                binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .state_argument_contract,
                 if at == 1 {
                     AggregateStateArgumentContract::ValueRootNullabilityIndependent
                 } else {
                     AggregateStateArgumentContract::ExactSignature
                 }
             );
-            assert_eq!(binding.intermediate_type.data_type(), &DataType::Utf8);
-            assert!(binding.intermediate_type.nullable());
+            assert_eq!(
+                binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .data_type(),
+                &DataType::Utf8
+            );
+            assert!(
+                binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .nullable()
+            );
             assert_eq!(binding.function.kind, FunctionKind::Aggregate);
             assert_eq!(binding.function.function_id.as_str(), "test/aggregate");
             assert_eq!(
@@ -386,16 +408,35 @@ fn aggregate_materialization_full_lambda_nominal_metadata_and_dictionary_owned_c
         assert!(fields[0].is_nullable());
         assert!(fields[0].metadata().as_arc().is_none());
         let original = headers.functions().type_table().value_type(8).unwrap();
-        assert_eq!(binding.intermediate_type, *original);
-        assert_eq!(binding.intermediate_type.data_type(), &DataType::Utf8);
+        assert_eq!(
+            binding.merge_state.as_ref().unwrap().intermediate_type,
+            *original
+        );
+        assert_eq!(
+            binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .data_type(),
+            &DataType::Utf8
+        );
         assert!(
             binding
+                .merge_state
+                .as_ref()
+                .unwrap()
                 .intermediate_type
                 .value_type()
                 .shares_storage(original.value_type())
         );
         assert!(std::ptr::eq(
-            binding.intermediate_type.data_type(),
+            binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .data_type(),
             original.data_type()
         ));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -618,10 +659,10 @@ fn aggregate_materialization_original_control_success_and_ordinary_all_prefixes(
 
 #[test]
 fn aggregate_materialization_wide_actual_320_arguments_and_consumed_emit_prefixes() {
-    let raw = [raw_aggregate(
-        u32::MAX,
-        wire::aggregate_phase::Kind::FinalSequenceId(0),
-    )];
+    let raw = [wire::AggregateBindingDefinition {
+        logical_argument_count: 320,
+        ..raw_aggregate(u32::MAX, wire::aggregate_phase::Kind::FinalSequenceId(0))
+    }];
     let baseline = Control::default();
     let prepare_trace = with_receivers(&baseline, &raw, true, |headers, functions| {
         baseline.arm(None);

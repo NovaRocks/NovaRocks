@@ -25,7 +25,7 @@ use novarocks_type_contract::PureCompileControl;
 
 use super::aggregate::{
     collect_non_agg_column_refs, dedup_group_by_exprs, expr_column_id, prepare_repeat_input,
-    project_aggregate_inputs, split_projection_for_aggregate,
+    project_aggregate_inputs, project_raw_aggregate_group_keys, split_projection_for_aggregate,
 };
 use super::relation::plan_relation_scoped;
 use super::subquery::{wrap_predicate_applies, wrap_scalar_applies};
@@ -260,7 +260,7 @@ pub(super) fn plan_select_scoped_with_source(
                 }));
             }
         }
-        let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
+        let mut aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
         let (mut project_items, mut agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
                 &aggregate_projection,
@@ -292,6 +292,12 @@ pub(super) fn plan_select_scoped_with_source(
         current = project_aggregate_inputs(current, &mut agg_calls, repeat.as_ref(), factory)?;
         if let Some(repeat) = repeat {
             current = LogicalPlanNode::new(LogicalPlanKind::Repeat(repeat), vec![current], None);
+        }
+        if agg_calls
+            .iter()
+            .any(|call| call.source.requires_raw_group_input())
+        {
+            current = project_raw_aggregate_group_keys(current, &mut aggregate_group_by, factory)?;
         }
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {

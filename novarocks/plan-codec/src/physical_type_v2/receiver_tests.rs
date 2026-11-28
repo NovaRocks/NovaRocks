@@ -17,7 +17,6 @@
 
 use super::*;
 use arrow::datatypes::TimeUnit;
-use novarocks_connector_contract::ConnectorErrorKind;
 use novarocks_proto_models::{physical_package_v2 as raw, plan};
 use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
 use std::sync::Mutex;
@@ -308,12 +307,6 @@ fn run(
     work.finish()?;
     result.map(|table| (table, last.expect("actual receiving admission facts")))
 }
-fn writer_resource(error: TypeCodecError) {
-    assert!(
-        matches!(error, TypeCodecError::Writer(error) if error.kind() == ConnectorErrorKind::ResourceExhausted)
-    );
-}
-
 #[test]
 #[allow(deprecated)]
 fn receiver_writer_struct_5000_preserves_sparse_fields_dictionary_and_complete_metadata() {
@@ -399,7 +392,7 @@ fn receiver_writer_only_large_metadata_and_timezone_return_original_arrow_attrib
 }
 
 #[test]
-fn receiver_value_schema_ipc_and_unused_strict_roots_reject_same_writer_wide_descendant() {
+fn receiver_value_schema_ipc_and_unused_roots_admit_wide_descendants() {
     for source in 0..2 {
         let mut p = wide(5000);
         if source == 0 {
@@ -414,13 +407,8 @@ fn receiver_value_schema_ipc_and_unused_strict_roots_reject_same_writer_wide_des
                 .carriers
                 .push(carrier(9, Kind::ListFieldId(u32::MAX)));
         }
-        assert!(matches!(
-            run(&p, limits(), 0, &Control::default()),
-            Err(TypeCodecError::ValueType(ValueTypeError::TooManyNodes))
-        ));
+        run(&p, limits(), 0, &Control::default()).unwrap();
     }
-    // A complete independently authored Execution Struct also retains its own
-    // node limit, whether selected directly as a Value or as a schema field.
     for schema in [false, true] {
         use novarocks_proto_models::value_type as logical;
         let mut p = wide(5000);
@@ -475,10 +463,7 @@ fn receiver_value_schema_ipc_and_unused_strict_roots_reject_same_writer_wide_des
                 field_ids: vec![u32::MAX],
             });
         }
-        assert!(matches!(
-            run(&p, limits(), 0, &Control::default()),
-            Err(TypeCodecError::ValueType(ValueTypeError::TooManyNodes))
-        ));
+        run(&p, limits(), 0, &Control::default()).unwrap();
     }
     let mut p = scalar();
     facts_mut(&mut p, u32::MAX).metadata = (0..65)
@@ -492,20 +477,16 @@ fn receiver_value_schema_ipc_and_unused_strict_roots_reject_same_writer_wide_des
         source_field_id: Some(u32::MAX),
         ..Default::default()
     });
-    // Strict Source permits up to 256 entries; the same actual Writer
-    // occurrence still has its original 64-entry law. Intersection65 therefore
-    // refuses with the original Writer resource category after strict validation.
-    writer_resource(run(&p, limits(), 0, &Control::default()).err().unwrap());
+    run(&p, limits(), 0, &Control::default()).unwrap();
 }
 
 #[test]
-fn receiver_writer_32_33_and_strict_64_65_keep_original_domain_errors() {
-    run(&chain(32, true), limits(), 0, &Control::default()).unwrap();
-    writer_resource(
-        run(&chain(33, true), limits(), 0, &Control::default())
-            .err()
-            .unwrap(),
-    );
+fn receiver_writer_and_value_use_the_logical_depth_limit() {
+    run(&chain(64, true), limits(), 0, &Control::default()).unwrap();
+    assert!(matches!(
+        run(&chain(65, true), limits(), 0, &Control::default()),
+        Err(TypeCodecError::ValueType(ValueTypeError::TooDeep))
+    ));
     let (decoded, _) = run(&chain(64, false), limits(), 0, &Control::default()).unwrap();
     assert!(decoded.value_type(u32::MAX).is_some());
     assert!(matches!(
@@ -515,7 +496,7 @@ fn receiver_writer_32_33_and_strict_64_65_keep_original_domain_errors() {
 }
 
 #[test]
-fn receiver_writer_recipe_quota_counts_repeated_occurrences_across_roles_and_resets_per_recipe() {
+fn receiver_accepts_repeated_wide_writer_occurrences_across_roles() {
     let mut p = scalar();
     facts_mut(&mut p, u32::MAX).metadata = vec![plan::ArrowFieldMetadataEntry {
         key: "k".into(),
@@ -536,7 +517,7 @@ fn receiver_writer_recipe_quota_counts_repeated_occurrences_across_roles_and_res
         }),
         ..Default::default()
     }];
-    writer_resource(run(&p, limits(), 0, &Control::default()).err().unwrap());
+    run(&p, limits(), 0, &Control::default()).unwrap();
     p.writes = vec![
         data(std::iter::repeat_n(u32::MAX, 128)),
         data(std::iter::repeat_n(u32::MAX, 128)),
@@ -566,11 +547,11 @@ fn receiver_writer_recipe_quota_counts_repeated_occurrences_across_roles_and_res
             ..Default::default()
         });
     p.writes = vec![data([u32::MAX])];
-    writer_resource(run(&p, limits(), 0, &Control::default()).err().unwrap());
+    run(&p, limits(), 0, &Control::default()).unwrap();
 }
 
 #[test]
-fn receiver_writer_source_logical_attribute_is_opaque_and_65_entry_resource_law_remains() {
+fn receiver_wide_writer_metadata_keeps_original_source_attributes() {
     let mut p = scalar();
     let mut metadata: Vec<_> = (0..63)
         .map(|i| plan::ArrowFieldMetadataEntry {
@@ -601,9 +582,8 @@ fn receiver_writer_source_logical_attribute_is_opaque_and_65_entry_resource_law_
             value: "v".into(),
         },
     );
-    writer_resource(run(&p, limits(), 0, &Control::default()).err().unwrap());
-    // Malformed authored execution semantics still precede the later Source
-    // entry quota. Unknown generic attributes cannot stand in for this error.
+    run(&p, limits(), 0, &Control::default()).unwrap();
+    // Unknown source attributes cannot replace malformed execution facts.
     use novarocks_proto_models::value_type as logical;
     p.types.as_mut().unwrap().logical_types[0].kind = Some(
         logical::logical_type_definition::Kind::Scalar(logical::ScalarValue {

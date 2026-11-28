@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Complete borrowed framing for a flat non-dictionary constant pool stream.
-//! Schema identity and batch geometry are checked by their existing authors.
+//! Borrowed framing and geometry for a flat non-dictionary constant pool.
+//! The exact Field comes from the original package type table.
 //! No array/schema materialization or reader entry is performed here. This
 //! projection does not authorize those allocations or replace the subsequent
 //! complete resource model, Field/FVT pairing and ConstantPool value admission.
@@ -24,9 +24,6 @@
 use crate::{
     ipc_flat_batch_v2::{
         FlatBatchGeometry, FlatBatchProjectionLimits, preflight_verified_flat_record_batch,
-    },
-    ipc_schema_v2::{
-        IpcSchemaProjectionLimits, verified_message_observed, verify_single_field_schema_with_work,
     },
     physical_type_v2::TypeCodecError,
 };
@@ -54,7 +51,6 @@ pub(crate) use reader::{PreparedFlatReader, ReaderFailure, ReaderResourceFailure
 #[derive(Clone, Copy, Debug)]
 pub struct FlatStreamProjectionLimits {
     pub max_input_bytes: usize,
-    pub schema: IpcSchemaProjectionLimits,
     pub batch: FlatBatchProjectionLimits,
 }
 
@@ -221,9 +217,8 @@ pub(crate) fn metadata_core<'a, E: ReaderGeometryFailure>(
     Ok((&input[range], end))
 }
 
-/// Requires continuation framing, V5/Little schema, one uncompressed flat
-/// RecordBatch, and an exact EOS with no trailing data. Every metadata Message
-/// is officially verified once, on the same original Decode work scope.
+/// Requires exactly one continuation-prefixed V5 RecordBatch. The verified
+/// header is reused for geometry and recovery on the original Decode scope.
 pub fn preflight_flat_constant_stream<'a, 'f>(
     input: &'a [u8],
     expected: &'f Field,
@@ -357,6 +352,127 @@ pub(crate) fn input_derived_batch_verifier(
         ignore_missing_null_terminator: false,
     })
 }
+/// Extract the RecordBatch from a trusted Arrow StreamWriter test fixture.
+#[cfg(test)]
+pub(crate) fn standard_test_record_frame(stream: &[u8]) -> &[u8] {
+    let ContinuationPrefix::Metadata { start, len } = continuation_prefix(stream, 0).unwrap()
+    else {
+        panic!("test fixture must contain an Arrow Schema");
+    };
+    let batch_start = start + len;
+    let ContinuationPrefix::Metadata { start, len } =
+        continuation_prefix(stream, batch_start).unwrap()
+    else {
+        panic!("test fixture must contain a RecordBatch");
+    };
+    let end = start + len;
+    let message = arrow::ipc::root_as_message(&stream[start..end]).unwrap();
+    assert_eq!(
+        message.header_type(),
+        arrow::ipc::MessageHeader::RecordBatch
+    );
+    let body_end = end + usize::try_from(message.bodyLength()).unwrap();
+    assert_eq!(stream[body_end..], [255, 255, 255, 255, 0, 0, 0, 0]);
+    &stream[batch_start..body_end]
+}
+
+pub(crate) struct RecordFrame<'a> {
+    pub metadata: &'a [u8],
+    pub body: &'a [u8],
+    pub message: arrow::ipc::Message<'a>,
+}
+
+/// Project one closed frame before interpreting its geometry. The declared
+/// body extent includes padding, with no EOS or subsequent bytes.
+pub(crate) fn record_frame<'a, E: ReaderGeometryFailure>(
+    input: &'a [u8],
+    max_metadata_bytes: Option<usize>,
+    max_body_bytes: Option<usize>,
+    verifier: Option<&VerifierOptions>,
+    mut admission: Option<&mut progress::Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecordFrame<'a>, E> {
+    let (metadata, body_start) = metadata_core(
+        input,
+        0,
+        max_metadata_bytes,
+        verifier.map(|options| options.max_apparent_size),
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let derived;
+    let verifier = if let Some(verifier) = verifier {
+        verifier
+    } else {
+        derived = input_derived_batch_verifier(metadata.len())?;
+        if let Some(admission) = admission.as_deref_mut() {
+            admission.batch_work_add(
+                derived
+                    .max_apparent_size
+                    .checked_add(metadata.len())
+                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+            )?;
+        }
+        &derived
+    };
+    let message = verified_record_message_observed(metadata, verifier, work)?;
+    framing_require(
+        message.version() == arrow::ipc::MetadataVersion::V5
+            && message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
+        "constant IPC frame must be a V5 RecordBatch",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let body_length = nonnegative_length(message.bodyLength()).map_err(|_| {
+        TypeCodecError::InvalidShape("constant IPC body length is negative or unrepresentable")
+    })?;
+    framing_limit(
+        max_body_bytes.is_none_or(|maximum| body_length <= maximum),
+        "constant IPC body envelope exceeded",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    framing_require(
+        body_length % 8 == 0,
+        "constant IPC body framing is not eight-byte aligned",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let range = checked_range(input.len(), body_start, body_length)
+        .map_err(|_| TypeCodecError::InvalidShape("constant IPC body is truncated"))?;
+    framing_require(
+        range.end == input.len(),
+        "constant IPC frame has trailing bytes",
+        admission,
+        work,
+    )?;
+    Ok(RecordFrame {
+        metadata,
+        body: &input[range],
+        message,
+    })
+}
+
+pub(crate) fn verified_record_message_observed<'a>(
+    metadata: &'a [u8],
+    verifier: &VerifierOptions,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<arrow::ipc::Message<'a>, TypeCodecError> {
+    // Bound opaque verification even when the message names a different
+    // union member. RecordBatch's vectors of structs need no deep recursion.
+    let mut verifier = verifier.clone();
+    verifier.max_depth = verifier.max_depth.min(3);
+    verifier.max_tables = verifier.max_tables.min(2);
+    verifier
+        .max_apparent_size
+        .checked_add(metadata.len())
+        .ok_or(TypeCodecError::InvalidShape("IPC verifier work overflows"))?;
+    work.flush()?;
+    let parsed = novarocks_arrow_ipc_frame::verified_message(metadata, &verifier);
+    work.flush()?;
+    parsed.map_err(|_| TypeCodecError::InvalidShape("invalid Arrow IPC message metadata"))
+}
+
 fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
     input: &'a [u8],
     expected: &'f Field,
@@ -376,110 +492,18 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
             work,
         )?;
     }
-    let (schema, schema_end) = metadata_core(
+    let RecordFrame {
+        metadata: batch_metadata,
+        body: batch_body,
+        message,
+    } = record_frame(
         input,
-        0,
-        limits.map(|limits| limits.schema.max_flatbuffer_bytes),
-        verifier.map(|verifier| verifier.max_apparent_size),
-        admission.as_deref_mut(),
-        work,
-    )?;
-    if admission.is_some() {
-        framing_step(&mut admission, work)?;
-    }
-    // The schema author also proves bodyLength==0, so the next frame starts
-    // exactly at metadata_end. No speculative body skip or schema conversion.
-    if let Some(a) = admission.as_deref_mut() {
-        let source = a.source();
-        let mut capture = |f: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
-            a.requests(4, f.request_bytes, f.request_count)?;
-            a.schema_work(f.work_upper_bound)
-        };
-        let mut host = |facts: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
-            capture(facts).map_err(crate::host_projection_v2::ProjectionFailure::Host)
-        };
-        let verified = if let (Some(limits), Some(verifier)) = (limits, verifier) {
-            crate::ipc_schema_v2::verify_single_field_schema_with_host_in(
-                schema,
-                expected,
-                limits.schema,
-                verifier,
-                source,
-                usize::MAX,
-                &mut host,
-                work,
-            )
-        } else {
-            crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
-                schema, expected, &mut host, work,
-            )
-            .map(|_| ())
-        };
-        verified.map_err(|error| match error {
-            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
-            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
-        })?;
-    } else {
-        verify_single_field_schema_with_work(
-            schema,
-            expected,
-            limits.expect("fixed plain schema profile").schema,
-            verifier.expect("fixed plain verifier"),
-            work,
-        )?;
-    }
-    let (batch_metadata, body_start) = metadata_core(
-        input,
-        schema_end,
         limits.map(|limits| limits.batch.max_metadata_bytes),
-        verifier.map(|verifier| verifier.max_apparent_size),
+        limits.map(|limits| limits.batch.max_body_bytes),
+        verifier,
         admission.as_deref_mut(),
         work,
     )?;
-    let derived;
-    let batch_verifier = if let Some(verifier) = verifier {
-        verifier
-    } else {
-        derived = input_derived_batch_verifier(batch_metadata.len())?;
-        if let Some(a) = admission.as_deref_mut() {
-            a.batch_work_add(
-                derived
-                    .max_apparent_size
-                    .checked_add(batch_metadata.len())
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
-            )?;
-        }
-        &derived
-    };
-    let message = verified_message_observed(batch_metadata, batch_verifier, work)?;
-    framing_require(
-        message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
-        "constant IPC schema must precede exactly one RecordBatch",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let body_length = nonnegative_length(message.bodyLength()).map_err(|_| {
-        TypeCodecError::InvalidShape("negative or unrepresentable constant IPC body length")
-    })?;
-    framing_limit(
-        limits.is_none_or(|limits| body_length <= limits.batch.max_body_bytes),
-        "constant IPC body envelope exceeded",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    framing_require(
-        body_length % 8 == 0,
-        "constant IPC body framing is not eight-byte aligned",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let range = checked_range(input.len(), body_start, body_length)
-        .map_err(|_| TypeCodecError::InvalidShape("constant IPC body is truncated"))?;
-    framing_step(&mut admission, work)?;
-    // bodyLength already includes the writer's body padding. Rounding again
-    // could skip hostile bytes or a genuine EOS and change the format verdict.
-    let body_end = range.end;
-    let batch_body = &input[range];
     let geometry = if let Some(a) = admission.as_deref_mut() {
         crate::ipc_flat_batch_v2::preflight_verified_flat_record_batch_profile(
             message,
@@ -503,16 +527,6 @@ fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
         .ok_or(TypeCodecError::InvalidShape(
             "constant IPC batch header is missing",
         ))?;
-    let end = continuation_prefix(input, body_end);
-    framing_step(&mut admission, work)?;
-    let end =
-        end.map_err(|_| TypeCodecError::InvalidShape("constant IPC stream is missing EOS"))?;
-    framing_require(
-        matches!(end, ContinuationPrefix::End { next_offset } if next_offset == input.len()),
-        "constant IPC EOS has extra messages or trailing data",
-        admission.as_deref_mut(),
-        work,
-    )?;
     Ok(FlatConstantStream {
         input,
         field: expected,

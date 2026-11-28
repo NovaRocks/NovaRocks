@@ -720,27 +720,113 @@ fn change_stream_receiver_preserves_each_interrupted_control_prefix() {
 }
 
 #[test]
-fn prior_plan_contract_revision_is_refused_by_the_original_package_constructor() {
-    let package = rich_package();
-    let prior_revision = p::PLAN_CONTRACT_REVISION
-        .checked_sub(1)
-        .filter(|revision| *revision != 0)
-        .expect("test requires a prior plan contract revision");
-    let bytes = mutated(&package, |dto| {
-        dto.required.as_mut().unwrap().plan_contract_revision = prior_revision;
-    });
-    let error = refused(&bytes);
-    match error {
-        PackageDecodeError::Package(p::FragmentPackageError::Structure(errors)) => {
-            assert!(errors.to_string().contains("package.required"));
-            assert!(
-                errors
-                    .to_string()
-                    .contains("plan contract revision differs")
-            );
-        }
-        other => panic!("prior contract must reach the original package validator: {other:?}"),
+fn prior_plan_contract_revision_is_refused_before_constant_frames() {
+    let package = cv_package();
+    for prior_revision in [48, 49] {
+        let bytes = mutated(&package, |dto| {
+            dto.required.as_mut().unwrap().plan_contract_revision = prior_revision;
+            dto.constants[0].arrow_ipc = vec![0xff];
+        });
+        assert!(matches!(
+            refused(&bytes),
+            PackageDecodeError::Metadata(PackageMetadataCodecError::PlanContractRevision { required })
+                if required == prior_revision
+        ));
     }
+}
+
+#[test]
+fn complete_packages_round_trip_logical_depth_and_wide_constant_geometry() {
+    use arrow::{
+        array::{Array, ArrayRef, Int64Array, MapArray, StructArray},
+        buffer::OffsetBuffer,
+        datatypes::{DataType, Field},
+    };
+    use novarocks_type_contract::{FunctionValueType, MAX_VALUE_TYPE_DEPTH};
+    use std::sync::Arc;
+
+    let leaf: ArrayRef = Arc::new(Int64Array::from(vec![73]));
+    let map = (1..MAX_VALUE_TYPE_DEPTH).fold(Arc::clone(&leaf), |value, _| {
+        let key = Arc::new(Field::new("key", DataType::Int64, false));
+        let field = Arc::new(Field::new("value", value.data_type().clone(), true));
+        let entries = StructArray::new(
+            vec![key, field].into(),
+            vec![Arc::new(Int64Array::from(vec![9])), value],
+            None,
+        );
+        Arc::new(
+            MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(vec![0, 1].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        )
+    });
+    let wide = |child: ArrayRef| -> ArrayRef {
+        let fields = (0..64)
+            .map(|i| Field::new(format!("f{i}"), child.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        Arc::new(StructArray::new(fields.into(), vec![child; 64], None))
+    };
+    let width = wide(wide(leaf));
+    for carrier in [map, width] {
+        let control = Control::default();
+        let field = Arc::new(Field::new("original", carrier.data_type().clone(), true));
+        let value = FunctionValueType::try_from_field(&field).unwrap();
+        let pool = p::ConstantPool::try_new(
+            Arc::clone(&field),
+            value,
+            carrier.to_data(),
+            novarocks_constant_contract::ConstantValidation::INPUT_DERIVED,
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let original = values_package_with_pool(1, 1, pool);
+        let bytes = encode(&original).unwrap();
+        let recovered =
+            decode_fragment_package(&bytes, &model(), &decode_limits(), &control).unwrap();
+        let pool = recovered
+            .constants()
+            .entries()
+            .get(&p::ConstantPoolId::new(0))
+            .unwrap();
+        assert_eq!(pool.field(), field.as_ref());
+        assert_eq!(pool.array().as_ref(), carrier.as_ref());
+    }
+}
+
+#[test]
+fn current_package_refuses_a_legacy_eos_after_a_valid_constant_record() {
+    let package = cv_package();
+    let bytes = mutated(&package, |dto| {
+        dto.constants[0]
+            .arrow_ipc
+            .extend([255, 255, 255, 255, 0, 0, 0, 0]);
+    });
+    assert!(matches!(refused(&bytes), PackageDecodeError::Constant(_)));
+}
+
+#[test]
+fn original_revision_47_stream_is_refused_by_the_current_receiver() {
+    // Original cv_package emitted at a9b7293be9 through the public package
+    // encoder. The old payload contains Schema, one RecordBatch, and EOS.
+    let bytes = include_bytes!("fixtures/revision_47_constant_package.pb");
+    let old = wire::FragmentPackage::decode(bytes.as_slice()).unwrap();
+    assert_eq!(old.required.unwrap().plan_contract_revision, 47);
+    assert_eq!(old.constants.len(), 1);
+    let frame = &old.constants[0].arrow_ipc;
+    assert_eq!(frame[..4], [0xff; 4]);
+    assert_eq!(frame[frame.len() - 8..], [255, 255, 255, 255, 0, 0, 0, 0]);
+    assert!(matches!(
+        refused(bytes),
+        PackageDecodeError::Metadata(PackageMetadataCodecError::PlanContractRevision {
+            required: 47
+        })
+    ));
 }
 
 #[test]

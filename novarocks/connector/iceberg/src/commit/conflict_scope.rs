@@ -31,6 +31,7 @@ use arrow::temporal_conversions::timestamp_us_to_datetime;
 use novarocks_spi::connector::read_stack::{Bound, ConnectorValue, Domain, TupleDomain};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+    ConnectorRowMutationPreparationIdentity,
 };
 use uuid::Uuid;
 
@@ -46,11 +47,11 @@ use crate::iceberg::spec::{
 };
 use crate::typed_read::{IcebergColumnHandle, IcebergMetadataColumn};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RewrittenTargetBinding {
     pub(crate) table_uuid: Uuid,
     pub(crate) snapshot_id: Option<i64>,
-    pub(crate) preparation_digest: [u8; 32],
+    pub(crate) preparation_identity: ConnectorRowMutationPreparationIdentity,
 }
 
 #[derive(Debug)]

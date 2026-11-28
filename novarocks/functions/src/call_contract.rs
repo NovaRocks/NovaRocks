@@ -61,8 +61,10 @@ impl FunctionCallContract {
                     "signature owner differs from the exact input borrow",
                 ));
             }
+            let expects_state = input.kind == FunctionKind::Aggregate
+                && input.request.logical_argument_count == input.request.arguments.len();
             if !input.context.matches_kind(input.kind)
-                || (input.kind == FunctionKind::Aggregate) != input.selected.aggregate.is_some()
+                || expects_state != input.selected.aggregate.is_some()
             {
                 return Err(invalid(
                     "aggregate state contract differs from the exact function kind",

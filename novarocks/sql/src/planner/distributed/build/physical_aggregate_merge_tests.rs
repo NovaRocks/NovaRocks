@@ -253,7 +253,14 @@ fn merge_genuine_count_star_keeps_logical_zero_and_physical_state_one() {
     );
     assert_eq!(
         kernel.contract().state_format().as_str(),
-        entry.source().binding.state_format.as_str()
+        entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
+            .as_str()
     );
     assert_eq!(
         result.frozen.effects.argument_control,
@@ -285,7 +292,13 @@ fn merge_genuine_count_min_max_keep_original_complete_logical_signature() {
         assert_eq!(kernel.contract().call().logical_argument_count(), 1);
         assert_eq!(
             kernel.contract().intermediate_type(),
-            &entry.source().binding.intermediate_type
+            &entry
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
         );
         assert_eq!(
             kernel.contract().state_input_type(),

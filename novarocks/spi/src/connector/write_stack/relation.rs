@@ -59,12 +59,7 @@ pub const ROOT_WRITE_RESULT_COLUMN_COUNT: usize = 12;
 /// The typed tail is intentionally wide, but still bounded before allocations
 /// at every plan boundary.
 pub const MAX_WRITER_AUXILIARY_CHANNELS: usize = 4_096;
-pub use novarocks_connector_contract::{
-    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,
-    MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD, MAX_WRITE_RELATION_METADATA_KEY_BYTES,
-    MAX_WRITE_RELATION_METADATA_VALUE_BYTES, MAX_WRITE_RELATION_TYPE_DEPTH,
-    WRITE_FIELD_ALLOCATION_CHARGE,
-};
+pub use novarocks_connector_contract::WRITE_FIELD_ALLOCATION_CHARGE;
 
 /// The first reserved id of the write relation's columns.
 ///
@@ -345,7 +340,6 @@ impl WriterAuxiliaryChannel {
                 "writer auxiliary channel name is empty",
             )));
         }
-        validate_field_name(name).map_err(WriterSchemaCreationFailure::Contract)?;
         if *value_type.data_type() == DataType::Null {
             return Err(WriterSchemaCreationFailure::Contract(corrupt(
                 "writer auxiliary channel cannot have Null type",
@@ -652,8 +646,6 @@ fn corrupt(message: &'static str) -> ConnectorError {
 fn resource_exhausted(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
 }
-
-use novarocks_connector_contract::validate_write_field_name as validate_field_name;
 
 /// A row a `TableWriter` operator emits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1220,7 +1212,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use novarocks_connector_contract::charge_write_schema as charge_decoded;
 
     #[test]
     fn both_relations_share_the_same_four_primitive_columns() {
@@ -1895,21 +1886,12 @@ mod tests {
 
     #[test]
     fn relation_limits_accept_boundary_and_reject_plus_one() {
-        let max_name = "n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES);
         WriterAuxiliaryChannel::try_new(
             1,
-            max_name,
+            "n".repeat(1025),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
-        .expect("name boundary");
-        assert!(
-            WriterAuxiliaryChannel::try_new(
-                1,
-                "n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES + 1),
-                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
-            )
-            .is_err()
-        );
+        .expect("legal wide name");
 
         let channels = (0..MAX_WRITER_AUXILIARY_CHANNELS)
             .map(|index| {
@@ -1942,66 +1924,21 @@ mod tests {
             1,
             "depth",
             novarocks_type_contract::FunctionValueType::new(
-                nested(MAX_WRITE_RELATION_TYPE_DEPTH),
+                nested(novarocks_type_contract::MAX_VALUE_TYPE_DEPTH),
                 true,
             ),
         )
         .expect("depth boundary");
-        assert!(
-            WriterAuxiliaryChannel::try_new(
-                1,
-                "depth",
-                novarocks_type_contract::FunctionValueType::new(
-                    nested(MAX_WRITE_RELATION_TYPE_DEPTH + 1),
-                    true
-                ),
-            )
-            .is_err()
-        );
-
-        let mut bytes = 0;
-        charge_decoded(&mut bytes, MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES)
-            .expect("allocation boundary");
-        assert!(charge_decoded(&mut bytes, 1).is_err());
-
-        // Source annotations are absent from execution value identity. Exercise
-        // the existing frozen descriptor limit with actual fields and names.
-        let large_type = DataType::Struct(Fields::from(
-            (0..256)
-                .map(|index| {
-                    let mut name = format!("payload_{index:04}");
-                    name.push_str(&"n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES - name.len()));
-                    Field::new(name, DataType::Int64, false)
-                })
-                .collect::<Vec<_>>(),
-        ));
-        let value_type = novarocks_type_contract::FunctionValueType::new(large_type, true);
-        let field = value_type.try_to_field("large_0000").unwrap();
-        let mut individual_charge = 0;
-        novarocks_connector_contract::validate_write_field_schema(
-            &field,
-            1,
-            &mut individual_charge,
+        let error = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            nested(novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical,
         )
-        .unwrap();
-        let prefix_charge = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
-        let count = (MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - prefix_charge) / individual_charge;
-        assert!(count < MAX_WRITER_AUXILIARY_CHANNELS);
-        let channels = (0..count + 1)
-            .map(|index| {
-                WriterAuxiliaryChannel::try_new(
-                    index as u32,
-                    format!("large_{index:04}"),
-                    value_type.clone(),
-                )
-                .expect("individual channel remains below the descriptor limit")
-            })
-            .collect::<Vec<_>>();
-        WriterMultiplexSchema::try_new(channels[..count].to_vec())
-            .expect("combined descriptor boundary");
-        assert_eq!(
-            WriterMultiplexSchema::try_new(channels).unwrap_err().kind(),
-            ConnectorErrorKind::ResourceExhausted
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&novarocks_type_contract::MAX_VALUE_TYPE_DEPTH.to_string())
         );
     }
 }

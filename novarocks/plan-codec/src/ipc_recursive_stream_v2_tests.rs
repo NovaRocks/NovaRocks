@@ -67,18 +67,11 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 28,
     }
 }
-fn schema_limits() -> IpcSchemaProjectionLimits {
-    IpcSchemaProjectionLimits {
-        max_field_occurrences: 4096,
-        max_type_occurrences: 4096,
-        max_string_bytes: 1 << 20,
-        max_flatbuffer_bytes: 1 << 20,
-    }
-}
+
 fn limits() -> RecursiveStreamProjectionLimits {
     RecursiveStreamProjectionLimits {
         max_input_bytes: 1 << 24,
-        schema: schema_limits(),
+
         batch: RecursiveBatchProjectionLimits {
             flat: crate::ipc_flat_batch_v2::FlatBatchProjectionLimits {
                 max_metadata_bytes: 1 << 20,
@@ -118,21 +111,7 @@ fn fixture(array: ArrayRef, field: &Arc<Field>) -> Vec<u8> {
         writer.write(&batch).unwrap();
         writer.finish().unwrap();
     }
-    // Independently emitted standard RecordBatch with the exact frozen schema.
-    let schema_end = 8 + u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let exact = crate::ipc_schema_v2::encode_single_field_schema(
-        field,
-        schema_limits(),
-        &Control::default(),
-    )
-    .unwrap();
-    let padded = exact.len().next_multiple_of(8);
-    let mut result = vec![255u8; 4];
-    result.extend_from_slice(&(padded as u32).to_le_bytes());
-    result.extend_from_slice(&exact);
-    result.resize(8 + padded, 0);
-    result.extend_from_slice(&bytes[schema_end..]);
-    result
+    crate::ipc_flat_stream_v2::standard_test_record_frame(&bytes).to_vec()
 }
 fn nested() -> ArrayRef {
     let json = Arc::new(

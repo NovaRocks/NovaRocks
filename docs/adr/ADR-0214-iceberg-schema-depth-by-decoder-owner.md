@@ -53,6 +53,8 @@ code-anchors:
 5. **可恢复拒绝规则。** 两处拒绝保留同一原因与恢复条件：iceberg-rust 正式版提供公开的按字节和表 metadata 解码 manifest 的入口，且不依赖 `schema-id` 是否存在；依 ADR-0174 重新基线后才移除判定。保留既有安全错误投影与细节长度边界。
 6. **有限支持规则。** 当前仅保留已有解析与拒绝能力，不以 metadata 可解证明相同深度的 Native scan、Writer 或值路径可用。用户已撤回本次最大深度读写扩展与最大深度验收；现有 SDK 契约、解码及 dev/release 栈材料只证明其实际局部覆盖，不作为完整 logical64 保证。两条 depth64 原生用例暂时 ignore，按现有精确 case 处置保留原因、owner、恢复条件与原失败，不计为 PASS。
 
+[ADR-0279](ADR-0279-one-logical-type-depth-and-schema-free-constants.md) 记录后续接受的 F9 深度恢复设计及验证状态。SDK manifest 的准入及上游恢复条件继续沿本 ADR。
+
 ## 接受的妥协（诚实记录）
 
 合法但内嵌 schema JSON 超过 127 个容器的表暂不支持；纯 STRUCT 链约从 42 层开始拒绝。LIST/MAP 或混合深类型仍受现有 scan、Writer 与值路径能力约束，不承诺完整逻辑深度64。这个限制来自当前 SDK 对 manifest 内嵌 schema 的重新解析，不是格式规范要求，也不是资源配额。

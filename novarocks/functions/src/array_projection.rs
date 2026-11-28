@@ -32,7 +32,10 @@ use arrow_array::{
     ListArray, ListViewArray, MapArray, StructArray, UnionArray, make_array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Fields, UnionFields};
-use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile};
+use novarocks_type_contract::{
+    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_TYPE_PATH_DEPTH, ValueTypeError,
+    visit_arrow_layout_nodes_observed,
+};
 
 mod failure;
 pub use failure::{
@@ -90,10 +93,6 @@ pub enum ArrayNormalizationStep<'a> {
     CreateChunkColumns {
         channels: usize,
     },
-    /// One actual temporary Vec<ArrayPathStep>, admitted before allocation.
-    CreateProjectionPath {
-        steps: usize,
-    },
     /// The sole new immutable Arc<RecordBatch> holder, before allocation.
     CreateRecordBatchWrapper,
     SliceArray {
@@ -143,12 +142,9 @@ where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    normalization_preflight_observed(
-        field.data_type(),
-        ArrowTypeDepth::ROOT,
-        &mut 0,
-        &mut |source| observe(ArrayNormalizationStep::InspectType(source)),
-    )?;
+    normalization_preflight_observed(field.data_type(), &mut |source| {
+        observe(ArrayNormalizationStep::InspectType(source))
+    })?;
     normalize_field(field, field.name(), &mut observe)
 }
 
@@ -165,12 +161,9 @@ where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    normalization_preflight_observed(
-        array.data_type(),
-        ArrowTypeDepth::ROOT,
-        &mut 0,
-        &mut |source| observe(ArrayNormalizationStep::InspectType(source)),
-    )?;
+    normalization_preflight_observed(array.data_type(), &mut |source| {
+        observe(ArrayNormalizationStep::InspectType(source))
+    })?;
     let target = normalize_type(array.data_type(), &mut observe)?;
     match target {
         Cow::Borrowed(_) => Ok(Arc::clone(array)),
@@ -180,60 +173,31 @@ where
 
 fn normalization_preflight_observed<E: From<ArrayProjectionFailure>>(
     source: &DataType,
-    depth: ArrowTypeDepth,
-    nodes: &mut usize,
     observe: &mut impl FnMut(&DataType) -> Result<(), E>,
 ) -> Result<(), E> {
-    observe(source)?;
-    depth
-        .check(ArrowTypeProfile::Value)
-        .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
-    *nodes = nodes.checked_add(1).ok_or_else(|| {
-        E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        ))
-    })?;
-    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        )));
+    visit_projection_nodes_observed(source, |source, _| observe(source))
+}
+
+fn visit_projection_nodes_observed<E: From<ArrayProjectionFailure>>(
+    source: &DataType,
+    mut observe: impl FnMut(&DataType, ArrowTypeDepth) -> Result<(), E>,
+) -> Result<(), E> {
+    enum VisitError<E> {
+        Type(ValueTypeError),
+        Caller(E),
     }
-    let mut child = |ty: &DataType, child_depth: Result<ArrowTypeDepth, _>| {
-        normalization_preflight_observed(
-            ty,
-            child_depth.map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?,
-            nodes,
-            observe,
-        )
-    };
-    match source {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _) => child(field.data_type(), depth.value_child())?,
-        DataType::Map(field, _) => child(field.data_type(), depth.map_entries())?,
-        DataType::Struct(fields) => {
-            for field in fields {
-                child(field.data_type(), depth.value_child())?;
-            }
+    impl<E> From<ValueTypeError> for VisitError<E> {
+        fn from(error: ValueTypeError) -> Self {
+            Self::Type(error)
         }
-        DataType::Union(fields, _) => {
-            for (_, field) in fields.iter() {
-                child(field.data_type(), depth.value_child())?;
-            }
-        }
-        DataType::Dictionary(keys, values) => {
-            child(keys, depth.encoding_child())?;
-            child(values, depth.encoding_child())?;
-        }
-        DataType::RunEndEncoded(ends, values) => {
-            child(ends.data_type(), depth.encoding_child())?;
-            child(values.data_type(), depth.encoding_child())?;
-        }
-        _ => {}
     }
-    Ok(())
+    visit_arrow_layout_nodes_observed(source, ArrowTypeProfile::Value, |source, depth| {
+        observe(source, depth).map_err(VisitError::Caller)
+    })
+    .map_err(|error| match error {
+        VisitError::Type(error) => E::from(ArrayProjectionFailure::ValueType(error)),
+        VisitError::Caller(error) => error,
+    })
 }
 
 /// Borrowed canonical-representation validation for already-authored schemas.
@@ -248,9 +212,7 @@ pub fn execution_field_is_normalized_observed<E: From<ArrayProjectionFailure>>(
     work: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
     work(1)?;
-    normalization_preflight_observed(field.data_type(), ArrowTypeDepth::ROOT, &mut 0, &mut |_| {
-        work(1)
-    })?;
+    normalization_preflight_observed(field.data_type(), &mut |_| work(1))?;
     Ok(field.metadata().as_arc().is_none()
         && !needs_normalization(field.data_type(), &mut |step| match step {
             ArrayNormalizationStep::InspectField { source, name } => {
@@ -489,7 +451,7 @@ where
     F: for<'b> FnMut(ArrayNormalizationStep<'b>) -> Result<(), E>,
 {
     for source in [left, right] {
-        normalization_preflight_observed(source, ArrowTypeDepth::ROOT, &mut 0, &mut |source| {
+        normalization_preflight_observed(source, &mut |source| {
             observe(ArrayNormalizationStep::InspectType(source))
         })?;
     }
@@ -651,14 +613,22 @@ where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    rebuild_array_at(source, target, observe, &[], ArrowTypeDepth::ROOT)
+    normalization_preflight_observed(source.data_type(), &mut |ty| {
+        observe(ArrayNormalizationStep::InspectType(ty))
+    })?;
+    normalization_preflight_observed(target, &mut |ty| {
+        observe(ArrayNormalizationStep::InspectType(ty))
+    })?;
+    let mut path = [ArrayPathStep::ListItem; MAX_ARROW_TYPE_PATH_DEPTH];
+    rebuild_array_at(source, target, observe, &mut path, 0, ArrowTypeDepth::ROOT)
 }
 
 fn rebuild_array_at<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    path: &[ArrayPathStep],
+    path: &mut [ArrayPathStep],
+    path_len: usize,
     depth: ArrowTypeDepth,
 ) -> Result<ArrayRef, E>
 where
@@ -675,7 +645,7 @@ where
         return Ok(Arc::clone(source));
     }
     observe(ArrayNormalizationStep::RebuildArray {
-        path,
+        path: &path[..path_len],
         source,
         target,
     })?;
@@ -684,7 +654,8 @@ where
         // logical NULL rule to a safely validated source representation.
         // The typed ingress owner checks required logical values with all
         // active ancestor masks; this operation authors no semantic promise.
-        let result = rebuild_default_validated_container(source, target, observe, path, depth)?;
+        let result =
+            rebuild_default_validated_container(source, target, observe, path, path_len, depth)?;
         observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
         return Ok(result);
     }
@@ -704,6 +675,7 @@ where
                     field.data_type(),
                     observe,
                     path,
+                    path_len,
                     depth,
                     ArrayPathStep::StructField(index),
                 )?);
@@ -725,6 +697,7 @@ where
                 field.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::ListItem,
             )?;
@@ -745,6 +718,7 @@ where
                 field.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::ListItem,
             )?;
@@ -765,6 +739,7 @@ where
                 field.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::ListItem,
             )?;
@@ -786,6 +761,7 @@ where
                 field.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::ListItem,
             )?;
@@ -807,6 +783,7 @@ where
                 field.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::ListItem,
             )?;
@@ -840,6 +817,7 @@ where
                         field.data_type(),
                         observe,
                         path,
+                        path_len,
                         depth,
                         if index == 0 {
                             ArrayPathStep::MapKey
@@ -880,6 +858,7 @@ where
                         field.data_type(),
                         observe,
                         path,
+                        path_len,
                         depth,
                         ArrayPathStep::UnionField(id),
                     )
@@ -898,7 +877,9 @@ where
         DataType::Dictionary(keys, values) => {
             macro_rules! dictionary {
                 ($key:ty) => {
-                    rebuild_dictionary::<$key, E, F>(source, values, observe, path, depth)?
+                    rebuild_dictionary::<$key, E, F>(
+                        source, values, observe, path, path_len, depth,
+                    )?
                 };
             }
             match keys.as_ref() {
@@ -935,6 +916,7 @@ where
                 values.data_type(),
                 observe,
                 path,
+                path_len,
                 depth,
                 ArrayPathStep::RunEndValue,
             )?;
@@ -965,7 +947,8 @@ fn rebuild_default_validated_container<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    path: &[ArrayPathStep],
+    path: &mut [ArrayPathStep],
+    path_len: usize,
     depth: ArrowTypeDepth,
 ) -> Result<ArrayRef, E>
 where
@@ -984,6 +967,7 @@ where
                         field.data_type(),
                         observe,
                         path,
+                        path_len,
                         depth,
                         ArrayPathStep::StructField(index),
                     )?
@@ -1010,6 +994,7 @@ where
                     field.data_type(),
                     observe,
                     path,
+                    path_len,
                     depth,
                     ArrayPathStep::ListItem,
                 )?
@@ -1032,6 +1017,7 @@ where
                         field.data_type(),
                         observe,
                         path,
+                        path_len,
                         depth,
                         if index == 0 {
                             ArrayPathStep::MapKey
@@ -1084,7 +1070,8 @@ fn rebuild_array_child<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    path: &[ArrayPathStep],
+    path: &mut [ArrayPathStep],
+    path_len: usize,
     depth: ArrowTypeDepth,
     child: ArrayPathStep,
 ) -> Result<ArrayRef, E>
@@ -1092,9 +1079,6 @@ where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    // The actual path can include encoding and Map scaffolding beyond the
-    // logical contract. Its temporary storage follows the observed path length,
-    // never a second local depth/wrapper quota or a derived fixed capacity.
     let depth = match child {
         ArrayPathStep::MapKey | ArrayPathStep::MapValue => {
             depth.map_entries().and_then(ArrowTypeDepth::value_child)
@@ -1106,32 +1090,19 @@ where
     depth
         .check(ArrowTypeProfile::Value)
         .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
-    let steps = path
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| E::from(ArrayProjectionFailure::RequestArithmetic))?;
-    let layout = std::alloc::Layout::array::<ArrayPathStep>(steps).map_err(|source| {
-        E::from(ArrayProjectionFailure::ArrayLayout {
-            count: steps,
-            width: std::mem::size_of::<ArrayPathStep>(),
-            source,
-        })
-    })?;
-    observe(ArrayNormalizationStep::InspectConstructionWork {
-        units: layout.size(),
-    })?;
-    observe(ArrayNormalizationStep::CreateProjectionPath { steps })?;
-    let mut next = Vec::with_capacity(steps);
-    next.extend_from_slice(path);
-    next.push(child);
-    rebuild_array_at(source, target, observe, &next, depth)
+    let step = path
+        .get_mut(path_len)
+        .ok_or_else(|| E::from(ArrayProjectionFailure::ValueType(ValueTypeError::TooDeep)))?;
+    *step = child;
+    rebuild_array_at(source, target, observe, path, path_len + 1, depth)
 }
 
 fn rebuild_dictionary<K, E, F>(
     source: &ArrayRef,
     target_values: &DataType,
     observe: &mut F,
-    path: &[ArrayPathStep],
+    path: &mut [ArrayPathStep],
+    path_len: usize,
     depth: ArrowTypeDepth,
 ) -> Result<ArrayRef, E>
 where
@@ -1145,6 +1116,7 @@ where
         target_values,
         observe,
         path,
+        path_len,
         depth,
         ArrayPathStep::DictionaryValue,
     )?;
@@ -1666,113 +1638,90 @@ mod projection_path_tests {
     use super::*;
     use arrow_array::Int32Array;
     use arrow_buffer::OffsetBuffer;
-    use std::cell::{Cell, RefCell};
 
-    fn encoded_source(wrappers: usize) -> (ArrayRef, *const u8) {
-        let values = Arc::new(Int32Array::from(vec![7]));
-        let payload = values.values().inner().as_ptr();
-        let mut source: ArrayRef = Arc::new(
+    fn dictionary(values: ArrayRef) -> ArrayRef {
+        Arc::new(DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), values).unwrap())
+    }
+
+    fn list(values: ArrayRef) -> ArrayRef {
+        Arc::new(
             ListArray::try_new(
-                Arc::new(Field::new("external-role", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "external-role",
+                    values.data_type().clone(),
+                    true,
+                )),
                 OffsetBuffer::new(vec![0i32, 1].into()),
                 values,
                 None,
             )
             .unwrap(),
-        );
-        for _ in 0..wrappers {
-            source = Arc::new(
-                DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), source).unwrap(),
-            );
-        }
-        (source, payload)
+        )
     }
 
     #[test]
-    fn projection_paths_beyond_the_removed_wrapper_bound_use_actual_observed_storage() {
-        // Logical depth is two; encodings do not introduce another quota.
-        // This also crosses the removed 126-entry local projection path cap.
-        let wrappers = 128;
-        let (source, payload) = encoded_source(wrappers);
-        let largest_path = Cell::new(0);
-        let actual_path_layouts = RefCell::new(Vec::new());
-        let output =
-            normalize_execution_array_observed::<ArrayProjectionFailure, _>(&source, |step| {
-                if let ArrayNormalizationStep::CreateProjectionPath { steps } = step {
-                    largest_path.set(largest_path.get().max(steps));
-                    // Use the same actual construction author, not a second estimate
-                    // or an observer that silently authorizes the path allocation.
-                    observe_array_normalization_construction(
-                        step,
-                        &mut |layout| {
-                            actual_path_layouts.borrow_mut().push(layout);
-                            Ok(())
-                        },
-                        &mut |_| Ok(()),
-                        &mut |_| Ok(()),
-                    )?;
-                } else {
-                    observe_array_normalization_construction(
-                        step,
-                        &mut |_| Ok(()),
-                        &mut |_| Ok(()),
-                        &mut |_| Ok(()),
-                    )?;
-                }
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(largest_path.get(), wrappers + 1);
-        assert!(actual_path_layouts.borrow().iter().any(|layout| {
-            *layout == std::alloc::Layout::array::<ArrayPathStep>(wrappers + 1).unwrap()
-        }));
-        let mut current = &output;
-        for _ in 0..wrappers {
-            current = current
-                .as_any()
-                .downcast_ref::<DictionaryArray<Int32Type>>()
-                .unwrap()
-                .values();
+    fn consecutive_dictionary_wrappers_are_rejected_before_array_construction() {
+        let mut source = list(Arc::new(Int32Array::from(vec![7])));
+        for _ in 0..128 {
+            source = dictionary(source);
         }
-        let list = current.as_any().downcast_ref::<ListArray>().unwrap();
+        let result =
+            normalize_execution_array_observed::<ArrayProjectionFailure, _>(&source, |step| {
+                assert!(matches!(step, ArrayNormalizationStep::InspectType(_)));
+                Ok(())
+            });
+        assert!(matches!(result, Err(ArrayProjectionFailure::ValueType(_))));
+    }
+
+    #[test]
+    fn separate_dictionary_occurrences_preserve_rows_nulls_and_leaf_backing() {
+        let inner_values = Arc::new(Int32Array::from(vec![Some(7), None]));
+        let payload = inner_values.values().inner().as_ptr();
+        let inner = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), inner_values.clone())
+                .unwrap(),
+        );
+        let source = dictionary(list(inner));
+        let output = normalize_execution_array(&source).unwrap();
+        let outer = output
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let list = outer.values().as_any().downcast_ref::<ListArray>().unwrap();
         let DataType::List(field) = list.data_type() else {
             panic!("List remains the original value representation")
         };
         assert_eq!(field.name(), "item");
-        assert_eq!(
-            list.values()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(0),
-            7
-        );
-        assert_eq!(
-            list.values()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values()
-                .inner()
-                .as_ptr(),
-            payload
-        );
+        let inner = list
+            .values()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let values = inner
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 7);
+        assert!(values.is_null(1));
+        assert_eq!(values.values().inner().as_ptr(), payload);
     }
 
     #[test]
-    fn path_storage_first_refusal_has_no_tail_and_keeps_the_original_source() {
-        let (source, _) = encoded_source(2);
+    fn first_original_refusal_on_child_array_keeps_the_source() {
+        let source = dictionary(list(Arc::new(Int32Array::from(vec![7]))));
         let original = crate::KernelFailure::Operational(crate::KernelDiagnostic::new(
-            "original projection path refusal",
+            "original projection child refusal",
         ));
         let mut refused = false;
         let result =
             normalize_execution_array_observed::<crate::KernelFailure, _>(&source, |step| {
-                assert!(
-                    !refused,
-                    "no work or construction follows the first original refusal"
-                );
-                if matches!(step, ArrayNormalizationStep::CreateProjectionPath { .. }) {
+                assert!(!refused, "no observation follows the first refusal");
+                if matches!(
+                    step,
+                    ArrayNormalizationStep::RebuildArray { path, .. }
+                        if path == [ArrayPathStep::DictionaryValue]
+                ) {
                     refused = true;
                     Err(original.clone())
                 } else {
@@ -1785,12 +1734,7 @@ mod projection_path_tests {
             .as_any()
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .unwrap();
-        let inner = outer
-            .values()
-            .as_any()
-            .downcast_ref::<DictionaryArray<Int32Type>>()
-            .unwrap();
-        let DataType::List(field) = inner.values().data_type() else {
+        let DataType::List(field) = outer.values().data_type() else {
             panic!("original List")
         };
         assert_eq!(field.name(), "external-role");

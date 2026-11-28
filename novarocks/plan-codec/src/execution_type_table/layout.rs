@@ -23,8 +23,8 @@ use super::{
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, UnionFields, UnionMode};
 use logical_wire::logical_type_definition::Kind as L;
 use novarocks_type_contract::{
-    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_FIELD_NAME_BYTES, MAX_VALUE_TYPE_NODES,
-    ValueLayout, ValueSchemaCreationFactory, ValueTypeStorageLifetime,
+    ArrowTypeDepth, ArrowTypeProfile, ValueLayout, ValueSchemaCreationFactory,
+    ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, sync::Arc};
 use wire::arrow_physical_type::Kind as P;
@@ -33,7 +33,6 @@ use wire::arrow_physical_type::Kind as P;
 pub(super) struct Counts {
     nodes: usize,
     strings: usize,
-    root_nodes: usize,
 }
 impl Counts {
     fn node<H>(
@@ -43,13 +42,6 @@ impl Counts {
         context: &mut Context<'_, '_, H>,
     ) -> Result<(), Failure<H>> {
         context.step()?;
-        if depth.physical() == 1 {
-            self.root_nodes = 0;
-        }
-        self.root_nodes = self
-            .root_nodes
-            .checked_add(1)
-            .ok_or_else(resources::arithmetic)?;
         self.nodes = self
             .nodes
             .checked_add(1)
@@ -57,7 +49,7 @@ impl Counts {
         depth
             .check(ArrowTypeProfile::CanonicalValue)
             .map_err(|_| invalid("execution layout exceeds logical or physical depth profile"))?;
-        if self.root_nodes > MAX_VALUE_TYPE_NODES || self.nodes > limits.max_layout_nodes {
+        if self.nodes > limits.max_layout_nodes {
             return Err(invalid("execution layout exceeds depth or node profile"));
         }
         Ok(())
@@ -100,10 +92,8 @@ fn source_header<H>(
     context: &mut Context<'_, '_, H>,
 ) -> Result<(), Failure<H>> {
     context.step()?;
-    if !field.metadata().is_empty() || field.name().len() > MAX_ARROW_FIELD_NAME_BYTES {
-        return Err(invalid(
-            "execution layout field is not metadata-free or exceeds name bound",
-        ));
+    if !field.metadata().is_empty() {
+        return Err(invalid("execution layout field contains metadata"));
     }
     counts.string(field.name().len(), limits)?;
     for _ in field.name().bytes() {
@@ -416,10 +406,7 @@ fn field_header<H>(
             "layout field reference disagrees with parent logical role",
         ));
     }
-    if field.name.len() > MAX_ARROW_FIELD_NAME_BYTES
-        || !name_equal(&field.name, name, context)?
-        || field.nullable != nullable
-    {
+    if !name_equal(&field.name, name, context)? || field.nullable != nullable {
         return Err(invalid(
             "layout field name or nullability disagrees with logical role",
         ));

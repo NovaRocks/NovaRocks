@@ -119,7 +119,7 @@ fn fixture() -> Fixture {
         .unwrap();
     assert_eq!(resolved.logical_argument_count, 1);
     assert_eq!(resolved.selected.argument_types.len(), 2);
-    assert!(resolved.selected.aggregate.is_some());
+    assert!(resolved.selected.aggregate.is_none());
     let binding = SqlFunctionBinding::from_test(resolved, DecimalOverflowPolicy::ReportError);
     Fixture {
         source: AggregateArgumentSource::logical_update(vec![argument], vec![order], binding),

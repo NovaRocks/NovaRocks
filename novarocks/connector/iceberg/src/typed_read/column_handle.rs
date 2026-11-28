@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::wire::dto;
-use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_NAME_BYTES};
+use novarocks_proto_codec::connector_read::MAX_JSON_BYTES;
 use novarocks_spi::connector::read_stack::{
     Bound, ColumnHandle, ConnectorValue, ConnectorValueType, Domain, Range, TupleDomain, ValueSet,
 };
@@ -41,14 +41,11 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::iceberg::spec::{NestedField, Schema, Type};
 
 /// Maximum nesting depth of a column identity tree, mirroring the wire bound.
-pub const MAX_COLUMN_IDENTITY_DEPTH: usize = 64;
+pub const MAX_COLUMN_IDENTITY_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
 
 /// Maximum number of field IDs in one dereference path, mirroring the wire
 /// bound on `IcebergColumnHandle.field_id_path`.
-pub const MAX_FIELD_ID_PATH_DEPTH: usize = 64;
-
-/// Maximum number of children one column identity may declare.
-pub const MAX_COLUMN_IDENTITY_CHILDREN: usize = 4096;
+pub const MAX_FIELD_ID_PATH_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH - 1;
 
 pub(crate) fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
@@ -86,6 +83,7 @@ pub struct ColumnIdentity {
     name: Arc<str>,
     category: ColumnIdentityCategory,
     children: Vec<ColumnIdentity>,
+    depth: usize,
 }
 
 impl ColumnIdentity {
@@ -99,16 +97,8 @@ impl ColumnIdentity {
             return Err(invalid("iceberg column identity field id must be positive"));
         }
         let name = name.as_ref();
-        if name.is_empty() || name.len() > MAX_NAME_BYTES {
-            return Err(invalid(
-                "iceberg column identity name must be non-empty and bounded",
-            ));
-        }
-        if children.len() > MAX_COLUMN_IDENTITY_CHILDREN {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "iceberg column identity child count exceeds the hard limit",
-            ));
+        if name.is_empty() {
+            return Err(invalid("iceberg column identity name must be non-empty"));
         }
         // The arity of each category is a table-format fact, not a convention:
         // an array always has exactly one element field and a map always has a
@@ -138,11 +128,18 @@ impl ColumnIdentity {
                 }
             }
         }
+        let depth = 1 + children.iter().map(|child| child.depth).max().unwrap_or(0);
+        if depth > MAX_COLUMN_IDENTITY_DEPTH {
+            return Err(invalid(
+                novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
+            ));
+        }
         Ok(Self {
             field_id,
             name: Arc::from(name),
             category,
             children,
+            depth,
         })
     }
 
@@ -162,9 +159,8 @@ impl ColumnIdentity {
 
     fn from_nested_field_at(field: &NestedField, depth: usize) -> Result<Self, ConnectorError> {
         if depth > MAX_COLUMN_IDENTITY_DEPTH {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "iceberg column identity nesting exceeds the hard limit",
+            return Err(invalid(
+                novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
             ));
         }
         let (category, children) = match field.field_type.as_ref() {
@@ -232,9 +228,8 @@ impl ColumnIdentity {
 
     fn from_proto_at(raw: &dto::ColumnIdentity, depth: usize) -> Result<Self, ConnectorError> {
         if depth > MAX_COLUMN_IDENTITY_DEPTH {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "iceberg column identity nesting exceeds the hard limit",
+            return Err(invalid(
+                novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
             ));
         }
         let category = dto::ColumnIdentityCategory::try_from(raw.category)
@@ -300,9 +295,8 @@ impl IcebergColumnHandle {
         let base_type = parse_type(&base_type_json, "base_type_json")?;
         let projected_type = parse_type(&type_json, "type_json")?;
         if field_id_path.len() > MAX_FIELD_ID_PATH_DEPTH {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "iceberg column dereference path exceeds the hard limit",
+            return Err(invalid(
+                novarocks_type_contract::ValueTypeError::TooDeep.to_string(),
             ));
         }
         if field_id_path.iter().any(|field_id| *field_id <= 0) {
@@ -1201,6 +1195,62 @@ pub(super) mod tests {
         let encoded = city.to_proto();
         let decoded = IcebergColumnHandle::from_proto(&encoded).expect("decoded handle");
         assert_eq!(decoded, city);
+    }
+
+    #[test]
+    fn private_column_codec_admits_logical_depth_with_envelope_position() {
+        use crate::wire::read::IcebergReadWireCodec;
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+            ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits,
+            ConnectorEnvelopeHeader, ConnectorInstanceId, ConnectorPrivateDecoder,
+            ConnectorPrivateEncoder, ConnectorProviderId, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+        };
+        let depth = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+        let mut field = NestedField::optional(
+            depth as i32,
+            "element",
+            Type::Primitive(PrimitiveType::Long),
+        );
+        for id in (1..depth).rev() {
+            field = NestedField::optional(
+                id as i32,
+                "element",
+                Type::List(ListType::new(field.into())),
+            );
+        }
+        let column = IcebergColumnHandle::base_column(&field).unwrap();
+        let payload = IcebergReadWireCodec.encode_private(&column).unwrap();
+        let header = ConnectorEnvelopeHeader::new(
+            ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("lake").unwrap(),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            ConnectorCodecCategory::ReadColumn,
+            ConnectorCodecRevision::try_new(crate::contract_revision::ICEBERG_CONTRACT_REVISION)
+                .unwrap(),
+        );
+        let limits = ConnectorDecodeLimits::try_new(
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            100_000,
+            MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+        )
+        .unwrap();
+        let mut ledger = ConnectorDecodeLedger::new(limits);
+        let decoded: IcebergColumnHandle = IcebergReadWireCodec
+            .decode_private(
+                &payload,
+                &mut ConnectorDecodeContext::new(&header, &mut ledger),
+            )
+            .unwrap();
+        assert_eq!(decoded, column);
+        let beyond = NestedField::optional(1, "over", Type::List(ListType::new(field.into())));
+        let error = ColumnIdentity::from_nested_field(&beyond).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains(&depth.to_string()));
     }
 
     #[test]

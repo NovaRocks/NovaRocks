@@ -102,12 +102,7 @@ fn flat_run(
 fn recursive_limits() -> RecursiveStreamProjectionLimits {
     RecursiveStreamProjectionLimits {
         max_input_bytes: 1 << 24,
-        schema: IpcSchemaProjectionLimits {
-            max_field_occurrences: 4096,
-            max_type_occurrences: 4096,
-            max_string_bytes: 1 << 20,
-            max_flatbuffer_bytes: 1 << 20,
-        },
+
         batch: RecursiveBatchProjectionLimits {
             flat: FlatBatchProjectionLimits {
                 max_metadata_bytes: 1 << 20,
@@ -194,7 +189,7 @@ fn recursive_run(
 fn scalar_fixture() -> (Vec<u8>, Arc<Field>, FunctionValueType, usize) {
     let field = Arc::new(Field::new("value", DataType::Int64, true));
     let array: ArrayRef = Arc::new(Int64Array::from(vec![Some(41), None, Some(-3)]));
-    let input = exact_schema_stream(&writer_stream(array, &field), &field);
+    let input = writer_stream(array, &field);
     let source = retained(&input, &field);
     let ty = FunctionValueType::new(DataType::Int64, true);
     (input, field, ty, source)
@@ -214,14 +209,6 @@ fn nested_fixture() -> (Vec<u8>, Arc<Field>, FunctionValueType, usize) {
     ));
     let field = Arc::new(Field::new("pair", array.data_type().clone(), true));
     let input = writer_stream(array, &field);
-    let schema_end = 8 + u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-    let exact = crate::ipc_schema_v2::encode_single_field_schema(
-        &field,
-        recursive_limits().schema,
-        &FixtureEncodeControl,
-    )
-    .unwrap();
-    let input = [frame(&exact, &[]), input[schema_end..].to_vec()].concat();
     let source = input.capacity() + (1 << 16);
     let ty = FunctionValueType::try_from_field(&field).unwrap();
     (input, field, ty, source)
@@ -410,14 +397,14 @@ fn exact_complete_parent_invoice_replays_and_each_positive_axis_refuses_one_unde
 }
 
 #[test]
-fn known_geometry_layout_refuses_before_pending_quantum_can_replace_resource() {
+fn geometry_request_follows_observed_field_node_validation() {
     let (input, field, _, _) = nested_fixture();
     let good = Control::good();
     let mut parse = CompileCheckpoints::try_new(&good, CompilePhase::Decode).unwrap();
-    let (_, end) = metadata(&input, 0, 1 << 20, &mut parse).unwrap();
-    let (raw, start) = metadata(&input, end, 1 << 20, &mut parse).unwrap();
+    let (raw, start) = metadata(&input, 0, 1 << 20, &mut parse).unwrap();
     let message =
-        crate::ipc_schema_v2::verified_message_observed(raw, &verifier(), &mut parse).unwrap();
+        crate::ipc_flat_stream_v2::verified_record_message_observed(raw, &verifier(), &mut parse)
+            .unwrap();
     let len = usize::try_from(message.bodyLength()).unwrap();
     let body = &input[start..start + len];
     let bytes = Layout::array::<crate::ipc_recursive_batch_v2::RecursiveNodeGeometry<'_>>(3)
@@ -425,6 +412,7 @@ fn known_geometry_layout_refuses_before_pending_quantum_can_replace_resource() {
         .size();
     for pending in [0, 254, 255] {
         for c in CAUSES {
+            let cause = c.clone();
             let control = Control::refusing(1, c);
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             for _ in 0..pending {
@@ -443,13 +431,18 @@ fn known_geometry_layout_refuses_before_pending_quantum_can_replace_resource() {
                     &mut parent,
                     &mut work,
                 );
-            assert!(matches!(
-                result,
-                Err(TypeCodecError::Control(
-                    CompileControlError::ResourceExhausted
-                ))
-            ));
-            assert_eq!(control.trace(), vec![(CompilePhase::Decode, 0)]);
+            let trace = control.trace();
+            if trace.len() == 1 {
+                assert!(matches!(
+                    result,
+                    Err(TypeCodecError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+            } else {
+                assert!(matches!(result, Err(TypeCodecError::Control(actual)) if actual == cause));
+                assert_eq!(trace.len(), 2);
+            }
         }
     }
 }

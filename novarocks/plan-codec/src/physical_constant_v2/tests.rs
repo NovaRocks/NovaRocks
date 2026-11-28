@@ -19,7 +19,6 @@ use super::*;
 use crate::{
     ipc_flat_batch_v2::FlatBatchProjectionLimits,
     ipc_recursive_batch_v2::RecursiveBatchProjectionLimits,
-    ipc_schema_v2::IpcSchemaProjectionLimits,
     physical_type_v2::{
         PackageTypeProjectionLimits, TypeProjectionLimits, decode_package_type_table_observed,
     },
@@ -94,21 +93,14 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 32 * 1024 * 1024,
     }
 }
-fn schema_limits() -> IpcSchemaProjectionLimits {
-    IpcSchemaProjectionLimits {
-        max_field_occurrences: 4096,
-        max_type_occurrences: 4096,
-        max_string_bytes: 65536,
-        max_flatbuffer_bytes: 4 * 1024 * 1024,
-    }
-}
+
 fn flat_write() -> FlatPoolWriteLimits {
     FlatPoolWriteLimits {
         max_rows: 4096,
         max_buffer_descriptors: 16384,
         max_body_bytes: 8 * 1024 * 1024,
         max_encoded_stream_bytes: 16 * 1024 * 1024,
-        schema: schema_limits(),
+
         max_new_allocation_request_bytes: 128 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
         max_cumulative_library_work: 512 * 1024 * 1024,
@@ -140,7 +132,7 @@ fn decode_limits() -> ConstantDecodeProjectionLimits {
     ConstantDecodeProjectionLimits {
         flat_stream: FlatStreamProjectionLimits {
             max_input_bytes: 16 * 1024 * 1024,
-            schema: schema_limits(),
+
             batch: batch_limits(),
         },
         flat_reader: FlatReaderProjectionLimits {
@@ -150,7 +142,7 @@ fn decode_limits() -> ConstantDecodeProjectionLimits {
         },
         recursive_stream: RecursiveStreamProjectionLimits {
             max_input_bytes: 16 * 1024 * 1024,
-            schema: schema_limits(),
+
             batch: RecursiveBatchProjectionLimits {
                 flat: batch_limits(),
                 max_field_nodes: 4096,
@@ -593,7 +585,7 @@ fn record_headers_reject_absence_unknown_compression_and_namespaces_before_ipc()
 }
 
 #[test]
-fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() {
+fn record_field_value_pairs_keep_the_type_table_authoritative() {
     let original = pool(Arc::new(Int32Array::from(vec![Some(1), None])));
     let record = encode(&original, 0, 0, 0);
     for (field, ty) in [
@@ -604,19 +596,6 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
         (
             Arc::clone(original.field_ref()),
             FunctionValueType::new(DataType::Int32, false),
-        ),
-        (
-            Arc::new(original.field().clone().with_name("foreign")),
-            original.value_type().clone(),
-        ),
-        (
-            Arc::new(
-                original
-                    .field()
-                    .clone()
-                    .with_metadata(HashMap::from([("provider".into(), "foreign".into())])),
-            ),
-            original.value_type().clone(),
         ),
     ] {
         let types = types(field, ty, 0, 0);

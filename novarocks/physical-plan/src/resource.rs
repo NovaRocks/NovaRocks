@@ -23,8 +23,10 @@ use arrow_schema::{
     DataType, Field, TimeUnit,
 };
 use novarocks_connector_contract::ConnectorEncodedPayload;
+use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
 use novarocks_type_contract::{
-    ArrowTypeDepth, ArrowTypeProfile, CompileCheckpoints, CompileControlError,
+    ArrowTypeProfile, CompileCheckpoints, CompileControlError, ValueTypeError, ValueTypeVisit,
+    validate_arrow_layout_structure_with_profile_observed,
 };
 use std::collections::BTreeSet;
 
@@ -46,21 +48,6 @@ pub const MAX_PLAN_DYNAMIC_ITEMS: usize = 16 * 1024 * 1024;
 pub const MAX_PLAN_DYNAMIC_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_ITEMS: usize = 32 * 1024 * 1024;
 pub const MAX_PLAN_DERIVED_CUT_BYTES: usize = 512 * 1024 * 1024;
-pub const MAX_DATA_TYPE_DEPTH: usize = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
-pub const MAX_DATA_TYPE_NODES: usize = novarocks_type_contract::MAX_VALUE_TYPE_NODES;
-pub const MAX_DATA_TYPE_FIELD_NAME_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_ENTRIES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_ENTRIES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_KEY_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES;
-pub const MAX_DATA_TYPE_FIELD_METADATA_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_FIELD_METADATA_BYTES;
-pub const MAX_TIMESTAMP_TIMEZONE_BYTES: usize =
-    novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES;
-pub const MAX_FIXED_SIZE_LENGTH: i32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 struct ResourceUsage {
@@ -106,7 +93,7 @@ impl CutResourcePreflight {
         &mut self,
         fragment: &Fragment,
         errors: &mut ValidationContext,
-        source_retained_bytes: usize,
+        _source_retained_bytes: usize,
         resources: &mut ControlResourceCounter,
         admit: &mut TypeAdmission<'_>,
         work: &mut CompileCheckpoints<'_>,
@@ -115,7 +102,6 @@ impl CutResourcePreflight {
             fragment,
             errors,
             &mut CallerTypeValidation {
-                source: source_retained_bytes,
                 resources,
                 admit,
                 work,
@@ -128,7 +114,7 @@ impl CutResourcePreflight {
         fragment: &Fragment,
         cuts: &FragmentCuts,
         errors: &mut ValidationContext,
-        source_retained_bytes: usize,
+        _source_retained_bytes: usize,
         resources: &mut ControlResourceCounter,
         admit: &mut TypeAdmission<'_>,
         work: &mut CompileCheckpoints<'_>,
@@ -138,7 +124,6 @@ impl CutResourcePreflight {
             cuts,
             errors,
             &mut CallerTypeValidation {
-                source: source_retained_bytes,
                 resources,
                 admit,
                 work,
@@ -152,7 +137,7 @@ impl CutResourcePreflight {
         filter: &RuntimeFilter,
         path: &str,
         errors: &mut ValidationContext,
-        source_retained_bytes: usize,
+        _source_retained_bytes: usize,
         resources: &mut ControlResourceCounter,
         admit: &mut TypeAdmission<'_>,
         work: &mut CompileCheckpoints<'_>,
@@ -163,7 +148,6 @@ impl CutResourcePreflight {
             &mut self.usage,
             errors,
             &mut CallerTypeValidation {
-                source: source_retained_bytes,
                 resources,
                 admit,
                 work,
@@ -251,7 +235,7 @@ impl CutResourcePreflight {
         ty: &ValueType,
         path: &str,
         errors: &mut ValidationContext,
-        source_retained_bytes: usize,
+        _source_retained_bytes: usize,
         resources: &mut ControlResourceCounter,
         admit: &mut TypeAdmission<'_>,
         work: &mut CompileCheckpoints<'_>,
@@ -262,7 +246,6 @@ impl CutResourcePreflight {
             &mut self.usage,
             errors,
             &mut CallerTypeValidation {
-                source: source_retained_bytes,
                 resources,
                 admit,
                 work,
@@ -1209,13 +1192,6 @@ fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    usage.add_bytes(binding.state_format.as_str().len());
-    if let Some(receipt) = &binding.state_interpretation {
-        usage.add_items(receipt.order_keys.len());
-        usage.add_bytes(receipt.order_keys.len().saturating_mul(std::mem::size_of::<
-            novarocks_type_contract::AggregateStateOrderKey,
-        >()));
-    }
     add_function_usage_core(
         &binding.function,
         &format!("{path}.function"),
@@ -1223,13 +1199,22 @@ fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
         errors,
         policy,
     )?;
-    validate_value_type_core(
-        &binding.intermediate_type,
-        &format!("{path}.intermediate_type"),
-        usage,
-        errors,
-        policy,
-    )?;
+    if let Some(state) = &binding.merge_state {
+        usage.add_bytes(state.state_format.as_str().len());
+        if let Some(receipt) = &state.state_interpretation {
+            usage.add_items(receipt.order_keys.len());
+            usage.add_bytes(receipt.order_keys.len().saturating_mul(std::mem::size_of::<
+                novarocks_type_contract::AggregateStateOrderKey,
+            >()));
+        }
+        validate_value_type_core(
+            &state.intermediate_type,
+            &format!("{path}.intermediate_type"),
+            usage,
+            errors,
+            policy,
+        )?;
+    }
     Ok(())
 }
 
@@ -1348,7 +1333,10 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
         NodeKind::SystemRelation { output_fields, .. } => {
             usage.add_items(output_fields.len());
             for field in output_fields.iter() {
-                validate_field_core(field, path, usage, errors, policy)?;
+                if usage.exhausted() {
+                    return Ok(());
+                }
+                account_field(field, usage, policy)?;
             }
         }
         NodeKind::Values { rows } => {
@@ -1490,12 +1478,6 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                     return Ok(());
                 }
                 usage.add_bytes(field.provider_name.len());
-                if field.provider_name.len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
-                    errors.push(ValidationError::resource_limit(
-                        format!("{path}.target_fields[{index}].provider_name"),
-                        "writer provider field name exceeds the field-name byte limit",
-                    ));
-                }
                 validate_value_type_core(
                     &field.ty,
                     &format!("{path}.target_fields[{index}].type"),
@@ -1871,7 +1853,6 @@ fn distribution_items(distribution: &crate::Distribution) -> usize {
 use crate::ValidationErrorCategory;
 use novarocks_type_contract::{
     ControlOwnedResourceFacts, ControlResourceCounter, ControlResourceError,
-    owned_resources::{copy::reserve_exit, hashmap, vec::reserve_for_push_in},
 };
 
 type TypeAdmission<'a> =
@@ -1898,32 +1879,9 @@ const fn type_message_bound(
     }
 }
 
-// The original plan-owned pending Vec now retains both semantic and physical
-// coordinates. Its own exact/amortized requests remain with this policy.
-type TypePending<'source> = (&'source DataType, ArrowTypeDepth);
-
 trait TypeValidationPolicy {
     type Error;
-    const CALLER: bool;
-    fn initial<'source>(
-        &mut self,
-        root: &'source DataType,
-    ) -> Result<Vec<TypePending<'source>>, Self::Error>;
-    fn push<'source>(
-        &mut self,
-        pending: &mut Vec<TypePending<'source>>,
-        entry: TypePending<'source>,
-    ) -> Result<(), Self::Error>;
-    fn children(
-        &mut self,
-        pending: &mut Vec<TypePending<'_>>,
-        count: usize,
-        allowed: bool,
-    ) -> Result<(), Self::Error>;
-    fn node(&mut self) -> Result<(), Self::Error>;
-    fn field_header(&mut self, field: &Field) -> Result<(), Self::Error>;
-    fn metadata_entry(&mut self) -> Result<(), Self::Error>;
-    fn metadata_end(&mut self) -> Result<(), Self::Error>;
+    fn visit(&mut self) -> Result<(), Self::Error>;
     fn message(
         &mut self,
         category: ValidationErrorCategory,
@@ -1950,39 +1908,7 @@ trait TypeValidationPolicy {
 struct PlainTypeValidation;
 impl TypeValidationPolicy for PlainTypeValidation {
     type Error = std::convert::Infallible;
-    const CALLER: bool = false;
-    fn initial<'source>(
-        &mut self,
-        root: &'source DataType,
-    ) -> Result<Vec<TypePending<'source>>, Self::Error> {
-        Ok(vec![(root, ArrowTypeDepth::ROOT)])
-    }
-    fn push<'source>(
-        &mut self,
-        pending: &mut Vec<TypePending<'source>>,
-        entry: TypePending<'source>,
-    ) -> Result<(), Self::Error> {
-        pending.push(entry);
-        Ok(())
-    }
-    fn children(
-        &mut self,
-        _: &mut Vec<TypePending<'_>>,
-        _: usize,
-        _: bool,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    fn node(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    fn field_header(&mut self, _: &Field) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    fn metadata_entry(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    fn metadata_end(&mut self) -> Result<(), Self::Error> {
+    fn visit(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
     fn message(
@@ -2024,7 +1950,6 @@ impl TypeValidationPolicy for PlainTypeValidation {
 }
 
 struct CallerTypeValidation<'a, 'control> {
-    source: usize,
     resources: &'a mut ControlResourceCounter,
     admit: &'a mut TypeAdmission<'a>,
     work: &'a mut CompileCheckpoints<'control>,
@@ -2033,115 +1958,14 @@ impl CallerTypeValidation<'_, '_> {
     fn gate(&mut self) -> Result<(), ControlResourceError> {
         (self.admit)(&self.resources.facts()).map_err(Into::into)
     }
-    fn hash_work(
-        &mut self,
-        result: Result<usize, hashmap::HashMapResourceError>,
-    ) -> Result<(), ControlResourceError> {
-        let work = result.map_err(|error| match error {
-            hashmap::HashMapResourceError::SourceModel(message) => {
-                ControlResourceError::SourceModel(message)
-            }
-            hashmap::HashMapResourceError::Arithmetic(_) => {
-                CompileControlError::ResourceExhausted.into()
-            }
-        })?;
-        self.resources.work(work)?;
-        self.gate()
-    }
 }
 
 impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
     type Error = ControlResourceError;
-    const CALLER: bool = true;
-    fn initial<'source>(
-        &mut self,
-        root: &'source DataType,
-    ) -> Result<Vec<TypePending<'source>>, Self::Error> {
-        self.resources.buffer::<TypePending<'_>>(1, 1)?;
-        self.resources.work(1)?; // The actual initial borrowed tuple move.
-        self.gate()?;
-        self.work.flush()?;
-        let mut pending = Vec::new();
-        let reserved = pending.try_reserve_exact(1);
-        if reserved.is_ok() {
-            self.work.step()?;
-        }
-        reserve_exit::<ControlResourceError>(reserved, self.work)?;
-        pending.push((root, ArrowTypeDepth::ROOT));
-        self.work.step()?;
-        Ok(pending)
-    }
-    fn push<'source>(
-        &mut self,
-        pending: &mut Vec<TypePending<'source>>,
-        entry: TypePending<'source>,
-    ) -> Result<(), Self::Error> {
-        reserve_for_push_in::<_, ControlResourceError>(
-            pending,
-            &mut |facts| {
-                if let Some(layout) = facts.requested_backing {
-                    self.resources.layout(layout, 1)?;
-                }
-                (self.admit)(&self.resources.facts()).map_err(Into::into)
-            },
-            self.work,
-        )?;
-        pending.push(entry);
-        self.work.step()?;
-        Ok(())
-    }
-    fn children(
-        &mut self,
-        pending: &mut Vec<TypePending<'_>>,
-        count: usize,
-        allowed: bool,
-    ) -> Result<(), Self::Error> {
-        if !allowed {
-            return Ok(());
-        }
-        let needed = novarocks_type_contract::control_resource_add(pending.len(), count)?;
-        let grows = needed > pending.capacity();
-        if grows {
-            let layout = std::alloc::Layout::array::<TypePending<'_>>(needed)
-                .map_err(|_| ControlResourceError::from(CompileControlError::ResourceExhausted))?;
-            // Rust 1.92 RawVec::try_reserve_exact requests len+additional.
-            // No amortized geometry or source backing is reconstructed here.
-            self.resources.layout(layout, 1)?;
-        }
-        self.resources.work(count)?;
-        self.gate()?;
-        if grows {
-            self.work.flush()?;
-            let reserved = pending.try_reserve_exact(count);
-            if reserved.is_ok() {
-                self.work.step()?;
-            }
-            reserve_exit::<ControlResourceError>(reserved, self.work)?;
-        }
-        Ok(())
-    }
-    fn node(&mut self) -> Result<(), Self::Error> {
+    fn visit(&mut self) -> Result<(), Self::Error> {
         self.resources.work(1)?;
         self.gate()?;
         self.work.step().map_err(Into::into)
-    }
-    fn field_header(&mut self, field: &Field) -> Result<(), Self::Error> {
-        // The real take(257) remains below, including the original over-limit
-        // diagnostics. Deleted backing is bounded by the true source invoice.
-        self.hash_work(hashmap::source_iterator_work_upper_bound(
-            self.source,
-            field
-                .metadata()
-                .len()
-                .min(MAX_DATA_TYPE_FIELD_METADATA_ENTRIES + 1),
-        ))?;
-        self.work.flush().map_err(Into::into)
-    }
-    fn metadata_entry(&mut self) -> Result<(), Self::Error> {
-        self.work.step().map_err(Into::into)
-    }
-    fn metadata_end(&mut self) -> Result<(), Self::Error> {
-        self.work.flush().map_err(Into::into)
     }
     fn message(
         &mut self,
@@ -2261,6 +2085,18 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
     )
 }
 
+enum TypeWalkFailure<E> {
+    Shape(ValueTypeError),
+    Caller(E),
+    UsageExhausted,
+}
+
+impl<E> From<ValueTypeError> for TypeWalkFailure<E> {
+    fn from(error: ValueTypeError) -> Self {
+        Self::Shape(error)
+    }
+}
+
 fn validate_data_type_with_profile_core<P: TypeValidationPolicy>(
     root: &DataType,
     profile: ArrowTypeProfile,
@@ -2269,402 +2105,148 @@ fn validate_data_type_with_profile_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    if usage.exhausted() {
-        return Ok(());
-    }
-    let mut pending = policy.initial(root)?;
-    let mut nodes = 0_usize;
-    while let Some((data_type, depth)) = pending.pop() {
+    let result = validate_arrow_layout_structure_with_profile_observed(root, profile, |event| {
         if usage.exhausted() {
-            return Ok(());
+            return Err(TypeWalkFailure::UsageExhausted);
         }
-        nodes = nodes.saturating_add(1);
-        usage.add_items(1);
-        if let Err(error) = depth.check(profile) {
-            if profile != ArrowTypeProfile::Physical {
-                let (category, message) = match error {
-                    novarocks_type_contract::ValueTypeError::InvalidType(_) => (
-                        ValidationErrorCategory::StructuralInvariant,
-                        "Arrow value layout contains runtime encoding",
-                    ),
-                    _ => (
-                        ValidationErrorCategory::ResourceLimit,
-                        "Arrow data type exceeds its logical or physical depth profile",
-                    ),
-                };
-                policy.message(category, path, message, errors)?;
-                return Ok(());
+        match event {
+            ValueTypeVisit::TypeNode(data_type) => {
+                usage.add_items(1);
+                validate_type_node(data_type, path, usage, errors, policy)
             }
-            policy.formatted(
-                ValidationErrorCategory::ResourceLimit,
-                path,
-                format_args!("Arrow data type depth exceeds {MAX_DATA_TYPE_DEPTH}"),
-                type_message_bound(
-                    "Arrow data type depth exceeds ".len() + TYPE_USIZE_WIDTH,
-                    1,
-                    TYPE_USIZE_WIDTH,
-                ),
-                errors,
-            )?;
-            return Ok(());
+            ValueTypeVisit::Field(field) => account_field(field, usage, policy),
+            ValueTypeVisit::ChildEdge(_) => Ok(()),
         }
-        if nodes > MAX_DATA_TYPE_NODES {
-            report_type_nodes(path, errors, policy)?;
-            return Ok(());
-        }
-        // Logical depth and the existing visited-node policy have already
-        // been checked. Map scaffolding and runtime encodings still consume
-        // their actual visits without another physical-depth quota.
-        match data_type {
-            DataType::Timestamp(_, Some(timezone)) => {
-                usage.add_bytes(timezone.len());
-                if timezone.len() > MAX_TIMESTAMP_TIMEZONE_BYTES {
-                    policy.formatted(
-                        ValidationErrorCategory::ResourceLimit,
-                        path,
-                        format_args!(
-                            "Arrow timestamp timezone exceeds {MAX_TIMESTAMP_TIMEZONE_BYTES} bytes"
-                        ),
-                        type_message_bound(
-                            "Arrow timestamp timezone exceeds  bytes".len() + TYPE_USIZE_WIDTH,
-                            1,
-                            TYPE_USIZE_WIDTH,
-                        ),
-                        errors,
-                    )?;
-                }
-            }
-            DataType::FixedSizeBinary(size) if *size < 0 || *size > MAX_FIXED_SIZE_LENGTH => {
-                invalid_fixed_size_core(path, *size, errors, policy)?;
-            }
-            DataType::Time32(unit) if !matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) => {
-                policy.message(
-                    ValidationErrorCategory::StructuralInvariant,
-                    path,
-                    "Arrow Time32 must use second or millisecond units",
-                    errors,
-                )?;
-            }
-            DataType::Time64(unit)
-                if !matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond) =>
-            {
-                policy.message(
-                    ValidationErrorCategory::StructuralInvariant,
-                    path,
-                    "Arrow Time64 must use microsecond or nanosecond units",
-                    errors,
-                )?;
-            }
-            DataType::FixedSizeList(field, size) => {
-                policy.children(&mut pending, 1, true)?;
-                if *size < 0 || *size > MAX_FIXED_SIZE_LENGTH {
-                    invalid_fixed_size_core(path, *size, errors, policy)?;
-                }
-                validate_field_core(field, path, usage, errors, policy)?;
-                policy.push(
-                    &mut pending,
-                    (
-                        field.data_type(),
-                        depth.value_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-            }
-            DataType::List(field)
-            | DataType::ListView(field)
-            | DataType::LargeList(field)
-            | DataType::LargeListView(field) => {
-                policy.children(&mut pending, 1, true)?;
-                validate_field_core(field, path, usage, errors, policy)?;
-                policy.push(
-                    &mut pending,
-                    (
-                        field.data_type(),
-                        depth.value_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-            }
-            DataType::Map(field, _) => {
-                policy.children(&mut pending, 1, true)?;
-                validate_field_core(field, path, usage, errors, policy)?;
-                policy.push(
-                    &mut pending,
-                    (
-                        field.data_type(),
-                        depth.map_entries().expect("bounded parent type depth"),
-                    ),
-                )?;
-            }
-            DataType::Struct(fields) => {
-                if data_type_children_exceed_budget_core(
-                    nodes,
-                    pending.len(),
-                    fields.len(),
-                    path,
-                    errors,
-                    policy,
-                )? {
-                    return Ok(());
-                }
-                policy.children(&mut pending, fields.len(), true)?;
-                usage.add_items(fields.len());
-                for field in fields {
-                    validate_field_core(field, path, usage, errors, policy)?;
-                    policy.push(
-                        &mut pending,
-                        (
-                            field.data_type(),
-                            depth.value_child().expect("bounded parent type depth"),
-                        ),
-                    )?;
-                }
-            }
-            DataType::Union(fields, _) => {
-                if data_type_children_exceed_budget_core(
-                    nodes,
-                    pending.len(),
-                    fields.len(),
-                    path,
-                    errors,
-                    policy,
-                )? {
-                    return Ok(());
-                }
-                policy.children(&mut pending, fields.len(), true)?;
-                usage.add_items(fields.len());
-                for (_, field) in fields.iter() {
-                    validate_field_core(field, path, usage, errors, policy)?;
-                    policy.push(
-                        &mut pending,
-                        (
-                            field.data_type(),
-                            depth.value_child().expect("bounded parent type depth"),
-                        ),
-                    )?;
-                }
-            }
-            DataType::Dictionary(key, value) => {
-                // Capture the numerical possibility without changing the old
-                // key-error-before-quota report order below.
-                let allowed = P::CALLER.then(|| data_type_children_fit(nodes, pending.len(), 2));
-                if let Some(allowed) = allowed {
-                    policy.children(&mut pending, 2, allowed)?;
-                }
-                if !matches!(
-                    key.as_ref(),
-                    DataType::Int8
-                        | DataType::Int16
-                        | DataType::Int32
-                        | DataType::Int64
-                        | DataType::UInt8
-                        | DataType::UInt16
-                        | DataType::UInt32
-                        | DataType::UInt64
-                ) {
-                    policy.message(
-                        ValidationErrorCategory::StructuralInvariant,
-                        path,
-                        "Arrow dictionary key must be an integer type",
-                        errors,
-                    )?;
-                }
-                if !allowed.unwrap_or_else(|| data_type_children_fit(nodes, pending.len(), 2)) {
-                    report_type_nodes(path, errors, policy)?;
-                    return Ok(());
-                }
-                policy.push(
-                    &mut pending,
-                    (
-                        key,
-                        depth.encoding_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-                policy.push(
-                    &mut pending,
-                    (
-                        value,
-                        depth.encoding_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-            }
-            DataType::RunEndEncoded(run_ends, values) => {
-                let allowed = P::CALLER.then(|| data_type_children_fit(nodes, pending.len(), 2));
-                if let Some(allowed) = allowed {
-                    policy.children(&mut pending, 2, allowed)?;
-                }
-                if !matches!(
-                    run_ends.data_type(),
-                    DataType::Int16 | DataType::Int32 | DataType::Int64
-                ) {
-                    policy.message(
-                        ValidationErrorCategory::StructuralInvariant,
-                        path,
-                        "Arrow run-end type must be Int16, Int32 or Int64",
-                        errors,
-                    )?;
-                }
-                if !allowed.unwrap_or_else(|| data_type_children_fit(nodes, pending.len(), 2)) {
-                    report_type_nodes(path, errors, policy)?;
-                    return Ok(());
-                }
-                validate_field_core(run_ends, path, usage, errors, policy)?;
-                validate_field_core(values, path, usage, errors, policy)?;
-                policy.push(
-                    &mut pending,
-                    (
-                        run_ends.data_type(),
-                        depth.encoding_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-                policy.push(
-                    &mut pending,
-                    (
-                        values.data_type(),
-                        depth.encoding_child().expect("bounded parent type depth"),
-                    ),
-                )?;
-            }
-            DataType::Decimal32(precision, scale) => validate_decimal_core(
-                path,
-                *precision,
-                *scale,
-                DECIMAL32_MAX_PRECISION,
-                DECIMAL32_MAX_SCALE,
-                errors,
-                policy,
-            )?,
-            DataType::Decimal64(precision, scale) => validate_decimal_core(
-                path,
-                *precision,
-                *scale,
-                DECIMAL64_MAX_PRECISION,
-                DECIMAL64_MAX_SCALE,
-                errors,
-                policy,
-            )?,
-            DataType::Decimal128(precision, scale) => validate_decimal_core(
-                path,
-                *precision,
-                *scale,
-                DECIMAL128_MAX_PRECISION,
-                DECIMAL128_MAX_SCALE,
-                errors,
-                policy,
-            )?,
-            DataType::Decimal256(precision, scale) => validate_decimal_core(
-                path,
-                *precision,
-                *scale,
-                DECIMAL256_MAX_PRECISION,
-                DECIMAL256_MAX_SCALE,
-                errors,
-                policy,
-            )?,
-            _ => {}
-        }
-        policy.node()?;
-    }
-    Ok(())
-}
-fn report_type_nodes<P: TypeValidationPolicy>(
-    path: &str,
-    errors: &mut ValidationContext,
-    policy: &mut P,
-) -> Result<(), P::Error> {
-    policy.formatted(
-        ValidationErrorCategory::ResourceLimit,
-        path,
-        format_args!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes"),
-        type_message_bound(
-            "Arrow data type contains more than  nodes".len() + TYPE_USIZE_WIDTH,
-            1,
-            TYPE_USIZE_WIDTH,
+        .map_err(TypeWalkFailure::Caller)
+    });
+    match result {
+        Ok(()) | Err(TypeWalkFailure::UsageExhausted) => Ok(()),
+        Err(TypeWalkFailure::Caller(error)) => Err(error),
+        Err(TypeWalkFailure::Shape(ValueTypeError::TooDeep)) => policy.formatted(
+            ValidationErrorCategory::UnsupportedCapability,
+            path,
+            format_args!(
+                "Arrow data type exceeds the nesting depth limit of {MAX_VALUE_TYPE_DEPTH}"
+            ),
+            type_message_bound(
+                "Arrow data type exceeds the nesting depth limit of ".len() + TYPE_USIZE_WIDTH,
+                1,
+                TYPE_USIZE_WIDTH,
+            ),
+            errors,
         ),
-        errors,
-    )
-}
-fn data_type_children_fit(visited: usize, pending: usize, children: usize) -> bool {
-    visited.saturating_add(pending).saturating_add(children) <= MAX_DATA_TYPE_NODES
-}
-fn data_type_children_exceed_budget_core<P: TypeValidationPolicy>(
-    visited: usize,
-    pending: usize,
-    children: usize,
-    path: &str,
-    errors: &mut ValidationContext,
-    policy: &mut P,
-) -> Result<bool, P::Error> {
-    if data_type_children_fit(visited, pending, children) {
-        return Ok(false);
+        Err(TypeWalkFailure::Shape(error)) => {
+            let message = match error {
+                ValueTypeError::InvalidType(message) => message,
+                _ => "invalid Arrow carrier type",
+            };
+            policy.message(
+                ValidationErrorCategory::StructuralInvariant,
+                path,
+                message,
+                errors,
+            )
+        }
     }
-    report_type_nodes(path, errors, policy)?;
-    Ok(true)
 }
-fn validate_field_core<P: TypeValidationPolicy>(
-    field: &Field,
+
+fn validate_type_node<P: TypeValidationPolicy>(
+    data_type: &DataType,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    policy.field_header(field)?;
-    usage.add_bytes(field.name().len());
-    if field.name().len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
-        policy.formatted(
-            ValidationErrorCategory::ResourceLimit,
-            path,
-            format_args!("Arrow field name exceeds {MAX_DATA_TYPE_FIELD_NAME_BYTES} bytes"),
-            type_message_bound(
-                "Arrow field name exceeds  bytes".len() + TYPE_USIZE_WIDTH,
-                1,
-                TYPE_USIZE_WIDTH,
-            ),
-            errors,
-        )?;
-    }
-    if field.metadata().len() > MAX_DATA_TYPE_FIELD_METADATA_ENTRIES {
-        policy.formatted(ValidationErrorCategory::ResourceLimit, path,
-            format_args!("Arrow field metadata contains more than {MAX_DATA_TYPE_FIELD_METADATA_ENTRIES} entries"),
-            type_message_bound("Arrow field metadata contains more than  entries".len() + TYPE_USIZE_WIDTH, 1, TYPE_USIZE_WIDTH), errors)?;
-    }
-    usage.add_items(field.metadata().len());
-    let mut metadata_bytes = 0_usize;
-    for (key, value) in field
-        .metadata()
-        .iter()
-        .take(MAX_DATA_TYPE_FIELD_METADATA_ENTRIES.saturating_add(1))
-    {
-        metadata_bytes = metadata_bytes
-            .saturating_add(key.len())
-            .saturating_add(value.len());
-        if key.len() > MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES
-            || value.len() > MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES
-        {
-            policy.message(
-                ValidationErrorCategory::ResourceLimit,
+    match data_type {
+        DataType::Timestamp(_, Some(timezone)) => usage.add_bytes(timezone.len()),
+        DataType::FixedSizeBinary(size) | DataType::FixedSizeList(_, size) if *size < 0 => {
+            policy.formatted(
+                ValidationErrorCategory::StructuralInvariant,
                 path,
-                "Arrow field metadata key or value exceeds its byte limit",
+                format_args!("Arrow fixed-size length {size} is negative"),
+                type_message_bound("Arrow fixed-size length  is negative".len() + 11, 1, 11),
                 errors,
             )?;
         }
-        policy.metadata_entry()?;
-    }
-    policy.metadata_end()?;
-    usage.add_bytes(metadata_bytes);
-    if metadata_bytes > MAX_DATA_TYPE_FIELD_METADATA_BYTES {
-        policy.formatted(
-            ValidationErrorCategory::ResourceLimit,
+        DataType::Time32(unit) if !matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) => {
+            policy.message(
+                ValidationErrorCategory::StructuralInvariant,
+                path,
+                "Arrow Time32 must use second or millisecond units",
+                errors,
+            )?;
+        }
+        DataType::Time64(unit) if !matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond) => {
+            policy.message(
+                ValidationErrorCategory::StructuralInvariant,
+                path,
+                "Arrow Time64 must use microsecond or nanosecond units",
+                errors,
+            )?;
+        }
+        DataType::Struct(fields) => usage.add_items(fields.len()),
+        DataType::Union(fields, _) => usage.add_items(fields.len()),
+        DataType::Decimal32(precision, scale) => validate_decimal_core(
             path,
-            format_args!("Arrow field metadata exceeds {MAX_DATA_TYPE_FIELD_METADATA_BYTES} bytes"),
-            type_message_bound(
-                "Arrow field metadata exceeds  bytes".len() + TYPE_USIZE_WIDTH,
-                1,
-                TYPE_USIZE_WIDTH,
-            ),
+            *precision,
+            *scale,
+            DECIMAL32_MAX_PRECISION,
+            DECIMAL32_MAX_SCALE,
             errors,
-        )?;
+            policy,
+        )?,
+        DataType::Decimal64(precision, scale) => validate_decimal_core(
+            path,
+            *precision,
+            *scale,
+            DECIMAL64_MAX_PRECISION,
+            DECIMAL64_MAX_SCALE,
+            errors,
+            policy,
+        )?,
+        DataType::Decimal128(precision, scale) => validate_decimal_core(
+            path,
+            *precision,
+            *scale,
+            DECIMAL128_MAX_PRECISION,
+            DECIMAL128_MAX_SCALE,
+            errors,
+            policy,
+        )?,
+        DataType::Decimal256(precision, scale) => validate_decimal_core(
+            path,
+            *precision,
+            *scale,
+            DECIMAL256_MAX_PRECISION,
+            DECIMAL256_MAX_SCALE,
+            errors,
+            policy,
+        )?,
+        _ => {}
+    }
+    policy.visit()
+}
+
+fn account_field<P: TypeValidationPolicy>(
+    field: &Field,
+    usage: &mut ResourceUsage,
+    policy: &mut P,
+) -> Result<(), P::Error> {
+    policy.visit()?;
+    usage.add_bytes(field.name().len());
+    usage.add_items(field.metadata().len());
+    // Arrow 60 Metadata iterates actual ordered entries, independent of any
+    // previously discarded source HashMap capacity.
+    for (key, value) in field.metadata() {
+        if usage.exhausted() {
+            break;
+        }
+        policy.visit()?;
+        usage.add_byte_counts([key.len(), value.len()]);
     }
     Ok(())
 }
+
 fn validate_decimal_core<P: TypeValidationPolicy>(
     path: &str,
     precision: u8,
@@ -2681,34 +2263,6 @@ fn validate_decimal_core<P: TypeValidationPolicy>(
             type_message_bound("Arrow decimal precision/scale (, ) is outside 1..= and -..=".len() + 2 * 3 + 3 * 4, 5, 2 * 3 + 3 * 4), errors)?;
     }
     Ok(())
-}
-fn invalid_fixed_size_core<P: TypeValidationPolicy>(
-    path: &str,
-    size: i32,
-    errors: &mut ValidationContext,
-    policy: &mut P,
-) -> Result<(), P::Error> {
-    // Preserve the original negative-vs-upper-limit error categories.
-    if size < 0 {
-        return policy.formatted(
-            ValidationErrorCategory::StructuralInvariant,
-            path,
-            format_args!("Arrow fixed-size length {size} is negative"),
-            type_message_bound("Arrow fixed-size length  is negative".len() + 11, 1, 11),
-            errors,
-        );
-    }
-    policy.formatted(
-        ValidationErrorCategory::ResourceLimit,
-        path,
-        format_args!("Arrow fixed-size length {size} exceeds {MAX_FIXED_SIZE_LENGTH}"),
-        type_message_bound(
-            "Arrow fixed-size length  exceeds ".len() + 2 * 11,
-            2,
-            2 * 11,
-        ),
-        errors,
-    )
 }
 
 #[cfg(test)]
@@ -2742,17 +2296,19 @@ mod tests {
             result_type: ValueType::new(DataType::Int64, false),
         };
         let binding = AggregateBinding {
-            state_interpretation: None,
-            state_argument_contract:
-                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function,
             phase: crate::AggregatePhase::Single,
             logical_argument_count: 0,
-            intermediate_type: ValueType::new(DataType::Int64, false),
-            state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
-                "s".repeat(1024),
-            )
-            .unwrap(),
+            merge_state: Some(crate::AggregateMergeBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                intermediate_type: ValueType::new(DataType::Int64, false),
+                state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
+                    "s".repeat(1024),
+                )
+                .unwrap(),
+            }),
         };
         let mut usage =
             ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);

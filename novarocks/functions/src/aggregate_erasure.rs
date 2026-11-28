@@ -78,7 +78,7 @@ impl PreparedAggregateHandle {
         if self.local_stages.is_some() {
             return Err(invalid("local aggregate stages were already prepared"));
         }
-        if !self.inner.supports_local_stages() {
+        if self.contract().merge_state().is_none() || !self.inner.supports_local_stages() {
             return Ok(());
         }
         let source = Arc::clone(self.contract());

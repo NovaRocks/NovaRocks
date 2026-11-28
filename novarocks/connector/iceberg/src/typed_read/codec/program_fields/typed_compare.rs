@@ -398,7 +398,7 @@ pub(super) fn source_facts(
     root_path: &[u32],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
-    let mut path = [0u32; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1];
+    let mut path = [0u32; novarocks_connector_contract::MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH];
     path[..root_path.len()].copy_from_slice(root_path);
     if let Some(declaration) = declaration {
         return formal_field(
@@ -424,7 +424,7 @@ pub(super) fn source_facts(
 fn formal_field(
     field: &NestedField,
     source: &novarocks_connector_contract::ConnectorSourceSchemaFacts,
-    path: &mut [u32; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1],
+    path: &mut [u32; novarocks_connector_contract::MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH],
     depth: usize,
     input_work: usize,
     work: &mut CompileCheckpoints<'_>,

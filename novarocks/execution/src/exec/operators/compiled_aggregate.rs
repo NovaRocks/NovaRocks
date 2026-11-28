@@ -523,6 +523,12 @@ impl CompiledAggregateProcessorFactory {
         })
     }
 
+    pub(crate) fn requires_raw_group_input(&self) -> bool {
+        self.calls
+            .iter()
+            .any(|call| call.contract.merge_state().is_none())
+    }
+
     /// Every call must have prepared its original local stages before the
     /// pipeline can exchange intermediate states.
     pub(crate) fn requires_local_update_stages(&self) -> bool {

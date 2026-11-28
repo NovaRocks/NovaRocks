@@ -307,8 +307,17 @@ pub(crate) fn freeze_binding_with_creation<H>(
     let argument_types = function.argument_types.clone_observed(|| work.step())?;
     let result_type =
         FunctionResultType::Scalar(function.result_type.clone_observed(|| work.step())?);
-    let intermediate_type = binding.intermediate_type.clone_observed(|| work.step())?;
-    let state_format = binding.state_format.clone_observed(|| work.step())?;
+    let aggregate = binding
+        .merge_state
+        .as_ref()
+        .map(|state| {
+            Ok::<_, novarocks_type_contract::CompileControlError>(AggregateBindingSelection {
+                state_argument_contract: state.state_argument_contract,
+                intermediate_type: state.intermediate_type.clone_observed(|| work.step())?,
+                state_format: state.state_format.clone_observed(|| work.step())?,
+            })
+        })
+        .transpose()?;
     crate::creation::request(
         arc_layout(std::alloc::Layout::new::<FunctionBindingSelection>())?,
         creation,
@@ -318,11 +327,7 @@ pub(crate) fn freeze_binding_with_creation<H>(
         overload,
         argument_types,
         result_type,
-        aggregate: Some(AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type,
-            state_format,
-        }),
+        aggregate,
     });
     let frozen = novarocks_local_program::FrozenAggregateSelection::try_new(
         function_id,
@@ -378,24 +383,37 @@ pub(crate) fn lower_call<H>(
         );
         work.step()?;
     }
-    let mut argument_types = Vec::new();
-    reserve_vec(&mut argument_types, function.argument_types.len(), work)?;
-    for argument in function.argument_types.iter() {
-        let FunctionArgumentType::Value(value) = argument else {
-            return Err(FragmentCompileError::Invalid("aggregate channel is not a value").into());
-        };
+    let resolved = if let Some(state) = &binding.merge_state {
+        let mut argument_types = Vec::new();
+        reserve_vec(&mut argument_types, function.argument_types.len(), work)?;
+        for argument in function.argument_types.iter() {
+            let FunctionArgumentType::Value(value) = argument else {
+                return Err(
+                    FragmentCompileError::Invalid("aggregate channel is not a value").into(),
+                );
+            };
+            work.flush()?;
+            argument_types.push(value.data_type().clone());
+            work.step()?;
+        }
+        let overload =
+            AggregateOverloadIdentity::try_new(function.overload.as_str()).map_err(|error| {
+                FragmentCompileError::Owner {
+                    phase: "aggregate overload identity",
+                    error: novarocks_failure_contract::SharedFailureCause::new(error),
+                }
+            })?;
         work.flush()?;
-        argument_types.push(value.data_type().clone());
-        work.step()?;
-    }
-    let overload =
-        AggregateOverloadIdentity::try_new(function.overload.as_str()).map_err(|error| {
-            FragmentCompileError::Owner {
-                phase: "aggregate overload identity",
-                error: novarocks_failure_contract::SharedFailureCause::new(error),
-            }
-        })?;
-    work.flush()?;
+        Some(ResolvedAggregateSignature {
+            overload,
+            argument_types,
+            intermediate_type: state.intermediate_type.data_type().clone(),
+            output_type: function.result_type.data_type().clone(),
+            state_format: state.state_format.clone(),
+        })
+    } else {
+        None
+    };
     let name: Arc<str> = Arc::from(function.function_id.as_str());
     work.flush()?;
     let mut ascending = Vec::new();
@@ -423,8 +441,9 @@ pub(crate) fn lower_call<H>(
         filter_root,
         frozen: Some(frozen),
         state_interpretation: binding
-            .state_interpretation
+            .merge_state
             .as_ref()
+            .and_then(|state| state.state_interpretation.as_ref())
             .map(|value| value.clone_observed(work))
             .transpose()?,
         // A diagnostic tag only; the frozen preparation owns the call.
@@ -437,13 +456,7 @@ pub(crate) fn lower_call<H>(
             nulls_first,
             is_distinct: call.distinct,
         },
-        resolved: ResolvedAggregateSignature {
-            overload,
-            argument_types,
-            intermediate_type: binding.intermediate_type.data_type().clone(),
-            output_type: function.result_type.data_type().clone(),
-            state_format: binding.state_format.clone(),
-        },
+        resolved,
     })
 }
 
@@ -600,11 +613,14 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         overload: function.overload.clone(),
         argument_types: function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(function.result_type.clone()),
-        aggregate: Some(AggregateBindingSelection {
-            state_argument_contract: binding.state_argument_contract,
-            intermediate_type: binding.intermediate_type.clone(),
-            state_format: binding.state_format.clone(),
-        }),
+        aggregate: binding
+            .merge_state
+            .as_ref()
+            .map(|state| AggregateBindingSelection {
+                state_argument_contract: state.state_argument_contract,
+                intermediate_type: state.intermediate_type.clone(),
+                state_format: state.state_format.clone(),
+            }),
     });
     work.flush()?;
     crate::expressions::validate_call_created(
@@ -685,8 +701,9 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         work.step()?;
     }
     let original = binding
-        .state_interpretation
+        .merge_state
         .as_ref()
+        .and_then(|state| state.state_interpretation.as_ref())
         .map(|value| value.clone_observed(work).map(Arc::new))
         .transpose()?;
     let mut order_keys = Vec::new();

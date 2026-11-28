@@ -666,10 +666,10 @@ impl IcebergTableHandle {
         self
     }
 
-    pub(crate) const fn rewritten_target(
+    pub(crate) fn rewritten_target(
         &self,
     ) -> Option<crate::commit::conflict_scope::RewrittenTargetBinding> {
-        self.rewritten_target
+        self.rewritten_target.clone()
     }
 
     pub(crate) fn with_prepared_manifest_list(

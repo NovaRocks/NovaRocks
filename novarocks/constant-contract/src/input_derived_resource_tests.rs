@@ -244,20 +244,16 @@ fn input_derived_preflight_keeps_metadata_and_reports_actual_offset_extent() {
         .with_metadata([("source", "x".repeat(64 * 1024))]);
     let ty = FunctionValueType::new(DataType::Utf8, false);
     let validation = ConstantValidation::INPUT_DERIVED;
-    assert!(matches!(
-        preflight_scalar_construction(
-            &field,
-            &ty,
-            1,
-            false,
-            validation,
-            CompilePhase::Decode,
-            &control,
-        ),
-        Err(ConstantError::Limit(
-            "constant metadata byte limit exceeded"
-        ))
-    ));
+    preflight_scalar_construction(
+        &field,
+        &ty,
+        1,
+        false,
+        validation,
+        CompilePhase::Decode,
+        &control,
+    )
+    .unwrap();
 
     for (carrier, extent_limit) in [
         (DataType::Utf8, i32::MAX as u64),
@@ -292,13 +288,13 @@ fn input_derived_preflight_keeps_metadata_and_reports_actual_offset_extent() {
 }
 
 #[test]
-fn input_derived_null_factory_rejects_excess_dictionary_depth_before_building() {
+fn input_derived_null_factory_rejects_consecutive_dictionary_before_building() {
     let control = Control(AtomicBool::new(false));
     let carrier = (0..9).fold(DataType::Int64, |values, _| {
         DataType::Dictionary(Box::new(DataType::Int8), Box::new(values))
     });
-    let field = Field::new("dictionary", carrier.clone(), true);
-    let ty = FunctionValueType::new(carrier, true);
+    let field = Field::new("dictionary", carrier, true);
+    let ty = FunctionValueType::new(DataType::Int64, true);
     assert!(matches!(
         preflight_scalar_construction(
             &field,
@@ -309,8 +305,6 @@ fn input_derived_null_factory_rejects_excess_dictionary_depth_before_building() 
             CompilePhase::Decode,
             &control,
         ),
-        Err(ConstantError::Limit(
-            "constant dictionary depth limit exceeded"
-        ))
+        Err(ConstantError::Type(..))
     ));
 }

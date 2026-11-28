@@ -285,8 +285,7 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
     let options = AggregatePreparationOptions {
         state_interpretation: source
             .binding
-            .state_interpretation
-            .as_ref()
+            .state_interpretation()
             .map(|value| value.clone_observed(work))
             .transpose()?
             .map(Arc::new),
@@ -384,15 +383,32 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         work,
     )?;
     if let Some(facts) = captured.binding().aggregate_state_source() {
-        let original = source.binding.state_interpretation.as_ref().ok_or(
-            PhysicalAggregateRequestError::InvalidSource(
-                "aggregate update has no original state interpretation",
-            ),
-        )?;
-        if !facts.matches_observed(original, || work.step())? || facts.distinct != source.distinct {
+        if facts.distinct != source.distinct || facts.order_keys.len() != source.order_by.len() {
             return Err(PhysicalAggregateRequestError::InvalidSource(
                 "aggregate physical update changes its logical source interpretation",
             ));
+        }
+        for (original, actual) in facts.order_keys.iter().zip(source.order_by.iter()) {
+            work.step()?;
+            if original.ascending != (actual.direction == SortDirection::Ascending)
+                || original.nulls_first != (actual.null_ordering == NullOrdering::First)
+            {
+                return Err(PhysicalAggregateRequestError::InvalidSource(
+                    "aggregate physical update changes its original ordering",
+                ));
+            }
+        }
+        if source.binding.merge_state.is_some() {
+            let state = source.binding.state_interpretation().ok_or(
+                PhysicalAggregateRequestError::InvalidSource(
+                    "aggregate update has no original state interpretation",
+                ),
+            )?;
+            if !facts.matches_observed(state, || work.step())? {
+                return Err(PhysicalAggregateRequestError::InvalidSource(
+                    "aggregate physical update changes its logical source interpretation",
+                ));
+            }
         }
     }
     // Retain the exact same-emission Arc for refinement and preparation.
@@ -417,8 +433,7 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
     let options = AggregatePreparationOptions {
         state_interpretation: source
             .binding
-            .state_interpretation
-            .as_ref()
+            .state_interpretation()
             .map(|value| value.clone_observed(work))
             .transpose()?
             .map(Arc::new),
@@ -606,8 +621,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     work.flush()?;
     let state_interpretation = source
         .binding
-        .state_interpretation
-        .as_ref()
+        .state_interpretation()
         .map(|value| value.clone_observed(work).map(Arc::new))
         .transpose()?;
     work.flush()?;
@@ -641,8 +655,8 @@ pub(in crate::planner::distributed::build) fn checked_aggregate_state_semantics_
         _ => false,
     };
     let same_state = match (
-        &consumer_binding.state_interpretation,
-        &producer_binding.state_interpretation,
+        consumer_binding.state_interpretation(),
+        producer_binding.state_interpretation(),
     ) {
         (None, None) => true,
         (Some(a), Some(b)) => a.matches_observed(b, || work.step())?,
@@ -796,11 +810,17 @@ pub(crate) fn selected_binding_correspondence_observed(
             "merge binding differs from its captured final result type",
         ));
     }
-    let aggregate = selected.aggregate.as_ref();
+    let capability = (selected.aggregate.as_ref(), binding.merge_state.as_ref());
     work.step()?;
-    let aggregate = aggregate.ok_or(PhysicalAggregateRequestError::InvalidSource(
-        "merge logical source has no aggregate state contract",
-    ))?;
+    let (aggregate, binding) = match capability {
+        (None, None) if binding.has_valid_phase_contract() => return Ok(()),
+        (Some(aggregate), Some(state)) if binding.has_valid_phase_contract() => (aggregate, state),
+        _ => {
+            return Err(PhysicalAggregateRequestError::InvalidSource(
+                "aggregate binding differs from its captured state capability or phase",
+            ));
+        }
+    };
     let format = aggregate.state_format == binding.state_format
         && aggregate.state_argument_contract == binding.state_argument_contract;
     work.step()?;

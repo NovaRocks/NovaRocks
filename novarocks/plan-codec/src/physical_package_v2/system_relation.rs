@@ -281,9 +281,6 @@ impl<H> UnitObserver for Observer<'_, '_, '_, '_, H> {
         self.checkpoint()?;
         request(&mut self.creation.borrow_mut(), layout)
     }
-    fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
-        self.checkpoint()
-    }
     fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
         self.checkpoint()
     }

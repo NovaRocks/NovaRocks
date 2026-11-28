@@ -21,7 +21,7 @@ use super::{
     geometry::{Geometry, add, mul},
 };
 use crate::host_projection_v2::ProjectionFailure;
-use crate::{ipc_schema_v2::SchemaWriterRequestFacts, physical_type_v2::TypeCodecError};
+use crate::physical_type_v2::TypeCodecError;
 use novarocks_type_contract::CompileControlError;
 type HostError<H> = ProjectionFailure<TypeCodecError, H>;
 pub(crate) struct Admission<'a, 'b, H> {
@@ -35,27 +35,24 @@ impl<H> Admission<'_, '_, H> {
         rows: usize,
         limits: FlatPoolWriteLimits,
     ) -> Result<FlatPoolWriteFacts, TypeCodecError> {
-        let policy = crate::ipc_schema_v2::owner_admission::Policy(true);
+        let policy = crate::ipc_flat_pool_v2::WriterAdmissionPolicy(true);
         policy.cap(
             rows,
             limits.max_rows.min(i64::MAX as usize),
             "flat pool writer row envelope exceeded",
         )?;
-        let bytes = super::allocations::prefix_request_bytes();
-        let work = policy.numeric(super::source_work(source, 0))?;
         Ok(FlatPoolWriteFacts {
             source_retained_bytes: source,
             rows,
             buffer_descriptors: 0,
             variadic_buffers: 0,
             body_bytes: 0,
-            schema_backing_bytes_upper_bound: 0,
             batch_backing_bytes_upper_bound: 0,
             encoded_stream_bytes_upper_bound: 0,
-            new_allocation_request_bytes_upper_bound: bytes,
-            allocation_request_count_upper_bound: 2,
-            coexisting_source_and_request_bytes_upper_bound: policy.numeric(add(source, bytes))?,
-            cumulative_library_work_upper_bound: work,
+            new_allocation_request_bytes_upper_bound: 0,
+            allocation_request_count_upper_bound: 0,
+            coexisting_source_and_request_bytes_upper_bound: source,
+            cumulative_library_work_upper_bound: 0,
         })
     }
     pub fn gate(&mut self) -> Result<(), HostError<H>> {
@@ -74,19 +71,23 @@ impl<H> Admission<'_, '_, H> {
         }
         (self.parent)(&self.facts)
     }
-    pub fn schema(&mut self, s: &SchemaWriterRequestFacts) -> Result<(), HostError<H>> {
+    pub fn construction(
+        &mut self,
+        requests: super::allocations::Requests,
+        work_upper_bound: usize,
+    ) -> Result<(), HostError<H>> {
         self.facts.new_allocation_request_bytes_upper_bound = self
             .facts
             .new_allocation_request_bytes_upper_bound
-            .max(s.request_bytes);
+            .max(requests.bytes);
         self.facts.allocation_request_count_upper_bound = self
             .facts
             .allocation_request_count_upper_bound
-            .max(s.request_count);
+            .max(requests.count);
         self.facts.cumulative_library_work_upper_bound = self
             .facts
             .cumulative_library_work_upper_bound
-            .max(s.work_upper_bound);
+            .max(work_upper_bound);
         self.facts.coexisting_source_and_request_bytes_upper_bound = add(
             self.facts.source_retained_bytes,
             self.facts.new_allocation_request_bytes_upper_bound,

@@ -209,9 +209,16 @@ impl AggregateCallContract {
                     "aggregate preparation requires its exact aggregate control",
                 ));
             }
-            let Some(state) = &call.selected().aggregate else {
-                return Err(invalid("aggregate binding has no state contract"));
-            };
+            let state = call.selected().aggregate.as_ref();
+            if state.is_none()
+                && (phase != AggregateKernelPhase::Single
+                    || state_interpretation.is_some()
+                    || order_keys.is_empty())
+            {
+                return Err(invalid(
+                    "ordered aggregate requires a Single call without merge state",
+                ));
+            }
             if !matches!(call.selected().result_type, FunctionResultType::Scalar(_)) {
                 return Err(invalid("aggregate binding requires a scalar final result"));
             }
@@ -264,6 +271,8 @@ impl AggregateCallContract {
                         "aggregate merge cannot repeat DISTINCT or function ORDER BY",
                     ));
                 }
+                let state =
+                    state.ok_or_else(|| invalid("aggregate merge has no state contract"))?;
                 let Some(input) = &state_input_type else {
                     return Err(invalid("aggregate merge has no exact state input layout"));
                 };
@@ -368,6 +377,9 @@ impl AggregateCallContract {
         self.call.selected().argument_types[self.call.logical_argument_count()..]
             .iter()
             .map(value_type)
+    }
+    pub fn merge_state(&self) -> Option<&crate::AggregateBindingSelection> {
+        self.call.selected().aggregate.as_ref()
     }
     pub fn intermediate_type(&self) -> &FunctionValueType {
         &self

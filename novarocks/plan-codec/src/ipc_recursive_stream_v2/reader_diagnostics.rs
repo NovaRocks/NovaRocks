@@ -30,7 +30,7 @@ use crate::ipc_flat_stream_v2::{
     },
 };
 use arrow::datatypes::{DataType, Field};
-use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+use novarocks_type_contract::MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Render {
@@ -127,7 +127,7 @@ fn type_render<W: ResourceWork>(
     depth: usize,
     work: &mut W,
 ) -> Result<Render, W::Error> {
-    if depth > MAX_VALUE_TYPE_DEPTH {
+    if depth > MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH {
         return Err(invalid("recursive reader diagnostic type depth").into());
     }
     let out = match ty {
@@ -215,7 +215,8 @@ pub(super) fn preflight<W: ResourceWork>(
     work: &mut W,
 ) -> Result<ReaderDiagnosticRequests, W::Error> {
     let digits = decimal_digits(usize::MAX, work)?;
-    let mut path: [Option<Render>; MAX_VALUE_TYPE_DEPTH] = [None; MAX_VALUE_TYPE_DEPTH];
+    let mut path: [Option<Render>; MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH] =
+        [None; MAX_CANONICAL_ARROW_TYPE_PATH_DEPTH];
     let mut largest = ReaderDiagnosticRequests::default();
     let mut eager = ReaderDiagnosticRequests::default();
     for node in input.nodes {

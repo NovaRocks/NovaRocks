@@ -177,13 +177,10 @@ pub fn open_view_scan(
                 max_read_rows: NonZeroUsize::new(4).unwrap(),
                 max_read_bytes: 1 << 20,
             },
-            reader_options: FileReaderOptions {
-                parquet_interpretation_policy:
-                    ParquetInterpretationPolicy::DerivedByteRepresentation {
-                        preserve_top_level_dictionary: true,
-                    },
-                ..Default::default()
+            parquet_policy: ParquetInterpretationPolicy::DerivedByteRepresentation {
+                preserve_top_level_dictionary: true,
             },
+            reader_options: FileReaderOptions::default(),
             scheduled_split_sequence_id: 1,
             dynamic_filter: Arc::new(CompleteAllDynamicFilter::new(Default::default())),
             prepared_input: None,

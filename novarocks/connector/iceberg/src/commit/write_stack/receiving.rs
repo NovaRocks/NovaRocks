@@ -167,7 +167,7 @@ impl QueryReceiving {
     }
 }
 
-fn matches_rewritten_target(metadata: &TableMetadata, binding: RewrittenTargetBinding) -> bool {
+fn matches_rewritten_target(metadata: &TableMetadata, binding: &RewrittenTargetBinding) -> bool {
     metadata.uuid() == binding.table_uuid
         && match binding.snapshot_id {
             Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id).is_some(),
@@ -205,7 +205,7 @@ impl IcebergReceiving {
                 "Iceberg rewritten target binding was installed after receiving started",
             ));
         }
-        if !matches_rewritten_target(metadata, binding) {
+        if !matches_rewritten_target(metadata, &binding) {
             return Err(rewritten_target_error(
                 "Iceberg rewritten target binding differs from the original write observation",
             ));
@@ -231,7 +231,7 @@ impl IcebergReceiving {
         let Some(receiving) = self.rewritten_target.as_mut() else {
             return Ok(None);
         };
-        if !matches_rewritten_target(source, receiving.binding)
+        if !matches_rewritten_target(source, &receiving.binding)
             || crate::read_snapshot::metadata_identity_digest(source)
                 .map_err(rewritten_target_error)?
                 != receiving.metadata_digest

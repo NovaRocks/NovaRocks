@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::{
     ConnectorExpression, ConnectorReadRelationRecipe, ConnectorReadRelationRecipeDraft,
-    ConnectorValueType, MAX_CONNECTOR_RECIPE_COLUMNS, TupleDomain,
+    ConnectorValueType, TupleDomain,
 };
 
 const MAX_SCAN_NAME_BYTES: usize = 256;
@@ -123,7 +123,6 @@ struct ConnectorScanFacts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticConnectorScanError {
     EmptyAssignments,
-    TooManyAssignments,
     RecipeColumnMismatch,
     InvalidVariable,
     DuplicateVariable,
@@ -502,9 +501,6 @@ fn validate_scan<R: AsRef<ConnectorReadRelationRecipeDraft>, S: ScanOperations>(
     let assignments = &input.assignments;
     if assignments.is_empty() {
         return Err(E::EmptyAssignments.into());
-    }
-    if assignments.len() > MAX_CONNECTOR_RECIPE_COLUMNS {
-        return Err(E::TooManyAssignments.into());
     }
     if assignments.len() != input.recipe.as_ref().columns().len() {
         return Err(E::RecipeColumnMismatch.into());

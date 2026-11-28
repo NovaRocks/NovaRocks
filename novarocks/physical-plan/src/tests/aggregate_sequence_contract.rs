@@ -83,9 +83,6 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
         }
     };
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: BoundFunction {
             legacy_metadata: Some(crate::LegacyBindingMetadata {
                 semantic_parameters: Box::default(),
@@ -105,8 +102,13 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
         },
         phase,
         logical_argument_count: 1,
-        intermediate_type: ty(DataType::Binary, false),
-        state_format: AggregateStateFormatId::try_new(state_format).unwrap(),
+        merge_state: Some(crate::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            intermediate_type: ty(DataType::Binary, false),
+            state_format: AggregateStateFormatId::try_new(state_format).unwrap(),
+        }),
     }
 }
 
@@ -311,7 +313,12 @@ fn add_aggregate_with_grouping(
     let output_type = if phase.produces_final_result() {
         binding.function.result_type.clone()
     } else {
-        binding.intermediate_type.clone()
+        binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type
+            .clone()
     };
     let output_origin = if phase.produces_final_result() {
         ValueOrigin::AggregateResult { call: call_id }

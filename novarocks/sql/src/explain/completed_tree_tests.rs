@@ -316,17 +316,26 @@ fn line_bound_is_enforced_by_the_production_tree_traversal() {
 }
 
 #[test]
-fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
+fn deep_node_paths_render_and_the_expression_budget_still_applies() {
     let (mut builder, mut root, value, ty) = base();
-    for _ in 0..MAX_TREE_DEPTH + 1 {
+    let limits = 191;
+    for _ in 0..limits {
         let node = builder.reserve_node_id().unwrap();
         builder.add_limit(node, root, Some(1), 0).unwrap();
         root = node;
     }
     let plan = finish(builder, root, value, ty, Vec::new());
-    assert!(
-        matches!(render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()), Err(SqlCompileError::InvalidRequest(message)) if message.contains("depth bound"))
-    );
+    let lines = render_completed_plan_tree(
+        &plan,
+        ExplainLevel::Normal,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    assert_eq!(lines.len(), limits + 1);
+    for (depth, line) in lines.iter().take(limits).enumerate() {
+        assert!(line.starts_with(&format!("{}{depth}:LIMIT", "  ".repeat(depth))));
+    }
+    assert!(lines[limits].starts_with(&format!("{}{limits}:VALUES", "  ".repeat(limits))));
     let plan = project(
         |builder, node, ty| {
             let mut expression = builder.constant(node, ty.clone(), checked::boolean(true));
@@ -375,14 +384,16 @@ fn node_prepass_rejects_a_back_edge_and_preserves_shared_node_numbering() {
         vec![NodeId::new(0)],
     ];
     let mut next = 0;
+    let mut out = ExplainRenderOutput::new(ExplainRenderBudget::default());
     assert!(
         assign_display_ids(
             &mut entries,
             fragment,
             NodeId::new(0),
-            0,
             &mut next,
-            &|id| Some(inputs[id.get() as usize].as_slice())
+            &|id| Some(inputs[id.get() as usize].as_slice()),
+            &mut Vec::with_capacity(inputs.len()),
+            &mut out,
         )
         .is_err()
     );
@@ -403,9 +414,10 @@ fn node_prepass_rejects_a_back_edge_and_preserves_shared_node_numbering() {
         &mut entries,
         fragment,
         NodeId::new(0),
-        0,
         &mut next,
         &|id| Some(inputs[id.get() as usize].as_slice()),
+        &mut Vec::with_capacity(inputs.len()),
+        &mut out,
     )
     .unwrap();
     assert_eq!(next, 3);

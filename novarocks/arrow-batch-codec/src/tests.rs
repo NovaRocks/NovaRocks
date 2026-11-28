@@ -90,13 +90,6 @@ struct Observed {
 }
 impl UnitObserver for Observed {
     type Error = Refusal;
-    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Refusal> {
-        assert_eq!(
-            work_upper,
-            novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()
-        );
-        self.checkpoint()
-    }
     fn project_carrier(
         &mut self,
         _: usize,

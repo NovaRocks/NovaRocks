@@ -530,7 +530,7 @@ fn one_accessor_overload_preserves_document_text_json_and_variant_domains() {
 }
 
 #[test]
-fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
+fn ordered_array_aggregate_has_no_merge_state_and_preserves_final_json() {
     let catalog = builtin_engine_function_catalog();
     for ordered in [false, true] {
         let mut arguments = vec![value(json())];
@@ -554,29 +554,16 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
             .validate_bound(&binding, request, crate::binding_test_control())
             .unwrap();
         assert_eq!(output(&binding), &physical(DataType::List(json_item(true))));
-        let state = &binding
-            .selected
-            .aggregate
-            .as_ref()
-            .unwrap()
-            .intermediate_type;
-        assert_eq!(state.logical_type(), ValueLogicalType::Physical);
         if ordered {
-            let DataType::Struct(fields) = state.data_type() else {
-                panic!("ordered state");
-            };
-            assert_eq!(fields.len(), 2);
-            for (field, carrier) in fields.iter().zip([DataType::LargeBinary, DataType::Int64]) {
-                let DataType::List(item) = field.data_type() else {
-                    panic!("channel list");
-                };
-                assert_eq!(item.data_type(), &carrier);
-                assert_eq!(
-                    novarocks_type_contract::field_logical_type(item).unwrap(),
-                    ValueLogicalType::Physical
-                );
-            }
+            assert!(binding.selected.aggregate.is_none());
         } else {
+            let state = &binding
+                .selected
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .intermediate_type;
+            assert_eq!(state.logical_type(), ValueLogicalType::Physical);
             let DataType::List(item) = state.data_type() else {
                 panic!("state list");
             };

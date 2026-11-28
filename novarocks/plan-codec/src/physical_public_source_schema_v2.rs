@@ -581,7 +581,8 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
         attrs_model(&mut model, &def.schema_attributes, work)?;
         for fact in &def.field_facts {
             if fact.field_path.is_empty()
-                || fact.field_path.len() > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 1
+                || fact.field_path.len()
+                    > novarocks_connector_contract::MAX_CONNECTOR_SOURCE_FIELD_PATH_DEPTH
             {
                 return Err(invalid("source field path has an invalid occurrence depth").into());
             }

@@ -93,6 +93,9 @@ impl StaticPlanInterpreter {
 /// Native JSON bytes replace the text carrier with plan revision 46, new
 /// root-result descriptor discriminants, and a changed sealed function catalog.
 /// Those exact inputs separate the compatibility islands under epoch 18.
+/// Plan revision 50 combines ContentApply, single-message RecordBatch constants,
+/// and the ordered aggregate's Single contract. The exact plan revision
+/// separates this compatibility island from revisions 48 and 49.
 /// Epoch 16 carries exact Exchange route failure stops in the existing
 /// refusal envelope. Epoch-15 senders treat this observation as a new Task
 /// failure, so they cannot share the same island.

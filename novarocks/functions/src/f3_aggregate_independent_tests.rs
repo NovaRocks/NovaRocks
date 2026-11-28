@@ -128,7 +128,7 @@ fn f3_array_aggregate_retains_order_duplicate_and_null_from_handwritten_input() 
     let spec = ArrayAggConfig {
         kind,
         output_type: &ty,
-        intermediate_type: &ty,
+        intermediate_type: Some(&ty),
         input_arg_type: Some(&input_type),
     };
     let out = build_array(&spec, std::iter::once(&state), false, &mut work).unwrap();

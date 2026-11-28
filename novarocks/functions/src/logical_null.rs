@@ -86,8 +86,26 @@ pub(crate) fn logical_is_null_observed<E>(
     depth: usize,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<bool, NullVisitError<E>> {
+    logical_is_null_at(array, row, depth.max(1), false, observe)
+}
+
+fn logical_is_null_at<E>(
+    array: &dyn Array,
+    row: usize,
+    depth: usize,
+    parent_encoding: bool,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, NullVisitError<E>> {
     observe().map_err(NullVisitError::Control)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH || row >= array.len() {
+        return Err(NullVisitError::Invalid(NullAddressViolation::NestedAddress));
+    }
+    if parent_encoding
+        && matches!(
+            array.data_type(),
+            DataType::Dictionary(..) | DataType::RunEndEncoded(..)
+        )
+    {
         return Err(NullVisitError::Invalid(NullAddressViolation::NestedAddress));
     }
     if array.is_null(row) {
@@ -105,12 +123,9 @@ pub(crate) fn logical_is_null_observed<E>(
                             NullVisitError::Invalid(NullAddressViolation::DictionaryCarrier)
                         })?;
                     match array.key(row) {
-                        Some(key) => logical_is_null_observed(
-                            array.values().as_ref(),
-                            key,
-                            depth + 1,
-                            observe,
-                        ),
+                        Some(key) => {
+                            logical_is_null_at(array.values().as_ref(), key, depth, true, observe)
+                        }
                         None => Ok(true),
                     }
                 }};
@@ -134,10 +149,11 @@ pub(crate) fn logical_is_null_observed<E>(
                         .as_any()
                         .downcast_ref::<RunArray<$key>>()
                         .ok_or_else(|| NullVisitError::Invalid(NullAddressViolation::RunCarrier))?;
-                    logical_is_null_observed(
+                    logical_is_null_at(
                         array.values().as_ref(),
                         array.get_physical_index(row),
-                        depth + 1,
+                        depth,
+                        true,
                         observe,
                     )
                 }};
@@ -166,10 +182,11 @@ pub(crate) fn logical_is_null_observed<E>(
             if !known {
                 return Err(NullVisitError::Invalid(NullAddressViolation::UnionTypeId));
             }
-            logical_is_null_observed(
+            logical_is_null_at(
                 array.child(type_id).as_ref(),
                 array.value_offset(row),
                 depth + 1,
+                false,
                 observe,
             )
         }

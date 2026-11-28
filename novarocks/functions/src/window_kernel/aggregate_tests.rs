@@ -17,12 +17,11 @@
 
 use super::*;
 use crate::{
-    AggregateBindingSelection, AggregateCallContract, AggregateKernelPhase, AggregateOrderKey,
-    AggregateStateFormatIdentity, AggregateStateMemoryPolicy, AggregateUpdateInvocation,
-    EvaluatedArgument, FunctionArgument, FunctionBindingRequest, FunctionEffectOwnerError,
-    FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, KernelDiagnostic,
-    SelectedAggregateMergeInput, SelectedAggregateUpdateInput, create_aggregate_state,
-    emit_aggregate,
+    AggregateCallContract, AggregateKernelPhase, AggregateOrderKey, AggregateStateMemoryPolicy,
+    AggregateUpdateInvocation, EvaluatedArgument, FunctionArgument, FunctionBindingRequest,
+    FunctionEffectOwnerError, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
+    KernelDiagnostic, SelectedAggregateMergeInput, SelectedAggregateUpdateInput,
+    create_aggregate_state, emit_aggregate,
 };
 use arrow_array::{ArrayRef, Int32Array, Int64Array};
 use arrow_schema::DataType;
@@ -94,15 +93,7 @@ impl Owner {
                     DataType::Int64,
                     false,
                 )),
-                aggregate: Some(AggregateBindingSelection {
-                    state_argument_contract:
-                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-                    intermediate_type: FunctionValueType::new(DataType::Int64, false),
-                    state_format: AggregateStateFormatIdentity::try_new(
-                        "fixture/aggregate-window/state-v1",
-                    )
-                    .unwrap(),
-                }),
+                aggregate: None,
             }),
             arguments,
             uses: [Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))],

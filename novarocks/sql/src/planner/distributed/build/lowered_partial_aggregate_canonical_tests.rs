@@ -251,11 +251,28 @@ fn verify_update_and_final(owner: &SqlAuthoredPhysicalPlan) {
             .as_ref()
             .unwrap()
             .state_format,
-        partial.source().binding.state_format
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(
-        partial.source().binding.state_format,
-        final_call.binding.state_format
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format,
+        final_call
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(
         partial
@@ -374,7 +391,7 @@ fn partial_avg_local_output_uses_intermediate_utf8_not_final_float64() {
 }
 
 #[test]
-fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logical_source() {
+fn partial_array_agg_refuses_original_order_channels() {
     let ty = ValueType::new(DataType::Int64, true);
     let field = Arc::new(
         Field::new("original_cv", DataType::Int64, true).with_metadata(
@@ -397,7 +414,7 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
         kind: ExprKind::Constant(pool.value(ordinal).unwrap()),
         value_type: ty.clone(),
     };
-    let source = chain(
+    let source = aggregate(
         "array_agg",
         vec![expr(1)],
         vec![SortItem {
@@ -407,88 +424,39 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
         }],
         values(vec![], vec![vec![]]),
     );
-    let owner = authored(&source, &Control::default()).unwrap();
-    verify_update_and_final(&owner);
-    let partial = entry(&owner, true);
-    let final_entry = entry(&owner, false);
-    let state_source = partial
-        .captured()
-        .binding()
-        .aggregate_state_source()
-        .expect("the original Partial lexical source");
-    assert!(!state_source.distinct);
-    assert_eq!(
-        state_source.order_keys.as_ref(),
-        &[novarocks_type_contract::AggregateStateOrderKey {
-            ascending: false,
-            nulls_first: true,
-        }]
+    let PhysicalPlanKind::HashAggregate(spec) = &source.kind else {
+        unreachable!()
+    };
+    assert!(
+        spec.aggregates[0]
+            .source
+            .binding()
+            .selected
+            .aggregate
+            .is_none()
     );
-    assert_eq!(
-        partial.source().binding.state_interpretation.as_ref(),
-        Some(state_source)
-    );
-    assert_eq!(
-        final_entry.source().binding.state_interpretation.as_ref(),
-        Some(state_source)
-    );
-    assert_eq!(
-        final_entry.captured().binding().aggregate_state_source(),
-        Some(state_source)
-    );
-    let canonical = partial.canonical().unwrap();
-    assert_eq!(canonical.request().logical_argument_count, 1);
-    assert_eq!(canonical.request().arguments.len(), 2);
-    assert_eq!(final_entry.captured().request().arguments.len(), 2);
-    assert_eq!(
-        partial.source().order_by[0].direction,
-        SortDirection::Descending
-    );
-    assert_eq!(
-        partial.source().order_by[0].null_ordering,
-        NullOrdering::First
-    );
-    for (position, ordinal) in [(0, 1), (1, 2)] {
-        for argument in [
-            &canonical.request().arguments[position],
-            &partial.captured().request().arguments[position],
-            &final_entry.captured().request().arguments[position],
-        ] {
-            let constant = value(argument).1.unwrap();
-            assert_eq!(constant.ordinal(), ordinal);
-            assert!(Arc::ptr_eq(constant.pool().field_ref(), &field));
-            assert!(Arc::ptr_eq(constant.pool().array(), pool.array()));
-            assert_eq!(constant.pool().backing_identity(), pool.backing_identity());
-        }
-        let expr = if position == 0 {
-            partial.source().arguments[0]
-        } else {
-            partial.source().order_by[0].expr
-        };
-        let ContractExprKind::Constant(reference) = partial
-            .fragment()
-            .root_expression(partial.node().id, expr)
+    let control = Control::default();
+    let mut work =
+        CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+    assert!(
+        lower_aggregate_binding(&spec.aggregates[0], AggregatePhase::Single, &mut work)
             .unwrap()
-            .kind
-        else {
-            panic!("actual retained Partial CV address");
-        };
-        let control = Control::default();
-        let mut work =
-            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
-        let actual = owner
-            .plan()
-            .constants()
-            .resolve_source_observed(reference, &mut work)
-            .unwrap();
-        work.finish().unwrap();
-        assert_eq!(actual.ordinal(), ordinal);
-        assert!(Arc::ptr_eq(actual.pool().field_ref(), &field));
-        assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
-    }
-    // Final consumes one actual state; its retained logical ORDER is not a runtime ORDER argument.
-    assert_eq!(final_entry.source().arguments.len(), 1);
-    assert!(final_entry.source().order_by.is_empty());
+            .merge_state
+            .is_none()
+    );
+    assert!(matches!(
+        lower_aggregate_binding(
+            &spec.aggregates[0],
+            AggregatePhase::Partial {
+                sequence: novarocks_physical_plan::AggregateSequenceId::new(1)
+            },
+            &mut work
+        ),
+        Err(ContractLoweringError::InvalidAggregate {
+            detail: "ordered call and aggregate state capability differ"
+        })
+    ));
+    work.finish().unwrap();
 }
 
 #[test]

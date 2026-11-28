@@ -699,7 +699,7 @@ pub use namespace::{
 #[cfg(test)]
 pub(crate) use write_namespace::prepare_constant_namespace_write_in;
 
-pub use crate::ipc_schema_v2::ConstantWriteRequest;
+pub use crate::ipc_flat_pool_v2::ConstantWriteRequest;
 pub use write_namespace::{
     ConstantNamespaceWriteFacts, ConstantRecordTypeIds, PreparedConstantNamespaceWrite,
     encode_constant_namespace, encode_constant_namespace_input_derived_in,

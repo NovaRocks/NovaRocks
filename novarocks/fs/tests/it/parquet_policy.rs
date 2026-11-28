@@ -82,7 +82,12 @@ fn same_file_interpretations_share_raw_footer_but_never_arrow_schema() {
         datacache_ttl_seconds: 0,
         datacache_sharing_work_period: None,
     });
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let inspect = |policy| {
         inspect_parquet_metadata(
             fixture.file.clone(),
@@ -130,7 +135,12 @@ fn same_file_interpretations_share_raw_footer_but_never_arrow_schema() {
 #[test]
 fn bad_last_arrow_hint_is_not_a_fallback_and_skip_policy_ignores_all_hints() {
     let fixture = policy_fixture(true);
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let error = inspect_parquet_metadata(
         fixture.file.clone(),
         None,
@@ -148,7 +158,7 @@ fn bad_last_arrow_hint_is_not_a_fallback_and_skip_policy_ignores_all_hints() {
     .expect("all hint bytes are irrelevant to skip policy");
     assert_eq!(inspection.physical_columns()[0].field_id(), Some(77));
     let mut request = request;
-    request.options.parquet_interpretation_policy = ParquetInterpretationPolicy::SkipArrowHint;
+    request.format = FileFormat::Parquet(ParquetInterpretationPolicy::SkipArrowHint);
     request.options.enable_parquet_reader_page_index = true;
     request.predicates.push(novarocks_fs::ScanPredicate::new(
         "value",
@@ -173,7 +183,12 @@ fn bad_last_arrow_hint_is_not_a_fallback_and_skip_policy_ignores_all_hints() {
 #[test]
 fn inspection_cannot_be_used_under_a_different_interpretation_policy() {
     let fixture = policy_fixture(false);
-    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let request = fixture.request(
+        FileFormat::Parquet(ParquetInterpretationPolicy::UseArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let inspection = inspect_parquet_metadata(
         fixture.file.clone(),
         None,
@@ -196,8 +211,12 @@ fn inspection_cannot_be_used_under_a_different_interpretation_policy() {
 #[test]
 fn skip_policy_survives_async_and_prepared_footer_open() {
     let fixture = policy_fixture(true);
-    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
-    request.options.parquet_interpretation_policy = ParquetInterpretationPolicy::SkipArrowHint;
+    let request = fixture.request(
+        FileFormat::Parquet(ParquetInterpretationPolicy::SkipArrowHint),
+        FileProjection::All,
+        4,
+        1024 * 1024,
+    );
     let prepared = novarocks_fs::PreparedFileInput::new(
         &fixture.file,
         0,

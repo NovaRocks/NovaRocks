@@ -99,14 +99,54 @@ impl AggregatePhase {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateBinding {
-    /// Original state-row policy, independent of this phase's input channels.
-    pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
-    pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub function: BoundFunction,
     pub phase: AggregatePhase,
     /// Number of logical SQL arguments at the front of `argument_types`.
     /// Remaining channels are aggregate-owned ORDER BY inputs.
     pub logical_argument_count: u32,
+    /// Present only for calls that can emit or consume a merge state.
+    pub merge_state: Option<AggregateMergeBinding>,
+}
+
+impl AggregateBinding {
+    pub fn state_interpretation(
+        &self,
+    ) -> Option<&novarocks_type_contract::AggregateStateInterpretation> {
+        self.merge_state
+            .as_ref()
+            .and_then(|state| state.state_interpretation.as_ref())
+    }
+
+    pub fn intermediate_type(&self) -> Option<&ValueType> {
+        self.merge_state
+            .as_ref()
+            .map(|state| &state.intermediate_type)
+    }
+
+    pub fn output_type(&self) -> Option<&ValueType> {
+        if self.phase.produces_final_result() {
+            Some(&self.function.result_type)
+        } else {
+            self.intermediate_type()
+        }
+    }
+
+    pub fn has_valid_phase_contract(&self) -> bool {
+        let logical = self.logical_argument_count as usize;
+        let channels = self.function.argument_types.len();
+        if logical == channels {
+            self.merge_state.is_some()
+        } else {
+            logical < channels && self.phase == AggregatePhase::Single && self.merge_state.is_none()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateMergeBinding {
+    /// Original state-row policy, independent of this phase's input channels.
+    pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
+    pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub intermediate_type: ValueType,
     pub state_format: AggregateStateFormatId,
 }

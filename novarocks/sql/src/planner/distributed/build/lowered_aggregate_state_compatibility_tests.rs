@@ -44,9 +44,24 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
     let canonical = partial.canonical().unwrap();
     let contract =
         novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent;
-    assert_eq!(partial.source().binding.state_argument_contract, contract);
     assert_eq!(
-        final_entry.source().binding.state_argument_contract,
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
+        contract
+    );
+    assert_eq!(
+        final_entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
         contract
     );
     assert_eq!(
@@ -121,16 +136,40 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
     };
     assert_eq!(final_entry.phase(), AggregatePhase::Final { sequence });
     assert_eq!(
-        partial.source().binding.intermediate_type,
-        final_entry.source().binding.intermediate_type
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        final_entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type
     );
     assert_eq!(
         partial.source().binding.function.result_type,
         final_entry.source().binding.function.result_type
     );
     assert_eq!(
-        partial.source().binding.state_format,
-        final_entry.source().binding.state_format
+        partial
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format,
+        final_entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(partial.source().binding.logical_argument_count, 1);
     assert_eq!(final_entry.source().binding.logical_argument_count, 1);
@@ -207,7 +246,16 @@ fn state_compat_count_and_min_repeat_keep_actual_partial_nullable_and_final_orig
         let partial = entry(&owner, true);
         let final_entry = entry(&owner, false);
         let expected = ValueType::new(DataType::Int64, name == "min");
-        assert_eq!(partial.source().binding.intermediate_type, expected);
+        assert_eq!(
+            partial
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type,
+            expected
+        );
         assert_eq!(final_entry.source().binding.function.result_type, expected);
     }
 }
@@ -253,8 +301,26 @@ fn assert_original_root_widening(
     let canonical = partial.canonical();
     let contract =
         novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent;
-    assert_eq!(partial.source.binding.state_argument_contract, contract);
-    assert_eq!(final_entry.source.binding.state_argument_contract, contract);
+    assert_eq!(
+        partial
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
+        contract
+    );
+    assert_eq!(
+        final_entry
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_argument_contract,
+        contract
+    );
     assert_eq!(
         canonical
             .selected()
@@ -322,16 +388,40 @@ fn assert_original_root_widening(
     };
     assert_eq!(final_entry.entry.phase, AggregatePhase::Final { sequence });
     assert_eq!(
-        partial.source.binding.intermediate_type,
-        final_entry.source.binding.intermediate_type
+        partial
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        final_entry
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type
     );
     assert_eq!(
         partial.source.binding.function.result_type,
         final_entry.source.binding.function.result_type
     );
     assert_eq!(
-        partial.source.binding.state_format,
-        final_entry.source.binding.state_format
+        partial
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format,
+        final_entry
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
     );
     assert_eq!(partial.source.binding.logical_argument_count, 1);
     assert_eq!(final_entry.source.binding.logical_argument_count, 1);
@@ -408,7 +498,16 @@ fn assert_original_root_widening(
     assert_eq!((producers, streams), (1, 1));
     let mut state = original.clone();
     state = state.with_nullable(true).unwrap();
-    assert_eq!(final_entry.source.binding.intermediate_type, state);
+    assert_eq!(
+        final_entry
+            .source
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        state
+    );
     assert_eq!(final_entry.source.binding.function.result_type, state);
     Ok(())
 }
@@ -429,7 +528,16 @@ fn state_compat_min_preserves_nested_metadata_beyond_root_nullable() {
     assert_actual_root_widening(&owner, &original);
     let state = original.with_nullable(true).unwrap();
     let final_entry = entry(&owner, false);
-    assert_eq!(final_entry.source().binding.intermediate_type, state);
+    assert_eq!(
+        final_entry
+            .source()
+            .binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type,
+        state
+    );
     assert_eq!(final_entry.source().binding.function.result_type, state);
 }
 
@@ -460,12 +568,27 @@ fn state_compat_any_value_preserves_nominal_json() {
         let canonical = entry.canonical().unwrap();
         assert!(canonical.belongs_to(entry.captured()));
         assert_eq!(
-            entry.source().binding.state_argument_contract,
+            entry
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_argument_contract,
             novarocks_type_contract::AggregateStateArgumentContract::ExactSignature
         );
         assert_eq!(value(&entry.captured().request().arguments[0]).0, &json);
         assert_eq!(value(&canonical.request().arguments[0]).0, &json);
-        assert_eq!(entry.source().binding.intermediate_type, state);
+        assert_eq!(
+            entry
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type,
+            state
+        );
         assert_eq!(entry.source().binding.function.result_type, state);
     }
 }

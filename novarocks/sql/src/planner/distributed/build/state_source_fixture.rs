@@ -347,10 +347,8 @@ fn nullable_narrow_negation(
     Ok(crate::analyzer::negation_for_test(narrow_input, control)?)
 }
 
-/// A checked typed physical construction fixture, NOT optimizer-produced SQL.
-/// One original aggregate update source is moved/borrowed across its phases.
-pub fn ordered_array_state_source_for_test(
-    intermediate: bool,
+/// A checked physical ordered call with an exact nullable narrow sort key.
+pub fn ordered_array_source_for_test(
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let order = SortItem {
@@ -367,66 +365,13 @@ pub fn ordered_array_state_source_for_test(
             nulls_first: order.nulls_first,
         }])),
     };
-    let mut partial = aggregate(
+    let source = aggregate(
         "array_agg",
         vec![integer(7)],
         vec![order],
         Some(state_interpretation),
         values(vec![], vec![vec![]]),
     );
-    let result_columns = partial.output_columns.clone();
-    let PhysicalPlanKind::HashAggregate(spec) = &mut partial.kind else {
-        unreachable!()
-    };
-    let original = spec.aggregates[0].source.clone();
-    let state_type = original
-        .binding()
-        .selected
-        .aggregate
-        .as_ref()
-        .unwrap()
-        .intermediate_type
-        .clone();
-    let mut state = column(
-        91,
-        "ordered_state",
-        state_type.data_type().clone(),
-        state_type.nullable(),
-    );
-    state.value_type = state_type;
-    spec.mode = AggMode::Local;
-    spec.aggregates[0].result_type = state.value_type.clone();
-    spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
-    spec.output_columns = vec![state.clone()];
-    partial.output_columns = vec![state.clone()];
-    let stage =
-        |child: PhysicalPlanNode, output: OutputColumn, stage_mode: AggMode| PhysicalPlanNode {
-            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
-                mode: stage_mode,
-                group_by: vec![],
-                aggregates: vec![AggregateCall {
-                    name: "array_agg".into(),
-                    source: original.clone(),
-                    distinct: false,
-                    result_type: output.value_type.clone(),
-                    output_column_id: output.column_id,
-                }],
-                is_merge: vec![true],
-                output_layout: AggregateOutputLayout::new(vec![], vec![output.clone()]),
-                output_columns: vec![output.clone()],
-                topn_runtime_filter_builds: vec![],
-            })),
-            children: vec![child],
-            output_columns: vec![output],
-            stats: stats(),
-            probe_runtime_filters: vec![],
-        };
-    let child = if intermediate {
-        stage(partial, state, AggMode::DistinctLocal)
-    } else {
-        partial
-    };
-    let source = stage(gather(child), result_columns[0].clone(), AggMode::Global);
     let draft = lower_final_physical_plan(
         &source,
         novarocks_physical_plan::PlanVersionId::try_new([41; 16]).unwrap(),

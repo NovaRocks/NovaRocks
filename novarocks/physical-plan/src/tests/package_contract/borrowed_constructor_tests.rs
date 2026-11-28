@@ -704,23 +704,16 @@ fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_sc
     no_port.result = None;
     let (without_type, missing) = measure(&no_port);
     assert!(matches!(missing, Err(FragmentPackageError::Structure(_))));
-    // Same actual fragment/call/graph walks; only the admitted primitive result
-    // type adds one real carrier Vec request. The second logical law uses its
-    // genuine fixed scratch and must also fund that complete initialization.
+    // Both borrowed walks observe the added result type in the caller scope.
     assert_eq!(
-        with_type.allocation_requests_upper_bound - without_type.allocation_requests_upper_bound,
-        1
+        with_type.allocation_requests_upper_bound,
+        without_type.allocation_requests_upper_bound,
     );
     assert_eq!(
-        with_type.allocation_request_bytes_upper_bound
-            - without_type.allocation_request_bytes_upper_bound,
-        Layout::new::<(
-            &arrow_schema::DataType,
-            novarocks_type_contract::ArrowTypeDepth
-        )>()
-        .size()
+        with_type.allocation_request_bytes_upper_bound,
+        without_type.allocation_request_bytes_upper_bound,
     );
-    assert!(with_type.cumulative_work_upper_bound - without_type.cumulative_work_upper_bound >= 1);
+    assert!(with_type.cumulative_work_upper_bound - without_type.cumulative_work_upper_bound >= 2);
     every_prefix(&input, Ok(()));
 }
 
@@ -754,22 +747,11 @@ fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scop
     // This actual Values fragment owns one ValueDef and one expression with
     // the same primitive type. Both original occurrences must be visited;
     // sharing that type cannot eliminate either carrier or logical law.
-    let tuple_bytes = Layout::new::<(
-        &arrow_schema::DataType,
-        novarocks_type_contract::ArrowTypeDepth,
-    )>()
-    .size();
-    assert_eq!(snapshots[0].allocation_requests_upper_bound, 1);
-    assert_eq!(
-        snapshots[0].allocation_request_bytes_upper_bound,
-        tuple_bytes
-    );
-    let second = snapshots
-        .iter()
-        .find(|facts| facts.allocation_requests_upper_bound == 2)
-        .unwrap();
-    assert_eq!(second.allocation_request_bytes_upper_bound, 2 * tuple_bytes);
-    assert!(second.cumulative_work_upper_bound >= 1);
+    for (index, snapshot) in snapshots[..4].iter().enumerate() {
+        assert_eq!(snapshot.allocation_requests_upper_bound, 0);
+        assert_eq!(snapshot.allocation_request_bytes_upper_bound, 0);
+        assert_eq!(snapshot.cumulative_work_upper_bound, index + 1);
+    }
     assert_no_constant_package_equal(
         &construct(&input, &BorrowedControl::new(None)).unwrap(),
         &FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap(),
@@ -778,7 +760,7 @@ fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scop
 }
 
 #[test]
-fn borrowed_package_fragment_type_known_request_precedes_pending_control_refusal() {
+fn borrowed_package_fragment_type_visit_preserves_pending_control_refusal() {
     let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (fragment, _) = literal_fragment(
         FragmentId::new(983),
@@ -799,7 +781,7 @@ fn borrowed_package_fragment_type_known_request_precedes_pending_control_refusal
     // Real character copies left exactly 255 completed units pending. No
     // synthetic step loop or scope reset manufactures this control window.
     for cause in CAUSES {
-        let control = BorrowedControl::new(Some((original_prefix.len(), cause)));
+        let control = BorrowedControl::new(Some((original_prefix.len(), cause.clone())));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let mut resources = ControlResourceCounter::default();
         resources
@@ -827,12 +809,9 @@ fn borrowed_package_fragment_type_known_request_precedes_pending_control_refusal
             },
             &mut work,
         );
-        assert_eq!(
-            result,
-            Err(FragmentPackageError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        );
-        assert_eq!(control.trace(), original_prefix);
+        assert_eq!(result, Err(FragmentPackageError::Control(cause)));
+        let mut expected = original_prefix.clone();
+        expected.push((CompilePhase::Decode, 256));
+        assert_eq!(control.trace(), expected);
     }
 }

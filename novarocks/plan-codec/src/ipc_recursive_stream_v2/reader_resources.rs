@@ -472,18 +472,8 @@ pub(crate) fn preflight_profile_core<E: ReaderResourceFailure>(
             &source_work,
             &mut observed,
         )?;
-        let scratch =
-            novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound();
-        let upper = a.numeric(add(
-            original,
-            a.numeric(
-                scratch
-                    .checked_mul(3)
-                    .ok_or_else(|| invalid("recursive reader source scratch work overflow")),
-            )?,
-        ))?;
-        a.reader_work(upper)?;
-        upper
+        a.reader_work(original)?;
+        original
     } else {
         reader_work::preflight(
             input,

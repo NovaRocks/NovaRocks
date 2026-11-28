@@ -1373,6 +1373,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_writer_and_iceberg_reader_preserve_deep_parquet_without_using_arrow_hint() {
+        use crate::iceberg::spec::{
+            FormatVersion, ListType, PartitionSpec, SortOrder, TableMetadataBuilder,
+        };
+        use arrow::array::{ArrayRef, Int64Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use novarocks_fs::{FileCancellation, FileProjection, FileReadContext};
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+        use parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+
+        let depth = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+        let mut declared = Type::Primitive(PrimitiveType::Long);
+        let mut values: ArrayRef = Arc::new(Int64Array::from(vec![Some(41), None, Some(-8)]));
+        for index in (2..=depth).rev() {
+            declared = Type::List(ListType::new(
+                NestedField::optional(index as i32, "element", declared).into(),
+            ));
+            values = Arc::new(ListArray::new(
+                Arc::new(
+                    Field::new("element", values.data_type().clone(), true)
+                        .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_owned(), index.to_string())]),
+                ),
+                OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+                values,
+                None,
+            ));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![NestedField::optional(1, "payload", declared).into()])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            location.clone(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "sdk_deep"]).unwrap())
+            .file_io(crate::fs_io::build_file_io_for_location(
+                &location,
+                local_test_binding(),
+            ))
+            .metadata(metadata)
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("payload", values.data_type().clone(), true)
+                .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_owned(), "1".to_owned())]),
+        ]));
+        let batch = RecordBatch::try_new(input_schema, vec![values]).unwrap();
+        let files = write_record_batches_as_data_files(&table, vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let sdk_path = files[0]
+            .file_path()
+            .strip_prefix("file://")
+            .unwrap_or(files[0].file_path());
+        let footer = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            std::fs::File::open(sdk_path).unwrap(),
+            ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+        )
+        .unwrap();
+        assert_eq!(
+            footer.parquet_schema().columns()[0]
+                .self_type()
+                .get_basic_info()
+                .id(),
+            depth as i32
+        );
+        assert!(
+            footer
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.key == ARROW_SCHEMA_META_KEY)
+        );
+        assert!(
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(sdk_path).unwrap())
+                .is_err()
+        );
+
+        // Independently written data without a hint uses the same declared values.
+        let unhinted = dir.path().join("external-without-hint.parquet");
+        let mut writer = ArrowWriter::try_new_with_options(
+            std::fs::File::create(&unhinted).unwrap(),
+            batch.schema(),
+            ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let runtime = tokio::runtime::Handle::current();
+        let context = FileReadContext {
+            turn: None,
+            cancellation: FileCancellation::new(),
+            deadline: None,
+            runtime: Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            io_spawner: Arc::new(TokioFileIoSpawner::new(runtime)),
+            range: None,
+        };
+        for path in [sdk_path, unhinted.to_str().unwrap()] {
+            let access = FsAccessResolver::new()
+                .resolve_location(
+                    novarocks_spi::connector::StorageAccessDomainId::from_bytes([18; 32]),
+                    path,
+                    None,
+                )
+                .unwrap();
+            let batches = crate::file_reader::read_parquet_batches_async(
+                &access,
+                path,
+                Some(std::fs::metadata(path).unwrap().len()),
+                FileProjection::FieldIds(vec![1]),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(batches.len(), 1);
+            let mut leaf = batches[0].batch.column(0);
+            for id in 2..=depth {
+                let list = leaf.as_any().downcast_ref::<ListArray>().unwrap();
+                assert_eq!(list.value_offsets(), &[0, 1, 2, 3]);
+                let DataType::List(element) = list.data_type() else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    element.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                    Some(&id.to_string())
+                );
+                leaf = list.values();
+            }
+            assert_eq!(
+                leaf.as_any().downcast_ref::<Int64Array>().unwrap(),
+                &Int64Array::from(vec![Some(41), None, Some(-8)]),
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn sdk_writer_preserves_values_and_writes_target_timezone_and_nested_ids() {
         use crate::iceberg::spec::{
             FormatVersion, ListType, MapType, PartitionSpec, SortOrder, TableMetadataBuilder,

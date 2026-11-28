@@ -211,11 +211,23 @@ fn journal_update_partial_count_min_max_borrow_canonical_request_and_selected_ar
                 .as_ref()
                 .unwrap()
                 .intermediate_type,
-            entry.source().binding.intermediate_type
+            entry
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .intermediate_type
         );
         assert_eq!(
             request.selected().aggregate.as_ref().unwrap().state_format,
-            entry.source().binding.state_format
+            entry
+                .source()
+                .binding
+                .merge_state
+                .as_ref()
+                .unwrap()
+                .state_format
         );
     }
 }

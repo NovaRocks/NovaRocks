@@ -3419,13 +3419,22 @@ mod tests {
                                     .logical_type(),
                                 input.logical_type()
                             );
-                            let DataType::List(item) = &call.binding.intermediate_type.data_type()
+                            let DataType::List(item) = &call
+                                .binding
+                                .merge_state
+                                .as_ref()
+                                .unwrap()
+                                .intermediate_type
+                                .data_type()
                             else {
                                 panic!("expected state List")
                             };
                             assert!(item.metadata().as_arc().is_none());
                             assert_eq!(
                                 call.binding
+                                    .merge_state
+                                    .as_ref()
+                                    .unwrap()
                                     .intermediate_type
                                     .child_at(0)
                                     .unwrap()
@@ -4019,7 +4028,7 @@ pub use crate::planner::distributed::build::writer_state_fixture::{
 pub use crate::planner::distributed::build::state_source_fixture::ordinary_extrema_constant_state_source_for_test;
 
 #[cfg(novarocks_dev_controls)]
-pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;
+pub use crate::planner::distributed::build::state_source_fixture::ordered_array_source_for_test;
 
 #[cfg(test)]
 mod c16_p1_json_object_error_effect_tests;

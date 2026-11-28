@@ -359,7 +359,7 @@ fn by_schema_origin_field_clone_requests_owned_dictionary_boxes_but_shares_neste
     let mut map = MaterializedMetadataMap::with_capacity(1);
     map.insert("original".into(), "retained".into());
     let field = map.into_field(Field::new("root", dtype, true));
-    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut scratch = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let mut calls = 0;
     let request = field
         .original_field_clone_request(&mut scratch, &mut || -> Result<(), CloneProbeError> {
@@ -538,8 +538,8 @@ fn by_schema_origin_reconcile_invoice_uses_each_actual_root_nested_and_sidecar_s
     let (source, child) = source();
     let bound = layout(source, &Control::default());
     let contract = ChunkSchema::from_compiled_layout(&bound).unwrap();
-    let mut traversal = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
-    let mut owned = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    let mut traversal = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
+    let mut owned = [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH];
     let facts = contract
         .original_reconcile_metadata_request_observed::<KernelCloneProbeError>(
             &mut traversal,
@@ -592,8 +592,8 @@ fn by_schema_origin_reconcile_invoice_uses_each_actual_root_nested_and_sidecar_s
     assert!(
         foreign
             .original_reconcile_metadata_request_observed::<KernelCloneProbeError>(
-                &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-                &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+                &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+                &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
                 &mut || {
                     called = true;
                     Ok(())
@@ -614,8 +614,8 @@ fn by_schema_origin_reconcile_invoice_every_callback_preserves_seven_causes() {
     let mut count = 0;
     contract
         .original_reconcile_metadata_request_observed::<KernelCloneProbeError>(
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-            &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+            &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
             &mut || {
                 count += 1;
                 Ok(())
@@ -637,8 +637,8 @@ fn by_schema_origin_reconcile_invoice_every_callback_preserves_seven_causes() {
             let mut calls = 0;
             let result = contract
                 .original_reconcile_metadata_request_observed::<KernelCloneProbeError>(
-                    &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-                    &mut [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+                    &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
+                    &mut [None; novarocks_type_contract::MAX_ARROW_TYPE_PATH_DEPTH],
                     &mut || {
                         let ordinal = calls;
                         calls += 1;

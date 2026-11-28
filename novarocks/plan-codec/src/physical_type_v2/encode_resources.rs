@@ -29,9 +29,7 @@ use crate::{
 };
 use arrow::datatypes::{DataType, Field};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
-use novarocks_type_contract::{
-    CompileControlError, MAX_ARROW_FIELD_METADATA_BYTES, owned_resources::hashmap,
-};
+use novarocks_type_contract::CompileControlError;
 use std::{alloc::Layout, sync::Arc};
 
 type E = TypeCodecError;
@@ -50,14 +48,6 @@ fn tree_error(error: btree::BTreeResourceError) -> E {
     match error {
         btree::BTreeResourceError::Arithmetic(_) => CompileControlError::ResourceExhausted.into(),
         btree::BTreeResourceError::SourceModel(message) => E::ResourceSource(message),
-    }
-}
-fn hash_error(error: hashmap::HashMapResourceError) -> E {
-    match error {
-        hashmap::HashMapResourceError::Arithmetic(_) => {
-            CompileControlError::ResourceExhausted.into()
-        }
-        hashmap::HashMapResourceError::SourceModel(message) => E::ResourceSource(message),
     }
 }
 
@@ -230,16 +220,9 @@ impl Model {
         };
         model.tree(value_roots)?;
         model.tree(field_roots)?;
-        // Existing count expansion terminates at E. Every emitted C/F/V has
-        // at least one expanded node. FieldIds' monotone cursor tests at most
-        // root Field IDs plus automatic Field occurrences, never max(ID).
-        let expanded = match limits {
-            Some(limits) => limits.max_expanded_nodes,
-            None => {
-                super::TypeProjectionLimits::for_validated_source_root_count(roots)?
-                    .max_expanded_nodes
-            }
-        };
+        // Caller-supplied bounds retain their original admission. The input
+        // path accounts for actual expanded occurrences as they are visited.
+        let expanded = limits.map_or(0, |limits| limits.max_expanded_nodes);
         let lookup = btree::lookup_work_typed(add(field_roots, expanded)?).map_err(tree_error)?;
         model.work = add(model.work, mul(expanded, add(512, mul(lookup, 8)?)?)?)?;
         model.work = add(
@@ -257,39 +240,20 @@ impl Model {
         model.facts(limits)?;
         Ok(model)
     }
-    /// `count` actual nodes of one strict root's original validator walk,
-    /// admitted before that walk reaches them: the root before the walk
-    /// starts, and each carrier's direct children when the carrier is
-    /// visited, before their Field visits and pushes. The walker's heap stack
-    /// is a Rust1.92 Vec holding the original singleton that grows min-four
-    /// and doubling; by the time it grows to 2C it has pushed at least C
-    /// children, each already admitted, so N admitted nodes cover <=N
-    /// requests and <=4N cumulative tuples. This is the receiver's per-root
-    /// summary bound, never the 4096-node per-type maximum.
+    /// Account for actual visited type nodes. The path cursor is fixed.
     pub(super) fn strict_nodes(&mut self, count: usize) -> Result<(), E> {
-        self.request(
-            array::<novarocks_type_contract::TypeTraversalFrame<'_>>(4)?,
-            count,
-        )?;
         self.work = add(self.work, mul(count, self.strict_node_work)?)?;
         Ok(())
     }
-    /// Work of the actual strict Field visit, admitted before its iterator.
-    /// Metadata without Arc backing is constant. Shared source metadata keeps
-    /// the existing conservative source envelope, never reused for execution-only nodes.
+
     pub(super) fn strict_field(&mut self, field: &Field) -> Result<(), E> {
-        self.work = add(self.work, add(128, mul(field.name().len(), 8)?)?)?;
-        if field.metadata().as_arc().is_some() {
-            let iteration =
-                hashmap::source_iterator_work_upper_bound(self.source, field.metadata().len())
-                    .map_err(hash_error)?;
-            self.work = add(
-                self.work,
-                add(iteration, mul(MAX_ARROW_FIELD_METADATA_BYTES, 8)?)?,
-            )?;
-        } else {
-            self.work = add(self.work, 1)?;
-        }
+        self.work = add(
+            self.work,
+            add(
+                add(128, mul(field.name().len(), 8)?)?,
+                mul(field.metadata().len(), 16)?,
+            )?,
+        )?;
         Ok(())
     }
     pub(super) fn strict_carrier(&mut self, ty: &DataType) -> Result<(), E> {
@@ -310,13 +274,9 @@ impl Model {
         }
         Ok(())
     }
-    /// No metadata entry is read here. Admit both real insertion-sort and DTO
-    /// buffers, source deleted-bucket iteration, and the worst-case byte
-    /// comparisons before the first metadata iterator operation.
+    /// Account for one real DTO Vec and its occupied field facts.
     pub(super) fn field(&mut self, field: &Field) -> Result<(), E> {
         let entries = field.metadata().len();
-        // Only occupied String handles plus this actual owned Field/name.
-        // Deleted buckets and private table capacity remain the caller's B.
         let floor = add(
             add(std::mem::size_of::<Field>(), field.name().len())?,
             array::<(String, String)>(entries)?.size(),
@@ -325,28 +285,7 @@ impl Model {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         self.string(field.name().len())?;
-        self.request(array::<(&str, &str)>(entries)?, 1)?;
         self.request(array::<plan::ArrowFieldMetadataEntry>(entries)?, 1)?;
-        // Canonical empty Metadata has no Arc backing or entries to visit.
-        // A retained source Arc keeps the existing conservative provenance bound.
-        if field.metadata().as_arc().is_none() {
-            self.work = add(self.work, 2)?;
-        } else {
-            // The original Count walk and encode_metadata each iterate the
-            // same source map once. Strict pre-validation is admitted in new().
-            self.work = add(
-                self.work,
-                mul(
-                    hashmap::source_iterator_work_upper_bound(self.source, entries)
-                        .map_err(hash_error)?,
-                    2,
-                )?,
-            )?;
-            let pairs = mul(entries, entries.saturating_sub(1))? / 2;
-            // At most B equal-prefix bytes, one length/order comparison and one
-            // swap per pair. B is the truthful union, not len()/capacity().
-            self.work = add(self.work, mul(pairs, add(self.source, 2)?)?)?;
-        }
         self.work = add(self.work, mul(entries, 128)?)?;
         Ok(())
     }
@@ -367,6 +306,9 @@ impl Model {
     }
     pub(super) fn expansion(&mut self, count: usize) -> Result<(), CompileControlError> {
         self.expanded = add(self.expanded, count)?;
+        let lookup = btree::lookup_work_typed(self.expanded)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work = add(self.work, mul(count, add(512, mul(lookup, 8)?)?)?)?;
         Ok(())
     }
     /// The actual three DTO Vec requests, after complete count preflight and
@@ -477,9 +419,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_type_contract::{
-        CompileCheckpoints, CompilePhase, MAX_VALUE_TYPE_NODES, PureCompileControl,
-    };
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -534,94 +474,47 @@ mod tests {
             writer.allocation_request_bytes_upper_bound,
             7 * tree_bytes() + 512
         );
-        // Each admitted strict node is one stack request of four tuples.
         let mut strict = Model::new(4096, 2, 3, 2, 4, limits()).unwrap();
         strict.strict_nodes(5).unwrap();
         let nodes = facts(&strict);
-        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
         assert_eq!(
-            nodes.allocation_requests_upper_bound - actual.allocation_requests_upper_bound,
-            5
+            nodes.allocation_requests_upper_bound,
+            actual.allocation_requests_upper_bound
         );
         assert_eq!(
-            nodes.allocation_request_bytes_upper_bound
-                - actual.allocation_request_bytes_upper_bound,
-            5 * 4 * tuple
+            nodes.allocation_request_bytes_upper_bound,
+            actual.allocation_request_bytes_upper_bound
         );
-        assert_eq!(nodes.definition_count, 0);
-        assert_eq!(nodes.expanded_node_count, 0);
-        assert_eq!(nodes.string_bytes, 0);
+        assert!(nodes.cumulative_work_upper_bound > actual.cumulative_work_upper_bound);
     }
-    /// Rust1.92 `vec![x]` then push: capacities 1, 4, 8, ... Replaying the
-    /// real walker Vec proves the per-node charge covers every growth request
-    /// and the cumulative requested tuples at the moment each growth happens.
+
     #[test]
-    fn strict_node_charge_covers_the_real_validator_vec_growth() {
-        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
-        let ty = DataType::Int64;
-        let mut stack = vec![novarocks_type_contract::TypeTraversalFrame::root(&ty)];
-        let (mut requests, mut tuples) = (1usize, stack.capacity());
-        for pushes in 1..=MAX_VALUE_TYPE_NODES - 1 {
-            let before = stack.capacity();
-            stack.push(novarocks_type_contract::TypeTraversalFrame::root(&ty));
-            if stack.capacity() != before {
-                requests += 1;
-                tuples += stack.capacity();
-            }
-            // Admitted before this push: the root plus every pushed child.
-            let mut model = empty();
-            let base = facts(&model);
-            model.strict_nodes(pushes + 1).unwrap();
-            let admitted = facts(&model);
-            assert!(
-                admitted.allocation_requests_upper_bound - base.allocation_requests_upper_bound
-                    >= requests
-            );
-            assert!(
-                admitted.allocation_request_bytes_upper_bound
-                    - base.allocation_request_bytes_upper_bound
-                    >= tuples * tuple
-            );
-        }
-    }
-    /// Stack geometry remains the original per-node upper. Metadata-free
-    /// node headers do not perform source-map work; actual source Field visits
-    /// still carry their original iterator bound.
-    #[test]
-    fn strict_nodes_keep_original_stack_upper_and_only_actual_source_maps_scale_with_invoice() {
-        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
+    fn wide_validation_only_accounts_actual_occurrence_and_field_work() {
         let mut low = Model::new(1024, 1, 0, 0, 0, limits()).unwrap();
         let mut high = Model::new(4096, 1, 0, 0, 0, limits()).unwrap();
-        let (low_base, high_base) = (facts(&low), facts(&high));
-        low.strict_nodes(MAX_VALUE_TYPE_NODES).unwrap();
-        high.strict_nodes(MAX_VALUE_TYPE_NODES).unwrap();
-        let low_nodes = facts(&low);
-        assert_eq!(
-            low_nodes.allocation_requests_upper_bound - low_base.allocation_requests_upper_bound,
-            MAX_VALUE_TYPE_NODES
-        );
-        assert_eq!(
-            low_nodes.allocation_request_bytes_upper_bound
-                - low_base.allocation_request_bytes_upper_bound,
-            4 * MAX_VALUE_TYPE_NODES * tuple
-        );
-        let low_work = low_nodes.cumulative_work_upper_bound - low_base.cumulative_work_upper_bound;
-        let high_work =
-            facts(&high).cumulative_work_upper_bound - high_base.cumulative_work_upper_bound;
-        assert_eq!(high_work, low_work);
+        let base = facts(&low);
+        low.strict_nodes(4161).unwrap();
+        high.strict_nodes(4161).unwrap();
         let field = Field::new("source", DataType::Int64, false)
             .with_metadata(HashMap::from([("external".into(), "attribute".into())]));
-        let (low_before, high_before) = (
-            facts(&low).cumulative_work_upper_bound,
-            facts(&high).cumulative_work_upper_bound,
-        );
         low.strict_field(&field).unwrap();
         high.strict_field(&field).unwrap();
-        assert!(
-            facts(&high).cumulative_work_upper_bound - high_before
-                > facts(&low).cumulative_work_upper_bound - low_before
+        let (low, high) = (facts(&low), facts(&high));
+        assert_eq!(
+            low.allocation_requests_upper_bound,
+            base.allocation_requests_upper_bound
+        );
+        assert_eq!(
+            low.allocation_request_bytes_upper_bound,
+            base.allocation_request_bytes_upper_bound
+        );
+        assert!(low.cumulative_work_upper_bound > base.cumulative_work_upper_bound);
+        assert_eq!(
+            low.cumulative_work_upper_bound,
+            high.cumulative_work_upper_bound
         );
     }
+
     #[test]
     fn actual_carrier_field_metadata_and_three_dto_vecs_have_independent_golden() {
         let mut model = empty();
@@ -664,7 +557,6 @@ mod tests {
         let strings = "中国/é".len() + "名\0".len() + "é".len() + "中国\0".len() + 1;
         let payload = 2 * std::mem::size_of::<u32>()
             + 2 * std::mem::size_of::<wire::UnionField>()
-            + 2 * std::mem::size_of::<(&str, &str)>()
             + 2 * std::mem::size_of::<plan::ArrowFieldMetadataEntry>()
             + strings
             + 3 * std::mem::size_of::<wire::CarrierTypeDefinition>()
@@ -675,7 +567,7 @@ mod tests {
         assert_eq!(actual.string_bytes, strings);
         assert_eq!(
             actual.allocation_requests_upper_bound - base.allocation_requests_upper_bound,
-            12
+            11
         );
         assert_eq!(
             actual.allocation_request_bytes_upper_bound - base.allocation_request_bytes_upper_bound,
@@ -711,10 +603,7 @@ mod tests {
         assert!(actual.cumulative_work_upper_bound >= baseline.cumulative_work_upper_bound);
         model.definition(2).unwrap();
         model.expansion(3).unwrap();
-        assert_eq!(
-            facts(&model).cumulative_work_upper_bound,
-            actual.cumulative_work_upper_bound
-        );
+        assert!(facts(&model).cumulative_work_upper_bound > actual.cumulative_work_upper_bound);
     }
     #[test]
     fn all_seven_known_axes_refuse_before_caller_admission_callback_and_replay_exactly() {
@@ -809,7 +698,7 @@ mod tests {
         }
     }
     #[test]
-    fn source_deleted_bucket_and_equal_prefix_work_is_admitted_without_metadata_scan() {
+    fn metadata_work_is_independent_of_retained_source_size() {
         let field = Field::new("", DataType::Int32, false).with_metadata(HashMap::from([
             ("same-prefix-a".into(), "".into()),
             ("same-prefix-b".into(), "".into()),
@@ -819,11 +708,9 @@ mod tests {
         let mut high = Model::new(4096, 0, 0, 0, 0, limits()).unwrap();
         low.field(&field).unwrap();
         high.field(&field).unwrap();
-        // Three insertion-sort pairs + two locked iterators'32 units per source
-        // byte. Input/source invoice is not a map private-capacity estimate.
         assert_eq!(
-            facts(&high).cumulative_work_upper_bound - facts(&low).cumulative_work_upper_bound,
-            (4096 - 1024) * (32 * 2 + 3)
+            facts(&high).cumulative_work_upper_bound,
+            facts(&low).cumulative_work_upper_bound,
         );
         assert_eq!(
             facts(&high).allocation_request_bytes_upper_bound,

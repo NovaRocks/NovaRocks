@@ -190,15 +190,10 @@ fn preflight(
             "aggregate header definition count exceeds its envelope",
         ));
     }
-    if !policy.0 && limits.is_some_and(|limits| n > limits.max_type_references) {
-        return Err(invalid(
-            "aggregate header type references exceed their envelope",
-        ));
-    }
     let requested = policy.bytes::<usize>(n, "aggregate header layout is unrepresentable")?;
     let mut facts = BindingProjectionFacts {
         definition_count: n,
-        type_reference_count: n,
+        type_reference_count: 0,
         allocation_requests_upper_bound: usize::from(requested != 0),
         request_bytes_upper_bound: requested,
         coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
@@ -262,6 +257,9 @@ fn preflight(
     let mut state_bytes = 0;
     admit_work(&mut facts, state_bytes, lookup_work, limits, policy, admit)?;
     for definition in definitions {
+        if definition.intermediate_value_type_id.is_some() {
+            facts.type_reference_count = add(facts.type_reference_count, 1)?;
+        }
         known = add(known, definition.state_format.capacity())?;
         if let Some(receipt) = &definition.state_interpretation {
             known = add(
@@ -277,6 +275,11 @@ fn preflight(
         source_floor(source, known)?;
         admit_work(&mut facts, state_bytes, lookup_work, limits, policy, admit)?;
         work.step()?;
+    }
+    if limits.is_some_and(|limits| facts.type_reference_count > limits.max_type_references) {
+        return Err(invalid(
+            "aggregate header type references exceed their envelope",
+        ));
     }
     Ok(facts)
 }
@@ -300,12 +303,6 @@ fn validate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     for definition in definitions {
-        if let Some(receipt) = &definition.state_interpretation {
-            validate_state_interpretation(receipt, work)?;
-        }
-        let state_contract = decode_state_argument_contract(definition.state_argument_contract);
-        work.step()?;
-        state_contract?;
         let function_id = definition
             .function_binding_id
             .ok_or_else(|| invalid("aggregate header function reference is absent"))?;
@@ -316,16 +313,6 @@ fn validate(
         work.step()?;
         if !kind_is_aggregate {
             return Err(invalid("aggregate header function has non-aggregate kind"));
-        }
-        let intermediate_id = definition
-            .intermediate_value_type_id
-            .ok_or_else(|| invalid("aggregate header intermediate type is absent"))?;
-        work.flush()?;
-        let present = functions.type_table().value_type(intermediate_id).is_some();
-        work.step()?;
-        work.flush()?;
-        if !present {
-            return Err(invalid("aggregate header intermediate type is unknown"));
         }
         let phase = definition
             .phase
@@ -344,9 +331,42 @@ fn validate(
         if !phase_present {
             return Err(invalid("aggregate header phase kind is absent"));
         }
-        // The generated oneof already represents all four closed phases.
-        // Sequence IDs and logical_argument_count are retained as authored;
-        // sequence closure and aggregate channels belong to semantic owners.
+        let channels = function.arguments.len();
+        let logical = definition.logical_argument_count as usize;
+        match wire::AggregateStateCapability::try_from(definition.state_capability) {
+            Ok(wire::AggregateStateCapability::SingleOnly)
+                if logical < channels
+                    && matches!(phase.kind, Some(wire::aggregate_phase::Kind::Single(_)))
+                    && definition.intermediate_value_type_id.is_none()
+                    && definition.state_format.is_empty()
+                    && definition.state_argument_contract == 0
+                    && definition.state_interpretation.is_none() =>
+            {
+                continue;
+            }
+            Ok(wire::AggregateStateCapability::Mergeable) if logical == channels => {}
+            _ => {
+                return Err(invalid(
+                    "aggregate header has an invalid state capability or phase",
+                ));
+            }
+        }
+        if let Some(receipt) = &definition.state_interpretation {
+            validate_state_interpretation(receipt, work)?;
+        }
+        let state_contract = decode_state_argument_contract(definition.state_argument_contract);
+        work.step()?;
+        state_contract?;
+        let intermediate_id = definition
+            .intermediate_value_type_id
+            .ok_or_else(|| invalid("aggregate header intermediate type is absent"))?;
+        work.flush()?;
+        let present = functions.type_table().value_type(intermediate_id).is_some();
+        work.step()?;
+        work.flush()?;
+        if !present {
+            return Err(invalid("aggregate header intermediate type is unknown"));
+        }
         AggregateStateFormatId::validate_str_observed::<StateValidationFailure>(
             &definition.state_format,
             || work.step().map_err(StateValidationFailure::from),

@@ -38,8 +38,8 @@ pub fn open_file_reader_with_parquet_inspection(
 ) -> FileResult<Box<dyn FileBatchReader>> {
     request.context.check_active()?;
     match request.format {
-        FileFormat::Parquet => Ok(Box::new(parquet::ParquetPhysicalReader::try_new(
-            request, inspection,
+        FileFormat::Parquet(policy) => Ok(Box::new(parquet::ParquetPhysicalReader::try_new(
+            request, policy, inspection,
         )?)),
         FileFormat::Orc => Err(FileError::unsupported(ORC_SUSPENSION)),
     }
@@ -54,11 +54,11 @@ pub async fn open_file_reader_async(
     inspection: Option<&ParquetMetadataInspection>,
 ) -> FileResult<AsyncFileBatchReader> {
     request.context.check_active()?;
-    if request.format != FileFormat::Parquet {
+    let FileFormat::Parquet(policy) = request.format else {
         return Err(FileError::unsupported(ORC_SUSPENSION));
-    }
+    };
     Ok(AsyncFileBatchReader {
-        inner: parquet::ParquetPhysicalReader::try_new_async(request, inspection).await?,
+        inner: parquet::ParquetPhysicalReader::try_new_async(request, policy, inspection).await?,
     })
 }
 

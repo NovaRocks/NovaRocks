@@ -103,6 +103,9 @@ fn is_wire_encodable_literal_type(value_type: &FunctionValueType) -> bool {
             | DataType::Date32
             | DataType::Decimal128(..)
             | DataType::Decimal256(..)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 

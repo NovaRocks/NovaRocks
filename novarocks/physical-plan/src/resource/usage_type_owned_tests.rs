@@ -81,17 +81,19 @@ fn function(kind: FunctionKind, lambda: bool) -> BoundFunction {
 }
 fn binding() -> AggregateBinding {
     AggregateBinding {
-        state_interpretation: None,
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: function(FunctionKind::Aggregate, false),
         phase: AggregatePhase::Single,
         logical_argument_count: 1,
-        intermediate_type: ty(),
-        state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
-            "test.resource.state",
-        )
-        .unwrap(),
+        merge_state: Some(crate::AggregateMergeBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            intermediate_type: ty(),
+            state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
+                "test.resource.state",
+            )
+            .unwrap(),
+        }),
     }
 }
 fn properties() -> PhysicalProperties {
@@ -587,7 +589,14 @@ fn function_heap(function: &BoundFunction) -> usize {
             .sum::<usize>()
 }
 fn binding_heap(binding: &AggregateBinding) -> usize {
-    function_heap(&binding.function) + binding.state_format.as_str().len()
+    function_heap(&binding.function)
+        + binding
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .state_format
+            .as_str()
+            .len()
 }
 #[derive(Debug)]
 struct Outcome {
@@ -628,13 +637,12 @@ fn assert_plain(fragment: &Fragment, actual: &Outcome) {
     assert_eq!(actual.errors, errors.into_vec());
 }
 fn assert_primitives(facts: ControlOwnedResourceFacts, data_roots: usize, logical_roots: usize) {
-    assert_eq!(Layout::new::<TypePending<'_>>().size(), 32);
-    assert_eq!(facts.allocation_requests_upper_bound, data_roots);
+    assert_eq!(facts.allocation_requests_upper_bound, 0);
+    assert_eq!(facts.allocation_request_bytes_upper_bound, 0);
     assert_eq!(
-        facts.allocation_request_bytes_upper_bound,
-        Layout::new::<TypePending<'_>>().size() * data_roots
+        facts.cumulative_work_upper_bound,
+        data_roots + logical_roots
     );
-    assert!(facts.cumulative_work_upper_bound >= logical_roots);
 }
 
 #[test]
@@ -813,7 +821,7 @@ fn each_actual_small_fragment_type_variant_callback_keeps_caller_cause() {
 }
 
 #[test]
-fn original_type_request_in_fragment_cuts_and_filter_wins_before_actual_pending_late_controls() {
+fn fragment_cuts_and_filter_type_visits_preserve_pending_late_controls() {
     let (fragment, _pools, fragment_source) = fragment(1, false, false);
     let cuts = cuts();
     let filter = filter();
@@ -821,7 +829,7 @@ fn original_type_request_in_fragment_cuts_and_filter_wins_before_actual_pending_
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((3, cause)),
+                refusal: Some((3, cause.clone())),
             };
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             // Real original UTF-8 copy ends with 255 units pending in this caller.
@@ -831,11 +839,9 @@ fn original_type_request_in_fragment_cuts_and_filter_wins_before_actual_pending_
             let mut errors = ValidationContext::new();
             let mut actual = CutResourcePreflight::new();
             let mut refuse = |facts: &ControlOwnedResourceFacts| {
-                if facts.allocation_requests_upper_bound > 0 {
-                    Err(CompileControlError::ResourceExhausted)
-                } else {
-                    Ok(())
-                }
+                assert_eq!(facts.allocation_requests_upper_bound, 0);
+                assert_eq!(facts.allocation_request_bytes_upper_bound, 0);
+                Ok(())
             };
             let result = match route {
                 0 => actual.add_fragment_in(
@@ -867,11 +873,9 @@ fn original_type_request_in_fragment_cuts_and_filter_wins_before_actual_pending_
             };
             assert!(matches!(
                 result,
-                Err(ControlResourceError::Control(
-                    CompileControlError::ResourceExhausted
-                ))
+                Err(ControlResourceError::Control(actual)) if actual == cause
             ));
-            assert_eq!(control.trace(), [0, 0, 1]);
+            assert_eq!(control.trace(), [0, 0, 1, 256]);
         }
     }
 }
@@ -999,55 +1003,45 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
 }
 
 #[test]
-fn actual_fragment_three_numeric_axes_accept_exact_snapshot_and_refuse_one_under() {
+fn actual_fragment_work_accepts_exact_snapshot_and_refuses_one_under() {
     let (fragment, _pools, source) = fragment(1, true, false);
     let complete = run_fragment(&fragment, source, &Control::default())
         .unwrap()
         .facts;
-    for axis in 0..3 {
-        for under in [false, true] {
-            let cap = match axis {
-                0 => complete.allocation_requests_upper_bound,
-                1 => complete.allocation_request_bytes_upper_bound,
-                _ => complete.cumulative_work_upper_bound,
-            } - usize::from(under);
-            let control = Control::default();
-            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            let mut counter = ControlResourceCounter::default();
-            let mut errors = ValidationContext::new();
-            let mut actual = CutResourcePreflight::new();
-            let result = actual.add_fragment_in(
-                &fragment,
-                &mut errors,
-                source,
-                &mut counter,
-                &mut |facts| {
-                    let value = match axis {
-                        0 => facts.allocation_requests_upper_bound,
-                        1 => facts.allocation_request_bytes_upper_bound,
-                        _ => facts.cumulative_work_upper_bound,
-                    };
-                    if value > cap {
-                        Err(CompileControlError::ResourceExhausted)
-                    } else {
-                        Ok(())
-                    }
-                },
-                &mut work,
-            );
-            if under {
-                assert!(matches!(
-                    result,
-                    Err(ControlResourceError::Control(
-                        CompileControlError::ResourceExhausted
-                    ))
-                ));
-                // A typed refusal owns its tail; no caller finish is issued.
-            } else {
-                result.unwrap();
-                work.finish().unwrap();
-                assert_eq!(counter.facts(), complete);
-            }
+    for under in [false, true] {
+        let cap = complete.cumulative_work_upper_bound - usize::from(under);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let mut counter = ControlResourceCounter::default();
+        let mut errors = ValidationContext::new();
+        let mut actual = CutResourcePreflight::new();
+        let result = actual.add_fragment_in(
+            &fragment,
+            &mut errors,
+            source,
+            &mut counter,
+            &mut |facts| {
+                assert_eq!(facts.allocation_requests_upper_bound, 0);
+                assert_eq!(facts.allocation_request_bytes_upper_bound, 0);
+                if facts.cumulative_work_upper_bound > cap {
+                    Err(CompileControlError::ResourceExhausted)
+                } else {
+                    Ok(())
+                }
+            },
+            &mut work,
+        );
+        if under {
+            assert!(matches!(
+                result,
+                Err(ControlResourceError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+        } else {
+            result.unwrap();
+            work.finish().unwrap();
+            assert_eq!(counter.facts(), complete);
         }
     }
 }

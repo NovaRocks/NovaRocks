@@ -104,14 +104,16 @@ fn aggregate(
     phase: AggregatePhase,
 ) -> AggregateBinding {
     AggregateBinding {
-        state_interpretation: None,
         function: function.clone(),
         phase,
         logical_argument_count: 1,
-        intermediate_type: intermediate.clone(),
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-        state_format: AggregateStateFormatId::try_new("test/state-identity-v1").unwrap(),
+        merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+            state_interpretation: None,
+            intermediate_type: intermediate.clone(),
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+            state_format: AggregateStateFormatId::try_new("test/state-identity-v1").unwrap(),
+        }),
     }
 }
 fn values() -> [(u32, FunctionValueType); 2] {
@@ -156,7 +158,7 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
     ];
     let mut sources = phases.map(|phase| aggregate(&function, &values[1].1, phase));
     for source in sources.iter_mut().skip(1).step_by(2) {
-        source.state_argument_contract =
+        source.merge_state.as_mut().unwrap().state_argument_contract =
             AggregateStateArgumentContract::ValueRootNullabilityIndependent;
     }
     let inputs = [0, 1, 2, u32::MAX]
@@ -166,7 +168,7 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
             id,
             source,
             function_binding_id: u32::MAX,
-            intermediate_value_type_id: u32::MAX,
+            intermediate_value_type_id: Some(u32::MAX),
         })
         .collect::<Vec<_>>();
     let encoded = encode_aggregate_bindings(
@@ -190,6 +192,7 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
         assert_eq!(
             *definition,
             wire::AggregateBindingDefinition {
+                state_capability: wire::AggregateStateCapability::Mergeable as i32,
                 state_interpretation: None,
                 id: input.id,
                 function_binding_id: Some(u32::MAX),
@@ -248,7 +251,15 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
         let roots = [
             (0, argument.clone()),
             (1, binding.function.result_type.clone()),
-            (2, binding.intermediate_type.clone()),
+            (
+                2,
+                binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .clone(),
+            ),
         ];
         let control = Control::default();
         let types = encode_type_table_sources(&roots, &[], type_limits(), &control).unwrap();
@@ -265,19 +276,18 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
             id: 0,
             source: binding,
             function_binding_id: 0,
-            intermediate_value_type_id: 2,
+            intermediate_value_type_id: Some(2),
         }];
         let aggregate =
-            encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control)
-                .unwrap();
-        (
+            encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control)?;
+        Ok::<_, BindingCodecError>((
             types.as_wire().clone(),
             functions.as_wire().to_vec(),
             aggregate.as_wire().to_vec(),
-        )
+        ))
     };
-    let expected = project(&left);
-    let compare = |right: &AggregateBinding| project(right) == expected;
+    let expected = project(&left).unwrap();
+    let compare = |right: &AggregateBinding| project(right).is_ok_and(|actual| actual == expected);
     let mut right = left.clone();
     // Legacy occurrence projections are deliberately outside the definition signature.
     right.function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
@@ -287,24 +297,37 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     };
     assert!(!compare(&right));
     right = left.clone();
-    right.state_argument_contract = AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    right.merge_state.as_mut().unwrap().state_argument_contract =
+        AggregateStateArgumentContract::ValueRootNullabilityIndependent;
     assert!(!compare(&right));
     right = left.clone();
     right.logical_argument_count = 0;
-    assert!(!compare(&right));
+    assert!(project(&right).is_err());
     right = left.clone();
-    right.state_format = AggregateStateFormatId::try_new("test/other-v1").unwrap();
+    right.merge_state.as_mut().unwrap().state_format =
+        AggregateStateFormatId::try_new("test/other-v1").unwrap();
     assert!(!compare(&right));
     right = left.clone();
     right.function.overload = FunctionOverloadId::try_new("test/other-overload").unwrap();
     assert!(!compare(&right));
     right = left.clone();
-    right.intermediate_type = right.intermediate_type.with_nullable(true).unwrap();
+    right.merge_state.as_mut().unwrap().intermediate_type = right
+        .merge_state
+        .as_ref()
+        .unwrap()
+        .intermediate_type
+        .with_nullable(true)
+        .unwrap();
     assert!(!compare(&right));
     right = left.clone();
-    right.intermediate_type = FunctionValueType::new(
+    right.merge_state.as_mut().unwrap().intermediate_type = FunctionValueType::new(
         DataType::Struct(vec![Arc::new(Field::new("changed", DataType::Int64, false))].into()),
-        right.intermediate_type.nullable(),
+        right
+            .merge_state
+            .as_ref()
+            .unwrap()
+            .intermediate_type
+            .nullable(),
     );
     assert!(!compare(&right));
     right = left.clone();
@@ -345,7 +368,7 @@ fn aggregate_refuses_foreign_type_emission_missing_ids_and_wrong_source_facts() 
         id: 0,
         source: &source,
         function_binding_id: 0,
-        intermediate_value_type_id: u32::MAX,
+        intermediate_value_type_id: Some(u32::MAX),
     };
     assert!(
         encode_aggregate_bindings(
@@ -364,11 +387,11 @@ fn aggregate_refuses_foreign_type_emission_missing_ids_and_wrong_source_facts() 
             ..base
         },
         AggregateBindingInput {
-            intermediate_value_type_id: 8,
+            intermediate_value_type_id: Some(8),
             ..base
         },
         AggregateBindingInput {
-            intermediate_value_type_id: 0,
+            intermediate_value_type_id: Some(0),
             ..base
         },
     ] {
@@ -455,7 +478,7 @@ fn aggregate_exact_resource_envelopes_and_checked_arithmetic_refuse_underbounds(
         id: 0,
         source: &source,
         function_binding_id: 0,
-        intermediate_value_type_id: u32::MAX,
+        intermediate_value_type_id: Some(u32::MAX),
     }];
     let facts = *encode_aggregate_bindings(
         &types,
@@ -569,7 +592,7 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
             id,
             source: &source,
             function_binding_id: 0,
-            intermediate_value_type_id: u32::MAX,
+            intermediate_value_type_id: Some(u32::MAX),
         })
         .collect::<Vec<_>>();
     let ordinary = [AggregateBindingInput {
@@ -577,8 +600,11 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
         ..inputs[0]
     }];
     let mut independent_source = source.clone();
-    independent_source.state_argument_contract =
-        AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    independent_source
+        .merge_state
+        .as_mut()
+        .unwrap()
+        .state_argument_contract = AggregateStateArgumentContract::ValueRootNullabilityIndependent;
     let independent = [AggregateBindingInput {
         source: &independent_source,
         ..inputs[0]
@@ -649,7 +675,7 @@ fn aggregate_source_identity_uses_original_pointer_and_first_sparse_alias() {
         id,
         source: &source,
         function_binding_id: 0,
-        intermediate_value_type_id: u32::MAX,
+        intermediate_value_type_id: Some(u32::MAX),
     });
     let encoded =
         encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control).unwrap();

@@ -80,12 +80,8 @@ pub use pruning_structure::*;
 pub use relation::*;
 pub use resource::{
     MAX_ANNOTATION_BYTES, MAX_ANNOTATION_KEY_BYTES, MAX_ANNOTATION_VALUE_BYTES, MAX_ANNOTATIONS,
-    MAX_DATA_TYPE_DEPTH, MAX_DATA_TYPE_FIELD_METADATA_BYTES, MAX_DATA_TYPE_FIELD_METADATA_ENTRIES,
-    MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES, MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES,
-    MAX_DATA_TYPE_FIELD_NAME_BYTES, MAX_DATA_TYPE_NODES, MAX_FIXED_SIZE_LENGTH,
     MAX_FRAGMENT_DYNAMIC_BYTES, MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_PLAN_DERIVED_CUT_BYTES,
     MAX_PLAN_DERIVED_CUT_ITEMS, MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS,
-    MAX_TIMESTAMP_TIMEZONE_BYTES,
 };
 pub use runtime_filter_binding::*;
 pub use structure_input::FragmentStructureInput;
@@ -171,8 +167,11 @@ pub fn supports_result_content_key(data_type: &arrow_schema::DataType) -> bool {
 /// higher-order overload to own NULL control.
 /// Revision 46 replaces the SQL JSON UTF-8 carrier with native JSON v1.
 /// Revision 47 retires package and call-request constant quota fields.
-/// Revision 48 installs content application and its demand filter placement.
-pub const PLAN_CONTRACT_REVISION: u32 = 48;
+/// Revision 48 installs content application and its demand filter placement
+/// on main. The earlier F9 branch used revisions 48 and 49 for its own formats.
+/// Revision 50 combines content application with single-message RecordBatch
+/// constants and the explicit ordered aggregate Single contract.
+pub const PLAN_CONTRACT_REVISION: u32 = 50;
 
 #[cfg(test)]
 mod tests;

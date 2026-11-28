@@ -1746,13 +1746,15 @@ impl CountStar {
             filter_root: None,
             id: AggregateCallId::new(id),
             binding: AggregateBinding {
-                state_interpretation: None,
-                state_argument_contract: self.aggregate().state_argument_contract,
                 function,
                 phase,
                 logical_argument_count: 0,
-                intermediate_type: self.aggregate().intermediate_type.clone(),
-                state_format: self.aggregate().state_format.clone(),
+                merge_state: Some(novarocks_physical_plan::AggregateMergeBinding {
+                    state_interpretation: None,
+                    state_argument_contract: self.aggregate().state_argument_contract,
+                    intermediate_type: self.aggregate().intermediate_type.clone(),
+                    state_format: self.aggregate().state_format.clone(),
+                }),
             },
             arguments,
             distinct: false,
@@ -1912,9 +1914,18 @@ fn freeze_counts(
             argument_types: binding.function.argument_types.clone(),
             result_type: FunctionResultType::Scalar(binding.function.result_type.clone()),
             aggregate: Some(AggregateBindingSelection {
-                state_argument_contract: binding.state_argument_contract,
-                intermediate_type: binding.intermediate_type.clone(),
-                state_format: binding.state_format.clone(),
+                state_argument_contract: binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .state_argument_contract,
+                intermediate_type: binding
+                    .merge_state
+                    .as_ref()
+                    .unwrap()
+                    .intermediate_type
+                    .clone(),
+                state_format: binding.merge_state.as_ref().unwrap().state_format.clone(),
             }),
         });
         let phase = match binding.phase {

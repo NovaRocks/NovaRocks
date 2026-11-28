@@ -744,52 +744,52 @@ mod tests {
     }
 
     #[test]
-    fn signed_integer_access_propagates_entry_interior_and_final_typed_controls() {
-        // A real selected scalar traverses nested run searches. This reaches
-        // an interior quantum without adding work or a synthetic callback.
+    fn consecutive_run_wrappers_are_rejected_at_constant_admission() {
+        let ends = Int32Array::from(vec![1, 2]);
+        let run = RunArray::<Int32Type>::try_new(&ends, &Int32Array::from(vec![7, -777])).unwrap();
+        let encoded = RunArray::<Int32Type>::try_new(&ends, &run).unwrap();
+        let result = ConstantPool::try_new(
+            Arc::new(Field::new("literal", encoded.data_type().clone(), false)),
+            FunctionValueType::new(DataType::Int32, false),
+            encoded.to_data(),
+            crate::ConstantValidation::INPUT_DERIVED,
+            CompilePhase::Validate,
+            &Control::good(),
+        );
+        assert!(matches!(result, Err(ConstantError::Type(..))));
+    }
+
+    #[test]
+    fn signed_integer_access_propagates_entry_and_final_typed_controls() {
         let ends = Int32Array::from((1..=512).collect::<Vec<i32>>());
         let mut values = vec![0i32; 512];
         values[511] = -777;
-        let mut encoded: ArrayRef = Arc::new(Int32Array::from(values));
-        for _ in 0..16 {
-            encoded = Arc::new(RunArray::<Int32Type>::try_new(&ends, encoded.as_ref()).unwrap());
-        }
-        let selected = pool(encoded, false).value(511).unwrap();
+        let encoded = RunArray::<Int32Type>::try_new(&ends, &Int32Array::from(values)).unwrap();
+        let selected = pool(Arc::new(encoded), false).value(511).unwrap();
         assert_eq!(
             selected
                 .signed_integer_observed(CompilePhase::LowerProgram, &Control::good())
                 .unwrap(),
             Some(-777)
         );
-        let short = pool(Arc::new(Int8Array::from(vec![-7])), false)
-            .value(0)
-            .unwrap();
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            for at_positive in [false, true] {
-                let control = Control::failing(error.clone(), at_positive);
-                assert_eq!(
-                    selected.signed_integer_observed(CompilePhase::LowerProgram, &control),
-                    Err(ConstantError::Control(error.clone()))
-                );
-                assert_eq!(
-                    *control.calls.lock().unwrap(),
-                    if at_positive {
-                        vec![
-                            (CompilePhase::LowerProgram, 0),
-                            (CompilePhase::LowerProgram, 256),
-                        ]
-                    } else {
-                        vec![(CompilePhase::LowerProgram, 0)]
-                    }
-                );
-            }
+            let control = Control::failing(error.clone(), false);
+            assert_eq!(
+                selected.signed_integer_observed(CompilePhase::LowerProgram, &control),
+                Err(ConstantError::Control(error.clone()))
+            );
+            assert_eq!(
+                *control.calls.lock().unwrap(),
+                vec![(CompilePhase::LowerProgram, 0)]
+            );
+
             let control = Control::failing(error.clone(), true);
             assert_eq!(
-                short.signed_integer_observed(CompilePhase::FunctionSpecialization, &control),
+                selected.signed_integer_observed(CompilePhase::FunctionSpecialization, &control),
                 Err(ConstantError::Control(error))
             );
             let calls = control.calls.lock().unwrap();

@@ -156,7 +156,7 @@ fn inspect_span_policy_core<H>(
     mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, HostError<H>> {
-    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let policy = crate::ipc_flat_pool_v2::WriterAdmissionPolicy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
     let aligned = |a| policy.numeric(aligned(a));
     let mul = |a, b| policy.numeric(mul(a, b));

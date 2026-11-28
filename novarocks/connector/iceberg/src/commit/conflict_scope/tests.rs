@@ -94,11 +94,24 @@ fn text(value: &str) -> ConnectorValue {
     ConnectorValue::Varchar(value.into())
 }
 
+pub(crate) fn preparation() -> novarocks_spi::connector::ConnectorRowMutationPreparation {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableHandle};
+    crate::commit::preparation_for_test_source(
+        ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("test").unwrap(),
+            bytes::Bytes::from_static(b"table"),
+        )
+        .unwrap(),
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+    )
+}
+
 pub(crate) fn binding(metadata: &TableMetadata) -> RewrittenTargetBinding {
     RewrittenTargetBinding {
         table_uuid: metadata.uuid(),
         snapshot_id: metadata.current_snapshot_id(),
-        preparation_digest: [1; 32],
+        preparation_identity: preparation().preparation_identity().clone(),
     }
 }
 

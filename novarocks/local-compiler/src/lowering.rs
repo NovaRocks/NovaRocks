@@ -604,15 +604,12 @@ fn lower_with_creation<
         .map_err(|_| CompileControlError::ResourceExhausted)?;
     // A join may consume one replica of a complete build subtree.
     let replicated_builds = crate::join::replicated_build_inputs(physical, work)?;
-    stack.push((physical.root(), false, 1usize));
+    stack.push((physical.root(), false, 0usize));
     while let Some((id, exiting, depth)) = stack.pop() {
         work.step()?;
         if exiting {
             order.push(id);
             continue;
-        }
-        if depth > MAX_PROGRAM_NODE_DEPTH {
-            return Err(CompileControlError::ResourceExhausted.into());
         }
         if !visited.insert(id) {
             return Err((FragmentCompileError::Unsupported {
@@ -625,6 +622,16 @@ fn lower_with_creation<
             .nodes()
             .get(&id)
             .ok_or(FragmentCompileError::Invalid("missing physical node"))?;
+        // Project and Aggregate lower to the linear worklist. Their outgoing
+        // chains keep the same recursive depth as the current physical node.
+        let recursive_depth = depth
+            + usize::from(!matches!(
+                node.kind,
+                NodeKind::Project { .. } | NodeKind::Aggregate { .. }
+            ));
+        if recursive_depth > MAX_RECURSIVE_PIPELINE_BUILD_DEPTH {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
         // A partitioned single-copy layout only says how rows are placed
         // across instances. Families with a whole-relation meaning (global
         // Sort, Single/Final TopN, Limit, global row-count assertion) reach
@@ -654,13 +661,12 @@ fn lower_with_creation<
             })
             .into());
         }
-        let set_operation = matches!(node.kind, NodeKind::SetOp { .. });
         let supported = match &node.kind {
             NodeKind::GenerateSeries { .. } => {
                 crate::generate_series::admit(package, node, work)?;
-                if depth
+                if recursive_depth
                     .checked_add(1)
-                    .is_none_or(|depth| depth > MAX_PROGRAM_NODE_DEPTH)
+                    .is_none_or(|depth| depth > MAX_RECURSIVE_PIPELINE_BUILD_DEPTH)
                 {
                     return Err(CompileControlError::ResourceExhausted.into());
                 }
@@ -756,11 +762,9 @@ fn lower_with_creation<
         }
         stack.push((id, true, depth));
         for &child in node.inputs.iter().rev() {
-            // Join selections, set operation normalizers and table function
-            // argument Projects each add one local node above the child.
-            let derived =
-                set_operation || join || matches!(node.kind, NodeKind::TableFunction { .. });
-            stack.push((child, false, depth + if derived { 2 } else { 1 }));
+            // The derived selection, normalization and argument Projects
+            // introduced by lowering also use the linear worklist.
+            stack.push((child, false, recursive_depth));
             work.step()?;
         }
     }

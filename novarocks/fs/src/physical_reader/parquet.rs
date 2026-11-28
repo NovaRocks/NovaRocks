@@ -546,13 +546,13 @@ pub fn plan_parquet_input_ranges(
     request: &FileReadRequest,
     inspection: &ParquetMetadataInspection,
 ) -> FileResult<Vec<FileReadRange>> {
-    if request.format != FileFormat::Parquet {
+    let FileFormat::Parquet(policy) = request.format else {
         return Err(FileError::invalid(
             "Parquet input planning requires Parquet format",
         ));
-    }
+    };
     request.context.check_active()?;
-    if inspection.policy != request.options.parquet_interpretation_policy {
+    if inspection.policy != policy {
         return Err(FileError::invalid(
             "Parquet inspection interpretation policy does not match reader policy",
         ));
@@ -1090,12 +1090,11 @@ struct ReaderOpen {
 impl ReaderOpen {
     fn try_new(
         request: &FileReadRequest,
+        policy: ParquetInterpretationPolicy,
         inspection: Option<&ParquetMetadataInspection>,
     ) -> FileResult<Self> {
         request.context.check_active()?;
-        if inspection.is_some_and(|inspection| {
-            inspection.policy != request.options.parquet_interpretation_policy
-        }) {
+        if inspection.is_some_and(|inspection| inspection.policy != policy) {
             return Err(FileError::invalid(
                 "Parquet inspection interpretation policy does not match reader policy",
             ));
@@ -1135,7 +1134,7 @@ impl ReaderOpen {
             identity,
             automatic_page_pruning,
             page_index_policy,
-            policy: request.options.parquet_interpretation_policy,
+            policy,
         })
     }
 
@@ -1266,9 +1265,10 @@ impl ReaderOpen {
 impl ParquetPhysicalReader {
     pub(crate) fn try_new(
         request: FileReadRequest,
+        policy: ParquetInterpretationPolicy,
         inspection: Option<&ParquetMetadataInspection>,
     ) -> FileResult<Self> {
-        let open = ReaderOpen::try_new(&request, inspection)?;
+        let open = ReaderOpen::try_new(&request, policy, inspection)?;
         let metadata = match inspection {
             Some(inspection) => inspection.metadata_for(
                 &request.file,
@@ -1297,9 +1297,10 @@ impl ParquetPhysicalReader {
     /// through the chunk reader.
     pub(crate) async fn try_new_async(
         request: FileReadRequest,
+        policy: ParquetInterpretationPolicy,
         inspection: Option<&ParquetMetadataInspection>,
     ) -> FileResult<Self> {
-        let open = ReaderOpen::try_new(&request, inspection)?;
+        let open = ReaderOpen::try_new(&request, policy, inspection)?;
         let metadata = match inspection {
             Some(inspection) => {
                 inspection

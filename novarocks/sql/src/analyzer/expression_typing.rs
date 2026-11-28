@@ -730,6 +730,7 @@ fn scalar_selection_error(
                     | FunctionBindingError::VariantTargetType(_)
                     | FunctionBindingError::ValueType(
                         novarocks_type_contract::ValueTypeError::InvalidCharacterWidth { .. }
+                            | novarocks_type_contract::ValueTypeError::TooDeep
                     )
                     | FunctionBindingError::UnknownFunction
                     | FunctionBindingError::OperatorNotFound
@@ -800,6 +801,9 @@ pub(super) fn analyze_typing_error(error: TypingError, span: Span) -> AnalyzeErr
             span,
         ),
         TypingError::Unsupported(message) => AnalyzeError::unsupported_expression(message, span),
+        TypingError::ValueType(novarocks_type_contract::ValueTypeError::TooDeep) => {
+            AnalyzeError::unsupported_type_depth().at_type_mismatch(span)
+        }
         TypingError::Control(error) => AnalyzeError::control(error),
         TypingError::Binding(error @ FunctionBindingError::AmbiguousOverload) => {
             AnalyzeError::ambiguous_function_call(error, span)

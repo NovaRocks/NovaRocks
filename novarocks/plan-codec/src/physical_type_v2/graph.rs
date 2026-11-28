@@ -70,6 +70,61 @@ impl Index<'_> {
             .as_ref()
             .ok_or(E::InvalidShape("missing carrier kind"))
     }
+    /// Check roles directly in the flat table before any Arrow type is built.
+    pub(super) fn validate_carrier_shape(&self, id: u32) -> Result<(), E> {
+        let (auxiliary, values, run_ends) = match self.kind(id)? {
+            Kind::Map(map) => {
+                let entries = self.field(required(map.entries_field_id)?)?;
+                if entries.nullable
+                    || !matches!(
+                        self.kind(required(entries.carrier_type_id)?)?,
+                        Kind::StructType(fields) if fields.field_ids.len() == 2
+                    )
+                {
+                    return Err(E::InvalidShape(
+                        "Map entries must be a required two-field Struct",
+                    ));
+                }
+                return Ok(());
+            }
+            Kind::Dictionary(dictionary) => (
+                self.kind(required(dictionary.key_type_id)?)?,
+                self.kind(required(dictionary.value_type_id)?)?,
+                false,
+            ),
+            Kind::RunEndEncoded(run_end) => {
+                let ends = self.field(required(run_end.run_ends_field_id)?)?;
+                if ends.nullable {
+                    return Err(E::InvalidShape("Arrow run-end field must be required"));
+                }
+                let values = self.field(required(run_end.values_field_id)?)?;
+                (
+                    self.kind(required(ends.carrier_type_id)?)?,
+                    self.kind(required(values.carrier_type_id)?)?,
+                    true,
+                )
+            }
+            _ => return Ok(()),
+        };
+        let integer = matches!(auxiliary, Kind::Primitive(_))
+            && super::scalars::decode_scalar(auxiliary)?.is_some_and(|carrier| {
+                if run_ends {
+                    carrier.is_run_ends_type()
+                } else {
+                    carrier.is_dictionary_key_type()
+                }
+            });
+        if !integer {
+            return Err(E::InvalidShape("invalid Arrow encoding auxiliary type"));
+        }
+        if matches!(values, Kind::Dictionary(_) | Kind::RunEndEncoded(_)) {
+            return Err(E::InvalidShape(
+                "an Arrow value node cannot carry consecutive encodings",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn child_count(&self, node: Node) -> Result<usize, E> {
         Ok(match node {
             Node::Field(_) => 1,

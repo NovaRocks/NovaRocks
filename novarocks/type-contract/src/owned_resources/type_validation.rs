@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Request geometry of the original type-validation pending storage.
-//! Neither the fixed scratch nor the dynamic request bound grants memory.
-//! Callers admit initialization and the complete original operation separately.
+//! Legacy borrowed backing for type-validation callers still migrating to the
+//! bounded cursor. This geometry describes initialization work, not a heap request.
 
 #[cfg(test)]
 use arrow_schema::DataType;
@@ -25,7 +24,7 @@ use std::{alloc::Layout, mem::MaybeUninit};
 
 /// The original borrowed traversal stack, including every slot's occupancy.
 pub type TypeValidationScratch<'a> =
-    [Option<crate::TypeTraversalFrame<'a>>; crate::MAX_VALUE_TYPE_NODES];
+    [Option<crate::TypeTraversalFrame<'a>>; crate::MAX_ARROW_TYPE_PATH_DEPTH];
 
 /// Actual backing layout; this function does not initialize or allocate it.
 pub fn scratch_layout() -> Layout {
@@ -48,7 +47,7 @@ pub fn initialize_scratch_observed<'a, 'storage>(
     let slots = storage
         .as_mut_ptr()
         .cast::<Option<crate::TypeTraversalFrame<'a>>>();
-    for index in 0..crate::MAX_VALUE_TYPE_NODES {
+    for index in 0..crate::MAX_ARROW_TYPE_PATH_DEPTH {
         // SAFETY: the exact original scratch backing has this many contiguous
         // slots. Each write initializes one slot without reading old contents.
         unsafe { slots.add(index).write(None) };
@@ -58,46 +57,6 @@ pub fn initialize_scratch_observed<'a, 'storage>(
     // SAFETY: every slot was initialized above. On any refusal this borrow is
     // never published; Option contains only borrowed references and has no Drop.
     Ok(unsafe { storage.assume_init_mut() })
-}
-
-/// Cumulative heap-request upper bound for the original dynamic validator.
-/// Its initial `vec![TypeTraversalFrame::root(root)]` requests one element. The sole walk checks
-/// visited + pending before every child push, so pending length never exceeds
-/// MAX_VALUE_TYPE_NODES, including on a type or observer error. Pops cannot
-/// increase capacity. The locked growth sequence after the exact one-element
-/// backing is a subsequence of the original fresh-push sequence starting at
-/// four elements. Include both, without replacing or pre-running validation.
-///
-/// This deliberately bounds every original shape; it does not inspect a
-/// foreign Vec's capacity or claim that the maximum is actually allocated.
-/// Element payloads are borrowed. Each emitted Layout is one possible original
-/// request contribution, including the initial request; no tail is included.
-pub fn original_dynamic_pending_allocation_requests_observed<
-    E: From<crate::ControlResourceError>,
->(
-    observe: &mut impl FnMut() -> Result<(), E>,
-    allocations: &mut Option<super::metadata_materialization::MetadataAllocationLoan<'_, E>>,
-) -> Result<usize, E> {
-    if !super::profile::LOCKED_TOOLCHAIN {
-        return Err(crate::ControlResourceError::SourceModel(
-            "Type validation pending source model drift",
-        )
-        .into());
-    }
-    let initial = Layout::new::<crate::TypeTraversalFrame<'_>>();
-    if let Some(allocations) = allocations.as_deref_mut() {
-        allocations(initial, 1)?;
-    }
-    observe()?;
-    let growth = super::vec::original_fresh_push_allocation_requests_observed::<
-        crate::TypeTraversalFrame<'_>,
-        E,
-    >(crate::MAX_VALUE_TYPE_NODES, observe, allocations)?;
-    initial.size().checked_add(growth).ok_or_else(|| {
-        E::from(crate::ControlResourceError::from(
-            crate::CompileControlError::ResourceExhausted,
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -140,7 +99,7 @@ mod scratch_tests {
         let trace = control.trace.lock().unwrap();
         assert_eq!(
             trace.iter().sum::<u32>() as usize,
-            crate::MAX_VALUE_TYPE_NODES
+            crate::MAX_ARROW_TYPE_PATH_DEPTH
         );
         assert!(
             trace
@@ -157,8 +116,8 @@ mod scratch_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            // Entry, first interior quantum, and final post-initialization tail.
-            for (at, completed) in [(2, 0), (3, 256), (19, crate::MAX_VALUE_TYPE_NODES)] {
+            // Entry and final post-initialization tail.
+            for (at, completed) in [(2, 0), (3, crate::MAX_ARROW_TYPE_PATH_DEPTH)] {
                 let control = Control {
                     trace: Mutex::default(),
                     refusal: Some((at, error.clone())),
@@ -167,7 +126,8 @@ mod scratch_tests {
                     CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
                 // Sentinels let this test inspect the actual untouched suffix.
                 let sentinel = crate::TypeTraversalFrame::root(&ty);
-                let mut storage = MaybeUninit::new([Some(sentinel); crate::MAX_VALUE_TYPE_NODES]);
+                let mut storage =
+                    MaybeUninit::new([Some(sentinel); crate::MAX_ARROW_TYPE_PATH_DEPTH]);
                 assert!(
                     matches!(initialize_scratch_observed(&mut storage, &mut work), Err(actual) if actual == error)
                 );

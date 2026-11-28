@@ -119,10 +119,9 @@ fn prepared_flat_writer_emission_success_and_internal_shape_tail_keep_all_origin
                 )
                 .unwrap();
                 if !successful {
-                    // Private invariant fault only: production exposes neither
-                    // mutable limits nor an unchecked prepared-owner constructor.
-                    // This reaches the real schema author's ordinary error tail.
-                    prepared.limits.schema.max_flatbuffer_bytes = 0;
+                    // Exercise the ordinary tail of a violated prepared
+                    // extent without authorizing further allocation.
+                    prepared.prepared.geometry.body_bytes = usize::MAX;
                 }
                 prepared.emit(control)
             },

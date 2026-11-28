@@ -387,6 +387,9 @@ impl FailureProjection for crate::physical_package_metadata_v2::PackageMetadataC
             Self::Identity(source) => source.failure_fact(),
             Self::Projection(source) => source.failure_fact(),
             Self::InvalidShape(_) => CodecReason::PackageMetadataShape.fact(FailureClass::Data),
+            Self::PlanContractRevision { .. } => {
+                CodecReason::PackageMetadataShape.fact(FailureClass::Invariant)
+            }
         }
     }
 }

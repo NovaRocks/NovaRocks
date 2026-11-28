@@ -611,7 +611,6 @@ fn aggregate_fragment() -> Fragment {
             filter_root: None,
             id,
             binding: AggregateBinding {
-                state_interpretation: None,
                 function: crate::BoundFunction::from_exact_signature(
                     FunctionId::try_new("fixture/static-request/aggregate").unwrap(),
                     FunctionOverloadId::try_new("fixture/static-request/aggregate-exact").unwrap(),
@@ -621,10 +620,13 @@ fn aggregate_fragment() -> Fragment {
                 ),
                 phase: AggregatePhase::Single,
                 logical_argument_count: 0,
-                intermediate_type: integer(false),
-                state_format: AggregateStateFormatId::try_new("fixture/state/v1").unwrap(),
-                state_argument_contract:
-                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                merge_state: Some(crate::AggregateMergeBinding {
+                    state_interpretation: None,
+                    intermediate_type: integer(false),
+                    state_format: AggregateStateFormatId::try_new("fixture/state/v1").unwrap(),
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                }),
             },
             arguments: Box::default(),
             distinct: false,
@@ -709,11 +711,7 @@ fn ordered_window_fragment() -> Fragment {
         function: binding.clone(),
         phase: AggregatePhase::Single,
         logical_argument_count: 1,
-        intermediate_type: ty,
-        state_format: AggregateStateFormatId::try_new("fixture/window/state").unwrap(),
-        state_argument_contract:
-            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
-        state_interpretation: None,
+        merge_state: None,
     };
     let properties = builder.node_output_properties(input).unwrap().clone();
     builder

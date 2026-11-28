@@ -24,7 +24,7 @@ use arrow::datatypes::Field;
 use crate::ipc_flat_batch_v2::FlatBatchProjectionLimits;
 use crate::ipc_flat_batch_v2::GeometryAdapter;
 #[cfg(test)]
-use crate::ipc_schema_v2::verified_message_observed;
+use crate::ipc_flat_stream_v2::verified_record_message_observed;
 use crate::physical_type_v2::TypeCodecError;
 #[cfg(test)]
 use arrow::datatypes::DataType;
@@ -101,7 +101,7 @@ pub(crate) fn preflight_recursive_record_batch<'a>(
             "recursive IPC metadata envelope exceeded",
             &mut work,
         )?;
-        let message = verified_message_observed(metadata, verifier, &mut work)?;
+        let message = verified_record_message_observed(metadata, verifier, &mut work)?;
         preflight_verified_recursive_record_batch(message, body, expected, limits, &mut work)
     })();
     if matches!(&result, Err(TypeCodecError::Control(_))) {

@@ -43,9 +43,11 @@ use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_types::SlotId;
 
 use super::memory::{ChunkAccounting, ChunkMemoryCharge, chunk_bytes_i64, record_batch_bytes};
-use super::schema::execution_carrier_matches_layout_observed;
 use super::schema::{
     ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch, align_chunk_schema_to_columns,
+};
+use super::schema::{
+    execution_carrier_matches_layout_observed, validate_chunk_carrier_encoding_observed,
 };
 use super::type_compatibility::retag_column;
 use super::typed_array_normalization::{
@@ -389,6 +391,9 @@ impl Chunk {
                     },
                 )));
             }
+            validate_chunk_carrier_encoding_observed(column.data_type(), &mut |source| {
+                observe(ArrayNormalizationStep::InspectType(source))
+            })?;
             if !execution_carrier_matches_layout_observed(
                 slot.typed_binding().layout(),
                 column.data_type(),
@@ -491,6 +496,9 @@ impl Chunk {
                     ChunkViolation::BatchOccurrence { column: index },
                 )));
             }
+            validate_chunk_carrier_encoding_observed(field.data_type(), &mut |source| {
+                observe(ArrayNormalizationStep::InspectType(source))
+            })?;
             if !execution_carrier_matches_layout_observed(
                 slot.typed_binding().layout(),
                 field.data_type(),
@@ -532,6 +540,11 @@ impl Chunk {
                 row_count,
                 |_| Ok(()),
             );
+        }
+        for column in &columns {
+            novarocks_type_contract::validate_arrow_layout_structure_observed::<
+                ChunkConstructionFailure,
+            >(column.data_type(), |_| Ok(()))?;
         }
         let chunk_schema = align_chunk_schema_to_columns(&columns, chunk_schema.as_ref())?;
         let columns = retag_columns_to_chunk_schema(&columns, chunk_schema.as_ref())?;
@@ -590,6 +603,11 @@ impl Chunk {
                 row_count,
                 |_| Ok(()),
             );
+        }
+        for field in batch.schema_ref().fields() {
+            novarocks_type_contract::validate_arrow_layout_structure_observed::<
+                ChunkConstructionFailure,
+            >(field.data_type(), |_| Ok(()))?;
         }
         let arrow_schema = chunk_schema.arrow_schema_ref();
         if batch.schema().as_ref() == arrow_schema.as_ref() {
@@ -1278,6 +1296,27 @@ mod shared_batch_projection_tests {
         .unwrap();
         Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap())
     }
+    #[test]
+    fn typed_chunk_rejects_encoded_wrapper_chain_before_binding_or_construction() {
+        let plain: ArrayRef = Arc::new(Int32Array::from(vec![7]));
+        let inner = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), plain).unwrap(),
+        );
+        let source: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), inner).unwrap(),
+        );
+        let result = Chunk::try_new_typed_with_columns_observed::<ChunkConstructionFailure, _>(
+            schema(),
+            vec![source],
+            1,
+            |step| {
+                assert!(matches!(step, ArrayNormalizationStep::InspectType(_)));
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn array_only_storage_consumption_releases_independently_of_schema_and_preserves_source_buffers()
      {

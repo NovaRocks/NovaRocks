@@ -146,7 +146,7 @@ pub(crate) fn capture_aggregate_logical_request(
         if resolved.kind != FunctionKind::Aggregate
             || resolved.logical_argument_count != arguments.len()
             || resolved.selected.argument_types.len() != count
-            || resolved.selected.aggregate.is_none()
+            || resolved.selected.aggregate.is_some() != order_by.is_empty()
             || !matches!(resolved.selected.result_type, FunctionResultType::Scalar(_))
         {
             return Err(AggregateRequestCaptureError::InvalidSource(

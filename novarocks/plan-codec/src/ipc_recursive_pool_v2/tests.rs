@@ -21,7 +21,6 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     ipc::{
         self,
-        reader::StreamReader,
         writer::{IpcWriteOptions, StreamWriter},
     },
     record_batch::RecordBatch,
@@ -33,7 +32,6 @@ use novarocks_type_contract::{
 };
 use std::{
     collections::HashMap,
-    io::Cursor,
     sync::{Arc, Mutex},
 };
 
@@ -105,12 +103,7 @@ fn limits() -> RecursivePoolWriteLimits {
             max_buffer_descriptors: 16384,
             max_body_bytes: 8 * 1024 * 1024,
             max_encoded_stream_bytes: 16 * 1024 * 1024,
-            schema: ipc_schema_v2::IpcSchemaProjectionLimits {
-                max_field_occurrences: 4096,
-                max_type_occurrences: 4096,
-                max_string_bytes: 65536,
-                max_flatbuffer_bytes: 4 * 1024 * 1024,
-            },
+
             max_new_allocation_request_bytes: 128 * 1024 * 1024,
             max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
             max_cumulative_library_work: 1024 * 1024 * 1024,
@@ -151,26 +144,30 @@ fn standard(pool: &ConstantPool) -> Vec<u8> {
         writer.write(&batch).unwrap();
         writer.finish().unwrap();
     }
-    bytes
+    crate::ipc_flat_stream_v2::standard_test_record_frame(&bytes).to_vec()
 }
 fn batch_parts(bytes: &[u8]) -> (ipc::RecordBatch<'_>, &[u8]) {
     assert_eq!(&bytes[..4], &[255; 4]);
-    let first = usize::try_from(i32::from_le_bytes(bytes[4..8].try_into().unwrap())).unwrap();
-    let second = 8 + first;
-    assert_eq!(&bytes[second..second + 4], &[255; 4]);
-    let length = usize::try_from(i32::from_le_bytes(
-        bytes[second + 4..second + 8].try_into().unwrap(),
-    ))
-    .unwrap();
-    let message = ipc::root_as_message(&bytes[second + 8..second + 8 + length]).unwrap();
+    let length = usize::try_from(i32::from_le_bytes(bytes[4..8].try_into().unwrap())).unwrap();
+    let end = 8 + length;
+    let message = ipc::root_as_message(&bytes[8..end]).unwrap();
+    assert_eq!(message.version(), ipc::MetadataVersion::V5);
     let batch = message.header_as_record_batch().unwrap();
-    let body_start = second + 8 + length;
-    let body = &bytes[body_start..body_start + usize::try_from(message.bodyLength()).unwrap()];
-    assert_eq!(
-        &bytes[body_start + body.len()..],
-        &[255, 255, 255, 255, 0, 0, 0, 0]
-    );
+    let body = &bytes[end..];
+    assert_eq!(body.len(), usize::try_from(message.bodyLength()).unwrap());
     (batch, body)
+}
+fn read_batch(bytes: &[u8], field: &Arc<Field>) -> RecordBatch {
+    let (batch, body) = batch_parts(bytes);
+    ipc::reader::read_record_batch(
+        &arrow::buffer::Buffer::from(body),
+        batch,
+        Arc::new(Schema::new([Arc::clone(field)])),
+        &HashMap::new(),
+        None,
+        &ipc::MetadataVersion::V5,
+    )
+    .unwrap()
 }
 // Derive descriptor roles from the public Arrow layout and the original
 // arrays, without consulting either writer's geometry or descriptor lengths.
@@ -304,16 +301,12 @@ fn agree_with_standard(pool: &ConstantPool, bytes: &[u8]) -> ArrayRef {
         assert_eq!(a.length(), b.length());
         assert_eq!(actual, &rb[bstart..bstart + length]);
     }
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
-    assert!(
-        novarocks_type_contract::arrow_fields_exact_observed::<
-            novarocks_constant_contract::ConstantError,
-        >(pool.field(), reader.schema().field(0), || Ok(()))
-        .unwrap()
-    );
-    let batch = reader.next().unwrap().unwrap();
+    let batch = read_batch(bytes, pool.field_ref());
+    assert!(Arc::ptr_eq(
+        batch.schema().fields().first().unwrap(),
+        pool.field_ref()
+    ));
     assert_eq!(batch.num_rows(), pool.data().len());
-    assert!(reader.next().is_none());
     Arc::clone(batch.column(0))
 }
 #[test]
@@ -804,7 +797,7 @@ fn pure_recursive_writer_without_invoice_matches_receiving_stream() {
     )
     .unwrap();
     assert_eq!(pure, receiving);
-    let mut reader = StreamReader::try_new(Cursor::new(pure), None).unwrap();
-    let batch = reader.next().unwrap().unwrap();
+    let decoded = read_batch(&pure, pool.field_ref());
+    let batch = decoded;
     assert_eq!(batch.column(0).as_ref(), pool.array().as_ref());
 }

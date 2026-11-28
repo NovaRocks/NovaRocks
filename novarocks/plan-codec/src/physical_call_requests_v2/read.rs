@@ -34,8 +34,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, MAX_VALUE_TYPE_DEPTH,
-    MAX_VALUE_TYPE_NODES, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use std::{alloc::Layout, mem::size_of};
 
@@ -261,13 +260,9 @@ impl Model {
         limits: Profile,
         parent: &mut Option<&mut Parent<'_, F>>,
     ) -> Result<(), F> {
-        // Original checked clone grammar bounds its fixed borrowed scratch and
-        // all possible visited owned Dictionary nodes BEFORE that helper runs.
-        // This deliberately conservative per-reference envelope is not an
-        // invented type cap or a claim about allocator/library cooperation.
-        let scratch =
-            bytes::<Option<(&arrow::datatypes::DataType, usize)>>(MAX_VALUE_TYPE_DEPTH + 1)?;
-        let clone = add(scratch, add(mul(MAX_VALUE_TYPE_NODES, 16)?, 64)?)?;
+        // FunctionValueType shares its canonical storage through a checked,
+        // constant-size clone. Charge the original owner for each reference.
+        let clone = crate::physical_type_v2::value_type_clone_preflight_work_upper_bound();
         let height = (usize::BITS - self.facts.definition_count.leading_zeros()) as usize;
         let index = mul(
             self.facts.definition_count,

@@ -211,8 +211,14 @@ pub(crate) struct IcebergWriteValueCodec {
 
 impl IcebergWriteValueCodec {
     pub(crate) fn decode_limits(max_bytes: usize) -> ConnectorDecodeLimits {
-        ConnectorDecodeLimits::try_new(max_bytes, max_bytes, max_bytes, 1_000_000, 64)
-            .expect("Iceberg write decode limits are finite and non-zero")
+        ConnectorDecodeLimits::try_new(
+            max_bytes,
+            max_bytes,
+            max_bytes,
+            1_000_000,
+            novarocks_spi::connector::MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+        )
+        .expect("Iceberg write decode limits are finite and non-zero")
     }
 
     pub(crate) fn new(owner: impl Into<Arc<str>>) -> Self {
@@ -2168,7 +2174,7 @@ mod tests {
             MAX_CONNECTOR_WRITER_HANDLE_BYTES,
             MAX_CONNECTOR_WRITER_HANDLE_BYTES,
             1_000_000,
-            64,
+            novarocks_spi::connector::MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
         )
         .expect("private codec limits")
     }

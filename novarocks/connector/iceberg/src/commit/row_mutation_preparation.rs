@@ -26,7 +26,8 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
+    ConnectorOperationControl, ConnectorProviderBindingKey, ConnectorRowMutationEffect,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationIdentity,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteFieldToken,
 };
@@ -86,7 +87,7 @@ pub(crate) struct AdmittedRowMutation {
     pub(crate) metadata: Arc<TableMetadata>,
     pub(crate) metadata_location: String,
     pub(crate) isolation: IsolationLevel,
-    pub(crate) preparation_digest: [u8; 32],
+    pub(crate) preparation_identity: ConnectorRowMutationPreparationIdentity,
 }
 
 pub(crate) fn open_admission(
@@ -100,7 +101,6 @@ pub(crate) fn open_admission(
     admission.validate_owner(owner)?;
     let preparation =
         admission.value::<ConnectorRowMutationPreparation>(owner.instance_id.as_str())?;
-    preparation.validate()?;
     if preparation.owner() != owner
         || preparation.target_ref() != &request.target_ref
         || Some(preparation.base_version()) != request.base.as_ref()
@@ -176,7 +176,7 @@ pub(crate) fn open_admission(
         metadata: Arc::new(metadata),
         metadata_location: location,
         isolation,
-        preparation_digest: preparation.digest(),
+        preparation_identity: preparation.preparation_identity().clone(),
     })
 }
 
@@ -188,6 +188,8 @@ pub(crate) fn prepare_row_mutation(
     owner: &ConnectorProviderBindingKey,
 ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
     request.validate(owner)?;
+    let control = request.context.original_operation_control();
+    control.check_active()?;
     let payload: IcebergTablePayload = decode_payload(
         request.table.payload(),
         "admitted Iceberg row-mutation table",
@@ -301,6 +303,19 @@ pub(crate) fn prepare_row_mutation(
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
     // layer binding; these familiar Iceberg names never become a Core rule.
+    let identity_token = row_mutation_token_prefix(
+        owner,
+        &request.table,
+        b"novarocks.iceberg.row-mutation-identity.v1\0",
+    );
+    let layout_overflow = || {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg row-mutation layout exceeds u32 ordinals",
+        )
+    };
+    let target_start =
+        u32::try_from(identity_source_fields.len()).map_err(|_| layout_overflow())?;
     let (canonical_fields, identity_fields) =
         crate::metadata::with_pure_schema_creation(&request.context, |creation| {
             creation
@@ -328,11 +343,13 @@ pub(crate) fn prepare_row_mutation(
                     field.is_nullable() || insert_eligible,
                     creation,
                 )?;
-                identity.push(ConnectorMutationSourceField::try_new_typed(
-                    row_mutation_identity_token(owner, &request.table, ordinal),
+                let ordinal = u32::try_from(ordinal).map_err(|_| layout_overflow())?;
+                identity.push(ConnectorMutationSourceField::try_new_typed_observed(
+                    token_at_ordinal(&identity_token, ordinal),
                     field.as_ref().clone().with_nullable(value.nullable()),
-                    ordinal as u32,
+                    ordinal,
                     value,
+                    |_| control.check_active(),
                 )?);
             }
             let canonical =
@@ -374,18 +391,16 @@ pub(crate) fn prepare_row_mutation(
             request.context.max_handle_payload_bytes(),
         )?,
     )?;
-    let target_start = u32::try_from(identity_fields.len()).map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Iceberg row-mutation identity layout exceeds u32 ordinals",
-        )
-    })?;
-    let target_width = u32::try_from(canonical_fields.len()).map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Iceberg row-mutation target layout exceeds u32 ordinals",
-        )
-    })?;
+    let target_width = u32::try_from(canonical_fields.len()).map_err(|_| layout_overflow())?;
+    let after_start = target_start
+        .checked_add(target_width)
+        .ok_or_else(layout_overflow)?;
+    let effect_ordinal = after_start
+        .checked_add(target_width)
+        .ok_or_else(layout_overflow)?;
+    effect_ordinal.checked_add(1).ok_or_else(layout_overflow)?;
+    let before_token = row_mutation_field_prefix(owner, &request.table, b"before");
+    let after_token = row_mutation_field_prefix(owner, &request.table, b"after");
     let (before_fields, after_fields) = crate::metadata::with_pure_schema_creation(
         &request.context,
         |creation| {
@@ -407,22 +422,23 @@ pub(crate) fn prepare_row_mutation(
                     value.nullable() || insert_eligible,
                     creation,
                 )?;
-                let mut before_field = ConnectorMutationTargetField::try_new_typed(
-                    row_mutation_field_token(owner, &request.table, b"before", ordinal),
+                let ordinal_u32 = u32::try_from(ordinal).map_err(|_| layout_overflow())?;
+                let mut before_field = ConnectorMutationTargetField::try_new_typed_observed(
+                    token_at_ordinal(&before_token, ordinal_u32),
                     canonical
                         .field()
                         .clone()
                         .with_nullable(before_value.nullable()),
-                    target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
+                    target_start + ordinal_u32,
                     before_value,
+                    |_| control.check_active(),
                 )?;
-                let mut after_field = ConnectorMutationTargetField::try_new_typed(
-                    row_mutation_field_token(owner, &request.table, b"after", ordinal),
+                let mut after_field = ConnectorMutationTargetField::try_new_typed_observed(
+                    token_at_ordinal(&after_token, ordinal_u32),
                     canonical.field().clone(),
-                    target_start
-                        + target_width
-                        + u32::try_from(ordinal).expect("target ordinal fits u32"),
+                    after_start + ordinal_u32,
                     value.clone(),
+                    |_| control.check_active(),
                 )?;
                 let original = &target_iceberg_schema.as_struct().fields()[ordinal];
                 let source = match_source_schema.field(ordinal);
@@ -460,21 +476,9 @@ pub(crate) fn prepare_row_mutation(
     let effect_field = ConnectorMutationEffectField::try_new(
         row_mutation_effect_token(owner, &request.table),
         Field::new("__row_mutation_effect", DataType::Int8, false),
-        target_start
-            .checked_add(target_width.checked_mul(2).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "Iceberg row-mutation target layout overflowed",
-                )
-            })?)
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "Iceberg row-mutation effect ordinal overflowed",
-                )
-            })?,
+        effect_ordinal,
     )?;
-    let contract = ConnectorMutationMatchContract::try_new(
+    let contract = ConnectorMutationMatchContract::try_new_observed(
         owner.clone(),
         request.table.clone(),
         base_version.clone(),
@@ -482,6 +486,7 @@ pub(crate) fn prepare_row_mutation(
         before_fields,
         after_fields,
         effect_field,
+        || control.check_active(),
     )?;
     let preparation_payload = preparation_payload(
         owner,
@@ -492,7 +497,7 @@ pub(crate) fn prepare_row_mutation(
         isolation,
     );
     Ok(ConnectorRowMutationPreparationOutcome::Prepared(
-        ConnectorRowMutationPreparation::try_new(
+        ConnectorRowMutationPreparation::try_new_observed(
             owner.clone(),
             request.operation_id,
             request.table,
@@ -509,45 +514,68 @@ pub(crate) fn prepare_row_mutation(
             // the branch head otherwise.
             target_snapshot_id,
             preparation_payload,
+            || control.check_active(),
         )?,
     ))
 }
 
-/// Sign one admitted source-identity column.
-///
-/// The hashed byte sequence is a frozen cross-layer domain: any change here
-/// silently invalidates every preparation already issued against it.
-fn row_mutation_identity_token(
+// Hash each table/role prefix once. Each field token retains the old domain
+// and ordinal bytes, including when the opaque table handle is large.
+fn row_mutation_token_prefix(
     owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
-    ordinal: usize,
-) -> ConnectorWriteFieldToken {
+    domain: &[u8],
+) -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.iceberg.row-mutation-identity.v1\0");
+    hasher.update(domain);
     hasher.update(owner.instance_id.as_str().as_bytes());
     hasher.update(owner.incarnation.to_bytes());
     hasher.update(table.payload());
-    hasher.update((ordinal as u64).to_be_bytes());
+    hasher
+}
+
+fn row_mutation_field_prefix(
+    owner: &ConnectorProviderBindingKey,
+    table: &ConnectorTableHandle,
+    role: &[u8],
+) -> Sha256 {
+    let mut hasher =
+        row_mutation_token_prefix(owner, table, b"novarocks.iceberg.row-mutation-field.v1\0");
+    hasher.update((role.len() as u64).to_be_bytes());
+    hasher.update(role);
+    hasher
+}
+
+fn token_at_ordinal(prefix: &Sha256, ordinal: u32) -> ConnectorWriteFieldToken {
+    let mut hasher = prefix.clone();
+    hasher.update(u64::from(ordinal).to_be_bytes());
     ConnectorWriteFieldToken::from_bytes(hasher.finalize().into())
 }
 
-/// Sign one before/after target column. `role` is length-prefixed so that no
-/// two role/ordinal pairs can collide by concatenation.
+#[cfg(test)]
+fn row_mutation_identity_token(
+    owner: &ConnectorProviderBindingKey,
+    table: &ConnectorTableHandle,
+    ordinal: u32,
+) -> ConnectorWriteFieldToken {
+    token_at_ordinal(
+        &row_mutation_token_prefix(
+            owner,
+            table,
+            b"novarocks.iceberg.row-mutation-identity.v1\0",
+        ),
+        ordinal,
+    )
+}
+
+#[cfg(test)]
 fn row_mutation_field_token(
     owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     role: &[u8],
-    ordinal: usize,
+    ordinal: u32,
 ) -> ConnectorWriteFieldToken {
-    let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.iceberg.row-mutation-field.v1\0");
-    hasher.update(owner.instance_id.as_str().as_bytes());
-    hasher.update(owner.incarnation.to_bytes());
-    hasher.update(table.payload());
-    hasher.update((role.len() as u64).to_be_bytes());
-    hasher.update(role);
-    hasher.update((ordinal as u64).to_be_bytes());
-    ConnectorWriteFieldToken::from_bytes(hasher.finalize().into())
+    token_at_ordinal(&row_mutation_field_prefix(owner, table, role), ordinal)
 }
 
 /// Sign the single logical-effect column. Unlike the identity and target
@@ -561,6 +589,65 @@ fn row_mutation_effect_token(
     hasher.update(owner.instance_id.as_str().as_bytes());
     hasher.update(table.payload());
     ConnectorWriteFieldToken::from_bytes(hasher.finalize().into())
+}
+
+#[cfg(test)]
+pub(crate) fn preparation_for_test_source(
+    source: ConnectorTableHandle,
+    schema: arrow::datatypes::SchemaRef,
+) -> ConnectorRowMutationPreparation {
+    use novarocks_spi::connector::{
+        ConnectorRowMutationIntent, ConnectorWriteBaseVersion, ConnectorWriteOperationId,
+        ConnectorWriteTargetRef, ProviderBindingEpoch,
+    };
+    let owner = ConnectorProviderBindingKey {
+        instance_id: source.owner().clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+    };
+    let base = ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test base")).unwrap();
+    let field = schema.field(0).clone();
+    let value = novarocks_type_contract::FunctionValueType::new(
+        field.data_type().clone(),
+        field.is_nullable(),
+    );
+    let contract = ConnectorMutationMatchContract::try_new(
+        owner.clone(),
+        source.clone(),
+        base.clone(),
+        vec![
+            ConnectorMutationSourceField::try_new_typed(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                field,
+                0,
+                value,
+            )
+            .unwrap(),
+        ],
+        vec![],
+        vec![],
+        ConnectorMutationEffectField::try_new(
+            ConnectorWriteFieldToken::from_bytes([2; 32]),
+            Field::new("effect", DataType::Int8, false),
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ConnectorRowMutationPreparation::try_new(
+        owner,
+        ConnectorWriteOperationId::from_bytes([9; 16]),
+        source.clone(),
+        source,
+        schema,
+        ConnectorWriteTargetRef::main(),
+        ConnectorRowMutationIntent::Delete,
+        base,
+        contract,
+        ConnectorRowMutationStrategy::PositionDelete,
+        None,
+        Bytes::from_static(b"test preparation"),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -1001,7 +1088,6 @@ mod tests {
             )
             .unwrap(),
         );
-        preparation.validate().unwrap();
         let schema = preparation.match_source_schema();
         let source = schema.field(1);
         assert_eq!(

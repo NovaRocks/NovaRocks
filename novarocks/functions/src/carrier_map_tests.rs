@@ -409,10 +409,8 @@ fn complete_map64_type_validation_uses_canonical_depth_and_original_control_owne
             assert_eq!(control.trace(), expected[..=at]);
         }
     }
-    assert!(matches!(
-        novarocks_type_contract::validate_value_type_structure_observed::<
-            novarocks_type_contract::ValueTypeError,
-        >(ty.data_type(), |_| Ok(())),
-        Err(novarocks_type_contract::ValueTypeError::TooDeep)
-    ));
+    novarocks_type_contract::validate_value_type_structure_observed::<
+        novarocks_type_contract::ValueTypeError,
+    >(ty.data_type(), |_| Ok(()))
+    .unwrap();
 }

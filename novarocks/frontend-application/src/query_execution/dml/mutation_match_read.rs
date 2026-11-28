@@ -16,6 +16,8 @@
 // under the License.
 
 use novarocks_parser::{ast, build};
+use std::collections::HashMap;
+
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningPin, ConnectorError,
     ConnectorReadSelector, ConnectorRowMutationPreparation, ConnectorTableColumnRole,
@@ -192,8 +194,9 @@ fn mutation_match_overlay(
     target_table.query_period = None;
 
     let schema = preparation.match_source_schema().clone();
+    let source_schema_digest = preparation.match_source_schema_digest();
     let snapshot = preparation.base_version_ordinal();
-    let preparation_digest = preparation.digest();
+    let preparation_identity = preparation.preparation_identity().clone();
     let (columns, hidden) = match_source_columns(preparation, original)?;
     let key = QueryTableBindingKey::strict_base(&target.catalog, &target.namespace, &table);
     let (catalog, namespace) = (target.catalog.clone(), target.namespace.clone());
@@ -229,7 +232,8 @@ fn mutation_match_overlay(
                 admission: QueryTableBindingAdmission::RowMutationMatch(
                     planning_pin.clone(),
                     snapshot,
-                    preparation_digest,
+                    preparation_identity.clone(),
+                    source_schema_digest,
                 ),
                 source_metadata: Some(original.clone()),
                 scan_materialization: match_source.as_ref().map(|table| QueryScanMaterialization {
@@ -253,16 +257,35 @@ fn match_source_columns(
     original: &ConnectorTableMetadata,
 ) -> Result<(Vec<ColumnDef>, Vec<ColumnDef>), String> {
     let contract = preparation.match_contract();
+    let mut original_by_name = HashMap::new();
+    for (ordinal, field) in original.schema().fields().iter().enumerate() {
+        if original_by_name
+            .insert(field.name().as_str(), (ordinal, field))
+            .is_some()
+        {
+            return Err("original mutation source repeats a field name".to_string());
+        }
+    }
+    let identity_by_name: HashMap<_, _> = contract
+        .identity_fields()
+        .iter()
+        .map(|field| (field.field().name().as_str(), field))
+        .collect();
+    let before_by_name: HashMap<_, _> = contract
+        .before_fields()
+        .iter()
+        .map(|field| (field.field().name().as_str(), field))
+        .collect();
     let mut columns = Vec::new();
     let mut hidden = Vec::new();
     for field in preparation.match_source_schema().fields() {
-        let original_ordinal = original.schema().fields().iter().position(|candidate| {
-            candidate.as_ref() == field.as_ref() && candidate.metadata() == field.metadata()
-        });
-        let identity = contract
-            .identity_fields()
-            .iter()
-            .find(|value| value.field().name() == field.name());
+        let original_ordinal = original_by_name
+            .get(field.name().as_str())
+            .filter(|(_, candidate)| {
+                candidate.as_ref() == field.as_ref() && candidate.metadata() == field.metadata()
+            })
+            .map(|(ordinal, _)| *ordinal);
+        let identity = identity_by_name.get(field.name().as_str());
         let original_role = original_ordinal
             .and_then(|ordinal| original.planning_facts.column_facts().get(ordinal))
             .map(|fact| fact.role());
@@ -289,10 +312,8 @@ fn match_source_columns(
             let signed = identity
                 .and_then(|value| value.execution_type())
                 .or_else(|| {
-                    contract
-                        .before_fields()
-                        .iter()
-                        .find(|value| value.field().name() == field.name())
+                    before_by_name
+                        .get(field.name().as_str())
                         .and_then(|value| value.execution_type())
                 })
                 .ok_or_else(|| {

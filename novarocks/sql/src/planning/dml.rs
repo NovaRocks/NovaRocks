@@ -4616,7 +4616,12 @@ mod tests {
                                 .root_expression(node.id, calls[0].arguments[0])
                                 .unwrap()
                                 .ty,
-                            calls[0].binding.intermediate_type,
+                            calls[0]
+                                .binding
+                                .merge_state
+                                .as_ref()
+                                .unwrap()
+                                .intermediate_type,
                             "Final runtime channel reads the actual materialized state"
                         );
                         assert_eq!(

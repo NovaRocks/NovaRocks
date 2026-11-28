@@ -108,9 +108,6 @@ pub trait UnitObserver {
     type Error;
     fn checkpoint(&mut self) -> Result<(), Self::Error>;
     fn before_allocation(&mut self, layout: Layout) -> Result<(), Self::Error>;
-    /// Finite initialization of the shared borrowed type stack. This is work,
-    /// not a heap allocation request or a grant derived from source bytes.
-    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Self::Error>;
     fn before_metadata_verification(&mut self, metadata: &[u8]) -> Result<(), Self::Error>;
     /// The original role creates the body and attaches retained capacity to its
     /// actual aliases. Implementations must use the pinned Arrow alignment and

@@ -572,7 +572,6 @@ mod tests {
         use crate::{
             ipc_flat_batch_v2::FlatBatchProjectionLimits,
             ipc_flat_stream_v2::{FlatStreamProjectionLimits, preflight_flat_constant_stream},
-            ipc_schema_v2::IpcSchemaProjectionLimits,
         };
         use arrow::{datatypes::Field, ipc::writer::StreamWriter, record_batch::RecordBatch};
         use novarocks_arrow_ipc_frame::VerifierOptions;
@@ -582,12 +581,7 @@ mod tests {
 
         let bounds = FlatStreamProjectionLimits {
             max_input_bytes: 65536,
-            schema: IpcSchemaProjectionLimits {
-                max_field_occurrences: 1,
-                max_type_occurrences: 1,
-                max_string_bytes: 1024,
-                max_flatbuffer_bytes: 16384,
-            },
+
             batch: FlatBatchProjectionLimits {
                 max_metadata_bytes: 16384,
                 max_body_bytes: 16384,
@@ -637,9 +631,14 @@ mod tests {
                 writer.finish().unwrap();
             }
             let control = Control(Mutex::new(Vec::new()));
-            let stream =
-                preflight_flat_constant_stream(&input, &field, bounds, &verifier, &control)
-                    .unwrap();
+            let stream = preflight_flat_constant_stream(
+                crate::ipc_flat_stream_v2::standard_test_record_frame(&input),
+                &field,
+                bounds,
+                &verifier,
+                &control,
+            )
+            .unwrap();
             let pool = stream
                 .preflight_pool_resources(&ty, policy, &control)
                 .unwrap();

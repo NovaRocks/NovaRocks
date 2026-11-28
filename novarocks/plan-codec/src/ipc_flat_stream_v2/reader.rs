@@ -563,21 +563,8 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
                 &diagnostics,
                 &mut observed,
             )?;
-            // The three Constant source passes now initialize its own fixed
-            // scratch. They no longer allocate the Plain DFS Vec requests.
-            let scratch =
-                novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound(
-                );
-            let upper = a.numeric(add(
-                original,
-                a.numeric(
-                    scratch
-                        .checked_mul(3)
-                        .ok_or_else(|| shape("flat reader source scratch work overflow")),
-                )?,
-            ))?;
-            a.reader_work(upper)?;
-            upper
+            a.reader_work(original)?;
+            original
         } else {
             reader_work::preflight(
                 self,
@@ -879,9 +866,6 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
             return Err(shape("flat reader requires the original source Field Arc").into());
         }
         if let Some(a) = admission.as_deref_mut() {
-            let scratch =
-                novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound(
-                );
             let header = reader_allocations::initial_header(&field)?;
             a.requests(
                 2,
@@ -891,11 +875,6 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
             let body_len = self.batch_body().len();
             let rounded = a.numeric(super::pool_resources::rounded_capacity(body_len))?;
             a.requests(1, rounded, usize::from(rounded != 0))?;
-            a.reader_work(
-                scratch
-                    .checked_mul(3)
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
-            )?;
             a.clone_work(crate::physical_type_v2::value_type_clone_preflight_work_upper_bound())?;
             crate::physical_type_v2::preflight_value_type_clone_admitted::<E>(
                 value_type.as_ref(),

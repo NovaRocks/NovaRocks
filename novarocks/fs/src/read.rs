@@ -33,7 +33,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileFormat {
-    Parquet,
+    Parquet(ParquetInterpretationPolicy),
     Orc,
 }
 
@@ -254,9 +254,8 @@ pub struct FileReadRequest {
 /// facts, including field IDs or ordered key/value metadata. The version is part
 /// of the interpretation cache identity.
 // Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ParquetInterpretationPolicy {
-    #[default]
     UseArrowHint,
     SkipArrowHint,
     /// Derive decoder-only byte-array carriers from the standard schema.
@@ -288,7 +287,6 @@ impl ParquetInterpretationPolicy {
 /// Reader-open policy that remains local to the neutral filesystem boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileReaderOptions {
-    pub parquet_interpretation_policy: ParquetInterpretationPolicy,
     pub enable_parquet_reader_page_index: bool,
     pub coalesce_reads: bool,
     pub coalesce_max_bytes: u64,
@@ -298,7 +296,6 @@ pub struct FileReaderOptions {
 impl Default for FileReaderOptions {
     fn default() -> Self {
         Self {
-            parquet_interpretation_policy: ParquetInterpretationPolicy::UseArrowHint,
             enable_parquet_reader_page_index: false,
             coalesce_reads: true,
             coalesce_max_bytes: 8 * 1024 * 1024,

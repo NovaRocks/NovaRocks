@@ -29,11 +29,8 @@ use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap;
 use novarocks_type_contract::{
     ArrowTypeProfile, CompileCheckpoints, CompileControlError, FunctionValueType,
-    MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-    MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_DEPTH,
-    MAX_VALUE_TYPE_NODES, TypedValueBinding, ValueLayout, ValueSchemaCreationScope, ValueTypeError,
-    ValueTypeStorageLifetime,
+    MAX_ARROW_TYPE_PATH_DEPTH, MAX_VALUE_TYPE_DEPTH, TypedValueBinding, ValueLayout,
+    ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -190,8 +187,7 @@ fn depth_profile<H>(
 }
 
 fn check_summary_depth(summary: Summary, profile: ArrowTypeProfile) -> Result<(), E> {
-    profile.check_physical_depth(summary.depth)?;
-    if profile != ArrowTypeProfile::Physical && summary.logical_depth > MAX_VALUE_TYPE_DEPTH {
+    if summary.depth > MAX_ARROW_TYPE_PATH_DEPTH || summary.logical_depth > MAX_VALUE_TYPE_DEPTH {
         return Err(ValueTypeError::TooDeep.into());
     }
     match profile {
@@ -352,22 +348,13 @@ fn preflight<'a, 'graph, H>(
             .kind
             .as_ref()
             .ok_or(E::InvalidShape("missing carrier kind"))?;
-        let is_strict = strict(receiver.as_ref(), Node::Carrier(carrier.id), work)?;
         if let Kind::Timestamp(timestamp) = kind
             && let Some(zone) = &timestamp.timezone
         {
-            if is_strict && zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
-                return Err(E::InvalidShape("Arrow timestamp zone exceeds its owner bound").into());
-            }
             add(&mut bytes, zone.len(), limits.max_string_bytes)?;
             observe_bytes(zone.as_bytes(), work)?;
         }
         match kind {
-            Kind::StructType(fields)
-                if is_strict && fields.field_ids.len() >= MAX_VALUE_TYPE_NODES =>
-            {
-                return Err(ValueTypeError::TooManyNodes.into());
-            }
             Kind::UnionType(fields) => {
                 if fields.fields.len() > 128 {
                     return Err(E::InvalidShape("too many union fields").into());
@@ -388,10 +375,9 @@ fn preflight<'a, 'graph, H>(
             }
             Kind::FixedSizeBinary(length)
             | Kind::FixedSizeList(wire::FixedSizeList { length, .. })
-                if *length < 0
-                    || (is_strict && *length > novarocks_physical_plan::MAX_FIXED_SIZE_LENGTH) =>
+                if *length < 0 =>
             {
-                return Err(E::InvalidShape("Arrow fixed size exceeds its owner bound").into());
+                return Err(E::InvalidShape("Arrow fixed size is negative").into());
             }
             _ => {}
         }
@@ -404,52 +390,16 @@ fn preflight<'a, 'graph, H>(
         } {
             return Err(E::InvalidShape("duplicate field identity").into());
         }
-        let is_strict = strict(receiver.as_ref(), Node::Field(field.id), work)?;
         let attributes = field_attributes(field, source_facts, work)?;
-        if is_strict
-            && (field.name.len() > MAX_ARROW_FIELD_NAME_BYTES
-                || attributes.metadata.len() > MAX_ARROW_FIELD_METADATA_ENTRIES)
-        {
-            return Err(E::InvalidShape("Arrow field attributes exceed their owner bounds").into());
-        }
         add(&mut bytes, field.name.len(), limits.max_string_bytes)?;
         observe_bytes(field.name.as_bytes(), work)?;
-        let mut metadata_bytes = 0;
         let mut previous: Option<&str> = None;
         for entry in attributes.metadata {
             work.step()?;
-            if is_strict
-                && (entry.key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
-                    || entry.value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES)
-            {
-                return Err(
-                    E::InvalidShape("Arrow field metadata entry exceeds its owner bound").into(),
-                );
-            }
-            add(
-                &mut metadata_bytes,
-                entry.key.len(),
-                if is_strict {
-                    MAX_ARROW_FIELD_METADATA_BYTES
-                } else {
-                    usize::MAX
-                },
-            )?;
-            add(
-                &mut metadata_bytes,
-                entry.value.len(),
-                if is_strict {
-                    MAX_ARROW_FIELD_METADATA_BYTES
-                } else {
-                    usize::MAX
-                },
-            )?;
             add(&mut bytes, entry.key.len(), limits.max_string_bytes)?;
             add(&mut bytes, entry.value.len(), limits.max_string_bytes)?;
             observe_bytes(entry.key.as_bytes(), work)?;
             observe_bytes(entry.value.as_bytes(), work)?;
-            // Keep the original owner bounds and diagnostic order; strict
-            // metadata order is supplied by the sole observed key author.
             if !crate::arrow_metadata_v2::ordered_key(previous, &entry.key, work)? {
                 return Err(E::InvalidShape("field metadata must be sorted and unique").into());
             }
@@ -518,7 +468,8 @@ fn topology<H>(
     let mut summaries = BTreeMap::<Node, Summary>::new();
     let mut active = BTreeMap::<Node, bool>::new();
     let mut order = Vec::new();
-    let mut stack = Vec::<Frame>::new();
+    const MAX_PATH_VERTICES: usize = 2 * MAX_ARROW_TYPE_PATH_DEPTH;
+    let mut stack: [Option<Frame>; MAX_PATH_VERTICES] = std::array::from_fn(|_| None);
     let package = receiver.is_some();
     let vertices = table
         .carriers
@@ -528,9 +479,6 @@ fn topology<H>(
     if package {
         opaque(true, work, |_| {
             order
-                .try_reserve_exact(vertices)
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
-            stack
                 .try_reserve_exact(vertices)
                 .map_err(|_| CompileControlError::ResourceExhausted)?;
             Ok(())
@@ -550,24 +498,15 @@ fn topology<H>(
             active.insert(root, true);
             Ok(())
         })?;
-        // The original raw physical policy remains independent of value
-        // declarations. Value and Writer paths use the admitted graph's actual
-        // vertices; physical wrappers do not introduce another rejection quota.
-        let max_path_vertices = match depth_profile(receiver.as_ref(), root, work)?
-            .and_then(ArrowTypeProfile::physical_depth_limit)
-        {
-            Some(limit) => limit
-                .checked_mul(2)
-                .ok_or(CompileControlError::ResourceExhausted)?,
-            None => vertices,
-        };
-        stack.push(Frame {
+        stack[0] = Some(Frame {
             node: root,
             next: 0,
             summary: Summary::default(),
         });
-        while let Some(frame) = stack.last_mut() {
+        let mut depth = 1;
+        while depth != 0 {
             work.step()?;
+            let frame = stack[depth - 1].as_mut().expect("active type graph cursor");
             let node = frame.node;
             if frame.next < opaque(package, work, |_| index.child_count(node))? {
                 let child = opaque(package, work, |_| index.child(node, frame.next))?;
@@ -597,14 +536,13 @@ fn topology<H>(
                 if opaque(package, work, |_| Ok(active.insert(child, true)))? == Some(true) {
                     return Err(E::InvalidShape("cyclic type table references").into());
                 }
-                if stack.len() >= max_path_vertices || (package && stack.len() >= vertices) {
-                    return Err(ValueTypeError::TooDeep.into());
-                }
-                stack.push(Frame {
+                let slot = stack.get_mut(depth).ok_or(ValueTypeError::TooDeep)?;
+                *slot = Some(Frame {
                     node: child,
                     next: 0,
                     summary: Summary::default(),
                 });
+                depth += 1;
             } else {
                 let mut summary = frame.summary;
                 if matches!(node, Node::Carrier(_)) {
@@ -618,24 +556,10 @@ fn topology<H>(
                         .ok_or_else(|| summary_overflow(package, "expanded type depth overflow"))?;
                 }
                 if let Node::Carrier(id) = node {
+                    index.validate_carrier_shape(id)?;
                     match index.kind(id)? {
-                        Kind::Map(map) => {
-                            // Validate this edge before removing its entries
-                            // scaffold from semantic depth. The same Struct
-                            // reached through any ordinary edge keeps its level.
-                            let field = index.field(required(map.entries_field_id)?)?;
-                            let Kind::StructType(entries) =
-                                index.kind(required(field.carrier_type_id)?)?
-                            else {
-                                return Err(E::InvalidShape("Map entries must be Struct").into());
-                            };
-                            if entries.field_ids.len() != 2 {
-                                return Err(E::InvalidShape(
-                                    "Map entries must contain key and value",
-                                )
-                                .into());
-                            }
-                        }
+                        // The entries Struct contributes this Map's level.
+                        Kind::Map(_) => {}
                         Kind::Dictionary(_) | Kind::RunEndEncoded(_) => {
                             summary.encoding_depth = summary
                                 .encoding_depth
@@ -685,25 +609,9 @@ fn topology<H>(
                     receiver.model.validation(summary.nodes)?;
                     receiver.gate()?;
                 }
-                if is_strict && summary.nodes > MAX_VALUE_TYPE_NODES {
-                    return Err(ValueTypeError::TooManyNodes.into());
-                }
-                if is_strict {
-                    let profile = depth_profile(receiver.as_ref(), node, work)?
-                        .ok_or(E::InvalidShape("strict type has no depth profile"))?;
-                    check_summary_depth(summary, profile)?;
-                }
-                if package && !is_strict {
-                    // The original Writer depth author protects recursive
-                    // clones before Arrow construction. Attributes and exact
-                    // per-recipe charges remain with the original field law.
-                    let mut charge = 0;
-                    novarocks_connector_contract::charge_write_type_header(
-                        summary.depth,
-                        None,
-                        &mut charge,
-                    )?;
-                }
+                let profile = depth_profile(receiver.as_ref(), node, work)?
+                    .unwrap_or(ArrowTypeProfile::Physical);
+                check_summary_depth(summary, profile)?;
                 opaque(package, work, |_| {
                     summaries.insert(node, summary);
                     Ok(())
@@ -717,7 +625,8 @@ fn topology<H>(
                     Ok(())
                 })?;
                 order.push(node);
-                stack.pop();
+                depth -= 1;
+                stack[depth] = None;
             }
         }
     }
@@ -2341,7 +2250,7 @@ fn decode_source_fields_core<H, F: novarocks_type_contract::ValueSchemaCreationF
         .shape
         .as_ref()
         .ok_or(E::InvalidShape("source field shape is absent"))?;
-    let mut model = TypeDecodeModel::new::<Summary, Frame>(table, source)?;
+    let mut model = TypeDecodeModel::new::<Summary>(table, source)?;
     if factory.is_some() {
         model.enable_entity_scopes()?;
     }
@@ -2402,22 +2311,13 @@ fn decode_source_fields_core<H, F: novarocks_type_contract::ValueSchemaCreationF
     )?;
     admission.exact(index_layout)?;
     let source_facts = SourceFactsIndex::prepare::<H>(&source_table.field_facts, table, work)?;
-    // Every actual source graph vertex is a possible root, including unused
-    // definitions. The same per-root checked Arrow grammar supplies finite
-    // expansion/name bounds; this is not a request or memory grant.
     let structural = match limits {
         Some(limits) => TypeProjectionLimits {
             max_definitions: limits.max_definitions,
             max_expanded_nodes: limits.max_expanded_nodes,
             max_string_bytes: limits.max_string_bytes,
         },
-        None => TypeProjectionLimits::for_validated_source_root_count(
-            table
-                .carriers
-                .len()
-                .checked_add(table.fields.len())
-                .ok_or(CompileControlError::ResourceExhausted)?,
-        )?,
+        None => TypeProjectionLimits::INPUT_DERIVED,
     };
     let graph = if let Some(package) = package {
         Some(
@@ -2601,7 +2501,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
         .types
         .as_ref()
         .ok_or(E::InvalidShape("package type table is absent"))?;
-    let mut model = TypeDecodeModel::new::<Summary, Frame>(table, source)?;
+    let mut model = TypeDecodeModel::new::<Summary>(table, source)?;
     if factory.is_some() {
         model.enable_entity_scopes()?;
     }

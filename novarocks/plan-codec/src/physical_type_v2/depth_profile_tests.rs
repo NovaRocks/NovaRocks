@@ -119,7 +119,7 @@ fn execution_map_64_roundtrips_through_real_value_and_schema_occurrences() {
 }
 
 #[test]
-fn actual_unbound_physical_root_cannot_borrow_a_value_profiles_larger_carrier_depth() {
+fn actual_unbound_physical_root_accepts_map_at_logical_depth_limit() {
     let value = FunctionValueType::new(maps(64), false);
     let mut table = encode_type_table(&[(7, value)], projection(), &Control).unwrap();
     let carrier = table.value_types[0].carrier_type_id;
@@ -133,16 +133,18 @@ fn actual_unbound_physical_root_cannot_borrow_a_value_profiles_larger_carrier_de
     });
     let package = raw::FragmentPackage {
         types: Some(table),
+        source_fields: Some(wire::SourceFieldTable {
+            shape: Some(wire::TypeTable::default()),
+            field_facts: vec![],
+        }),
         schemas: vec![raw::SchemaDefinition {
             id: 0,
             field_ids: vec![u32::MAX],
         }],
         ..Default::default()
     };
-    assert!(matches!(
-        receive(&package),
-        Err(TypeCodecError::ValueType(ValueTypeError::TooDeep))
-    ));
+    let decoded = receive(&package).unwrap();
+    assert_eq!(decoded.field(u32::MAX).unwrap().data_type(), &maps(64));
 }
 
 #[test]
@@ -166,11 +168,68 @@ fn canonical_profile_does_not_turn_a_generic_struct_190_into_a_logical_value() {
 }
 
 #[test]
-fn legacy_pure_dto_decoder_retains_its_explicit_physical64_policy() {
+fn plain_type_table_decoder_uses_logical_map_depth() {
     let value = FunctionValueType::new(maps(64), false);
     let table = encode_type_table(&[(7, value)], projection(), &Control).unwrap();
-    assert!(matches!(
-        decode_type_table_pure(&table, projection(), &Control),
-        Err(TypeCodecError::ValueType(ValueTypeError::TooDeep))
-    ));
+    let decoded = decode_type_table_pure(&table, projection(), &Control).unwrap();
+    assert_eq!(decoded.value_type(7).unwrap().data_type(), &maps(64));
+}
+
+#[test]
+fn flat_type_table_rejects_every_consecutive_encoding_pair() {
+    use novarocks_proto_models::plan::ArrowPrimitiveType;
+    use wire::carrier_type_definition::Kind;
+
+    for (inner_run_end, outer_run_end) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut table = wire::TypeTable {
+            carriers: vec![
+                wire::CarrierTypeDefinition {
+                    id: 0,
+                    kind: Some(Kind::Primitive(ArrowPrimitiveType::Int16 as i32)),
+                },
+                wire::CarrierTypeDefinition {
+                    id: 1,
+                    kind: Some(Kind::Primitive(ArrowPrimitiveType::Int64 as i32)),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut wrap = |id, child, run_end| {
+            let kind = if run_end {
+                let ends = 2 * id;
+                let values = ends + 1;
+                for (field, name, ty) in [(ends, "run_ends", 0), (values, "values", child)] {
+                    table.fields.push(wire::FieldDefinition {
+                        id: field,
+                        name: name.into(),
+                        carrier_type_id: Some(ty),
+                        ..Default::default()
+                    });
+                }
+                Kind::RunEndEncoded(wire::RunEndEncodedFields {
+                    run_ends_field_id: Some(ends),
+                    values_field_id: Some(values),
+                })
+            } else {
+                Kind::Dictionary(wire::DictionaryTypes {
+                    key_type_id: Some(0),
+                    value_type_id: Some(child),
+                })
+            };
+            table.carriers.push(wire::CarrierTypeDefinition {
+                id,
+                kind: Some(kind),
+            });
+        };
+        wrap(2, 1, inner_run_end);
+        wrap(3, 2, outer_run_end);
+        assert!(matches!(
+            decode_type_table_pure(&table, projection(), &Control),
+            Err(TypeCodecError::InvalidShape(
+                "an Arrow value node cannot carry consecutive encodings"
+            ))
+        ));
+    }
 }

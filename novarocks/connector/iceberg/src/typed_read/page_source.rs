@@ -917,6 +917,7 @@ pub struct IcebergPageSourceRequest<'a> {
     pub cache: Option<novarocks_fs::DataCachePolicy>,
     pub budget: ReaderSizing,
     pub reader_options: FileReaderOptions,
+    pub parquet_policy: novarocks_fs::ParquetInterpretationPolicy,
     /// Names this split within its task attempt; the only scheduling identity.
     pub scheduled_split_sequence_id: u64,
     pub dynamic_filter: Arc<IcebergDynamicFilter>,
@@ -1028,6 +1029,7 @@ struct ParquetSplitRequest {
     cache: Option<novarocks_fs::DataCachePolicy>,
     budget: ReaderSizing,
     reader_options: FileReaderOptions,
+    parquet_policy: novarocks_fs::ParquetInterpretationPolicy,
     scheduled_split_sequence_id: u64,
     dynamic_filter: Arc<IcebergDynamicFilter>,
     prepared_input: Option<PreparedFileInput>,
@@ -1052,6 +1054,7 @@ impl ParquetSplitRequest {
                 cache: request.cache,
                 budget: request.budget,
                 reader_options: request.reader_options,
+                parquet_policy: request.parquet_policy,
                 scheduled_split_sequence_id: request.scheduled_split_sequence_id,
                 dynamic_filter: request.dynamic_filter,
                 prepared_input: request.prepared_input,
@@ -1106,6 +1109,7 @@ impl ParquetSplitRequest {
             footers: self.footers,
             budget: self.budget,
             reader_options: self.reader_options,
+            parquet_policy: self.parquet_policy,
             dynamic_filter: LiveDynamicFilter::new(
                 self.dynamic_filter,
                 self.scheduled_split_sequence_id,
@@ -1146,6 +1150,7 @@ pub(super) struct PreparedInputRequest<'a> {
     pub(super) cache: Option<novarocks_fs::DataCachePolicy>,
     pub(super) budget: ReaderSizing,
     pub(super) reader_options: FileReaderOptions,
+    pub(super) parquet_policy: novarocks_fs::ParquetInterpretationPolicy,
     pub(super) row_group_ordinal: Option<u32>,
 }
 
@@ -1167,6 +1172,7 @@ pub(super) fn plan_iceberg_prepared_input(
         cache,
         budget,
         mut reader_options,
+        parquet_policy,
         row_group_ordinal,
     } = request;
     admit_file_format(split.file_format())?;
@@ -1252,7 +1258,7 @@ pub(super) fn plan_iceberg_prepared_input(
     reader_options.enable_parquet_reader_page_index = false;
     let request = FileReadRequest {
         file: file.clone(),
-        format: novarocks_fs::FileFormat::Parquet,
+        format: novarocks_fs::FileFormat::Parquet(parquet_policy),
         range,
         projection,
         sizing: budget,
@@ -1622,6 +1628,7 @@ pub struct IcebergParquetPageSource {
     footers: Arc<ParquetFooterCache>,
     budget: ReaderSizing,
     reader_options: FileReaderOptions,
+    parquet_policy: novarocks_fs::ParquetInterpretationPolicy,
     dynamic_filter: LiveDynamicFilter,
     prepared_input: Option<PreparedFileInput>,
     prepared_retained_capacity: u64,
@@ -1671,7 +1678,7 @@ impl IcebergParquetPageSource {
                 &self.context,
                 self.split.path(),
                 file_size,
-                self.reader_options.parquet_interpretation_policy,
+                self.parquet_policy,
             )
             .await?;
         self.open_with_footer(footer)
@@ -2017,7 +2024,7 @@ impl IcebergParquetPageSource {
             .map_err(map_file_error)?;
         Ok(FileReadRequest {
             file,
-            format: novarocks_fs::FileFormat::Parquet,
+            format: novarocks_fs::FileFormat::Parquet(self.parquet_policy),
             range,
             projection,
             sizing: self.budget,
@@ -2142,6 +2149,7 @@ impl IcebergParquetPageSource {
             let cache = self.cache.clone();
             let budget = self.budget;
             let options = self.reader_options;
+            let parquet_policy = self.parquet_policy;
             let planner = Arc::new(move |context: FileReadContext| {
                 plan_iceberg_prepared_input(PreparedInputRequest {
                     relation: &relation,
@@ -2154,6 +2162,7 @@ impl IcebergParquetPageSource {
                     cache: cache.clone(),
                     budget,
                     reader_options: options,
+                    parquet_policy,
                     row_group_ordinal: Some(next_ordinal),
                 })
             });

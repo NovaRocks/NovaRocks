@@ -84,7 +84,7 @@ impl Fixture {
                         .collect::<Box<[_]>>(),
                 ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
-                aggregate: Some(AggregateBindingSelection {
+                aggregate: order.is_empty().then(|| AggregateBindingSelection {
                     state_argument_contract:
                         novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: state,
@@ -258,7 +258,7 @@ fn selected<'a>(selection: Selection<'a>, values: ArrayRef) -> SelectedValues<'a
 
 #[test]
 fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
-    let fixture = ordered_fixture();
+    let fixture = Fixture::new(&[i64_type(true)], &[], i64_type(false));
     let call = fixture.call();
     for phase in [
         AggregateKernelPhase::Single,
@@ -282,7 +282,7 @@ fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
         );
         assert_eq!(
             contract.order_argument_types().cloned().collect::<Vec<_>>(),
-            [FunctionValueType::new(DataType::Int32, true)]
+            []
         );
         assert_eq!(contract.intermediate_type(), &i64_type(false));
         assert_eq!(contract.final_type(), &i64_type(false));
@@ -290,10 +290,7 @@ fn all_four_phases_preserve_one_exact_logical_binding_and_state_format() {
             contract.state_format(),
             &fixture.selected.aggregate.as_ref().unwrap().state_format
         );
-        assert_eq!(
-            contract.order_keys().len(),
-            usize::from(phase.consumes_logical_arguments())
-        );
+        assert!(contract.order_keys().is_empty());
         assert_eq!(
             contract.state_input_type().is_some(),
             !phase.consumes_logical_arguments()
@@ -346,7 +343,7 @@ fn zero_argument_count_shape_needs_only_selection_for_update() {
 #[test]
 fn logical_and_order_carriers_share_exact_selection_but_stay_independent() {
     let call = ordered_fixture().call();
-    let contract = aggregate(call, AggregateKernelPhase::Partial);
+    let contract = aggregate(call, AggregateKernelPhase::Single);
     let rows = [1, 4];
     let other_rows = [0, 4];
     let selection = Selection::try_sparse(6, &rows).unwrap();
@@ -615,35 +612,43 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
 #[test]
 fn phase_contract_rejects_repeated_distinct_order_and_wrong_state_channels() {
     let call = ordered_fixture().call();
-    for phase in [AggregateKernelPhase::Single, AggregateKernelPhase::Partial] {
-        let legal = AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            true,
-            keys(1),
-            None,
-            &CompileControl(None),
-        )
-        .unwrap();
-        assert!(legal.distinct());
-        assert_eq!(legal.order_keys(), keys(1).as_ref());
-        invalid_program(AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            false,
-            keys(0),
-            None,
-            &CompileControl(None),
-        ));
-        invalid_program(AggregateCallContract::try_new(
-            call.clone(),
-            phase,
-            false,
-            keys(1),
-            Some(i64_type(false)),
-            &CompileControl(None),
-        ));
-    }
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        AggregateKernelPhase::Partial,
+        true,
+        keys(1),
+        None,
+        &CompileControl(None),
+    ));
+    let phase = AggregateKernelPhase::Single;
+    let legal = AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        true,
+        keys(1),
+        None,
+        &CompileControl(None),
+    )
+    .unwrap();
+    assert!(legal.distinct());
+    assert_eq!(legal.order_keys(), keys(1).as_ref());
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        false,
+        keys(0),
+        None,
+        &CompileControl(None),
+    ));
+    invalid_program(AggregateCallContract::try_new(
+        call.clone(),
+        phase,
+        false,
+        keys(1),
+        Some(i64_type(false)),
+        &CompileControl(None),
+    ));
+    let call = Fixture::new(&[i64_type(true)], &[], i64_type(false)).call();
     for phase in [
         AggregateKernelPhase::Intermediate,
         AggregateKernelPhase::Final,
@@ -1033,42 +1038,24 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
 }
 
 #[test]
-fn call_preparation_bounds_typed_names_and_timezones_at_checked_author() {
-    use novarocks_type_contract::{
-        MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueLogicalType,
-    };
-    for (boundary, oversized) in [
-        (
-            DataType::Struct(
-                vec![arrow_schema::Field::new(
-                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES),
-                    DataType::Int64,
-                    false,
-                )]
-                .into(),
-            ),
-            DataType::Struct(
-                vec![arrow_schema::Field::new(
-                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES + 1),
-                    DataType::Int64,
-                    false,
-                )]
-                .into(),
-            ),
+fn call_preparation_accepts_names_and_timezones_beyond_former_limits() {
+    use novarocks_type_contract::ValueLogicalType;
+    for carrier in [
+        DataType::Struct(
+            vec![arrow_schema::Field::new(
+                "n".repeat(1024 + 1),
+                DataType::Int64,
+                false,
+            )]
+            .into(),
         ),
-        (
-            DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES).into()),
-            ),
-            DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1).into()),
-            ),
+        DataType::Timestamp(
+            arrow_schema::TimeUnit::Nanosecond,
+            Some("z".repeat(1024 + 1).into()),
         ),
     ] {
         let state =
-            FunctionValueType::try_with_logical_type(boundary, false, ValueLogicalType::Physical)
+            FunctionValueType::try_with_logical_type(carrier, false, ValueLogicalType::Physical)
                 .unwrap();
         let fixture = Fixture::new(&[], &[], state);
         let input = fixture.input();
@@ -1080,9 +1067,5 @@ fn call_preparation_bounds_typed_names_and_timezones_at_checked_author() {
             &CompileControl(None),
         )
         .unwrap();
-        assert!(
-            FunctionValueType::try_with_logical_type(oversized, false, ValueLogicalType::Physical)
-                .is_err()
-        );
     }
 }
